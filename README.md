@@ -21,7 +21,11 @@ The full README with installation instructions, examples, and detailed documenta
   - `get_kin_model(arm)`, `get_tool_from_ee(arm)`, `get_ik_solver(arm)`
   - `get_gripper_spheres(arm)`, `get_joint_limits(arm)`
   - `is_dual_arm` property
-
+- [`t1_domain.py`](cutamp/t1_domain.py) - TAMP domain for T1 dual-arm robot:
+  - Arm-specific fluents: `LeftAt`, `RightAt`, `LeftHandEmpty`, `RightHandEmpty`, `LeftHolding`, `RightHolding`, etc.
+  - Arm-specific operators: `LeftMoveFree`, `RightMoveFree`, `LeftPick`, `RightPick`, `LeftPlace`, `RightPlace`, etc.
+  - Separate task planning for each arm.
+  
 📁 **[Tests](cutamp/tests/)**
 - [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) - T1 robot module tests
 - [`test_tamp_world_dual_arm.py`](cutamp/tests/test_tamp_world_dual_arm.py) - Dual-arm helper method tests
