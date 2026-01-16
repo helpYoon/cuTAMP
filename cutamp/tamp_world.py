@@ -20,9 +20,10 @@ from curobo.geom.types import Obstacle
 from curobo.types.base import TensorDeviceType
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 from cutamp.envs import TAMPEnvironment
-from cutamp.robots import RobotContainer, load_robot_container
+from cutamp.robots import RobotContainer, DualArmRobotContainer, load_robot_container
 from cutamp.robots.franka import franka_curobo_cfg, get_franka_ik_solver
 from cutamp.robots.ur5 import ur5_curobo_cfg, get_ur5_ik_solver
+from cutamp.robots.t1 import t1_curobo_cfg, get_t1_ik_solver
 from cutamp.tamp_domain import get_initial_state
 from cutamp.task_planning import State
 from cutamp.utils.collision import get_world_collision_cost
@@ -43,7 +44,7 @@ class TAMPWorld:
         self,
         env: TAMPEnvironment,
         tensor_args: TensorDeviceType,
-        robot: Union[Literal["panda", "ur5"], RobotContainer],
+        robot: Union[Literal["panda", "ur5", "t1"], RobotContainer, DualArmRobotContainer],
         q_init: Float[torch.Tensor, "dof"],
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
@@ -75,6 +76,10 @@ class TAMPWorld:
             self.ik_solver = get_franka_ik_solver(self.world_cfg)
         elif self.robot_name == "ur5":
             self.ik_solver = get_ur5_ik_solver(self.world_cfg)
+        elif self.robot_name == "t1":
+            # Dual-arm robot has two IK solvers, one for each arm
+            self.ik_solver_left = get_t1_ik_solver("left", self.world_cfg)
+            self.ik_solver_right = get_t1_ik_solver("right", self.world_cfg)
         else:
             raise ValueError(f"Unsupported robot: {self.robot_name}")
 
@@ -101,13 +106,143 @@ class TAMPWorld:
         return self.env.statics
 
     @property
+    def is_dual_arm(self) -> bool:
+        """Whether the robot is a dual-arm robot (e.g., T1)."""
+        return isinstance(self.robot_container, DualArmRobotContainer)
+
+    @property
     def kin_model(self) -> CudaRobotModel:
+        """
+        Get kinematics model (single-arm robots only).
+        
+        For dual-arm robots, use get_kin_model(arm) instead.
+        
+        Raises:
+            RuntimeError: If called on a dual-arm robot.
+        """
+        if self.is_dual_arm:
+            raise RuntimeError(
+                "kin_model property is not available for dual-arm robots. "
+                "Use get_kin_model('left') or get_kin_model('right') instead."
+            )
         return self.robot_container.kin_model
 
     @property
     def tool_from_ee(self) -> Float[torch.Tensor, "4 4"]:
-        """Transformation from tool frame to end-effector frame used by kinematics model and IK solver."""
+        """
+        Transformation from EE frame to tool/grasp frame (single-arm robots only).
+        
+        For dual-arm robots, use get_tool_from_ee(arm) instead.
+        
+        Raises:
+            RuntimeError: If called on a dual-arm robot.
+        """
+        if self.is_dual_arm:
+            raise RuntimeError(
+                "tool_from_ee property is not available for dual-arm robots. "
+                "Use get_tool_from_ee('left') or get_tool_from_ee('right') instead."
+            )
         return self.robot_container.tool_from_ee
+
+    def get_kin_model(self, arm: Literal["left", "right"] = "left") -> CudaRobotModel:
+        """
+        Get kinematics model for specified arm.
+        
+        Args:
+            arm: Which arm's kinematics model to get ("left" or "right").
+                 Ignored for single-arm robots.
+        
+        Returns:
+            CudaRobotModel for the specified arm.
+        """
+        if self.is_dual_arm:
+            if arm == "left":
+                return self.robot_container.left_kin_model
+            elif arm == "right":
+                return self.robot_container.right_kin_model
+            else:
+                raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
+        return self.robot_container.kin_model
+
+    def get_tool_from_ee(self, arm: Literal["left", "right"] = "left") -> Float[torch.Tensor, "4 4"]:
+        """
+        Get tool_from_ee transformation for specified arm.
+        
+        Args:
+            arm: Which arm's tool_from_ee to get ("left" or "right").
+                 Ignored for single-arm robots.
+        
+        Returns:
+            4x4 transformation matrix from EE frame to tool/grasp frame.
+        """
+        if self.is_dual_arm:
+            if arm == "left":
+                return self.robot_container.left_tool_from_ee
+            elif arm == "right":
+                return self.robot_container.right_tool_from_ee
+            else:
+                raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
+        return self.robot_container.tool_from_ee
+
+    def get_ik_solver(self, arm: Literal["left", "right"] = "left"):
+        """
+        Get IK solver for specified arm.
+        
+        Args:
+            arm: Which arm's IK solver to get ("left" or "right").
+                 Ignored for single-arm robots.
+        
+        Returns:
+            IKSolver for the specified arm.
+        """
+        if self.is_dual_arm:
+            if arm == "left":
+                return self.ik_solver_left
+            elif arm == "right":
+                return self.ik_solver_right
+            else:
+                raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
+        return self.ik_solver
+
+    def get_gripper_spheres(self, arm: Literal["left", "right"] = "left") -> Float[torch.Tensor, "n 4"]:
+        """
+        Get gripper collision spheres for specified arm.
+        
+        Args:
+            arm: Which arm's gripper spheres to get ("left" or "right").
+                 Ignored for single-arm robots.
+        
+        Returns:
+            Tensor of shape (N, 4) with sphere centers and radii.
+        """
+        if self.is_dual_arm:
+            if arm == "left":
+                return self.robot_container.left_gripper_spheres
+            elif arm == "right":
+                return self.robot_container.right_gripper_spheres
+            else:
+                raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
+        return self.robot_container.gripper_spheres
+
+    def get_joint_limits(self, arm: Literal["left", "right"] = "left") -> Float[torch.Tensor, "2 d"]:
+        """
+        Get joint limits for specified arm.
+        
+        Args:
+            arm: Which arm's joint limits to get ("left" or "right").
+                 Ignored for single-arm robots.
+        
+        Returns:
+            Tensor of shape (2, DOF) where [0] is lower limits and [1] is upper limits.
+        """
+        if self.is_dual_arm:
+            if arm == "left":
+                return self.robot_container.left_joint_limits
+            elif arm == "right":
+                return self.robot_container.right_joint_limits
+            else:
+                raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
+        return self.robot_container.joint_limits
 
     @property
     def device(self) -> torch.device:
@@ -176,20 +311,47 @@ class TAMPWorld:
         union_aabb = torch.stack([union_lower, union_upper])
         return union_aabb
 
-    def warmup_ik_solver(self, num_particles: int):
-        """Warmup cuRobo IK solver."""
-        q = sample_between_bounds(num_particles, bounds=self.robot_container.joint_limits)
-        goal_pose = self.kin_model.get_state(q).ee_pose
-        _ = self.ik_solver.solve_batch(goal_pose)
-
-    def get_motion_gen(self, collision_activation_distance: float, use_cuda_graph: bool = True) -> MotionGen:
+    def warmup_ik_solver(self, num_particles: int, arm: Literal["left", "right"] = "left"):
         """
-        Get the cuRobo motion generator for the robot. If you're debugging, you should set `use_cuda_graph=False`
+        Warmup cuRobo IK solver by running a batch solve.
+        
+        Args:
+            num_particles: Number of random configurations to use for warmup.
+            arm: Which arm's IK solver to warmup ("left" or "right").
+                 For single-arm robots, this is ignored.
+        """
+        joint_limits = self.get_joint_limits(arm)
+        kin_model = self.get_kin_model(arm)
+        ik_solver = self.get_ik_solver(arm)
+        
+        q = sample_between_bounds(num_particles, bounds=joint_limits)
+        goal_pose = kin_model.get_state(q).ee_pose
+        _ = ik_solver.solve_batch(goal_pose)
+
+    def get_motion_gen(
+        self,
+        collision_activation_distance: float,
+        use_cuda_graph: bool = True,
+        arm: Literal["left", "right"] = "left",
+    ) -> MotionGen:
+        """
+        Get the cuRobo motion generator for the robot.
+        
+        Args:
+            collision_activation_distance: Distance threshold for collision activation.
+            use_cuda_graph: Whether to use CUDA graph optimization. Set to False for debugging.
+            arm: Which arm's motion generator to get ("left" or "right").
+                 For single-arm robots, this is ignored.
+        
+        Returns:
+            MotionGen configured for the specified arm.
         """
         if self.robot_name == "panda":
             robot_cfg = franka_curobo_cfg()
         elif self.robot_name == "ur5":
             robot_cfg = ur5_curobo_cfg()
+        elif self.robot_name == "t1":
+            robot_cfg = t1_curobo_cfg(arm)
         else:
             raise ValueError(f"Unsupported robot: {self.robot_name}")
 

@@ -13,8 +13,19 @@ The full README with installation instructions, examples, and detailed documenta
   - `t1_spheres.yml` - Collision sphere definitions for motion planning
   - `left_gripper_spheres.pt` / `right_gripper_spheres.pt` - Pre-computed gripper collision spheres for grasp planning
   - `meshes/` - STL mesh files for robot visualization and collision checking
-- [`__init__.py`](cutamp/robots/__init__.py) - Robot container factory and registry. Provides `DualArmRobotContainer` dataclasses, and `load_robot_container()` function for T1 robot. Includes tool frame transformations (`tool_from_ee`) for top-down grasping.
-- [`t1.py`](cutamp/robots/t1.py) - T1 dual-arm humanoid robot module. Provides cuRobo integration including kinematics models, IK solvers, gripper collision spheres, and joint mapping between cuRobo's 11-DOF model and URDF's 28-DOF representation. Supports Rerun visualization.
+  - [`__init__.py`](cutamp/robots/__init__.py) - Robot container factory and registry. Provides `DualArmRobotContainer` dataclasses, and `load_robot_container()` function for T1 robot. Includes tool frame transformations (`tool_from_ee`) for top-down grasping.
+  - [`t1.py`](cutamp/robots/t1.py) - T1 dual-arm humanoid robot module. Provides cuRobo integration including kinematics models, IK solvers, gripper collision spheres, and joint mapping between cuRobo's 11-DOF model and URDF's 28-DOF representation. Supports Rerun visualization.
+
+📁 **[Core Modifications](cutamp/)**
+- [`tamp_world.py`](cutamp/tamp_world.py) - Added dual-arm helper methods:
+  - `get_kin_model(arm)`, `get_tool_from_ee(arm)`, `get_ik_solver(arm)`
+  - `get_gripper_spheres(arm)`, `get_joint_limits(arm)`
+  - `is_dual_arm` property
+
+📁 **[Tests](cutamp/tests/)**
+- [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) - T1 robot module tests
+- [`test_tamp_world_dual_arm.py`](cutamp/tests/test_tamp_world_dual_arm.py) - Dual-arm helper method tests
+- [`debug_t1_tool_frame.py`](cutamp/tests/debug_t1_tool_frame.py) - Tool frame transformation debug script
 
 📁 **[Scripts Folder](cutamp/scripts/)**
 
