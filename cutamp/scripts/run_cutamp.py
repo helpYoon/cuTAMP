@@ -93,7 +93,7 @@ def entrypoint():
     )
 
     # Robot and grasp
-    parser.add_argument("--robot", default="panda", choices=["panda", "ur5"], help="Robot to use")
+    parser.add_argument("--robot", default="t1", choices=["panda", "ur5", "t1"], help="Robot to use")
     parser.add_argument(
         "--grasp_dof",
         type=int,

@@ -8,7 +8,12 @@
 # its affiliates is strictly prohibited.
 
 """
-Domain file like in PDDL. The task planner can be improved, but it suffices for now.
+TAMP Domain for T1 dual-arm robot.
+
+This domain uses generic parameter names (q, q_start, q_end, traj) instead of
+arm-prefixed names (left_q, right_q). The arm information is encoded in the
+fluent/operator names (LeftAt vs RightAt, LeftPick vs RightPick), not in the
+parameter names. This keeps the domain compatible with the existing task planner.
 """
 
 from typing import Sequence
@@ -90,15 +95,11 @@ all_tamp_fluents = [
 ]
 
 
-# Parameters - used for naming in operators, so it's easier to read when debugging
-left_q = Parameter("left_q", Conf)
-right_q = Parameter("right_q", Conf)
-left_q_start = Parameter("left_q_start", Conf)
-right_q_start = Parameter("right_q_start", Conf)
-left_q_end = Parameter("left_q_end", Conf)
-right_q_end = Parameter("right_q_end", Conf)
-left_traj = Parameter("left_traj", Traj)
-right_traj = Parameter("right_traj", Traj)
+# Parameters - generic names, arm info comes from fluent/operator context
+q = Parameter("q", Conf)
+q_start = Parameter("q_start", Conf)
+q_end = Parameter("q_end", Conf)
+traj = Parameter("traj", Traj)
 
 obj = Parameter("obj", Movable)
 button = Parameter("button", Button)
@@ -110,62 +111,66 @@ placement = Parameter("placement", Pose)
 
 
 # Operators - this is the important part!
+# Left arm operators use LeftAt, LeftHandEmpty, etc.
+# Right arm operators use RightAt, RightHandEmpty, etc.
+# The operator name (LeftMoveFree vs RightMoveFree) tells downstream code which arm to use.
+
 LeftMoveFree = TAMPOperator(
-    "MoveFree",
-    [left_q_start, left_traj, left_q_end],
-    preconditions=[LeftAt(left_q_start), LeftHandEmpty(), LeftCanMove()],
-    add_effects=[LeftAt(left_q_end), LeftJustMoved()],
-    del_effects=[LeftAt(left_q_start), LeftCanMove()],
-    constraints=[CollisionFree(left_q_start, left_traj, left_q_end), Motion(left_q_start, left_traj, left_q_end)],
-    costs=[TrajectoryLength(left_q_start, left_traj, left_q_end)],
+    "LeftMoveFree",
+    [q_start, traj, q_end],
+    preconditions=[LeftAt(q_start), LeftHandEmpty(), LeftCanMove()],
+    add_effects=[LeftAt(q_end), LeftJustMoved()],
+    del_effects=[LeftAt(q_start), LeftCanMove()],
+    constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    costs=[TrajectoryLength(q_start, traj, q_end)],
 )
 
 RightMoveFree = TAMPOperator(
-    "MoveFree",
-    [right_q_start, right_traj, right_q_end],
-    preconditions=[RightAt(right_q_start), RightHandEmpty(), RightCanMove()],
-    add_effects=[RightAt(right_q_end), RightJustMoved()],
-    del_effects=[RightAt(right_q_start), RightCanMove()],
-    constraints=[CollisionFree(right_q_start, right_traj, right_q_end), Motion(right_q_start, right_traj, right_q_end)],
-    costs=[TrajectoryLength(right_q_start, right_traj, right_q_end)],
+    "RightMoveFree",
+    [q_start, traj, q_end],
+    preconditions=[RightAt(q_start), RightHandEmpty(), RightCanMove()],
+    add_effects=[RightAt(q_end), RightJustMoved()],
+    del_effects=[RightAt(q_start), RightCanMove()],
+    constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    costs=[TrajectoryLength(q_start, traj, q_end)],
 )
 
 
 LeftMoveHolding = TAMPOperator(
-    "MoveHolding",
-    [obj, grasp, left_q_start, left_traj, left_q_end],
+    "LeftMoveHolding",
+    [obj, grasp, q_start, traj, q_end],
     preconditions=[
-        LeftAt(left_q_start),
+        LeftAt(q_start),
         LeftHolding(obj),
         LeftHoldingWithGrasp(obj, grasp),
         LeftCanMove(),
     ],
-    add_effects=[LeftAt(left_q_end), LeftJustMoved()],
-    del_effects=[LeftAt(left_q_start), LeftCanMove()],
-    constraints=[CollisionFreeHolding(obj, grasp, left_q_start, left_traj, left_q_end), Motion(left_q_start, left_traj, left_q_end)],
-    costs=[TrajectoryLength(left_q_start, left_traj, left_q_end)],
+    add_effects=[LeftAt(q_end), LeftJustMoved()],
+    del_effects=[LeftAt(q_start), LeftCanMove()],
+    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    costs=[TrajectoryLength(q_start, traj, q_end)],
 )
 
 RightMoveHolding = TAMPOperator(
-    "MoveHolding",
-    [obj, grasp, right_q_start, right_traj, right_q_end],
+    "RightMoveHolding",
+    [obj, grasp, q_start, traj, q_end],
     preconditions=[
-        RightAt(right_q_start),
+        RightAt(q_start),
         RightHolding(obj),
         RightHoldingWithGrasp(obj, grasp),
         RightCanMove(),
     ],
-    add_effects=[RightAt(right_q_end), RightJustMoved()],
-    del_effects=[RightAt(right_q_start), RightCanMove()],
-    constraints=[CollisionFreeHolding(obj, grasp, right_q_start, right_traj, right_q_end), Motion(right_q_start, right_traj, right_q_end)],
-    costs=[TrajectoryLength(right_q_start, right_traj, right_q_end)],
+    add_effects=[RightAt(q_end), RightJustMoved()],
+    del_effects=[RightAt(q_start), RightCanMove()],
+    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    costs=[TrajectoryLength(q_start, traj, q_end)],
 )
 
 LeftPick = TAMPOperator(
-    "Pick",
-    [obj, grasp, left_q],
+    "LeftPick",
+    [obj, grasp, q],
     preconditions=[
-        LeftAt(left_q),
+        LeftAt(q),
         LeftHandEmpty(),
         IsMovable(obj),
         LeftJustMoved(),
@@ -177,15 +182,15 @@ LeftPick = TAMPOperator(
         LeftCanMove(),
     ],
     del_effects=[LeftHandEmpty(), LeftJustMoved(), HasNotPickedUp(obj)],
-    constraints=[KinematicConstraint(left_q, grasp), CollisionFreeGrasp(obj, grasp)],
+    constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
     costs=[GraspCost(obj, grasp)],
 )
 
 RightPick = TAMPOperator(
-    "Pick",
-    [obj, grasp, right_q],
+    "RightPick",
+    [obj, grasp, q],
     preconditions=[
-        RightAt(right_q),
+        RightAt(q),
         RightHandEmpty(),
         IsMovable(obj),
         RightJustMoved(),
@@ -197,15 +202,15 @@ RightPick = TAMPOperator(
         RightCanMove(),
     ],
     del_effects=[RightHandEmpty(), RightJustMoved(), HasNotPickedUp(obj)],
-    constraints=[KinematicConstraint(right_q, grasp), CollisionFreeGrasp(obj, grasp)],
+    constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
     costs=[GraspCost(obj, grasp)],
 )
 
 LeftPlace = TAMPOperator(
-    "Place",
-    [obj, grasp, placement, surface, left_q],
+    "LeftPlace",
+    [obj, grasp, placement, surface, q],
     preconditions=[
-        LeftAt(left_q),
+        LeftAt(q),
         LeftHolding(obj),
         LeftHoldingWithGrasp(obj, grasp),
         IsSurface(surface),
@@ -218,7 +223,7 @@ LeftPlace = TAMPOperator(
         LeftJustMoved(),
     ],
     constraints=[
-        KinematicConstraint(left_q, placement),
+        KinematicConstraint(q, placement),
         StablePlacement(obj, grasp, placement, surface),
         CollisionFreePlacement(obj, placement, surface),
     ],
@@ -226,10 +231,10 @@ LeftPlace = TAMPOperator(
 )
 
 RightPlace = TAMPOperator(
-    "Place",
-    [obj, grasp, placement, surface, right_q],
+    "RightPlace",
+    [obj, grasp, placement, surface, q],
     preconditions=[
-        RightAt(right_q),
+        RightAt(q),
         RightHolding(obj),
         RightHoldingWithGrasp(obj, grasp),
         IsSurface(surface),
@@ -242,7 +247,7 @@ RightPlace = TAMPOperator(
         RightJustMoved(),
     ],
     constraints=[
-        KinematicConstraint(right_q, placement),
+        KinematicConstraint(q, placement),
         StablePlacement(obj, grasp, placement, surface),
         CollisionFreePlacement(obj, placement, surface),
     ],
@@ -251,42 +256,42 @@ RightPlace = TAMPOperator(
 
 
 LeftPush = TAMPOperator(
-    "Push",
-    [button, pose, left_q],
+    "LeftPush",
+    [button, pose, q],
     preconditions=[
-        LeftAt(left_q),
+        LeftAt(q),
         IsButton(button),
         LeftHandEmpty(),
         CanPush(button),
         LeftJustMoved(),
     ],
     add_effects=[ButtonPushed(button), LeftCanMove()],
-    del_effects=[LeftJustMoved(), CanPush(button)],  # Note: CFree for Push already encoded in the Move operator
-    constraints=[KinematicConstraint(left_q, pose), ValidPush(button, pose)],
+    del_effects=[LeftJustMoved(), CanPush(button)],
+    constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
     costs=[],
 )
 
 RightPush = TAMPOperator(
-    "Push",
-    [button, pose, right_q],
+    "RightPush",
+    [button, pose, q],
     preconditions=[
-        RightAt(right_q),
+        RightAt(q),
         IsButton(button),
         RightHandEmpty(),
         CanPush(button),
         RightJustMoved(),
     ],
     add_effects=[ButtonPushed(button), RightCanMove()],
-    del_effects=[RightJustMoved(), CanPush(button)],  # Note: CFree for Push already encoded in the Move operator
-    constraints=[KinematicConstraint(right_q, pose), ValidPush(button, pose)],
+    del_effects=[RightJustMoved(), CanPush(button)],
+    constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
     costs=[],
 )
 
 LeftPushStick = TAMPOperator(
-    "PushStick",
-    [button, obj, grasp, pose, left_q],
+    "LeftPushStick",
+    [button, obj, grasp, pose, q],
     preconditions=[
-        LeftAt(left_q),
+        LeftAt(q),
         LeftHolding(obj),
         LeftHoldingWithGrasp(obj, grasp),
         IsButton(button),
@@ -296,16 +301,15 @@ LeftPushStick = TAMPOperator(
     ],
     add_effects=[ButtonPushed(button), LeftCanMove(), PushedWithStick(button, obj)],
     del_effects=[LeftJustMoved(), CanPush(button)],
-    # CFree is automatically handled right now within the operator
-    constraints=[KinematicConstraint(left_q, pose), ValidPushStick(button, obj, pose)],
+    constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
     costs=[],
 )
 
 RightPushStick = TAMPOperator(
-    "PushStick",
-    [button, obj, grasp, pose, right_q],
+    "RightPushStick",
+    [button, obj, grasp, pose, q],
     preconditions=[
-        RightAt(right_q),
+        RightAt(q),
         RightHolding(obj),
         RightHoldingWithGrasp(obj, grasp),
         IsButton(button),
@@ -315,19 +319,36 @@ RightPushStick = TAMPOperator(
     ],
     add_effects=[ButtonPushed(button), RightCanMove(), PushedWithStick(button, obj)],
     del_effects=[RightJustMoved(), CanPush(button)],
-    # CFree is automatically handled right now within the operator
-    constraints=[KinematicConstraint(right_q, pose), ValidPushStick(button, obj, pose)],
+    constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
     costs=[],
 )
 
-all_tamp_operators = [LeftMoveFree, RightMoveFree, LeftMoveHolding, RightMoveHolding, LeftPick, RightPick, LeftPlace, RightPlace, LeftPush, RightPush, LeftPushStick, RightPushStick]
+all_t1_operators = [
+    LeftMoveFree, RightMoveFree,
+    LeftMoveHolding, RightMoveHolding,
+    LeftPick, RightPick,
+    LeftPlace, RightPlace,
+    LeftPush, RightPush,
+    LeftPushStick, RightPushStick,
+]
 
 
 def get_initial_state(
     movables: Sequence[str] = (), surfaces: Sequence[str] = (), sticks: Sequence[str] = (), buttons: Sequence[str] = ()
 ) -> State:
-    """Ground the initial state of the TAMP domain."""
-    initial_state = {LeftAt.ground("left_q0"), RightAt.ground("right_q0"), LeftHandEmpty.ground(), RightHandEmpty.ground(), LeftCanMove.ground(), RightCanMove.ground()}
+    """Ground the initial state of the T1 TAMP domain.
+    
+    Note: left_q0 is the initial left arm configuration, right_q0 is the initial right arm configuration.
+    The fluent (LeftAt vs RightAt) determines which arm the configuration belongs to.
+    """
+    initial_state = {
+        LeftAt.ground("left_q0"),
+        RightAt.ground("right_q0"),
+        LeftHandEmpty.ground(),
+        RightHandEmpty.ground(),
+        LeftCanMove.ground(),
+        RightCanMove.ground(),
+    }
     for movable in movables:
         initial_state.add(IsMovable.ground(movable))
         initial_state.add(HasNotPickedUp.ground(movable))

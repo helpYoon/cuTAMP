@@ -24,7 +24,8 @@ from cutamp.robots import RobotContainer, DualArmRobotContainer, load_robot_cont
 from cutamp.robots.franka import franka_curobo_cfg, get_franka_ik_solver
 from cutamp.robots.ur5 import ur5_curobo_cfg, get_ur5_ik_solver
 from cutamp.robots.t1 import t1_curobo_cfg, get_t1_ik_solver
-from cutamp.tamp_domain import get_initial_state
+from cutamp.tamp_domain import get_initial_state as get_initial_state_single_arm
+from cutamp.t1_domain import get_initial_state as get_initial_state_dual_arm
 from cutamp.task_planning import State
 from cutamp.utils.collision import get_world_collision_cost
 from cutamp.utils.common import approximate_goal_aabb, transform_spheres
@@ -45,7 +46,7 @@ class TAMPWorld:
         env: TAMPEnvironment,
         tensor_args: TensorDeviceType,
         robot: Union[Literal["panda", "ur5", "t1"], RobotContainer, DualArmRobotContainer],
-        q_init: Float[torch.Tensor, "dof"],
+        q_init: Union[Float[torch.Tensor, "dof"], Dict[str, Float[torch.Tensor, "dof"]]],
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
@@ -69,7 +70,16 @@ class TAMPWorld:
         else:
             self.robot_container = robot
         self.robot_name = self.robot_container.name
-        self.q_init = q_init
+        
+        # Store q_init - for dual-arm robots, expect dict with 'left' and 'right' keys
+        if isinstance(q_init, dict):
+            self._left_q_init = q_init["left"]
+            self._right_q_init = q_init["right"]
+            self._q_init = None  # Not used for dual-arm
+        else:
+            self._q_init = q_init
+            self._left_q_init = None
+            self._right_q_init = None
 
         # Setup the IK solver, right now it needs WorldCfg and I don't know the behavior, can speed up later
         if self.robot_name == "panda":
@@ -249,8 +259,54 @@ class TAMPWorld:
         return self.tensor_args.device
 
     @property
+    def q_init(self) -> Float[torch.Tensor, "dof"]:
+        """
+        Get initial configuration (single-arm robots only).
+        
+        For dual-arm robots, use left_q_init and right_q_init instead.
+        
+        Raises:
+            RuntimeError: If called on a dual-arm robot.
+        """
+        if self.is_dual_arm:
+            raise RuntimeError(
+                "q_init property is not available for dual-arm robots. "
+                "Use left_q_init and right_q_init instead."
+            )
+        return self._q_init
+    
+    @property
+    def left_q_init(self) -> Float[torch.Tensor, "dof"]:
+        """
+        Get initial configuration for left arm (dual-arm robots only).
+        
+        Raises:
+            RuntimeError: If called on a single-arm robot.
+        """
+        if not self.is_dual_arm:
+            raise RuntimeError(
+                "left_q_init property is only available for dual-arm robots."
+            )
+        return self._left_q_init
+    
+    @property
+    def right_q_init(self) -> Float[torch.Tensor, "dof"]:
+        """
+        Get initial configuration for right arm (dual-arm robots only).
+        
+        Raises:
+            RuntimeError: If called on a single-arm robot.
+        """
+        if not self.is_dual_arm:
+            raise RuntimeError(
+                "right_q_init property is only available for dual-arm robots."
+            )
+        return self._right_q_init
+
+    @property
     def initial_state(self) -> State:
-        initial_state = get_initial_state(
+        get_initial_state_fn = get_initial_state_dual_arm if self.is_dual_arm else get_initial_state_single_arm
+        initial_state = get_initial_state_fn(
             movables=self.get_objects_by_type("Movable", return_name=True),
             surfaces=self.get_objects_by_type("Surface", return_name=True),
             sticks=self.get_objects_by_type("Stick", return_name=True),

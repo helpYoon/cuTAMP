@@ -10,7 +10,7 @@
 import itertools
 import warnings
 from collections import defaultdict
-from typing import Dict, Union
+from typing import Dict, Literal, Optional, Union
 
 import roma
 import torch
@@ -19,7 +19,7 @@ from jaxtyping import Float
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
-from cutamp.rollout import Rollout
+from cutamp.rollout import Rollout, get_conf_to_arm
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import (
@@ -90,17 +90,45 @@ class CostFunction:
             iter(itertools.chain.from_iterable(con.params for con in self.motion_constraints))
         )
 
-        # Setup self-collision cost
-        self_collision_config = SelfCollisionCostConfig(
-            self.world.tensor_args.to_device([1.0]),
-            self.world.tensor_args,
-            return_loss=True,
-            self_collision_kin_config=self.world.kin_model.get_self_collision_config(),
-        )
-        self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
-        # Should be using experimental kernel by default
-        if not self.self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
-            raise ValueError("Expected self-collision cost to use experimental kernel")
+        # Track dual-arm status and build conf_to_arm mapping
+        self.is_dual_arm = world.is_dual_arm
+        self.conf_to_arm = get_conf_to_arm(plan_skeleton, self.is_dual_arm)
+
+        # Setup self-collision cost (need separate configs for dual-arm)
+        if self.is_dual_arm:
+            # For dual-arm, create self-collision costs for each arm
+            left_self_collision_config = SelfCollisionCostConfig(
+                self.world.tensor_args.to_device([1.0]),
+                self.world.tensor_args,
+                return_loss=True,
+                self_collision_kin_config=self.world.get_kin_model("left").get_self_collision_config(),
+            )
+            self.left_self_collision_cost_fn = SelfCollisionCost(left_self_collision_config)
+            
+            right_self_collision_config = SelfCollisionCostConfig(
+                self.world.tensor_args.to_device([1.0]),
+                self.world.tensor_args,
+                return_loss=True,
+                self_collision_kin_config=self.world.get_kin_model("right").get_self_collision_config(),
+            )
+            self.right_self_collision_cost_fn = SelfCollisionCost(right_self_collision_config)
+            
+            # Should be using experimental kernel by default
+            if not self.left_self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
+                raise ValueError("Expected left self-collision cost to use experimental kernel")
+            if not self.right_self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
+                raise ValueError("Expected right self-collision cost to use experimental kernel")
+        else:
+            self_collision_config = SelfCollisionCostConfig(
+                self.world.tensor_args.to_device([1.0]),
+                self.world.tensor_args,
+                return_loss=True,
+                self_collision_kin_config=self.world.kin_model.get_self_collision_config(),
+            )
+            self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
+            # Should be using experimental kernel by default
+            if not self.self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
+                raise ValueError("Expected self-collision cost to use experimental kernel")
 
         # Conf parameters for kinematic constraints, order in rollout should match
         self.kinematic_confs, self.kinematic_actions = zip(*(con.params for con in self.kinematic_constraints))
@@ -175,9 +203,15 @@ class CostFunction:
             self.traj_length_confs.append(q_start)
             self.traj_length_confs.append(q_end)
         self.traj_length_confs = list(dict.fromkeys(self.traj_length_confs))  # remove duplicates
-        if self.traj_length_confs[0] != "q0":
-            raise ValueError("Expected q0 to be the first conf")
-        self.traj_length_confs = self.traj_length_confs[1:]
+        
+        # Remove initial configuration(s) from traj_length_confs
+        if self.is_dual_arm:
+            # For dual-arm, remove both left_q0 and right_q0
+            self.traj_length_confs = [c for c in self.traj_length_confs if c not in ("left_q0", "right_q0")]
+        else:
+            if self.traj_length_confs and self.traj_length_confs[0] != "q0":
+                raise ValueError("Expected q0 to be the first conf")
+            self.traj_length_confs = self.traj_length_confs[1:] if self.traj_length_confs else []
 
     def _validate_rollout(self, rollout: Rollout):
         """Checks structure of the rollout conforms to the assumptions we make in the cost function implementation."""
@@ -214,15 +248,49 @@ class CostFunction:
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
         """Motion constraints - valid motions don't exceed joint limits or self-collide."""
-        # Joint limits
         confs = rollout["confs"]
-        dist_from_joint_lims = dist_from_bounds_jit(
-            confs, self.world.robot_container.joint_limits[0], self.world.robot_container.joint_limits[1]
-        )
-
-        # Self collisions
         robot_spheres = rollout["robot_spheres"]
-        self_coll_vals = self.self_collision_cost_fn(robot_spheres)
+        conf_params = rollout["conf_params"]
+        
+        if self.is_dual_arm:
+            # For dual-arm, compute joint limits and self-collision separately for each arm
+            # then combine based on which arm each configuration belongs to
+            num_particles = confs.shape[0]
+            num_timesteps = confs.shape[1]
+            
+            # Process each configuration's joint limit based on its arm
+            dist_from_joint_lims_list = []
+            self_coll_vals_list = []
+            
+            for t, conf_name in enumerate(conf_params):
+                arm = self.conf_to_arm.get(conf_name, "left")  # default to left if unknown
+                joint_limits = self.world.get_joint_limits(arm)
+                conf_t = confs[:, t]  # (num_particles, dof)
+                
+                # Joint limits for this timestep
+                dist_t = dist_from_bounds_jit(
+                    conf_t.unsqueeze(1), joint_limits[0], joint_limits[1]
+                ).squeeze(1)  # (num_particles,)
+                dist_from_joint_lims_list.append(dist_t)
+                
+                # Self-collision for this timestep
+                spheres_t = robot_spheres[:, t]  # (num_particles, num_spheres, 4)
+                if arm == "left":
+                    self_coll_t = self.left_self_collision_cost_fn(spheres_t.unsqueeze(1)).squeeze(1)
+                else:
+                    self_coll_t = self.right_self_collision_cost_fn(spheres_t.unsqueeze(1)).squeeze(1)
+                self_coll_vals_list.append(self_coll_t)
+            
+            dist_from_joint_lims = torch.stack(dist_from_joint_lims_list, dim=1)
+            self_coll_vals = torch.stack(self_coll_vals_list, dim=1)
+        else:
+            # Single-arm: original logic
+            dist_from_joint_lims = dist_from_bounds_jit(
+                confs, self.world.robot_container.joint_limits[0], self.world.robot_container.joint_limits[1]
+            )
+
+            # Self collisions
+            self_coll_vals = self.self_collision_cost_fn(robot_spheres)
 
         motion_cost = {
             "type": "constraint",

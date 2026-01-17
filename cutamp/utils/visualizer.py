@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import rerun as rr
@@ -23,9 +23,10 @@ from cutamp.utils.rerun_utils import log_curobo_pose_to_rerun, curobo_to_rerun, 
 
 
 class Visualizer(ABC):
-    def __init__(self, config: TAMPConfiguration, q_init: Float[torch.Tensor, "d"]):
+    def __init__(self, config: TAMPConfiguration, q_init: Optional[Float[torch.Tensor, "d"]]):
         self.config = config
-        self.set_joint_positions(q_init)
+        if q_init is not None:
+            self.set_joint_positions(q_init)
 
     @abstractmethod
     def set_time_sequence(self, timeline: str, val: int):

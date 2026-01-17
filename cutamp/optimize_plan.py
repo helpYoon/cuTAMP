@@ -78,12 +78,14 @@ class ParticleOptimizer:
 
         param_groups = []
         param_msg = []
+        # Initial configurations that we don't optimize
+        initial_confs = {"q0", "left_q0", "right_q0"}
         for param, val in particles.items():
             param_type = param_to_type[param]
             if param_type not in self.types_to_optimize:
                 continue
-            if param == "q0":
-                continue  # we don't optimize the initial configuration
+            if param in initial_confs:
+                continue  # we don't optimize the initial configuration(s)
             param_msg.append(f"(param: {param} = {tuple(val.shape)})")
             group = {"params": val}
             if param_type == Conf:
@@ -236,7 +238,13 @@ class ParticleOptimizer:
         timer.start("visualize_rollout")
         world = rollout_fn.world
         visualizer.set_time_sequence(f"rollout_{self.opt_counter}", 0)
-        visualizer.set_joint_positions(world.q_init.tolist())
+        if world.is_dual_arm:
+            # For dual-arm, concatenate left and right configs (22-DOF total)
+            # The T1RerunRobot will convert this to full 28-DOF URDF format
+            q_init_concat = world.left_q_init.tolist() + world.right_q_init.tolist()
+            visualizer.set_joint_positions(q_init_concat)
+        else:
+            visualizer.set_joint_positions(world.q_init.tolist())
         for obj in world.movables:
             obj_pose = world.get_object_pose(obj).cpu()
             visualizer.log_mat4x4(f"world/{obj.name}", obj_pose)
@@ -250,6 +258,10 @@ class ParticleOptimizer:
                 gripper_joints = [0.4] if gripper_close else [0.0]
             elif self.config.robot == "panda":
                 gripper_joints = [0.01, 0.01] if gripper_close else [0.04, 0.04]
+            elif self.config.robot == "t1":
+                # T1 gripper: 4-bar parallel linkage, 4 joints per hand
+                # GRIPPER_OPEN = (0.0, 0.0, 0.0, 0.0), GRIPPER_CLOSED = (1.0, -1.0, -1.0, 1.0)
+                gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
             else:
                 gripper_joints = []
             visualizer.set_joint_positions(q.tolist() + gripper_joints)

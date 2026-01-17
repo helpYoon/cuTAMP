@@ -11,7 +11,7 @@
 
 import logging
 from datetime import datetime
-from typing import List, Union, Optional, Tuple
+from typing import Dict, List, Union, Optional, Tuple
 from unittest.mock import Mock
 
 import torch
@@ -29,6 +29,7 @@ from cutamp.particle_initialization import ParticleInitializer
 from cutamp.robots import get_q_home, load_robot_container
 from cutamp.rollout import RolloutFunction
 from cutamp.tamp_domain import all_tamp_operators
+from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
 from cutamp.task_planning import PlanSkeleton, task_plan_generator
 from cutamp.utils.timer import TorchTimer
@@ -235,7 +236,7 @@ def resample_plan_info(
 def setup_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
-    q_init: Optional[List[float]] = None,
+    q_init: Optional[Union[List[float], Dict[str, List[float]]]] = None,
     experiment_id: Optional[str] = None,
 ):
     # Validate args and setup experiment logger
@@ -249,9 +250,33 @@ def setup_cutamp(
     # Loading robot can be done offline, so doesn't count towards timing
     tensor_args = TensorDeviceType()
     robot_container = load_robot_container(config.robot, tensor_args)
-    if q_init is None:
-        q_init = get_q_home(config.robot)
-    q_init = tensor_args.to_device(q_init)
+    
+    # Handle initial configurations - dual-arm (T1) vs single-arm robots
+    is_dual_arm = config.robot == "t1"
+    if is_dual_arm:
+        # Dual-arm robot needs both left and right configurations
+        from cutamp.robots import robot_to_fns
+        if q_init is None:
+            q_init = {
+                "left": tensor_args.to_device(robot_to_fns["t1"]["q_home_left"]),
+                "right": tensor_args.to_device(robot_to_fns["t1"]["q_home_right"]),
+            }
+        elif isinstance(q_init, dict):
+            q_init = {
+                "left": tensor_args.to_device(q_init["left"]),
+                "right": tensor_args.to_device(q_init["right"]),
+            }
+        else:
+            raise ValueError("For T1 robot, q_init must be a dict with 'left' and 'right' keys")
+        # For visualizer, concatenate left and right configs (22-DOF total)
+        # The T1RerunRobot will convert this to full 28-DOF URDF format
+        q_init_for_visualizer = torch.cat([q_init["left"], q_init["right"]])
+    else:
+        # Single-arm robot
+        if q_init is None:
+            q_init = get_q_home(config.robot)
+        q_init = tensor_args.to_device(q_init)
+        q_init_for_visualizer = q_init
 
     # Load TAMP world and warmup IK solver
     timer = TorchTimer()
@@ -269,11 +294,16 @@ def setup_cutamp(
 
     if config.warmup_ik:
         with timer.time("warmup_ik_solver", log_callback=_log.info):
-            world.warmup_ik_solver(config.num_particles)
+            if is_dual_arm:
+                # Warmup both left and right IK solvers for dual-arm robots
+                world.warmup_ik_solver(config.num_particles, arm="left")
+                world.warmup_ik_solver(config.num_particles, arm="right")
+            else:
+                world.warmup_ik_solver(config.num_particles)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
-        RerunVisualizer(config, q_init, application_id=env.name, recording_id=experiment_id, spawn=config.rr_spawn)
+        RerunVisualizer(config, q_init_for_visualizer, application_id=env.name, recording_id=experiment_id, spawn=config.rr_spawn)
         if config.enable_visualizer
         else MockVisualizer()
     )
@@ -286,7 +316,7 @@ def run_cutamp(
     config: TAMPConfiguration,
     cost_reducer: CostReducer,
     constraint_checker: ConstraintChecker,
-    q_init: Optional[List[float]] = None,
+    q_init: Optional[Union[List[float], Dict[str, List[float]]]] = None,
     experiment_id: Optional[str] = None,
 ):
     """Overall cuTAMP algorithm implementation."""
@@ -297,11 +327,13 @@ def run_cutamp(
     # Task plan generator
     _log.info(f"Initial State: {world.initial_state}")
     _log.info(f"Goal State: {world.goal_state}")
+    # Select operators based on robot type
+    all_operators = all_t1_operators if config.robot == "t1" else all_tamp_operators
     with timer.time("get_plan_generator", log_callback=_log.info):
         plan_gen = task_plan_generator(
             world.initial_state,
             world.goal_state,
-            operators=all_tamp_operators,
+            operators=all_operators,
             explored_state_check=config.explored_state_check,
         )
 

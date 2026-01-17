@@ -10,7 +10,7 @@
 """Solving motions with cuRobo."""
 
 import logging
-from typing import List
+from typing import List, Literal, Optional
 
 import torch
 from curobo.geom.sphere_fit import SphereFitType
@@ -23,11 +23,24 @@ from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
 from cutamp.tamp_domain import MoveHolding, Push, PushStick, MoveFree, Place, Pick
+from cutamp.t1_domain import (
+    LeftMoveFree, LeftMoveHolding, LeftPick, LeftPlace, LeftPush, LeftPushStick,
+    RightMoveFree, RightMoveHolding, RightPick, RightPlace, RightPush, RightPushStick,
+)
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
 _log = logging.getLogger(__name__)
+
+
+def get_arm_from_operator(op_name: str) -> Optional[Literal["left", "right"]]:
+    """Extract arm identifier from T1 operator name. Returns None for single-arm operators."""
+    if op_name.startswith("Left"):
+        return "left"
+    elif op_name.startswith("Right"):
+        return "right"
+    return None
 
 
 def solve_curobo(
@@ -42,9 +55,38 @@ def solve_curobo(
     """
     Solve for full motion plan given a plan skeleton and optimized particles.
     Note that visualization adds non-trivial overhead.
+    
+    For dual-arm robots (T1), motion planning is currently only supported for plans
+    that use a single arm throughout. Full dual-arm motion planning with arm switching
+    is not yet implemented.
     """
     plan_skeleton = plan_info["plan_skeleton"]
-    motion_gen = world.get_motion_gen(collision_activation_distance=config.world_activation_distance)
+    is_dual_arm = world.is_dual_arm
+    
+    # For dual-arm, determine which arm is being used and get appropriate motion generator
+    if is_dual_arm:
+        # Find which arms are used in this plan
+        arms_used = set()
+        for ground_op in plan_skeleton:
+            arm = get_arm_from_operator(ground_op.operator.name)
+            if arm:
+                arms_used.add(arm)
+        
+        if len(arms_used) > 1:
+            raise NotImplementedError(
+                "Motion planning for T1 with both arms in the same plan is not yet supported. "
+                f"Plan uses arms: {arms_used}"
+            )
+        
+        active_arm = list(arms_used)[0] if arms_used else "left"
+        motion_gen = world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm=active_arm)
+        initial_q = best_particle[f"{active_arm}_q0"]
+        last_q_name = f"{active_arm}_q0"
+    else:
+        motion_gen = world.get_motion_gen(collision_activation_distance=config.world_activation_distance)
+        initial_q = best_particle["q0"]
+        last_q_name = "q0"
+    
     if config.warmup_motion_gen:
         with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
             motion_gen.warmup()
@@ -57,12 +99,19 @@ def solve_curobo(
     ts = 0.0
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
     visualizer.set_time_seconds(timeline, ts)
-    visualizer.set_joint_positions(best_particle["q0"])
+    if is_dual_arm:
+        # For dual-arm, show both arms at initial state
+        # Concatenate left and right configs (22-DOF total)
+        left_q = best_particle["left_q0"]
+        right_q = best_particle["right_q0"]
+        q_init_for_viz = torch.cat([left_q, right_q])
+        visualizer.set_joint_positions(q_init_for_viz)
+    else:
+        visualizer.set_joint_positions(initial_q)
     for obj, pose in obj_to_current_pose.items():
         visualizer.log_mat4x4(f"world/{obj}", pose)
 
-    last_js = JointState.from_position(best_particle["q0"][None].clone())
-    last_q_name = "q0"
+    last_js = JointState.from_position(initial_q[None].clone())
 
     # Fixed approach offset. This could be something we eventually optimize too
     approach_offset = torch.eye(4, device=world.device)
@@ -71,36 +120,53 @@ def solve_curobo(
     # Accumulated plans we return that the real robot can actually execute
     accum_plans = []
 
+    # Define operator sets for easier checking
+    move_free_ops = {MoveFree.name, LeftMoveFree.name, RightMoveFree.name}
+    move_holding_ops = {MoveHolding.name, LeftMoveHolding.name, RightMoveHolding.name}
+    pick_ops = {Pick.name, LeftPick.name, RightPick.name}
+    place_ops = {Place.name, LeftPlace.name, RightPlace.name}
+    push_ops = {Push.name, LeftPush.name, RightPush.name}
+    push_stick_ops = {PushStick.name, LeftPushStick.name, RightPushStick.name}
+    
+    # Get arm-specific helpers (for dual-arm)
+    if is_dual_arm:
+        kin_model = world.get_kin_model(active_arm)
+        tool_from_ee = world.get_tool_from_ee(active_arm)
+    else:
+        kin_model = world.kin_model
+        tool_from_ee = world.tool_from_ee
+
     # Iterate through skeleton and motion plan
     for idx, ground_op in enumerate(plan_skeleton):
         op_name = ground_op.operator.name
 
         # MoveFree, defer motion planning to pick to use object pose instead of planning from q_start to q_end.
         # This works more reliably and gives higher quality motions.
-        if op_name == MoveFree.name:
+        if op_name in move_free_ops:
             q_start, traj, q_end = ground_op.values
             if traj in best_particle:
                 raise NotImplementedError("Trajectories not supported yet")
             last_q_name = q_start
 
         # MoveHolding
-        elif op_name == MoveHolding.name:
+        elif op_name in move_holding_ops:
             obj, grasp, q_start, traj, q_end = ground_op.values
             if traj in best_particle:
                 raise NotImplementedError("Trajectories not supported yet")
             last_q_name = q_start
 
-        # Pick
-        elif op_name == Pick.name:
+        # Pick (single-arm and dual-arm)
+        elif op_name in pick_ops:
             obj, grasp, q = ground_op.values
             assert last_js is not None
 
             with timer.time("curobo_planning"):
                 start_js = last_js
 
-                # Get the retract pose and plan to it if it's not q0
-                if last_q_name != "q0":
-                    world_from_ee = world.kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
+                # Get the retract pose and plan to it if it's not the initial configuration
+                initial_conf_names = {"q0", "left_q0", "right_q0"}
+                if last_q_name not in initial_conf_names:
+                    world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
                     world_from_retract = world_from_ee @ approach_offset
                     retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
                     if not retract_result.success:
@@ -119,7 +185,7 @@ def solve_curobo(
                 else:
                     obj_from_grasp = action_6dof_to_mat4x4(best_particle[grasp].clone())
                 world_from_grasp = world_from_obj @ obj_from_grasp
-                world_from_ee = world_from_grasp @ world.tool_from_ee
+                world_from_ee = world_from_grasp @ tool_from_ee
 
                 world_from_approach = world_from_ee @ approach_offset
                 approach_result = motion_gen.plan_single(retract_js, Pose.from_matrix(world_from_approach), plan_config)
@@ -200,6 +266,12 @@ def solve_curobo(
                 end_val = 0.4
                 interp = torch.linspace(0.0, end_val, 20)
                 interp = interp[:, None]
+            elif config.robot == "t1":
+                # T1 gripper: 4-bar parallel linkage, 4 joints per hand
+                # GRIPPER_OPEN = (0.0, 0.0, 0.0, 0.0) -> GRIPPER_CLOSED = (1.0, -1.0, -1.0, 1.0)
+                interp = torch.zeros(20, 4)
+                for i, (start, end) in enumerate([(0.0, 1.0), (0.0, -1.0), (0.0, -1.0), (0.0, 1.0)]):
+                    interp[:, i] = torch.linspace(start, end, 20)
             else:
                 end_val = 0.02
                 interp = torch.linspace(0.04, end_val, 20)[:, None]
@@ -211,8 +283,8 @@ def solve_curobo(
             all_pos = torch.cat([all_pos, interp], dim=1)
             ts = visualizer.log_joint_trajectory(all_pos, timeline=timeline, start_time=ts, dt=dt)
 
-        # Place
-        elif op_name == Place.name:
+        # Place (single-arm and dual-arm)
+        elif op_name in place_ops:
             obj, grasp, placement, surface, q = ground_op.values
             assert last_js is not None
 
@@ -220,7 +292,7 @@ def solve_curobo(
                 start_js = last_js
 
                 # Plan to retract
-                world_from_ee = world.kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
+                world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
                 world_from_ee_start = world_from_ee
                 world_from_retract = world_from_ee @ approach_offset
                 retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
@@ -237,7 +309,7 @@ def solve_curobo(
                 else:
                     obj_from_grasp = action_6dof_to_mat4x4(best_particle[grasp].clone())
                 world_from_grasp = world_from_obj @ obj_from_grasp
-                world_from_ee = world_from_grasp @ world.tool_from_ee
+                world_from_ee = world_from_grasp @ tool_from_ee
                 world_from_approach = world_from_ee @ approach_offset
                 approach_result = motion_gen.plan_single(retract_js, Pose.from_matrix(world_from_approach), plan_config)
                 if not approach_result.success:
@@ -264,7 +336,7 @@ def solve_curobo(
                 last_js = JointState.from_position(plan[-1:].position)
 
                 # Forward kinematics to get end-effector pose
-                robot_state = world.kin_model.get_state(plan.position)
+                robot_state = kin_model.get_state(plan.position)
                 world_from_ee = robot_state.ee_pose.get_matrix()
                 world_from_obj = world_from_ee @ ee_from_obj
                 ts = visualizer.log_joint_trajectory_with_mat4x4(
@@ -293,6 +365,12 @@ def solve_curobo(
                 end_val = 0.0
                 interp = torch.linspace(0.4, end_val, 20)
                 interp = interp[:, None]
+            elif config.robot == "t1":
+                # T1 gripper: 4-bar parallel linkage, 4 joints per hand
+                # GRIPPER_CLOSED = (1.0, -1.0, -1.0, 1.0) -> GRIPPER_OPEN = (0.0, 0.0, 0.0, 0.0)
+                interp = torch.zeros(20, 4)
+                for i, (start, end) in enumerate([(1.0, 0.0), (-1.0, 0.0), (-1.0, 0.0), (1.0, 0.0)]):
+                    interp[:, i] = torch.linspace(start, end, 20)
             else:
                 end_val = 0.04
                 interp = torch.linspace(0.02, end_val, 20)[:, None]
@@ -304,8 +382,8 @@ def solve_curobo(
             all_pos = torch.cat([all_pos, interp], dim=1)
             ts = visualizer.log_joint_trajectory(all_pos, timeline=timeline, start_time=ts, dt=dt)
 
-        # Push and PushStick
-        elif op_name == Push.name or op_name == PushStick.name:
+        # Push and PushStick (single-arm and dual-arm)
+        elif op_name in push_ops or op_name in push_stick_ops:
             # TODO: implement motion solving for these operators
             raise NotImplementedError("Push and PushStick operations are not yet supported in cuRobo motion planning.")
 
@@ -318,7 +396,7 @@ def solve_curobo(
     start_js = last_js
 
     # Plan to retract
-    world_from_ee = world.kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
+    world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
     world_from_retract = world_from_ee @ approach_offset
     retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
     if not retract_result.success:
@@ -329,9 +407,9 @@ def solve_curobo(
     last_js = JointState.from_position(plan[-1:].position)
     ts = visualizer.log_joint_trajectory(plan.position, timeline=timeline, start_time=ts, dt=dt)
 
-    # Plan to go home at the end which we'll assume is q0
+    # Plan to go home at the end
     q_last = last_js.position[0]
-    q_home = best_particle["q0"].clone()
+    q_home = initial_q.clone()  # Use the initial configuration for this arm
     js_last = JointState.from_position(q_last[None])
     js_home = JointState.from_position(q_home[None])
     with timer.time("curobo_planning"):

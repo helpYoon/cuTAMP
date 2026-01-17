@@ -7,6 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import re
 import itertools
 import logging
 from collections import defaultdict
@@ -53,6 +54,20 @@ class _Node:
             node = node.parent
         return list(reversed(solution))
 
+def _extract_number(s: str) -> int:
+    """Extract the trailing number from a string like 'q0', 'left_q5', 'grasp12'."""
+    match = re.search(r'(\d+)$', s)
+    return int(match.group(1)) if match else 0
+
+def _extract_prefix(s: str, param_type: str) -> str:
+    """Extract the prefix before the base name. E.g., 'left_q0' -> 'left_', 'q0' -> ''"""
+    # Map param_type to base name
+    base_names = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
+    base = base_names.get(param_type, param_type)
+    
+    # Find where base name starts
+    idx = s.find(base)
+    return s[:idx] if idx > 0 else ""
 
 def get_valid_ground_operators(
     node: _Node, operators: Sequence[Operator], verbose: bool = False
@@ -75,30 +90,36 @@ def get_valid_ground_operators(
         # Got to do it inside here so we reset for each operator
         param_type_to_literals = node.parameters()
 
-        # This is hacky and could break things due to naming, but ok for now
+        # Sample new parameter names, handling both prefixed (left_q0) and unprefixed (q0) formats.
+        # Base names map parameter types to their string representations.
+        base_names = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
+        
         def _sample_param_type(param_type: str) -> str:
-            if param_type in param_type_to_literals:
-                if param_type == "conf":
-                    # remove the 'q' prefix
-                    conf_nums = {int(lit[1:]) for lit in param_type_to_literals[param_type]}
-                    conf_max = max(conf_nums)
-                    return f"q{conf_max + 1}"
-                elif param_type == "pose":
-                    pose_nums = {int(lit[4:]) for lit in param_type_to_literals[param_type]}
-                    pose_max = max(pose_nums)
-                    return f"pose{pose_max + 1}"
-                elif param_type == "traj":
-                    traj_nums = {int(lit[4:]) for lit in param_type_to_literals[param_type]}
-                    traj_max = max(traj_nums)
-                    return f"traj{traj_max + 1}"
-                elif param_type == "grasp":
-                    grasp_nums = {int(lit[5:]) for lit in param_type_to_literals[param_type]}
-                    grasp_max = max(grasp_nums)
-                    return f"grasp{grasp_max + 1}"
-                else:
-                    raise NotImplementedError
-            else:
-                return f"{param_type}1"
+            if param_type not in param_type_to_literals:
+                return f"{base_names.get(param_type, param_type)}1"
+            
+            literals = param_type_to_literals[param_type]
+            base = base_names.get(param_type)
+            if base is None:
+                raise NotImplementedError(f"Unknown param type: {param_type}")
+            
+            # Group literals by prefix and find max number for each prefix
+            prefix_to_max = defaultdict(lambda: -1)
+            for lit in literals:
+                prefix = _extract_prefix(lit, param_type)
+                num = _extract_number(lit)
+                prefix_to_max[prefix] = max(prefix_to_max[prefix], num)
+            
+            # Find the prefix with the highest max number and increment it
+            # This ensures we generate unique names across all prefixes
+            best_prefix = ""
+            best_max = -1
+            for prefix, max_num in prefix_to_max.items():
+                if max_num > best_max:
+                    best_max = max_num
+                    best_prefix = prefix
+            
+            return f"{best_prefix}{base}{best_max + 1}"
 
         def sample_param_type(param_type: str) -> str:
             new_sample = _sample_param_type(param_type)

@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import List, Dict, TypedDict
+from typing import List, Dict, Literal, Optional, TypedDict
 
 import torch
 from jaxtyping import Float
@@ -15,13 +15,26 @@ from jaxtyping import Float
 from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to_mat4x4
 from cutamp.config import TAMPConfiguration
 from cutamp.tamp_domain import MoveFree, MoveHolding, Pick, Place, Push, PushStick, Conf
+from cutamp.t1_domain import (
+    LeftMoveFree, LeftMoveHolding, LeftPick, LeftPlace, LeftPush, LeftPushStick,
+    RightMoveFree, RightMoveHolding, RightPick, RightPlace, RightPush, RightPushStick,
+)
 from cutamp.tamp_world import (
     TAMPWorld,
 )
 from cutamp.task_planning import PlanSkeleton
 
 
-def get_conf_parameters(plan_skeleton: PlanSkeleton, ignore_initial: bool) -> List[str]:
+def get_arm_from_operator(op_name: str) -> Optional[Literal["left", "right"]]:
+    """Extract arm identifier from T1 operator name. Returns None for single-arm operators."""
+    if op_name.startswith("Left"):
+        return "left"
+    elif op_name.startswith("Right"):
+        return "right"
+    return None
+
+
+def get_conf_parameters(plan_skeleton: PlanSkeleton, ignore_initial: bool, is_dual_arm: bool = False) -> List[str]:
     """Get the parameters of the plan skeletons that are of type Conf. Returns a list of unique parameter names."""
     conf_params = []
     for ground_op in plan_skeleton:
@@ -31,9 +44,31 @@ def get_conf_parameters(plan_skeleton: PlanSkeleton, ignore_initial: bool) -> Li
     conf_params = list(dict.fromkeys(conf_params))  # remove duplicates
 
     if ignore_initial:
-        assert conf_params[0] == "q0", "Expected first configuration to be q0"
-        conf_params = conf_params[1:]  # remove the initial configuration
+        if is_dual_arm:
+            # For dual-arm, remove both left_q0 and right_q0 from the conf_params
+            conf_params = [c for c in conf_params if c not in ("left_q0", "right_q0")]
+        else:
+            assert conf_params[0] == "q0", "Expected first configuration to be q0"
+            conf_params = conf_params[1:]  # remove the initial configuration
     return conf_params
+
+
+def get_conf_to_arm(plan_skeleton: PlanSkeleton, is_dual_arm: bool) -> Dict[str, Optional[Literal["left", "right"]]]:
+    """Build a mapping from configuration parameter names to their associated arm (for dual-arm robots)."""
+    if not is_dual_arm:
+        return {}
+    
+    conf_to_arm = {"left_q0": "left", "right_q0": "right"}
+    for ground_op in plan_skeleton:
+        op_name = ground_op.operator.name
+        arm = get_arm_from_operator(op_name)
+        if arm:
+            conf_idxs = [idx for idx, param in enumerate(ground_op.operator.parameters) if param.type == Conf]
+            for idx in conf_idxs:
+                conf_name = ground_op.values[idx]
+                if conf_name not in conf_to_arm:
+                    conf_to_arm[conf_name] = arm
+    return conf_to_arm
 
 
 class Rollout(TypedDict):
@@ -63,7 +98,9 @@ class RolloutFunction:
         self.plan_skeleton = plan_skeleton
         self.world = world
         self.config = config
-        self.conf_params = get_conf_parameters(plan_skeleton, ignore_initial=True)
+        self.is_dual_arm = world.is_dual_arm
+        self.conf_params = get_conf_parameters(plan_skeleton, ignore_initial=True, is_dual_arm=self.is_dual_arm)
+        self.conf_to_arm = get_conf_to_arm(plan_skeleton, self.is_dual_arm)
         self.obj_to_initial_pose = {obj.name: self.world.get_object_pose(obj) for obj in self.world.movables}
 
         # Grasp to 4x4 matrix function
@@ -86,18 +123,79 @@ class RolloutFunction:
         Rollout particles given the plan skeleton through the world. We keep the rollout information minimal to avoid
         unnecessary computations and backward passes.
         """
-        num_particles = particles["q0"].shape[0]
+        # Determine num_particles from first available initial config
+        if self.is_dual_arm:
+            num_particles = particles["left_q0"].shape[0]
+        else:
+            num_particles = particles["q0"].shape[0]
 
-        # Forward kinematics, we use .view() as it's faster than rearrange
-        confs = torch.stack([particles[conf] for conf in self.conf_params], dim=1)
-        confs_flat = confs.view(-1, confs.shape[-1])
-        robot_state = self.world.kin_model.get_state(confs_flat)
-        world_from_ee_flat = robot_state.ee_pose.get_matrix()
-        world_from_ee = world_from_ee_flat.view(num_particles, confs.shape[1], 4, 4)
+        # Forward kinematics - handle dual-arm vs single-arm
+        if self.is_dual_arm:
+            # For dual-arm, we need to compute FK for each arm separately
+            # Group configurations by arm
+            left_conf_params = [c for c in self.conf_params if self.conf_to_arm.get(c) == "left"]
+            right_conf_params = [c for c in self.conf_params if self.conf_to_arm.get(c) == "right"]
+            
+            all_world_from_ee = []
+            all_robot_spheres = []
+            
+            # Process left arm configurations
+            if left_conf_params:
+                left_confs = torch.stack([particles[conf] for conf in left_conf_params], dim=1)
+                left_confs_flat = left_confs.view(-1, left_confs.shape[-1])
+                left_kin_model = self.world.get_kin_model("left")
+                left_robot_state = left_kin_model.get_state(left_confs_flat)
+                left_ee_flat = left_robot_state.ee_pose.get_matrix()
+                left_ee = left_ee_flat.view(num_particles, left_confs.shape[1], 4, 4)
+                left_spheres_flat = left_robot_state.get_link_spheres()
+                left_spheres = left_spheres_flat.view(num_particles, left_confs.shape[1], -1, 4)
+            else:
+                left_ee = None
+                left_spheres = None
+            
+            # Process right arm configurations  
+            if right_conf_params:
+                right_confs = torch.stack([particles[conf] for conf in right_conf_params], dim=1)
+                right_confs_flat = right_confs.view(-1, right_confs.shape[-1])
+                right_kin_model = self.world.get_kin_model("right")
+                right_robot_state = right_kin_model.get_state(right_confs_flat)
+                right_ee_flat = right_robot_state.ee_pose.get_matrix()
+                right_ee = right_ee_flat.view(num_particles, right_confs.shape[1], 4, 4)
+                right_spheres_flat = right_robot_state.get_link_spheres()
+                right_spheres = right_spheres_flat.view(num_particles, right_confs.shape[1], -1, 4)
+            else:
+                right_ee = None
+                right_spheres = None
+            
+            # Interleave results in original conf_params order
+            world_from_ee_list = []
+            robot_spheres_list = []
+            left_idx, right_idx = 0, 0
+            for conf in self.conf_params:
+                arm = self.conf_to_arm.get(conf)
+                if arm == "left":
+                    world_from_ee_list.append(left_ee[:, left_idx])
+                    robot_spheres_list.append(left_spheres[:, left_idx])
+                    left_idx += 1
+                elif arm == "right":
+                    world_from_ee_list.append(right_ee[:, right_idx])
+                    robot_spheres_list.append(right_spheres[:, right_idx])
+                    right_idx += 1
+            
+            world_from_ee = torch.stack(world_from_ee_list, dim=1) if world_from_ee_list else torch.empty(num_particles, 0, 4, 4)
+            robot_spheres = torch.stack(robot_spheres_list, dim=1) if robot_spheres_list else torch.empty(num_particles, 0, 0, 4)
+            confs = torch.stack([particles[conf] for conf in self.conf_params], dim=1) if self.conf_params else torch.empty(num_particles, 0, 11)
+        else:
+            # Single-arm: original logic
+            confs = torch.stack([particles[conf] for conf in self.conf_params], dim=1)
+            confs_flat = confs.view(-1, confs.shape[-1])
+            robot_state = self.world.kin_model.get_state(confs_flat)
+            world_from_ee_flat = robot_state.ee_pose.get_matrix()
+            world_from_ee = world_from_ee_flat.view(num_particles, confs.shape[1], 4, 4)
 
-        # Robot link spheres for collision checking from cuRobo
-        robot_spheres_flat = robot_state.get_link_spheres()
-        robot_spheres = robot_spheres_flat.view(num_particles, confs.shape[1], -1, 4)
+            # Robot link spheres for collision checking from cuRobo
+            robot_spheres_flat = robot_state.get_link_spheres()
+            robot_spheres = robot_spheres_flat.view(num_particles, confs.shape[1], -1, 4)
 
         # Stores the desired actions
         world_from_tool_desired = []
@@ -130,16 +228,28 @@ class RolloutFunction:
         # Timestep of all actionable operators, and the corresponding timestep in the obj_to_pose list
         ts, pose_ts = 0, 0
 
+        # Sets of operator names for easier checking
+        move_free_ops = {MoveFree.name, LeftMoveFree.name, RightMoveFree.name}
+        move_holding_ops = {MoveHolding.name, LeftMoveHolding.name, RightMoveHolding.name}
+        pick_ops = {Pick.name, LeftPick.name, RightPick.name}
+        place_ops = {Place.name, LeftPlace.name, RightPlace.name}
+        push_ops = {Push.name, LeftPush.name, RightPush.name}
+        push_stick_ops = {PushStick.name, LeftPushStick.name, RightPushStick.name}
+        
+        # Track which arm each action uses (for dual-arm tool_from_ee)
+        action_to_arm: Dict[str, Optional[Literal["left", "right"]]] = {}
+
         # Rollout each ground operator in the plan skeleton
         for ground_op in self.plan_skeleton:
             op_name = ground_op.operator.name
+            arm = get_arm_from_operator(op_name)
 
             # Skip MoveFree and MoveHolding as we don't support trajectories yet
-            if op_name == MoveFree.name or op_name == MoveHolding.name:
+            if op_name in move_free_ops or op_name in move_holding_ops:
                 continue
 
-            # Pick
-            elif op_name == Pick.name:
+            # Pick (single-arm and dual-arm)
+            elif op_name in pick_ops:
                 obj_name, grasp_name, _ = ground_op.values
                 # Grasp is in object frame
                 obj_from_grasp = get_grasp_mat4x4(grasp_name)
@@ -153,9 +263,10 @@ class RolloutFunction:
                 action_params.append(grasp_name)
                 action_to_ts[grasp_name] = ts
                 action_to_pose_ts[grasp_name] = pose_ts
+                action_to_arm[grasp_name] = arm
 
-            # Place
-            elif op_name == Place.name:
+            # Place (single-arm and dual-arm)
+            elif op_name in place_ops:
                 obj_name, grasp_name, place_name, _, _ = ground_op.values
 
                 # Place is desired object pose in world frame
@@ -180,9 +291,10 @@ class RolloutFunction:
                 action_to_ts[place_name] = ts
                 action_to_pose_ts[place_name] = pose_ts
                 ts_to_pose_ts[ts] = pose_ts
+                action_to_arm[place_name] = arm
 
-            # Push
-            elif op_name == Push.name:
+            # Push (single-arm and dual-arm)
+            elif op_name in push_ops:
                 button_name, pose_name, _ = ground_op.values
 
                 # Push pose is desired tool pose
@@ -194,9 +306,10 @@ class RolloutFunction:
                 action_params.append(pose_name)
                 action_to_ts[pose_name] = ts
                 action_to_pose_ts[pose_name] = pose_ts
+                action_to_arm[pose_name] = arm
 
-            # PushStick
-            elif op_name == PushStick.name:
+            # PushStick (single-arm and dual-arm)
+            elif op_name in push_stick_ops:
                 button_name, stick_name, grasp_name, pose_name, _ = ground_op.values
 
                 # Pose is desired stick pose
@@ -220,6 +333,7 @@ class RolloutFunction:
                 action_params.append(pose_name)
                 action_to_ts[pose_name] = ts
                 action_to_pose_ts[pose_name] = pose_ts
+                action_to_arm[pose_name] = arm
 
             # Unknown
             else:
@@ -231,7 +345,17 @@ class RolloutFunction:
 
         # Stack and store in rollout
         world_from_tool_desired = torch.stack(world_from_tool_desired, dim=1)
-        world_from_ee_desired = world_from_tool_desired @ self.world.tool_from_ee
+        
+        # Compute world_from_ee_desired using arm-specific tool_from_ee for dual-arm
+        if self.is_dual_arm:
+            world_from_ee_desired_list = []
+            for i, action in enumerate(action_params):
+                arm = action_to_arm.get(action)
+                tool_from_ee = self.world.get_tool_from_ee(arm) if arm else self.world.get_tool_from_ee("left")
+                world_from_ee_desired_list.append(world_from_tool_desired[:, i] @ tool_from_ee)
+            world_from_ee_desired = torch.stack(world_from_ee_desired_list, dim=1) if world_from_ee_desired_list else torch.empty(num_particles, 0, 4, 4)
+        else:
+            world_from_ee_desired = world_from_tool_desired @ self.world.tool_from_ee
 
         # Object poses for each timestep
         obj_to_pose = {k: torch.stack(v, dim=1) for k, v in obj_to_pose.items()}
