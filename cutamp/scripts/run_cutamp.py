@@ -42,6 +42,9 @@ def load_demo_env(name: str) -> TAMPEnvironment:
     elif name == "unpack":
         env_path = os.path.join(get_env_dir(), "unpack_3.yml")
         env = load_env(env_path)
+    elif name == "blocks_t1":
+        env_path = os.path.join(get_env_dir(), "blocks_t1.yml")
+        env = load_env(env_path)
     else:
         raise ValueError(f"Unknown environment name: {name}")
     return env
@@ -76,7 +79,7 @@ def entrypoint():
         "--env",
         help="Environment name to run",
         default="tetris_3",
-        choices=["tetris_1", "tetris_2", "tetris_3", "tetris_5", "book_shelf", "stick_button", "blocks", "unpack"],
+        choices=["tetris_1", "tetris_2", "tetris_3", "tetris_5", "book_shelf", "stick_button", "blocks", "unpack", "blocks_t1"],
     )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=1024, help="Number of particles to use (i.e. batch size)"
