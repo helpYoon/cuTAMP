@@ -19,8 +19,6 @@
 # Gripper Mechanism:
 #   The gripper is a 4-bar parallel linkage with 4 joints but 1 effective DOF.
 #   Joints rotate around the local Z-axis (axis xyz="0 0 1" in URDF).
-#   - Closed: all joints at 0.0
-#   - Open: pattern like (θ, -θ, -θ, θ) where Link11=-Link1, Link22=-Link2
 #
 # Collision Configuration:
 #   - collision_sphere_buffer: Shrinks spheres for world collision checking
@@ -57,21 +55,21 @@ robot_cfg:
         "Head_pitch": 0.0,
 
         # Left arm (locked at neutral position)
-        "Left_Shoulder_Pitch": 0.0,
-        "Left_Shoulder_Roll": -1.2,
+        "Left_Shoulder_Pitch": 0.5,
+        "Left_Shoulder_Roll": -1.0,
         "Left_Elbow_Pitch": 0.0,
-        "Left_Elbow_Yaw": 0.0,
+        "Left_Elbow_Yaw": -1.4,
         "Left_Wrist_Pitch": 0.0,
         "Left_Wrist_Yaw": 0.0,
         "Left_Hand_Roll": 0.0,
 
-        # Left gripper (closed: all at 0)
+        # Left gripper (open: all at 0)
         "left_Link1": 0.0,
         "left_Link11": 0.0,
         "left_Link2": 0.0,
         "left_Link22": 0.0,
 
-        # Right gripper (closed: all at 0)
+        # Right gripper (open: all at 0)
         "right_Link1": 0.0,
         "right_Link11": 0.0,
         "right_Link2": 0.0,
@@ -105,25 +103,7 @@ robot_cfg:
       "attached_object",
     ]
     
-    # Collision sphere buffer: shrinks/expands sphere radius for collision checking
-    # Negative values = smaller effective radius (less conservative)
-    # These are necessary to allow gripper to approach table surface
-    collision_sphere_buffer: 
-      {
-        "default": 0.0,
-        "Trunk": -0.04,
-        # Gripper links need negative buffer to reach near table
-        "left_base_link": -0.02,
-        "left_Link1": -0.01,
-        "left_Link11": -0.01,
-        "left_Link2": -0.01,
-        "left_Link22": -0.01,
-        "right_base_link": -0.02,
-        "right_Link1": -0.01,
-        "right_Link11": -0.01,
-        "right_Link2": -0.01,
-        "right_Link22": -0.01,
-      }
+    collision_sphere_buffer: {}
     
     extra_collision_spheres: {"attached_object": 50}
     
@@ -217,7 +197,7 @@ robot_cfg:
 
       # Retract configuration (11 DOF)
       # [lift1, lift2, torso_pitch, waist_yaw, R_shoulder_p, R_shoulder_r, R_elbow_p, R_elbow_y, R_wrist_p, R_wrist_y, R_hand_r]
-      retract_config: [0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0]
+      retract_config: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
       
       null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]

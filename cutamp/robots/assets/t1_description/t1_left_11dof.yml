@@ -19,8 +19,6 @@
 # Gripper Mechanism:
 #   The gripper is a 4-bar parallel linkage with 4 joints but 1 effective DOF.
 #   Joints rotate around the local Z-axis (axis xyz="0 0 1" in URDF).
-#   - Closed: all joints at 0.0
-#   - Open: pattern like (θ, -θ, -θ, θ) where Link11=-Link1, Link22=-Link2
 #
 # Collision Configuration:
 #   - collision_sphere_buffer: Shrinks spheres for world collision checking
@@ -57,10 +55,10 @@ robot_cfg:
         "Head_pitch": 0.0,
 
         # Right arm (locked at neutral position)
-        "Right_Shoulder_Pitch": 0.0,
-        "Right_Shoulder_Roll": 1.2,
+        "Right_Shoulder_Pitch": 0.5,
+        "Right_Shoulder_Roll": 1.0,
         "Right_Elbow_Pitch": 0.0,
-        "Right_Elbow_Yaw": 0.0,
+        "Right_Elbow_Yaw": 1.4,
         "Right_Wrist_Pitch": 0.0,
         "Right_Wrist_Yaw": 0.0,
         "Right_Hand_Roll": 0.0,
@@ -105,9 +103,6 @@ robot_cfg:
       "attached_object",
     ]
     
-    # Collision sphere buffer: shrinks/expands sphere radius for collision checking
-    # Negative values = smaller effective radius (less conservative)
-    # These are necessary to allow gripper to approach table surface
     collision_sphere_buffer: {}
     
     extra_collision_spheres: {"attached_object": 50}
@@ -171,46 +166,7 @@ robot_cfg:
       }
 
     # Buffer distances for self-collision checking
-    # Negative buffers shrink collision spheres for self-collision, allowing tighter configs
-    self_collision_buffer:
-      {
-        # Torso/trunk - keep small positive buffer
-        "Trunk": 0.001,
-        "Waist": 0.001,
-        "H1": 0.001,
-        "H2": 0.001,
-        # Lifting column
-        "lifting_base_link": 0.001,
-        "column_stage_1": 0.001,
-        "column_stage_2": 0.001,
-        "column_stage_3": 0.001,
-        # Left arm (active) - negative buffer for tighter self-collision tolerance
-        "AL1": -0.01,
-        "AL2": -0.01,
-        "AL3": -0.01,
-        "AL4": -0.01,
-        "AL5": -0.01,
-        "AL6": -0.01,
-        "left_hand_link": -0.015,
-        "left_base_link": -0.015,
-        "left_Link1": -0.01,
-        "left_Link11": -0.01,
-        "left_Link2": -0.01,
-        "left_Link22": -0.01,
-        # Right arm (locked) - keep small buffer since not moving
-        "AR1": 0.001,
-        "AR2": 0.001,
-        "AR3": 0.001,
-        "AR4": 0.001,
-        "AR5": 0.001,
-        "AR6": 0.001,
-        "right_hand_link": 0.001,
-        "right_base_link": 0.001,
-        "right_Link1": 0.001,
-        "right_Link11": 0.001,
-        "right_Link2": 0.001,
-        "right_Link22": 0.001,
-      }
+    self_collision_buffer: {}
 
     use_global_cumul: True
     mesh_link_names: null
@@ -240,7 +196,7 @@ robot_cfg:
 
       # Retract configuration (11 DOF)
       # [lift1, lift2, torso_pitch, waist_yaw, L_shoulder_p, L_shoulder_r, L_elbow_p, L_elbow_y, L_wrist_p, L_wrist_y, L_hand_r]
-      retract_config: [0.0, 0.0, 0.0, 0.0, 0.0, -1.2, 0.0, 0.0, 0.0, 0.0, 0.0]
+      retract_config: [0.0, 0.0, 0.0, 0.0, 0.5, -1.0, 0.0, -1.4, 0.0, 0.0, 0.0]
       
       null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
