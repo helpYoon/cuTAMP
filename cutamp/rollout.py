@@ -14,42 +14,34 @@ from jaxtyping import Float
 
 from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to_mat4x4
 from cutamp.config import TAMPConfiguration
-from cutamp.tamp_domain import MoveFree, MoveHolding, Pick, Place, Push, PushStick, Conf
-from cutamp.t1_domain import (
-    LeftMoveFree, LeftMoveHolding, LeftPick, LeftPlace, LeftPush, LeftPushStick,
-    RightMoveFree, RightMoveHolding, RightPick, RightPlace, RightPush, RightPushStick,
-)
+from cutamp.tamp_domain import Conf
 from cutamp.tamp_world import (
     TAMPWorld,
 )
 from cutamp.task_planning import PlanSkeleton
 
 
-def get_arm_from_operator(op_name: str) -> Optional[Literal["left", "right"]]:
-    """Extract arm identifier from T1 operator name. Returns None for single-arm operators."""
-    if op_name.startswith("Left"):
-        return "left"
-    elif op_name.startswith("Right"):
-        return "right"
-    return None
-
-
-def get_conf_parameters(plan_skeleton: PlanSkeleton, ignore_initial: bool, is_dual_arm: bool = False) -> List[str]:
-    """Get the parameters of the plan skeletons that are of type Conf. Returns a list of unique parameter names."""
+def get_conf_parameters(plan_skeleton: PlanSkeleton, is_dual_arm: bool = False) -> List[str]:
+    """Get the parameters of the plan skeletons that are of type Conf. Returns a list of unique parameter names.
+    
+    Only includes configurations from actionable operators (Pick, Place, Push, PushStick).
+    Motion operators (MoveFree, MoveHolding) configs are excluded as they're determined by actionable ops.
+    
+    Note: Initial configs (q0, left_q0, right_q0) are never included since they only appear in
+    motion operators (MoveFree), so no explicit removal is needed.
+    """
     conf_params = []
     for ground_op in plan_skeleton:
-        conf_idxs = [idx for idx, param in enumerate(ground_op.operator.parameters) if param.type == Conf]
-        op_conf_params = [ground_op.values[idx] for idx in conf_idxs]
-        conf_params.extend(op_conf_params)
-    conf_params = list(dict.fromkeys(conf_params))  # remove duplicates
+        metadata = ground_op.operator.metadata
 
-    if ignore_initial:
-        if is_dual_arm:
-            # For dual-arm, remove both left_q0 and right_q0 from the conf_params
-            conf_params = [c for c in conf_params if c not in ("left_q0", "right_q0")]
-        else:
-            assert conf_params[0] == "q0", "Expected first configuration to be q0"
-            conf_params = conf_params[1:]  # remove the initial configuration
+        # Only include configs from actionable operators (not motion operators)
+        if metadata.is_actionable:
+            conf_idx = [idx for idx, param in enumerate(ground_op.operator.parameters) if param.type == Conf]
+            op_conf_params = [ground_op.values[idx] for idx in conf_idx]
+            conf_params.extend(op_conf_params)
+    
+    # remove duplicates while preserving order
+    conf_params = list(dict.fromkeys(conf_params))  
     return conf_params
 
 
@@ -60,8 +52,7 @@ def get_conf_to_arm(plan_skeleton: PlanSkeleton, is_dual_arm: bool) -> Dict[str,
     
     conf_to_arm = {"left_q0": "left", "right_q0": "right"}
     for ground_op in plan_skeleton:
-        op_name = ground_op.operator.name
-        arm = get_arm_from_operator(op_name)
+        arm = ground_op.operator.metadata.arm
         if arm:
             conf_idxs = [idx for idx, param in enumerate(ground_op.operator.parameters) if param.type == Conf]
             for idx in conf_idxs:
@@ -69,6 +60,35 @@ def get_conf_to_arm(plan_skeleton: PlanSkeleton, is_dual_arm: bool) -> Dict[str,
                 if conf_name not in conf_to_arm:
                     conf_to_arm[conf_name] = arm
     return conf_to_arm
+
+def get_action_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
+    """
+    Get action parameters (grasps, placements, push poses) in the order they appear in Pick/Place/Push operators.
+    
+    This matches the order used by RolloutFunction when building action_params.
+    """
+    action_params = []
+    for ground_op in plan_skeleton:
+        action_type = ground_op.operator.metadata.action_type
+        
+        if action_type == "pick":
+            # Pick: [obj, grasp, q] -> grasp is action param
+            _, grasp_name, _ = ground_op.values
+            action_params.append(grasp_name)
+        elif action_type == "place":
+            # Place: [obj, grasp, placement, surface, q] -> placement is action param
+            _, _, place_name, _, _ = ground_op.values
+            action_params.append(place_name)
+        elif action_type == "push":
+            # Push: [button, pose, q] -> pose is action param
+            _, pose_name, _ = ground_op.values
+            action_params.append(pose_name)
+        elif action_type == "push_stick":
+            # PushStick: [button, obj, grasp, pose, q] -> pose is action param
+            _, _, _, pose_name, _ = ground_op.values
+            action_params.append(pose_name)
+    
+    return action_params
 
 
 class Rollout(TypedDict):
@@ -99,7 +119,7 @@ class RolloutFunction:
         self.world = world
         self.config = config
         self.is_dual_arm = world.is_dual_arm
-        self.conf_params = get_conf_parameters(plan_skeleton, ignore_initial=True, is_dual_arm=self.is_dual_arm)
+        self.conf_params = get_conf_parameters(plan_skeleton, is_dual_arm=self.is_dual_arm)
         self.conf_to_arm = get_conf_to_arm(plan_skeleton, self.is_dual_arm)
         self.obj_to_initial_pose = {obj.name: self.world.get_object_pose(obj) for obj in self.world.movables}
 
@@ -227,29 +247,21 @@ class RolloutFunction:
 
         # Timestep of all actionable operators, and the corresponding timestep in the obj_to_pose list
         ts, pose_ts = 0, 0
-
-        # Sets of operator names for easier checking
-        move_free_ops = {MoveFree.name, LeftMoveFree.name, RightMoveFree.name}
-        move_holding_ops = {MoveHolding.name, LeftMoveHolding.name, RightMoveHolding.name}
-        pick_ops = {Pick.name, LeftPick.name, RightPick.name}
-        place_ops = {Place.name, LeftPlace.name, RightPlace.name}
-        push_ops = {Push.name, LeftPush.name, RightPush.name}
-        push_stick_ops = {PushStick.name, LeftPushStick.name, RightPushStick.name}
         
         # Track which arm each action uses (for dual-arm tool_from_ee)
         action_to_arm: Dict[str, Optional[Literal["left", "right"]]] = {}
 
         # Rollout each ground operator in the plan skeleton
         for ground_op in self.plan_skeleton:
-            op_name = ground_op.operator.name
-            arm = get_arm_from_operator(op_name)
+            metadata = ground_op.operator.metadata
+            arm = metadata.arm
 
-            # Skip MoveFree and MoveHolding as we don't support trajectories yet
-            if op_name in move_free_ops or op_name in move_holding_ops:
+            # Skip motion operators (MoveFree and MoveHolding) as we don't support trajectories yet
+            if metadata.is_motion:
                 continue
 
             # Pick (single-arm and dual-arm)
-            elif op_name in pick_ops:
+            elif metadata.action_type == "pick":
                 obj_name, grasp_name, _ = ground_op.values
                 # Grasp is in object frame
                 obj_from_grasp = get_grasp_mat4x4(grasp_name)
@@ -266,7 +278,7 @@ class RolloutFunction:
                 action_to_arm[grasp_name] = arm
 
             # Place (single-arm and dual-arm)
-            elif op_name in place_ops:
+            elif metadata.action_type == "place":
                 obj_name, grasp_name, place_name, _, _ = ground_op.values
 
                 # Place is desired object pose in world frame
@@ -294,7 +306,7 @@ class RolloutFunction:
                 action_to_arm[place_name] = arm
 
             # Push (single-arm and dual-arm)
-            elif op_name in push_ops:
+            elif metadata.action_type == "push":
                 button_name, pose_name, _ = ground_op.values
 
                 # Push pose is desired tool pose
@@ -309,7 +321,7 @@ class RolloutFunction:
                 action_to_arm[pose_name] = arm
 
             # PushStick (single-arm and dual-arm)
-            elif op_name in push_stick_ops:
+            elif metadata.action_type == "push_stick":
                 button_name, stick_name, grasp_name, pose_name, _ = ground_op.values
 
                 # Pose is desired stick pose
@@ -337,7 +349,7 @@ class RolloutFunction:
 
             # Unknown
             else:
-                raise ValueError(f"Unsupported operator {op_name}")
+                raise ValueError(f"Unsupported operator {ground_op.operator.name}")
 
             # Increment time step
             ts_to_pose_ts[ts] = pose_ts

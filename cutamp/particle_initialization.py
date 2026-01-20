@@ -23,11 +23,6 @@ from cutamp.samplers import (
     place_4dof_sampler,
     sample_yaw,
 )
-from cutamp.tamp_domain import MoveFree, MoveHolding, Pick, Place, Push, PushStick
-from cutamp.t1_domain import (
-    LeftMoveFree, LeftMoveHolding, LeftPick, LeftPlace, LeftPush, LeftPushStick, 
-    RightMoveFree, RightMoveHolding, RightPick, RightPlace, RightPush, RightPushStick,
-)
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
@@ -44,15 +39,6 @@ _log = logging.getLogger(__name__)
 
 # Number of shared joints (lift + torso) for T1 dual-arm robot
 NUM_SHARED_JOINTS = 4
-
-
-def get_arm_from_operator(op_name: str) -> Optional[Literal["left", "right"]]:
-    """Extract arm identifier from T1 operator name. Returns None for single-arm operators."""
-    if op_name.startswith("Left"):
-        return "left"
-    elif op_name.startswith("Right"):
-        return "right"
-    return None
 
 
 def propagate_shared_joints(
@@ -136,35 +122,35 @@ class ParticleInitializer:
         # Note: we don't consider state after executing earlier samples
         # Iterate through each ground operator in the plan skeleton and initialize and build up particles
         for idx, ground_op in enumerate(plan_skeleton):
-            op_name = ground_op.operator.name
+            metadata = ground_op.operator.metadata
             params = ground_op.values
             header = f"{idx + 1}. {ground_op}"
+            arm = metadata.arm  # None for single-arm, "left"/"right" for dual-arm
 
-            # MoveFree (single-arm and dual-arm)
-            if op_name in (MoveFree.name, LeftMoveFree.name, RightMoveFree.name):
-                q_start, _traj, q_end = params
-                if q_start not in particles:
-                    raise ValueError(f"{q_start=} should already be bound")
-                deferred_params.add(q_end)
-                move_free_deferred[q_end] = q_start
-                log_debug(f"{header}. Deferred {q_end}")
-
-            # MoveHolding (single-arm and dual-arm)
-            elif op_name in (MoveHolding.name, LeftMoveHolding.name, RightMoveHolding.name):
-                obj, grasp, q_start, _traj, q_end = params
-                if not world.has_object(obj):
-                    raise ValueError(f"{obj=} not found in world")
-                if grasp not in particles:
-                    raise ValueError(f"{grasp=} should already be bound")
-                if q_start not in particles:
-                    raise ValueError(f"{q_start=} should already be bound")
-                deferred_params.add(q_end)
-                log_debug(f"{header}. Deferred {q_end}")
+            # MoveFree (single-arm and dual-arm) - motion operators without holding
+            if metadata.is_motion and metadata.action_type is None:
+                # Check if it's MoveFree (3 params) vs MoveHolding (5 params)
+                if len(params) == 3:  # MoveFree: q_start, traj, q_end
+                    q_start, _traj, q_end = params
+                    if q_start not in particles:
+                        raise ValueError(f"{q_start=} should already be bound")
+                    deferred_params.add(q_end)
+                    move_free_deferred[q_end] = q_start
+                    log_debug(f"{header}. Deferred {q_end}")
+                else:  # MoveHolding: obj, grasp, q_start, traj, q_end
+                    obj, grasp, q_start, _traj, q_end = params
+                    if not world.has_object(obj):
+                        raise ValueError(f"{obj=} not found in world")
+                    if grasp not in particles:
+                        raise ValueError(f"{grasp=} should already be bound")
+                    if q_start not in particles:
+                        raise ValueError(f"{q_start=} should already be bound")
+                    deferred_params.add(q_end)
+                    log_debug(f"{header}. Deferred {q_end}")
 
             # Pick (single-arm and dual-arm)
-            elif op_name in (Pick.name, LeftPick.name, RightPick.name):
+            elif metadata.action_type == "pick":
                 obj, grasp, q = params
-                arm = get_arm_from_operator(op_name)
                 
                 if not world.has_object(obj):
                     raise ValueError(f"{obj=} not found in world")
@@ -248,9 +234,8 @@ class ParticleInitializer:
                     self.pick_cache[cache_key] = {"sampled_grasps": particles[grasp], "ik_result": ik_result}
 
             # Place (single-arm and dual-arm)
-            elif op_name in (Place.name, LeftPlace.name, RightPlace.name):
+            elif metadata.action_type == "place":
                 obj, grasp, placement, surface, q = params
-                arm = get_arm_from_operator(op_name)
                 
                 if not world.has_object(obj):
                     raise ValueError(f"{obj=} not found in world")
@@ -354,9 +339,8 @@ class ParticleInitializer:
                     }
 
             # Push Button (without stick) - single-arm and dual-arm
-            elif op_name in (Push.name, LeftPush.name, RightPush.name):
+            elif metadata.action_type == "push":
                 button, push_pose, q = params
-                arm = get_arm_from_operator(op_name)
                 
                 assert not config.random_init, "Random initialization not supported for pushing"
                 if not world.has_object(button):
@@ -440,9 +424,8 @@ class ParticleInitializer:
                     self.push_button_cache[cache_key] = {"sampled_push": sampled_push, "ik_result": ik_result}
 
             # Push Button with Stick - single-arm and dual-arm
-            elif op_name in (PushStick.name, LeftPushStick.name, RightPushStick.name):
+            elif metadata.action_type == "push_stick":
                 button, stick_name, grasp, push_pose, q = params
-                arm = get_arm_from_operator(op_name)
                 
                 assert not config.random_init, "Random initialization not supported for pushing"
                 if not world.has_object(button):
@@ -560,7 +543,7 @@ class ParticleInitializer:
 
             # Unknown
             else:
-                raise NotImplementedError(f"Unsupported operator {op_name}")
+                raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
         
         # Handle unresolved deferred parameters
         # MoveFree params that weren't resolved are trailing moves (no Pick/Place after them)

@@ -22,25 +22,11 @@ from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
 from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to_mat4x4
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
-from cutamp.tamp_domain import MoveHolding, Push, PushStick, MoveFree, Place, Pick
-from cutamp.t1_domain import (
-    LeftMoveFree, LeftMoveHolding, LeftPick, LeftPlace, LeftPush, LeftPushStick,
-    RightMoveFree, RightMoveHolding, RightPick, RightPlace, RightPush, RightPushStick,
-)
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
 _log = logging.getLogger(__name__)
-
-
-def get_arm_from_operator(op_name: str) -> Optional[Literal["left", "right"]]:
-    """Extract arm identifier from T1 operator name. Returns None for single-arm operators."""
-    if op_name.startswith("Left"):
-        return "left"
-    elif op_name.startswith("Right"):
-        return "right"
-    return None
 
 
 def solve_curobo(
@@ -68,7 +54,7 @@ def solve_curobo(
         # Find which arms are used in this plan
         arms_used = set()
         for ground_op in plan_skeleton:
-            arm = get_arm_from_operator(ground_op.operator.name)
+            arm = ground_op.operator.metadata.arm
             if arm:
                 arms_used.add(arm)
         
@@ -120,14 +106,6 @@ def solve_curobo(
     # Accumulated plans we return that the real robot can actually execute
     accum_plans = []
 
-    # Define operator sets for easier checking
-    move_free_ops = {MoveFree.name, LeftMoveFree.name, RightMoveFree.name}
-    move_holding_ops = {MoveHolding.name, LeftMoveHolding.name, RightMoveHolding.name}
-    pick_ops = {Pick.name, LeftPick.name, RightPick.name}
-    place_ops = {Place.name, LeftPlace.name, RightPlace.name}
-    push_ops = {Push.name, LeftPush.name, RightPush.name}
-    push_stick_ops = {PushStick.name, LeftPushStick.name, RightPushStick.name}
-    
     # Get arm-specific helpers (for dual-arm)
     if is_dual_arm:
         kin_model = world.get_kin_model(active_arm)
@@ -138,25 +116,24 @@ def solve_curobo(
 
     # Iterate through skeleton and motion plan
     for idx, ground_op in enumerate(plan_skeleton):
-        op_name = ground_op.operator.name
+        metadata = ground_op.operator.metadata
 
-        # MoveFree, defer motion planning to pick to use object pose instead of planning from q_start to q_end.
-        # This works more reliably and gives higher quality motions.
-        if op_name in move_free_ops:
-            q_start, traj, q_end = ground_op.values
-            if traj in best_particle:
-                raise NotImplementedError("Trajectories not supported yet")
-            last_q_name = q_start
-
-        # MoveHolding
-        elif op_name in move_holding_ops:
-            obj, grasp, q_start, traj, q_end = ground_op.values
-            if traj in best_particle:
-                raise NotImplementedError("Trajectories not supported yet")
-            last_q_name = q_start
+        # Motion operators - defer planning until actionable operator
+        if metadata.is_motion:
+            # Check params length to distinguish MoveFree (3) vs MoveHolding (5)
+            if len(ground_op.values) == 3:  # MoveFree
+                q_start, traj, q_end = ground_op.values
+                if traj in best_particle:
+                    raise NotImplementedError("Trajectories not supported yet")
+                last_q_name = q_start
+            else:  # MoveHolding
+                obj, grasp, q_start, traj, q_end = ground_op.values
+                if traj in best_particle:
+                    raise NotImplementedError("Trajectories not supported yet")
+                last_q_name = q_start
 
         # Pick (single-arm and dual-arm)
-        elif op_name in pick_ops:
+        elif metadata.action_type == "pick":
             obj, grasp, q = ground_op.values
             assert last_js is not None
 
@@ -284,7 +261,7 @@ def solve_curobo(
             ts = visualizer.log_joint_trajectory(all_pos, timeline=timeline, start_time=ts, dt=dt)
 
         # Place (single-arm and dual-arm)
-        elif op_name in place_ops:
+        elif metadata.action_type == "place":
             obj, grasp, placement, surface, q = ground_op.values
             assert last_js is not None
 
@@ -383,13 +360,13 @@ def solve_curobo(
             ts = visualizer.log_joint_trajectory(all_pos, timeline=timeline, start_time=ts, dt=dt)
 
         # Push and PushStick (single-arm and dual-arm)
-        elif op_name in push_ops or op_name in push_stick_ops:
+        elif metadata.action_type in ("push", "push_stick"):
             # TODO: implement motion solving for these operators
             raise NotImplementedError("Push and PushStick operations are not yet supported in cuRobo motion planning.")
 
         # Unsupported
         else:
-            raise NotImplementedError(f"Unsupported operator {op_name}")
+            raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
 
         print(f"{idx + 1}. {ground_op.name}")
 

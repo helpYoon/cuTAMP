@@ -9,7 +9,7 @@
 
 from typing import Sequence
 
-from .base_structs import Atom, Fluent, GroundOperator, Operator, Parameter, State
+from .base_structs import Atom, Fluent, GroundOperator, Operator, OperatorMetadata, Parameter, State
 from .tamp_structs import Constraint, Cost, GroundTAMPOperator, PlanSkeleton, TAMPOperator
 from .search import breadth_first_search
 

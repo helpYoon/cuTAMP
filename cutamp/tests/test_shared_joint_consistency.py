@@ -8,32 +8,50 @@ These tests verify that shared joints are properly propagated between arms.
 import pytest
 import torch
 
-from cutamp.particle_initialization import propagate_shared_joints, get_arm_from_operator, NUM_SHARED_JOINTS
+from cutamp.particle_initialization import propagate_shared_joints, NUM_SHARED_JOINTS
+from cutamp.tamp_domain import Pick, Place, MoveFree, MoveHolding, Push, PushStick
+from cutamp.t1_domain import (
+    LeftPick, RightPick, LeftPlace, RightPlace,
+    LeftMoveFree, RightMoveFree, LeftMoveHolding, RightMoveHolding,
+    LeftPush, RightPush, LeftPushStick, RightPushStick,
+)
 
 
-class TestGetArmFromOperator:
-    """Test operator name parsing to extract arm identifier."""
+class TestOperatorMetadataArm:
+    """Test that operator metadata correctly stores arm information."""
 
-    def test_left_pick_returns_left(self):
-        assert get_arm_from_operator("LeftPick") == "left"
+    def test_left_pick_metadata_arm(self):
+        assert LeftPick.metadata.arm == "left"
 
-    def test_right_pick_returns_right(self):
-        assert get_arm_from_operator("RightPick") == "right"
+    def test_right_pick_metadata_arm(self):
+        assert RightPick.metadata.arm == "right"
 
-    def test_left_move_free_returns_left(self):
-        assert get_arm_from_operator("LeftMoveFree") == "left"
+    def test_left_move_free_metadata_arm(self):
+        assert LeftMoveFree.metadata.arm == "left"
 
-    def test_right_move_holding_returns_right(self):
-        assert get_arm_from_operator("RightMoveHolding") == "right"
+    def test_right_move_holding_metadata_arm(self):
+        assert RightMoveHolding.metadata.arm == "right"
 
-    def test_single_arm_pick_returns_none(self):
-        assert get_arm_from_operator("Pick") is None
+    def test_single_arm_pick_metadata_arm_is_none(self):
+        assert Pick.metadata.arm is None
 
-    def test_single_arm_place_returns_none(self):
-        assert get_arm_from_operator("Place") is None
+    def test_single_arm_place_metadata_arm_is_none(self):
+        assert Place.metadata.arm is None
 
-    def test_unknown_operator_returns_none(self):
-        assert get_arm_from_operator("UnknownOp") is None
+    def test_all_left_operators_have_left_arm(self):
+        left_ops = [LeftPick, LeftPlace, LeftMoveFree, LeftMoveHolding, LeftPush, LeftPushStick]
+        for op in left_ops:
+            assert op.metadata.arm == "left", f"{op.name} should have arm='left'"
+
+    def test_all_right_operators_have_right_arm(self):
+        right_ops = [RightPick, RightPlace, RightMoveFree, RightMoveHolding, RightPush, RightPushStick]
+        for op in right_ops:
+            assert op.metadata.arm == "right", f"{op.name} should have arm='right'"
+
+    def test_all_single_arm_operators_have_no_arm(self):
+        single_ops = [Pick, Place, MoveFree, MoveHolding, Push, PushStick]
+        for op in single_ops:
+            assert op.metadata.arm is None, f"{op.name} should have arm=None"
 
 
 class TestSharedJointPropagation:

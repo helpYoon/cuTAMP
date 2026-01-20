@@ -8,7 +8,24 @@
 # its affiliates is strictly prohibited.
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Literal, Optional, Sequence
+
+
+@dataclass(frozen=True)
+class OperatorMetadata:
+    """Metadata for operators that determines their behavior in the TAMP pipeline.
+    
+    Attributes:
+        is_actionable: Whether this operator creates action parameters (grasps, placements, push poses)
+                       that require IK solving. True for Pick, Place, Push, PushStick operators.
+        is_motion: Whether this operator represents a motion between configurations (MoveFree, MoveHolding).
+        arm: For dual-arm robots, which arm this operator uses ("left", "right", or None for single-arm).
+        action_type: The type of action ("pick", "place", "push", "push_stick", None for motion ops).
+    """
+    is_actionable: bool = False
+    is_motion: bool = False
+    arm: Optional[Literal["left", "right"]] = None
+    action_type: Optional[Literal["pick", "place", "push", "push_stick"]] = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +128,7 @@ class Operator:
     preconditions: Sequence[Fluent] = field(default_factory=list)
     add_effects: Sequence[Fluent] = field(default_factory=list)
     del_effects: Sequence[Fluent] = field(default_factory=list)
+    metadata: OperatorMetadata = field(default_factory=OperatorMetadata)
 
     def ground(self, substitutions: dict[str, str]) -> "GroundOperator":
         """Ground this operator using the given values for the parameters."""

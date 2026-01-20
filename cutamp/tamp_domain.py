@@ -13,7 +13,7 @@ Domain file like in PDDL. The task planner can be improved, but it suffices for 
 
 from typing import Sequence
 
-from cutamp.task_planning import Fluent, Parameter, TAMPOperator, State
+from cutamp.task_planning import Fluent, OperatorMetadata, Parameter, TAMPOperator, State
 from cutamp.task_planning.constraints import (
     CollisionFree,
     CollisionFreeGrasp,
@@ -97,6 +97,7 @@ MoveFree = TAMPOperator(
     del_effects=[At(q_start), CanMove()],
     constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True),
 )
 
 
@@ -113,6 +114,7 @@ MoveHolding = TAMPOperator(
     del_effects=[At(q_start), CanMove()],
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True),
 )
 
 
@@ -134,6 +136,7 @@ Pick = TAMPOperator(
     del_effects=[HandEmpty(), JustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
     costs=[GraspCost(obj, grasp)],
+    metadata=OperatorMetadata(is_actionable=True, action_type="pick"),
 )
 
 Place = TAMPOperator(
@@ -158,6 +161,7 @@ Place = TAMPOperator(
         CollisionFreePlacement(obj, placement, surface),
     ],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="place"),
 )
 
 
@@ -175,6 +179,7 @@ Push = TAMPOperator(
     del_effects=[JustMoved(), CanPush(button)],  # Note: CFree for Push already encoded in the Move operator
     constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="push"),
 )
 
 
@@ -195,6 +200,7 @@ PushStick = TAMPOperator(
     # CFree is automatically handled right now within the operator
     constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="push_stick"),
 )
 
 all_tamp_operators = [MoveFree, MoveHolding, Pick, Place, Push, PushStick]

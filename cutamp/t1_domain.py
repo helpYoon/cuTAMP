@@ -18,7 +18,7 @@ parameter names. This keeps the domain compatible with the existing task planner
 
 from typing import Sequence
 
-from cutamp.task_planning import Fluent, Parameter, TAMPOperator, State
+from cutamp.task_planning import Fluent, OperatorMetadata, Parameter, TAMPOperator, State
 from cutamp.task_planning.constraints import (
     CollisionFree,
     CollisionFreeGrasp,
@@ -113,7 +113,7 @@ placement = Parameter("placement", Pose)
 # Operators - this is the important part!
 # Left arm operators use LeftAt, LeftHandEmpty, etc.
 # Right arm operators use RightAt, RightHandEmpty, etc.
-# The operator name (LeftMoveFree vs RightMoveFree) tells downstream code which arm to use.
+# The arm information is now stored in metadata.arm, not encoded in the operator name.
 
 LeftMoveFree = TAMPOperator(
     "LeftMoveFree",
@@ -123,6 +123,7 @@ LeftMoveFree = TAMPOperator(
     del_effects=[LeftAt(q_start), LeftCanMove()],
     constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True, arm="left"),
 )
 
 RightMoveFree = TAMPOperator(
@@ -133,6 +134,7 @@ RightMoveFree = TAMPOperator(
     del_effects=[RightAt(q_start), RightCanMove()],
     constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True, arm="right"),
 )
 
 
@@ -149,6 +151,7 @@ LeftMoveHolding = TAMPOperator(
     del_effects=[LeftAt(q_start), LeftCanMove()],
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True, arm="left"),
 )
 
 RightMoveHolding = TAMPOperator(
@@ -164,6 +167,7 @@ RightMoveHolding = TAMPOperator(
     del_effects=[RightAt(q_start), RightCanMove()],
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True, arm="right"),
 )
 
 LeftPick = TAMPOperator(
@@ -184,6 +188,7 @@ LeftPick = TAMPOperator(
     del_effects=[LeftHandEmpty(), LeftJustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
     costs=[GraspCost(obj, grasp)],
+    metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="left"),
 )
 
 RightPick = TAMPOperator(
@@ -204,6 +209,7 @@ RightPick = TAMPOperator(
     del_effects=[RightHandEmpty(), RightJustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
     costs=[GraspCost(obj, grasp)],
+    metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="right"),
 )
 
 LeftPlace = TAMPOperator(
@@ -228,6 +234,7 @@ LeftPlace = TAMPOperator(
         CollisionFreePlacement(obj, placement, surface),
     ],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="place", arm="left"),
 )
 
 RightPlace = TAMPOperator(
@@ -252,6 +259,7 @@ RightPlace = TAMPOperator(
         CollisionFreePlacement(obj, placement, surface),
     ],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="place", arm="right"),
 )
 
 
@@ -269,6 +277,7 @@ LeftPush = TAMPOperator(
     del_effects=[LeftJustMoved(), CanPush(button)],
     constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="push", arm="left"),
 )
 
 RightPush = TAMPOperator(
@@ -285,6 +294,7 @@ RightPush = TAMPOperator(
     del_effects=[RightJustMoved(), CanPush(button)],
     constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="push", arm="right"),
 )
 
 LeftPushStick = TAMPOperator(
@@ -303,6 +313,7 @@ LeftPushStick = TAMPOperator(
     del_effects=[LeftJustMoved(), CanPush(button)],
     constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="push_stick", arm="left"),
 )
 
 RightPushStick = TAMPOperator(
@@ -321,6 +332,7 @@ RightPushStick = TAMPOperator(
     del_effects=[RightJustMoved(), CanPush(button)],
     constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
     costs=[],
+    metadata=OperatorMetadata(is_actionable=True, action_type="push_stick", arm="right"),
 )
 
 all_t1_operators = [

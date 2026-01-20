@@ -11,13 +11,14 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Sequence, Protocol, List
 
-from cutamp.task_planning import Operator, GroundOperator
+from cutamp.task_planning import Operator, GroundOperator, OperatorMetadata
 
 
 @dataclass(frozen=True)
 class TAMPOperator(Operator):
     constraints: Sequence["Constraint"] = field(default_factory=list)
     costs: Sequence["Cost"] = field(default_factory=list)
+    # Note: metadata is inherited from Operator, can be overridden with default_factory
 
     def ground(self, substitutions: dict[str, str]) -> "GroundTAMPOperator":
         ground_operator: GroundOperator = super().ground(substitutions)
