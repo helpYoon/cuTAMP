@@ -59,9 +59,10 @@ def propagate_shared_joints(
     particles: Particles, 
     active_arm: Literal["left", "right"], 
     solved_q: torch.Tensor,
+    solved_configs: set = None,
 ) -> None:
     """
-    Propagate shared joints from active arm's IK solution to all inactive arm's configurations.
+    Propagate shared joints from active arm's IK solution to unsolved inactive arm's configurations.
     
     T1 robot has 4 shared joints (lift + torso) that appear in both arms' 11-DOF configs.
     When IK solves for one arm, we update ALL of the other arm's configurations to match,
@@ -72,16 +73,21 @@ def propagate_shared_joints(
                    left_q0, left_q1, right_q0, right_q1, etc.
         active_arm: Which arm just solved IK ("left" or "right")
         solved_q: The IK solution for the active arm, shape (num_particles, 11)
+        solved_configs: Set of configuration names that have already been solved by IK
+                        which will not be updated.
     """
+    if solved_configs is None:
+        solved_configs = set()
+    
     # Get the shared joint values from the active arm's solution
     shared_joints = solved_q[:, :NUM_SHARED_JOINTS]  # First 4 joints are shared
     
     # Determine the prefix for the inactive arm's configurations
     inactive_prefix = "right_q" if active_arm == "left" else "left_q"
     
-    # Update ALL configurations belonging to the inactive arm
+    # Update unsolved configurations belonging to the inactive arm
     for key in particles.keys():
-        if key.startswith(inactive_prefix):
+        if key.startswith(inactive_prefix) and key not in solved_configs:
             # Clone to avoid modifying in-place
             inactive_q = particles[key].clone()
             # Update shared joints while keeping arm-specific joints unchanged
@@ -121,6 +127,10 @@ class ParticleInitializer:
         else:
             particles = {"q0": self.q_init.clone()}
         deferred_params = set()
+        # move_free at the end of plan skeleton don't need IK resolution
+        move_free_deferred: dict[str, str] = {}
+        # track conf solved by IK
+        solved_configs = set()
         log_debug = _log.debug if verbose else lambda *args, **kwargs: None
 
         # Note: we don't consider state after executing earlier samples
@@ -136,6 +146,7 @@ class ParticleInitializer:
                 if q_start not in particles:
                     raise ValueError(f"{q_start=} should already be bound")
                 deferred_params.add(q_end)
+                move_free_deferred[q_end] = q_start
                 log_debug(f"{header}. Deferred {q_end}")
 
             # MoveHolding (single-arm and dual-arm)
@@ -176,10 +187,13 @@ class ParticleInitializer:
                     particles[grasp] = self.pick_cache[cache_key]["sampled_grasps"].clone()
                     ik_result = self.pick_cache[cache_key]["ik_result"]
                     particles[q] = ik_result.solution[:, 0].clone()
+                    solved_configs.add(q)
                     deferred_params.remove(q)
+                    # clean up deferred params
+                    move_free_deferred.pop(q, None)
                     # Propagate shared joints for dual-arm
                     if arm:
-                        propagate_shared_joints(particles, arm, particles[q])
+                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
                     log_debug(
                         f"{header}. Using cached grasp poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
                     )
@@ -221,11 +235,13 @@ class ParticleInitializer:
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                     )
                     particles[q] = ik_result.solution[:, 0]
+                solved_configs.add(q)
                 deferred_params.remove(q)
-                
+                move_free_deferred.pop(q, None)
+
                 # Propagate shared joints for dual-arm
                 if arm:
-                    propagate_shared_joints(particles, arm, particles[q])
+                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
                 # Store in cache
                 if config.cache_subgraphs:
@@ -266,10 +282,13 @@ class ParticleInitializer:
                     particles[placement] = sampled_placements
                     ik_result = self.place_cache[cache_key]["ik_result"]
                     particles[q] = ik_result.solution[:, 0].clone()
+                    solved_configs.add(q)
                     deferred_params.remove(q)
+                    # clean up deferred params
+                    move_free_deferred.pop(q, None)
                     # Propagate shared joints for dual-arm
                     if arm:
-                        propagate_shared_joints(particles, arm, particles[q])
+                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
                     log_debug(
                         f"{header}. Using cached placement poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
                     )
@@ -319,11 +338,12 @@ class ParticleInitializer:
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                     )
                     particles[q] = ik_result.solution[:, 0]
+                solved_configs.add(q)
                 deferred_params.remove(q)
-                
+                move_free_deferred.pop(q, None)
                 # Propagate shared joints for dual-arm
                 if arm:
-                    propagate_shared_joints(particles, arm, particles[q])
+                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
                 # Store in cache
                 if config.cache_subgraphs:
@@ -364,10 +384,12 @@ class ParticleInitializer:
                     particles[push_pose] = sampled_push
                     ik_result = self.push_button_cache[cache_key]["ik_result"]
                     particles[q] = ik_result.solution[:, 0].clone()
+                    solved_configs.add(q)
                     deferred_params.remove(q)
+                    move_free_deferred.pop(q, None)
                     # Propagate shared joints for dual-arm
                     if arm:
-                        propagate_shared_joints(particles, arm, particles[q])
+                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
                     log_debug(
                         f"{header}. Using cached push poses for {button}. {ik_result.success.sum()}/{num_particles} success"
                     )
@@ -402,11 +424,12 @@ class ParticleInitializer:
                     f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                 )
                 particles[q] = ik_result.solution[:, 0]
+                solved_configs.add(q)
                 deferred_params.remove(q)
-                
+                move_free_deferred.pop(q, None)
                 # Propagate shared joints for dual-arm
                 if arm:
-                    propagate_shared_joints(particles, arm, particles[q])
+                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
                 # Failed subgraph!
                 if not ik_result.success.any():
@@ -451,10 +474,12 @@ class ParticleInitializer:
                     particles[push_pose] = sampled_push
                     ik_result = self.push_stick_cache[cache_key]["ik_result"]
                     particles[q] = ik_result.solution[:, 0].clone()
+                    solved_configs.add(q)
                     deferred_params.remove(q)
+                    move_free_deferred.pop(q, None)
                     # Propagate shared joints for dual-arm
                     if arm:
-                        propagate_shared_joints(particles, arm, particles[q])
+                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
                     log_debug(
                         f"{header}. Using cached push for {button} with {stick_name}. "
@@ -518,11 +543,12 @@ class ParticleInitializer:
                     f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                 )
                 particles[q] = ik_result.solution[:, 0]
+                solved_configs.add(q)
                 deferred_params.remove(q)
-                
+                move_free_deferred.pop(q, None)
                 # Propagate shared joints for dual-arm
                 if arm:
-                    propagate_shared_joints(particles, arm, particles[q])
+                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
                 # Store in cache
                 if config.cache_subgraphs:
@@ -535,7 +561,17 @@ class ParticleInitializer:
             # Unknown
             else:
                 raise NotImplementedError(f"Unsupported operator {op_name}")
-
+        
+        # Handle unresolved deferred parameters
+        # MoveFree params that weren't resolved are trailing moves (no Pick/Place after them)
+        # We can use the source config as a fallback since we don't need IK for trailing moves
+        unresolved_move_free = deferred_params & set(move_free_deferred.keys())
+        for q_end in unresolved_move_free:
+            q_start = move_free_deferred[q_end]
+            particles[q_end] = particles[q_start].clone()
+            deferred_params.remove(q_end)
+            log_debug(f"Resolved trailing MoveFree config {q_end} using {q_start}")
+            
         # There should not be any deferred parameters left
         if deferred_params:
             raise RuntimeError(f"Deferred parameters not resolved: {deferred_params}")

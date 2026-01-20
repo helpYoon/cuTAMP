@@ -1,2 +1,6 @@
 # Ignore curobo directory
 curobo/
+
+# Python cache
+__pycache__/
+*.pyc
