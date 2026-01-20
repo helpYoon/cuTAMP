@@ -170,7 +170,6 @@ robot_cfg:
 
     use_global_cumul: True
     mesh_link_names: null
-    external_asset_path: null
 
     # Joint space configuration (11 DOF: lift(2) + torso(2) + left arm(7))
     cspace:

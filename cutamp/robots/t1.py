@@ -83,8 +83,8 @@ GRIPPER_JOINTS_PER_HAND = 4
 # Home positions for 11 DOF arms
 # Joint order: [lift1, lift2, torso_pitch, waist_yaw, shoulder_p, shoulder_r,
 #               elbow_p, elbow_y, wrist_p, wrist_y, hand_r]
-t1_home_left: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, -1.2, 0.0, 0.0, 0.0, 0.0, 0.0)
-t1_home_right: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0)
+t1_home_left: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.5, -1.0, 0.0, -1.4, 0.0, 0.0, 0.0)
+t1_home_right: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.0, 1.4, 0.0, 0.0, 0.0)
 # Joints: AAHead_yaw, Head_pitch
 t1_home_head: Tuple[float, ...] = (0.0, 0.0)
 
@@ -115,12 +115,19 @@ def t1_curobo_cfg(arm: Literal["left", "right"]) -> dict:
     config_path = _get_t1_config_path(arm)
     cfg = load_yaml(config_path)
     
-    # Set asset paths so cuRobo can find URDF and collision spheres
+    # Resolve all paths to absolute paths so cuRobo can find t1 assets
     kinematics = cfg["robot_cfg"]["kinematics"]
     
-    # Set external asset path to the t1_description directory
-    kinematics["external_asset_path"] = str(T1_ASSETS_DIR)
-    kinematics["external_robot_configs_path"] = str(T1_ASSETS_DIR)
+    # Resolve URDF path to absolute
+    if isinstance(kinematics.get("urdf_path"), str):
+        kinematics["urdf_path"] = str(T1_ASSETS_DIR / kinematics["urdf_path"])
+    
+    # Resolve collision_spheres to absolute path
+    if isinstance(kinematics.get("collision_spheres"), str):
+        kinematics["collision_spheres"] = str(T1_ASSETS_DIR / kinematics["collision_spheres"])
+    
+    # Set asset_root_path for mesh loading (will be derived from urdf_path dirname if not set)
+    kinematics["asset_root_path"] = str(T1_ASSETS_DIR)
     
     return cfg
 
@@ -244,7 +251,11 @@ def get_t1_home(arm: Literal["left", "right"]) -> tuple:
     else:
         raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
 
-def curobo_to_urdf_joints(q_curobo: tuple | list, arm: Literal["left", "right"] = "left") -> tuple:
+def curobo_to_urdf_joints(
+    q_curobo: tuple | list,
+    arm: Literal["left", "right"] = "left",
+    gripper: tuple = GRIPPER_OPEN,
+) -> tuple:
     """
     Map cuRobo's 11-DOF joint configuration to the full URDF's 28-DOF configuration.
     
@@ -290,7 +301,7 @@ def curobo_to_urdf_joints(q_curobo: tuple | list, arm: Literal["left", "right"] 
             *torso,                               # 2-3: torso
             *t1_home_head,                        # 4-5: head (locked)
             *active_arm,                          # 6-12: left arm (active)
-            *GRIPPER_OPEN,                        # 13-16: left gripper (open)
+            *gripper,                             # 13-16: left gripper (open)
             *t1_home_right[4:11],                 # 17-23: right arm (neutral)
             *GRIPPER_OPEN,                        # 24-27: right gripper (open)
         )
@@ -303,7 +314,7 @@ def curobo_to_urdf_joints(q_curobo: tuple | list, arm: Literal["left", "right"] 
             *t1_home_left[4:11],                  # 6-12: left arm (at home)
             *GRIPPER_OPEN,                        # 13-16: left gripper (open)
             *active_arm,                          # 17-23: right arm (active)
-            *GRIPPER_OPEN,                        # 24-27: right gripper (open)
+            *gripper,                             # 24-27: right gripper (open)
         )
     else:
         raise ValueError(f"Invalid arm: {arm}. Must be 'left' or 'right'.")
@@ -370,6 +381,7 @@ class T1RerunRobot(RerunRobot):
     
     Supports multiple input formats:
     - 11 DOF: Single arm cuRobo format (uses active_arm to determine which arm)
+    - 15 DOF: Single arm (11) + gripper (4) - gripper applied to specified arm
     - 22 DOF: Dual arm cuRobo format (left[11] + right[11])
     - 28 DOF: Full URDF format (passed through directly)
     """
@@ -378,17 +390,28 @@ class T1RerunRobot(RerunRobot):
         self.active_arm = arm
         super().__init__(name, urdf, q_neutral, load_mesh)
     
-    def set_joint_positions(self, joint_positions) -> None:
+    def set_joint_positions(self, joint_positions, arm: Literal["left", "right"] = None) -> None:
         """Override to handle cuRobo DOF to URDF's 28-DOF mapping."""
         if hasattr(joint_positions, 'tolist'):
             joint_positions = joint_positions.tolist()
         elif hasattr(joint_positions, '__iter__'):
             joint_positions = list(joint_positions)
         
+        # Use provided arm or fall back to default active_arm
+        active_arm = arm if arm is not None else self.active_arm
+        
         # Handle different input sizes
         if len(joint_positions) == 11:
             # Single arm cuRobo format - use active_arm to determine mapping
-            joint_positions = curobo_to_urdf_joints(joint_positions, self.active_arm)
+            joint_positions = curobo_to_urdf_joints(joint_positions, active_arm)
+
+        elif len(joint_positions) == 15:
+            # Single arm (11) + gripper (4) - gripper applied to active arm
+            joint_positions = curobo_to_urdf_joints(joint_positions, active_arm)
+            q_arm = joint_positions[:11]
+            gripper = tuple(joint_positions[11:15])
+            joint_positions = curobo_to_urdf_joints(q_arm, active_arm, gripper=gripper)
+
         elif len(joint_positions) == 22:
             # Dual arm cuRobo format: left[11] + right[11]
             q_left = joint_positions[:11]
@@ -399,17 +422,42 @@ class T1RerunRobot(RerunRobot):
         # Call parent implementation
         super().set_joint_positions(joint_positions)
     
-    def get_rr_columns(self, joint_positions: Float[torch.Tensor, "n d"]):
-        """Override to handle cuRobo DOF to URDF's 28-DOF mapping for batched positions."""
+    def get_rr_columns(self, joint_positions: Float[torch.Tensor, "n d"], arm: Literal["left", "right"] = None):
+        """
+        Override to handle cuRobo DOF to URDF's 28-DOF mapping for batched positions.
+        Supported input formats (same as set_joint_positions):
+        - 11 DOF: Single arm cuRobo format
+        - 15 DOF: Single arm (11) + gripper (4)
+        - 22 DOF: Dual arm cuRobo format
+        - 28 DOF: Full URDF format
+        
+        Args:
+            joint_positions: Batched joint positions tensor
+            arm: Which arm to use for mapping. If None, uses self.active_arm
+        """
+        # Use provided arm or fall back to default active_arm
+        active_arm = arm if arm is not None else self.active_arm
+        
         dof = joint_positions.shape[-1]
         
         if dof == 11:
             # Single arm: map each to 28-DOF
             mapped_positions = []
             for q in joint_positions:
-                q_mapped = curobo_to_urdf_joints(q.tolist(), self.active_arm)
+                q_mapped = curobo_to_urdf_joints(q.tolist(), active_arm)
                 mapped_positions.append(q_mapped)
             joint_positions = torch.tensor(mapped_positions, dtype=joint_positions.dtype, device=joint_positions.device)
+        
+        elif dof == 15:
+            # Single arm (11) + gripper (4) - gripper applied to active arm
+            mapped_positions = []
+            for q in joint_positions:
+                q_arm = q[:11].tolist()
+                gripper = tuple(q[11:15].tolist())
+                q_mapped = curobo_to_urdf_joints(q_arm, active_arm, gripper=gripper)
+                mapped_positions.append(q_mapped)
+            joint_positions = torch.tensor(mapped_positions, dtype=joint_positions.dtype, device=joint_positions.device)
+        
         elif dof == 22:
             # Dual arm: map each pair to 28-DOF
             mapped_positions = []

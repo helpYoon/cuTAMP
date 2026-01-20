@@ -170,16 +170,10 @@ def load_t1_container(tensor_args: TensorDeviceType) -> DualArmRobotContainer:
     
     left_tool_from_ee = torch.eye(4, device=tensor_args.device, dtype=torch.float32)
     left_tool_from_ee[:3, :3] = grasp_from_ee
-    # NOTE: Zero translation assumes left_base_link origin is at the grasp point.
-    # If T1 gripper has offset from left_base_link to fingertips, adjust this value.
-    # Compare: Panda uses 0.105m, UR5 uses 0.01m
-    left_tool_from_ee[:3, 3] = tensor_args.to_device([0.0, 0.0, 0.0])
+    left_tool_from_ee[:3, 3] = tensor_args.to_device([0.01, 0.0, 0.085])
     
     # Build tool_from_ee for right arm (right_base_link)
-    # Although left_base_link and right_base_link have different yaw orientations in URDF
-    # (+90° vs -90° relative to their hand_links), BOTH frames have the same local convention:
-    # +X points toward fingertips (see finger joint origins: xyz="0.036 ...").
-    # Therefore, both arms use the same tool_from_ee transformation.
+    # Both arms use the same tool_from_ee transformation
     right_tool_from_ee = left_tool_from_ee.clone()
     
     return DualArmRobotContainer(

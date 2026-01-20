@@ -31,13 +31,13 @@ class TestT1ConfigLoading:
         cfg2 = t1_curobo_cfg("left")
         assert cfg1 is cfg2  # Same cached object
 
-    def test_config_has_external_asset_path(self):
-        """Test that external_asset_path is set correctly."""
+    def test_config_has_asset_root_path(self):
+        """Test that asset_root_path is set correctly."""
         from cutamp.robots.t1 import t1_curobo_cfg
         cfg = t1_curobo_cfg("left")
-        ext_path = cfg["robot_cfg"]["kinematics"]["external_asset_path"]
-        assert ext_path is not None
-        assert "t1_description" in ext_path
+        asset_path = cfg["robot_cfg"]["kinematics"]["asset_root_path"]
+        assert asset_path is not None
+        assert "t1_description" in asset_path
 
 
 class TestT1KinematicsModel:

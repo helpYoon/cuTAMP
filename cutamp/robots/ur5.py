@@ -91,7 +91,8 @@ def get_ur5_gripper_spheres(tensor_args: TensorDeviceType = TensorDeviceType()) 
 def load_ur5_rerun(load_mesh: bool = True) -> RerunRobot:
     robot_cfg = _ur5_cfg_dict()
     urdf_rel_path = robot_cfg["kinematics"]["urdf_path"]
-    urdf_path = os.path.join(robot_cfg["kinematics"].get("external_asset_path", ""), urdf_rel_path) or join_path(
+    asset_root = robot_cfg["kinematics"].get("asset_root_path", "")
+    urdf_path = os.path.join(asset_root, urdf_rel_path) if asset_root else join_path(
         get_assets_path(), urdf_rel_path
     )
 
