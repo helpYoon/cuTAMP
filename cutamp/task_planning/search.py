@@ -94,10 +94,21 @@ def get_valid_ground_operators(
         # Base names map parameter types to their string representations.
         base_names = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
         
+        # Determine arm prefix
+        op_name = operator.name
+        arm_prefix = ""
+        if op_name.startswith("Left"):
+            arm_prefix = "left_"
+        elif op_name.startswith("Right"):
+            arm_prefix = "right_"
+        
         def _sample_param_type(param_type: str) -> str:
             if param_type not in param_type_to_literals:
+                # For dual-arm operators, use arm prefix for conf parameters.
+                if arm_prefix and param_type == "conf":
+                    return f"{arm_prefix}{base_names.get(param_type, param_type)}1"
                 return f"{base_names.get(param_type, param_type)}1"
-            
+                
             literals = param_type_to_literals[param_type]
             base = base_names.get(param_type)
             if base is None:
@@ -109,6 +120,11 @@ def get_valid_ground_operators(
                 prefix = _extract_prefix(lit, param_type)
                 num = _extract_number(lit)
                 prefix_to_max[prefix] = max(prefix_to_max[prefix], num)
+            
+            # For dual-arm operators with conf parameters, use the arm-specific prefix
+            if arm_prefix and param_type == "conf":
+                max_num = prefix_to_max.get(arm_prefix, -1)
+                return f"{arm_prefix}{base}{max_num + 1}"
             
             # Find the prefix with the highest max number and increment it
             # This ensures we generate unique names across all prefixes

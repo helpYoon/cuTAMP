@@ -70,7 +70,7 @@ IsStick = Fluent("IsStick", [Parameter("obj", Movable)])
 HasNotPickedUp = Fluent("HasNotPickedUp", [Parameter("obj", Movable)])
 On = Fluent("On", [Parameter("obj", Movable), Parameter("surface", Surface)])
 
-all_tamp_fluents = [
+all_t1_fluents = [
     LeftAt,
     RightAt,
     LeftHandEmpty,
