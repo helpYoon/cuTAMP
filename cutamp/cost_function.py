@@ -19,7 +19,7 @@ from jaxtyping import Float
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
-from cutamp.rollout import Rollout, get_conf_to_arm
+from cutamp.rollout import Rollout, get_conf_to_arm, get_conf_parameters, get_action_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import (
@@ -274,7 +274,7 @@ class CostFunction:
                 dist_from_joint_lims_list.append(dist_t)
                 
                 # Self-collision for this timestep
-                spheres_t = robot_spheres[:, t]  # (num_particles, num_spheres, 4)
+                spheres_t = robot_spheres[:, t].contiguous()  # (num_particles, num_spheres, 4)
                 if arm == "left":
                     self_coll_t = self.left_self_collision_cost_fn(spheres_t.unsqueeze(1)).squeeze(1)
                 else:
