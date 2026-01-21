@@ -170,7 +170,7 @@ def load_t1_container(tensor_args: TensorDeviceType) -> DualArmRobotContainer:
     
     left_tool_from_ee = torch.eye(4, device=tensor_args.device, dtype=torch.float32)
     left_tool_from_ee[:3, :3] = grasp_from_ee
-    left_tool_from_ee[:3, 3] = tensor_args.to_device([0.01, 0.0, 0.085])
+    left_tool_from_ee[:3, 3] = tensor_args.to_device([0.01, 0.0, 0.09])
     
     # Build tool_from_ee for right arm (right_base_link)
     # Both arms use the same tool_from_ee transformation
