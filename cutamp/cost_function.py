@@ -230,9 +230,13 @@ class CostFunction:
         if self.kinematic_actions != rollout["action_params"]:
             raise RuntimeError(f"Expected action params {self.kinematic_actions} but got {rollout['action_params']}")
 
-        # Trajectory length parameters should match
-        if self.traj_length_confs != rollout["conf_params"]:
-            raise RuntimeError(f"Expected conf params {self.traj_length_confs} but got {rollout['conf_params']}")
+        # Trajectory length parameters: rollout conf_params should be subset of traj_length_confs
+        # (traj_length_confs may include trailing MoveFree configs not in rollout)
+        if not set(rollout["conf_params"]).issubset(set(self.traj_length_confs)):
+            raise RuntimeError(
+                f"Rollout conf_params {rollout['conf_params']} is not a subset of "
+                f"traj_length_confs {self.traj_length_confs}"
+            )
 
         self._rollout_validated = True
 
