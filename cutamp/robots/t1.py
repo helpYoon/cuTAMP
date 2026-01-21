@@ -407,7 +407,6 @@ class T1RerunRobot(RerunRobot):
 
         elif len(joint_positions) == 15:
             # Single arm (11) + gripper (4) - gripper applied to active arm
-            joint_positions = curobo_to_urdf_joints(joint_positions, active_arm)
             q_arm = joint_positions[:11]
             gripper = tuple(joint_positions[11:15])
             joint_positions = curobo_to_urdf_joints(q_arm, active_arm, gripper=gripper)
