@@ -37,7 +37,7 @@ class Visualizer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"]):
+    def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"], arm: str = None):
         raise NotImplementedError
 
     @abstractmethod
@@ -90,7 +90,7 @@ class MockVisualizer(Visualizer):
     def set_time_seconds(self, timeline: str, val: float):
         pass
 
-    def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"]):
+    def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"], arm: str = None):
         pass
 
     def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float):
@@ -141,10 +141,14 @@ class RerunVisualizer(Visualizer):
     def set_time_seconds(self, timeline: str, val: float):
         rr.set_time_seconds(timeline, val)
 
-    def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"]):
+    def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"], arm: str = None):
         if isinstance(q, torch.Tensor):
             q = q.tolist()
-        self.robot.set_joint_positions(q)
+        # Pass arm parameter if the robot supports it (e.g., T1 dual-arm)
+        if arm is not None and hasattr(self.robot, 'set_joint_positions'):
+            self.robot.set_joint_positions(q, arm=arm)
+        else:
+            self.robot.set_joint_positions(q)
 
     def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float):
         end_time = start_time + len(traj) * dt
