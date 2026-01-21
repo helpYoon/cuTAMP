@@ -25,6 +25,7 @@ from cutamp.tamp_domain import Conf, Grasp, Pose, Traj
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
+from cutamp.robots.t1 import t1_home_left, t1_home_right
 
 _log = logging.getLogger(__name__)
 _known_types = {Conf, Grasp, Pose, Traj}
@@ -81,6 +82,9 @@ class ParticleOptimizer:
         # Initial configurations that we don't optimize
         initial_confs = {"q0", "left_q0", "right_q0"}
         for param, val in particles.items():
+            # Skip particles that aren't used in this plan (e.g., right_q0 in a left-arm only plan)
+            if param not in param_to_type:
+                continue
             param_type = param_to_type[param]
             if param_type not in self.types_to_optimize:
                 continue
@@ -181,7 +185,26 @@ class ParticleOptimizer:
                 # Show last state after rolling out the best particle
                 visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
                 q_last = rollout["confs"][best_idx, -1].tolist()
-                visualizer.set_joint_positions(q_last)
+                
+                # For T1, construct 22-DOF config with active arm + inactive arm at home
+                # 22-DOF format: left[11] + right[11], where each 11 = shared(4) + arm(7)
+                if self.config.robot == "t1":
+                    last_conf_name = rollout["conf_params"][-1]
+                    shared_joints = q_last[:4]  # lift (2) + torso (2)
+                    arm_joints = q_last[4:11]   # 7 arm joints
+                    
+                    if last_conf_name.startswith("left_"):
+                        # Left arm active: left = active config, right = home with same shared
+                        q_left_11 = shared_joints + arm_joints
+                        q_right_11 = shared_joints + list(t1_home_right[4:11])
+                    else:
+                        # Right arm active: left = home with same shared, right = active config
+                        q_left_11 = shared_joints + list(t1_home_left[4:11])
+                        q_right_11 = shared_joints + arm_joints
+                    q_22dof = q_left_11 + q_right_11
+                    visualizer.set_joint_positions(q_22dof)
+                else:
+                    visualizer.set_joint_positions(q_last)
                 for obj in rollout["obj_to_pose"]:
                     mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]
                     visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
@@ -252,6 +275,7 @@ class ParticleOptimizer:
         for ts in range(len(rollout["conf_params"])):
             visualizer.set_time_sequence(f"rollout_{self.opt_counter}", ts + 1)
             q = rollout["confs"][best_idx, ts]
+            conf_name = rollout["conf_params"][ts]
 
             gripper_close = rollout["gripper_close"][ts]
             if self.config.robot == "ur5":
@@ -264,7 +288,13 @@ class ParticleOptimizer:
                 gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
             else:
                 gripper_joints = []
-            visualizer.set_joint_positions(q.tolist() + gripper_joints)
+            
+            # For T1, determine which arm this configuration belongs to and pass it
+            if self.config.robot == "t1":
+                arm = "left" if conf_name.startswith("left_") else "right"
+                visualizer.set_joint_positions(q.tolist() + gripper_joints, arm=arm)
+            else:
+                visualizer.set_joint_positions(q.tolist() + gripper_joints)
 
             world_from_ee = rollout["world_from_ee"][best_idx, ts].cpu()
             visualizer.log_mat4x4("rollout/ee_pose", world_from_ee)
