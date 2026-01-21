@@ -36,7 +36,7 @@ graph TD
 
 - **t1_description/** - T1 robot assets and configuration files:
   - `t1_simplified.urdf` - Simplified URDF model for T1 dual-arm humanoid robot
-  - `t1_left_11dof.yml` / `t1_right_11dof.yml` - cuRobo configuration files for left/right arm (11 DOF each: 2 lift + 2 torso + 7 arm)
+  - `t1_left_11dof.yml` / `t1_right_11dof.yml` - cuRobo configuration files for left/right arm (11 DOF each: 2 lift + 2 torso + 7 arm). Includes `lock_joints` set to home positions for the inactive arm.
   - `t1_spheres.yml` - Collision sphere definitions for motion planning
   - `left_gripper_spheres.pt` / `right_gripper_spheres.pt` - Pre-computed gripper collision spheres for grasp planning
   - `meshes/` - STL mesh files for robot visualization and collision checking
@@ -44,13 +44,16 @@ graph TD
 - [`__init__.py`](cutamp/robots/__init__.py) - Robot container factory and registry:
   - `DualArmRobotContainer` dataclass for dual-arm robots
   - `load_robot_container()` with T1 support
-  - Tool frame transformations (`tool_from_ee`) for top-down grasping
+  - Tool frame transformations (`tool_from_ee`) for top-down grasping:
+    - **T1**: Uses `Ry(+90°)` rotation because T1's EE frame has +X toward fingertips
 
 - [`t1.py`](cutamp/robots/t1.py) - T1 dual-arm humanoid robot module:
   - cuRobo integration (kinematics, IK solvers, collision spheres)
-  - `curobo_to_urdf_joints()` - Maps 11-DOF cuRobo config to 28-DOF URDF
-  - `curobo_dual_arm_to_urdf_joints()` - Combines both arms' configs for visualization
-  - `T1RerunRobot` class for Rerun visualization (handles 11/22/28 DOF inputs)
+  - `curobo_to_urdf_joints()` - Maps 11-DOF or 15-DOF (11 arm + 4 gripper) cuRobo config to 28-DOF URDF
+  - `curobo_dual_arm_to_urdf_joints()` - Combines both arms' configs (22-DOF → 28-DOF) for visualization
+  - `T1RerunRobot` class for Rerun visualization:
+    - Handles 11-DOF (single arm), 15-DOF (arm + gripper), 22-DOF (dual arm), 30-DOF (dual arm + grippers)
+    - Automatically adds head joints at home position
 
 ### 📁 **[Core Modifications](cutamp/)**
 
@@ -85,15 +88,18 @@ graph TD
   - Separate self-collision cost functions per arm
   - Arm-specific joint limit checking
   - `conf_to_arm` mapping for per-configuration cost computation
+  - Flexible trajectory length validation - allows trailing motion configs in `traj_length_confs`
 
 - [`optimize_plan.py`](cutamp/optimize_plan.py) - Dual-arm optimization:
   - Skips optimization for both `left_q0` and `right_q0`
-  - T1 gripper joint handling for visualization
+  - T1 gripper joint handling for visualization (4-bar linkage: open/closed states)
   - Dual-arm initial state visualization (22-DOF)
+  - During optimization, constructs 22-DOF config showing active arm's IK solution + inactive arm at home
 
 - [`motion_solver.py`](cutamp/motion_solver.py) - Dual-arm motion planning:
   - Supports all T1 operators
   - Arm-specific motion generator, kinematics, and tool_from_ee
+  - World-frame approach offset for consistent top-down grasping across all robots
   - T1 gripper joint values for visualization
   - Currently requires single-arm plans (both arms in same plan not yet supported)
 
@@ -103,6 +109,7 @@ graph TD
 
 - [`utils/visualizer.py`](cutamp/utils/visualizer.py) - Visualization:
   - Optional `q_init` for dual-arm flexibility
+  - `set_joint_positions(arm=...)` parameter for arm-specific visualization in dual-arm robots
 
 ### 📁 **[Tests](cutamp/tests/)**
 
@@ -130,4 +137,4 @@ Available scripts:
 
 3. **Inactive arm inherits shared joints** - The inactive arm's local joints (7 DOF) remain fixed, but its EE position changes due to torso movement
 
-4. **Collision checking** - Uses arm-specific self-collision models; inter-arm collision not yet implemented
+4. **Inactive arm locking** - cuRobo configs lock the inactive arm at home position (not zeros) to prevent collision
