@@ -99,9 +99,9 @@ def solve_curobo(
 
     last_js = JointState.from_position(initial_q[None].clone())
 
-    # Fixed approach offset. This could be something we eventually optimize too
-    approach_offset = torch.eye(4, device=world.device)
-    approach_offset[2, 3] = -0.05
+    # Fixed approach offset in WORLD frame (not EE frame)
+    # This ensures consistent top-down approach for all robots regardless of EE frame convention
+    approach_height = 0.05  # 5cm above the grasp pose
 
     # Accumulated plans we return that the real robot can actually execute
     accum_plans = []
@@ -144,7 +144,8 @@ def solve_curobo(
                 initial_conf_names = {"q0", "left_q0", "right_q0"}
                 if last_q_name not in initial_conf_names:
                     world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
-                    world_from_retract = world_from_ee @ approach_offset
+                    world_from_retract = world_from_ee.clone()
+                    world_from_retract[2, 3] += approach_height  # Move up in world Z
                     retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
                     if not retract_result.success:
                         raise RuntimeError(
@@ -164,7 +165,8 @@ def solve_curobo(
                 world_from_grasp = world_from_obj @ obj_from_grasp
                 world_from_ee = world_from_grasp @ tool_from_ee
 
-                world_from_approach = world_from_ee @ approach_offset
+                world_from_approach = world_from_ee.clone()
+                world_from_approach[2, 3] += approach_height  # Move up in world Z
                 approach_result = motion_gen.plan_single(retract_js, Pose.from_matrix(world_from_approach), plan_config)
                 if not approach_result.success:
                     raise RuntimeError(
@@ -271,7 +273,8 @@ def solve_curobo(
                 # Plan to retract
                 world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
                 world_from_ee_start = world_from_ee
-                world_from_retract = world_from_ee @ approach_offset
+                world_from_retract = world_from_ee.clone()
+                world_from_retract[2, 3] += approach_height  # Move up in world Z
                 retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
                 if not retract_result.success:
                     raise RuntimeError(
@@ -287,7 +290,8 @@ def solve_curobo(
                     obj_from_grasp = action_6dof_to_mat4x4(best_particle[grasp].clone())
                 world_from_grasp = world_from_obj @ obj_from_grasp
                 world_from_ee = world_from_grasp @ tool_from_ee
-                world_from_approach = world_from_ee @ approach_offset
+                world_from_approach = world_from_ee.clone()
+                world_from_approach[2, 3] += approach_height  # Move up in world Z
                 approach_result = motion_gen.plan_single(retract_js, Pose.from_matrix(world_from_approach), plan_config)
                 if not approach_result.success:
                     raise RuntimeError(
@@ -374,7 +378,8 @@ def solve_curobo(
 
     # Plan to retract
     world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
-    world_from_retract = world_from_ee @ approach_offset
+    world_from_retract = world_from_ee.clone()
+    world_from_retract[2, 3] += approach_height  # Move up in world Z
     retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
     if not retract_result.success:
         raise RuntimeError(f"Failed to plan for retract. Status: {retract_result.status}")
