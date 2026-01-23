@@ -85,7 +85,7 @@ def get_best_particle(
     particles, rollout_fn, cost_fn = plan_info["particles"], plan_info["rollout_fn"], plan_info["cost_fn"]
     with torch.no_grad():
         rollout = rollout_fn(particles)
-        cost_dict = cost_fn(rollout)
+        cost_dict = cost_fn(rollout, particles)
 
     # Take the best particle that is satisfying and has the best soft cost
     satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
@@ -130,7 +130,7 @@ def sample_plan_skeleton(
     cost_fn = CostFunction(plan_skeleton, world, config)
     with timer.time("measure_heuristic"), torch.no_grad():
         rollout = rollout_fn(plan_particles)
-        cost_dict = cost_fn(rollout)
+        cost_dict = cost_fn(rollout, plan_particles)
         heuristic = heuristic_fn(plan_skeleton, cost_dict, constraint_checker)
 
     # Number of satisfying particles
@@ -520,16 +520,20 @@ def run_cutamp(
         # Now we've either optimized or resampled
         overall_metrics["num_optimized_plans"] += 1
         if has_satisfying:
-            found_solution = True
             if config.curobo_plan:
-                curobo_plan = solve_curobo(
-                    plan_info,
-                    best_particle,
-                    world,
-                    config,
-                    timer,
-                    visualizer,
-                )
+                try:
+                    curobo_plan = solve_curobo(
+                        plan_info,
+                        best_particle,
+                        world,
+                        config,
+                        timer,
+                        visualizer,
+                    )
+                except NotImplementedError as e:
+                    _log.warning(f"Motion planning not supported for this plan: {e}. Trying next plan...")
+                    continue  # Skip to next plan
+            found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
             _log.debug(f"Total num satisfying {metrics['num_satisfying_final']}")
