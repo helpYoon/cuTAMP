@@ -41,7 +41,7 @@ class Visualizer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float):
+    def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float, arm: str = None):
         raise NotImplementedError
 
     @abstractmethod
@@ -93,7 +93,7 @@ class MockVisualizer(Visualizer):
     def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"], arm: str = None):
         pass
 
-    def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float):
+    def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float, arm: str = None):
         pass
 
     def log_joint_trajectory_with_mat4x4(
@@ -150,10 +150,14 @@ class RerunVisualizer(Visualizer):
         else:
             self.robot.set_joint_positions(q)
 
-    def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float):
+    def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float, arm: str = None):
         end_time = start_time + len(traj) * dt
         times = [rr.TimeColumn(timeline, duration=np.linspace(start_time, end_time, len(traj)))]
-        key_to_columns = self.robot.get_rr_columns(traj)
+        # Pass arm parameter for T1 robot (needed for 26-DOF format with gripper)
+        if arm is not None and hasattr(self.robot, 'get_rr_columns'):
+            key_to_columns = self.robot.get_rr_columns(traj, arm=arm)
+        else:
+            key_to_columns = self.robot.get_rr_columns(traj)
         for key, columns in key_to_columns.items():
             rr.send_columns(key, indexes=times * len(columns), columns=columns)
         return end_time
