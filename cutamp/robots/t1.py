@@ -83,10 +83,36 @@ GRIPPER_JOINTS_PER_HAND = 4
 # Home positions for 11 DOF arms
 # Joint order: [lift1, lift2, torso_pitch, waist_yaw, shoulder_p, shoulder_r,
 #               elbow_p, elbow_y, wrist_p, wrist_y, hand_r]
-t1_home_left: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.5, -1.0, 0.0, -1.4, 0.0, 0.0, 0.0)
-t1_home_right: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.0, 1.4, 0.0, 0.0, 0.0)
+t1_home_left: Tuple[float, ...] = (0.15, 0.15, 0.0, 0.0, 0.5, -1.0, 0.0, -1.4, 0.0, 0.0, 0.0)
+t1_home_right: Tuple[float, ...] = (0.15, 0.15, 0.0, 0.0, 0.5, 1.0, 0.0, 1.4, 0.0, 0.0, 0.0)
 # Joints: AAHead_yaw, Head_pitch
 t1_home_head: Tuple[float, ...] = (0.0, 0.0)
+
+# Number of shared joints (lift + torso) in 11-DOF arm config
+NUM_SHARED_JOINTS = 4
+
+# Joint names for arm-specific joints (indices 4-10 in 11-DOF config)
+# These are used for updating locked joints in dual-arm motion planning
+LEFT_ARM_JOINT_NAMES: Tuple[str, ...] = (
+    "Left_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch",
+    "Left_Elbow_Yaw", "Left_Wrist_Pitch", "Left_Wrist_Yaw", "Left_Hand_Roll"
+)
+RIGHT_ARM_JOINT_NAMES: Tuple[str, ...] = (
+    "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch",
+    "Right_Elbow_Yaw", "Right_Wrist_Pitch", "Right_Wrist_Yaw", "Right_Hand_Roll"
+)
+
+# Collision link names for each arm (used for disabling collision in dual-arm planning)
+LEFT_ARM_COLLISION_LINKS: Tuple[str, ...] = (
+    "AL1", "AL2", "AL3", "AL4", "AL5", "AL6",
+    "left_hand_link", "left_base_link",
+    "left_Link1", "left_Link11", "left_Link2", "left_Link22",
+)
+RIGHT_ARM_COLLISION_LINKS: Tuple[str, ...] = (
+    "AR1", "AR2", "AR3", "AR4", "AR5", "AR6",
+    "right_hand_link", "right_base_link",
+    "right_Link1", "right_Link11", "right_Link2", "right_Link22",
+)
 
 # Path to T1 robot assets
 T1_ASSETS_DIR = Path(__file__).parent / "assets" / "t1_description"
@@ -464,6 +490,20 @@ class T1RerunRobot(RerunRobot):
                 q_left = q[:11].tolist()
                 q_right = q[11:].tolist()
                 q_mapped = curobo_dual_arm_to_urdf_joints(q_left, q_right)
+                mapped_positions.append(q_mapped)
+            joint_positions = torch.tensor(mapped_positions, dtype=joint_positions.dtype, device=joint_positions.device)
+        
+        elif dof == 26:
+            # Dual arm (22) + gripper (4) for active arm
+            mapped_positions = []
+            for q in joint_positions:
+                q_left = q[:11].tolist()
+                q_right = q[11:22].tolist()
+                gripper = tuple(q[22:26].tolist())
+                if active_arm == "left":
+                    q_mapped = curobo_dual_arm_to_urdf_joints(q_left, q_right, left_gripper=gripper)
+                else:
+                    q_mapped = curobo_dual_arm_to_urdf_joints(q_left, q_right, right_gripper=gripper)
                 mapped_positions.append(q_mapped)
             joint_positions = torch.tensor(mapped_positions, dtype=joint_positions.dtype, device=joint_positions.device)
         # else: assume it's already 28-DOF URDF format
