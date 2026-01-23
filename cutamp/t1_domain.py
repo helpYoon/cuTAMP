@@ -30,7 +30,7 @@ from cutamp.task_planning.constraints import (
     ValidPush,
     ValidPushStick,
 )
-from cutamp.task_planning.costs import GraspCost, TrajectoryLength
+from cutamp.task_planning.costs import GraspCost, RetractCost, TrajectoryLength
 
 # Types
 Conf = "conf"
@@ -53,6 +53,11 @@ RightCanMove = Fluent("RightCanMove")
 
 LeftJustMoved = Fluent("LeftJustMoved")
 RightJustMoved = Fluent("RightJustMoved")
+
+LeftJustPicked = Fluent("LeftJustPicked")
+RightJustPicked = Fluent("RightJustPicked")
+LeftJustPlaced = Fluent("LeftJustPlaced")
+RightJustPlaced = Fluent("RightJustPlaced")
 
 LeftHolding = Fluent("LeftHolding", [Parameter("obj", Movable)])
 RightHolding = Fluent("RightHolding", [Parameter("obj", Movable)])
@@ -79,6 +84,10 @@ all_t1_fluents = [
     RightCanMove,
     LeftJustMoved,
     RightJustMoved,
+    LeftJustPicked,
+    RightJustPicked,
+    LeftJustPlaced,
+    RightJustPlaced,
     LeftHolding,
     RightHolding,
     LeftHoldingWithGrasp,
@@ -99,6 +108,7 @@ all_t1_fluents = [
 q = Parameter("q", Conf)
 q_start = Parameter("q_start", Conf)
 q_end = Parameter("q_end", Conf)
+q_retract = Parameter("q_retract", Conf)
 traj = Parameter("traj", Traj)
 
 obj = Parameter("obj", Movable)
@@ -118,9 +128,9 @@ placement = Parameter("placement", Pose)
 LeftMoveFree = TAMPOperator(
     "LeftMoveFree",
     [q_start, traj, q_end],
-    preconditions=[LeftAt(q_start), LeftHandEmpty(), LeftCanMove()],
+    preconditions=[LeftAt(q_start), LeftHandEmpty(), LeftCanMove(), RightCanMove()],  # Require RightCanMove to prevent interleaving
     add_effects=[LeftAt(q_end), LeftJustMoved()],
-    del_effects=[LeftAt(q_start), LeftCanMove()],
+    del_effects=[LeftAt(q_start), LeftCanMove(), RightCanMove()],  # Block right arm until LeftPick completes
     constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="left"),
@@ -129,9 +139,9 @@ LeftMoveFree = TAMPOperator(
 RightMoveFree = TAMPOperator(
     "RightMoveFree",
     [q_start, traj, q_end],
-    preconditions=[RightAt(q_start), RightHandEmpty(), RightCanMove()],
+    preconditions=[RightAt(q_start), RightHandEmpty(), RightCanMove(), LeftCanMove()],  # Require LeftCanMove to prevent interleaving
     add_effects=[RightAt(q_end), RightJustMoved()],
-    del_effects=[RightAt(q_start), RightCanMove()],
+    del_effects=[RightAt(q_start), RightCanMove(), LeftCanMove()],  # Block left arm until RightPick completes
     constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="right"),
@@ -146,9 +156,10 @@ LeftMoveHolding = TAMPOperator(
         LeftHolding(obj),
         LeftHoldingWithGrasp(obj, grasp),
         LeftCanMove(),
+        RightCanMove(),  # Require RightCanMove to prevent interleaving
     ],
     add_effects=[LeftAt(q_end), LeftJustMoved()],
-    del_effects=[LeftAt(q_start), LeftCanMove()],
+    del_effects=[LeftAt(q_start), LeftCanMove(), RightCanMove()],  # Block right arm until LeftPlace completes
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="left"),
@@ -162,9 +173,10 @@ RightMoveHolding = TAMPOperator(
         RightHolding(obj),
         RightHoldingWithGrasp(obj, grasp),
         RightCanMove(),
+        LeftCanMove(),  # Require LeftCanMove to prevent interleaving
     ],
     add_effects=[RightAt(q_end), RightJustMoved()],
-    del_effects=[RightAt(q_start), RightCanMove()],
+    del_effects=[RightAt(q_start), RightCanMove(), LeftCanMove()],  # Block left arm until RightPlace completes
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="right"),
@@ -183,7 +195,7 @@ LeftPick = TAMPOperator(
     add_effects=[
         LeftHolding(obj),
         LeftHoldingWithGrasp(obj, grasp),
-        LeftCanMove(),
+        LeftJustPicked(),  # Trigger retract after pick
     ],
     del_effects=[LeftHandEmpty(), LeftJustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
@@ -204,7 +216,7 @@ RightPick = TAMPOperator(
     add_effects=[
         RightHolding(obj),
         RightHoldingWithGrasp(obj, grasp),
-        RightCanMove(),
+        RightJustPicked(),  # Trigger retract after pick
     ],
     del_effects=[RightHandEmpty(), RightJustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
@@ -222,7 +234,7 @@ LeftPlace = TAMPOperator(
         IsSurface(surface),
         LeftJustMoved(),
     ],
-    add_effects=[LeftHandEmpty(), LeftCanMove(), On(obj, surface)],
+    add_effects=[LeftHandEmpty(), LeftJustPlaced(), On(obj, surface)],  # Trigger retract after place
     del_effects=[
         LeftHolding(obj),
         LeftHoldingWithGrasp(obj, grasp),
@@ -247,7 +259,7 @@ RightPlace = TAMPOperator(
         IsSurface(surface),
         RightJustMoved(),
     ],
-    add_effects=[RightHandEmpty(), RightCanMove(), On(obj, surface)],
+    add_effects=[RightHandEmpty(), RightJustPlaced(), On(obj, surface)],  # Trigger retract after place
     del_effects=[
         RightHolding(obj),
         RightHoldingWithGrasp(obj, grasp),
@@ -335,11 +347,78 @@ RightPushStick = TAMPOperator(
     metadata=OperatorMetadata(is_actionable=True, action_type="push_stick", arm="right"),
 )
 
+# Retract operators - move arm to home configuration after pick/place
+# These use soft costs to find the closest collision-free configuration to home
+
+LeftRetractHolding = TAMPOperator(
+    "LeftRetractHolding",
+    [obj, grasp, q_start, traj, q_retract],
+    preconditions=[
+        LeftAt(q_start),
+        LeftHolding(obj),
+        LeftHoldingWithGrasp(obj, grasp),
+        LeftJustPicked(),
+    ],
+    add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
+    del_effects=[LeftAt(q_start), LeftJustPicked()],
+    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    costs=[RetractCost(q_retract)],
+    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
+)
+
+RightRetractHolding = TAMPOperator(
+    "RightRetractHolding",
+    [obj, grasp, q_start, traj, q_retract],
+    preconditions=[
+        RightAt(q_start),
+        RightHolding(obj),
+        RightHoldingWithGrasp(obj, grasp),
+        RightJustPicked(),
+    ],
+    add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
+    del_effects=[RightAt(q_start), RightJustPicked()],
+    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    costs=[RetractCost(q_retract)],
+    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
+)
+
+LeftRetractFree = TAMPOperator(
+    "LeftRetractFree",
+    [q_start, traj, q_retract],
+    preconditions=[
+        LeftAt(q_start),
+        LeftHandEmpty(),
+        LeftJustPlaced(),
+    ],
+    add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
+    del_effects=[LeftAt(q_start), LeftJustPlaced()],
+    constraints=[CollisionFree(q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    costs=[RetractCost(q_retract)],
+    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
+)
+
+RightRetractFree = TAMPOperator(
+    "RightRetractFree",
+    [q_start, traj, q_retract],
+    preconditions=[
+        RightAt(q_start),
+        RightHandEmpty(),
+        RightJustPlaced(),
+    ],
+    add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
+    del_effects=[RightAt(q_start), RightJustPlaced()],
+    constraints=[CollisionFree(q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    costs=[RetractCost(q_retract)],
+    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
+)
+
 all_t1_operators = [
     LeftMoveFree, RightMoveFree,
     LeftMoveHolding, RightMoveHolding,
     LeftPick, RightPick,
     LeftPlace, RightPlace,
+    LeftRetractHolding, RightRetractHolding,
+    LeftRetractFree, RightRetractFree,
     LeftPush, RightPush,
     LeftPushStick, RightPushStick,
 ]
