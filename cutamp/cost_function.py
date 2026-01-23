@@ -19,7 +19,7 @@ from jaxtyping import Float
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
-from cutamp.rollout import Rollout, get_conf_to_arm, get_conf_parameters, get_action_parameters
+from cutamp.rollout import Rollout, get_conf_to_arm, get_retract_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import (
@@ -34,7 +34,7 @@ from cutamp.task_planning.constraints import (
     ValidPush,
     ValidPushStick,
 )
-from cutamp.task_planning.costs import GraspCost, TrajectoryLength
+from cutamp.task_planning.costs import GraspCost, RetractCost, TrajectoryLength
 from cutamp.utils.common import transform_spheres
 
 
@@ -74,7 +74,7 @@ class CostFunction:
             ValidPushStick.type: self.valid_push_stick_constraints,
             TrajectoryLength.type: self.traj_length_costs,
         }
-        warning_co = {GraspCost.type}
+        warning_co = {GraspCost.type, RetractCost.type}
         for ground_op in plan_skeleton:
             for co in [*ground_op.constraints, *ground_op.costs]:
                 if co.type not in type_to_list:
@@ -93,6 +93,9 @@ class CostFunction:
         # Track dual-arm status and build conf_to_arm mapping
         self.is_dual_arm = world.is_dual_arm
         self.conf_to_arm = get_conf_to_arm(plan_skeleton, self.is_dual_arm)
+        
+        # Track retract configurations for soft cost
+        self.retract_params = get_retract_parameters(plan_skeleton)
 
         # Setup self-collision cost (need separate configs for dual-arm)
         if self.is_dual_arm:
@@ -492,14 +495,49 @@ class CostFunction:
             yaw_diffs = yaw_diffs[mask].view(mask.shape[0], -1)  # reshape into num pairs
             yaw_diffs = yaw_diffs.sum(-1)
             values = {"align_yaw": yaw_diffs}
+        elif self.config.soft_cost == "retract_close_to_home":
+            # Compute distance from home for all retract configurations
+            # Only penalize indices 2-10 (torso + arm), not lift columns (0-1)
+            if not self.is_dual_arm:
+                raise ValueError("retract_close_to_home soft cost only supported for dual-arm robots")
+            if self._particles is None:
+                raise RuntimeError("Particles must be provided for retract_close_to_home soft cost")
+            
+            from cutamp.robots.t1 import t1_home_left, t1_home_right
+            
+            device = self.world.tensor_args.device
+            num_particles = rollout["num_particles"]
+            
+            # Pre-slice home configs (indices 2-10: torso + arm joints)
+            home_left_slice = torch.tensor(t1_home_left[2:], device=device)
+            home_right_slice = torch.tensor(t1_home_right[2:], device=device)
+            
+            # Group retract params by arm for batched computation
+            left_params = [p for p in self.retract_params if self.conf_to_arm.get(p) == "left"]
+            right_params = [p for p in self.retract_params if self.conf_to_arm.get(p) == "right"]
+            
+            total_dist = torch.zeros(num_particles, device=device)
+            
+            if left_params:
+                left_qs = torch.stack([self._particles[p][:, 2:] for p in left_params], dim=1)
+                total_dist += (left_qs - home_left_slice).abs().sum(dim=(1, 2))
+            
+            if right_params:
+                right_qs = torch.stack([self._particles[p][:, 2:] for p in right_params], dim=1)
+                total_dist += (right_qs - home_right_slice).abs().sum(dim=(1, 2))
+            
+            values = {"retract_close_to_home": total_dist}
         else:
             raise ValueError(f"Unsupported soft cost: {self.config.soft_cost}")
 
         return {"type": "cost", "constraints": [], "values": values}
 
-    def __call__(self, rollout: Rollout) -> Dict[str, dict]:
+    def __call__(self, rollout: Rollout, particles: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, dict]:
         self._validate_rollout(rollout)
         cost_dict = {}
+        
+        # Store particles for soft cost computation
+        self._particles = particles
 
         def add_cost(k_, v_):
             if v_ is not None:
