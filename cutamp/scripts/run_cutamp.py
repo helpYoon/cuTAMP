@@ -91,7 +91,7 @@ def entrypoint():
     )
     parser.add_argument(
         "--soft_cost",
-        choices=["dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw"],
+        choices=["dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home"],
         help="Soft cost to optimize or minimize. If used without --optimize_soft_costs, will be used to score the particles.",
     )
 
