@@ -44,7 +44,7 @@ class TAMPConfiguration:
 
     ## Soft Costs
     optimize_soft_costs: bool = False
-    # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw
+    # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home
     soft_cost: Optional[str] = None
 
     ## Task Planning and subgraph caching
