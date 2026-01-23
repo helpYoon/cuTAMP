@@ -49,7 +49,7 @@ from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
 
 from curobo.geom.types import WorldConfig
 from curobo.types.robot import RobotConfig
-from curobo.util_file import get_robot_configs_path, join_path, load_yaml, get_assets_path
+from curobo.util_file import load_yaml
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 from cutamp.robots.utils import RerunRobot
 
