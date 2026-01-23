@@ -8,7 +8,8 @@ These tests verify that shared joints are properly propagated between arms.
 import pytest
 import torch
 
-from cutamp.particle_initialization import propagate_shared_joints, NUM_SHARED_JOINTS
+from cutamp.particle_initialization import propagate_shared_joints
+from cutamp.robots.t1 import NUM_SHARED_JOINTS
 from cutamp.tamp_domain import Pick, Place, MoveFree, MoveHolding, Push, PushStick
 from cutamp.t1_domain import (
     LeftPick, RightPick, LeftPlace, RightPlace,
