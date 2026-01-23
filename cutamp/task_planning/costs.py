@@ -18,3 +18,9 @@ class GraspCost(Cost):
 class TrajectoryLength(Cost):
     def __init__(self, q_start, traj, q_end):
         super().__init__(q_start, traj, q_end)
+
+
+class RetractCost(Cost):
+    """Cost for retract operations - penalizes distance from home configuration."""
+    def __init__(self, q_retract):
+        super().__init__(q_retract)
