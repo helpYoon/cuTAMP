@@ -45,6 +45,24 @@ def get_conf_parameters(plan_skeleton: PlanSkeleton, is_dual_arm: bool = False) 
     return conf_params
 
 
+def get_retract_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
+    """Get the q_retract parameters from retract operators.
+    
+    Returns a list of unique q_retract parameter names in order.
+    """
+    retract_params = []
+    for ground_op in plan_skeleton:
+        metadata = ground_op.operator.metadata
+        if metadata.action_type == "retract":
+            # Last param is always q_retract
+            q_retract = ground_op.values[-1]
+            retract_params.append(q_retract)
+    
+    # remove duplicates while preserving order
+    retract_params = list(dict.fromkeys(retract_params))
+    return retract_params
+
+
 def get_conf_to_arm(plan_skeleton: PlanSkeleton, is_dual_arm: bool) -> Dict[str, Optional[Literal["left", "right"]]]:
     """Build a mapping from configuration parameter names to their associated arm (for dual-arm robots)."""
     if not is_dual_arm:

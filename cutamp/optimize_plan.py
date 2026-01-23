@@ -145,7 +145,7 @@ class ParticleOptimizer:
             optimizer.zero_grad()
 
             rollout = rollout_fn(particles)
-            cost_dict = cost_fn(rollout)
+            cost_dict = cost_fn(rollout, particles)
             costs = self.cost_reducer(cost_dict, consider_types=consider_types)
             satisfying_mask = self.get_satisfying_mask(cost_dict, verbose=False)
             num_satisfying = satisfying_mask.sum().item()
@@ -224,7 +224,7 @@ class ParticleOptimizer:
         # Now we've finished the optimization loop. Check the satisfying particles and compute soft/hard costs.
         with torch.no_grad():
             rollout = rollout_fn(particles)
-            cost_dict = cost_fn(rollout)
+            cost_dict = cost_fn(rollout, particles)
             costs = self.cost_reducer(cost_dict, consider_types=consider_types)
             soft_costs = self.cost_reducer.soft_costs(cost_dict)
             hard_costs = self.cost_reducer.hard_costs(cost_dict)

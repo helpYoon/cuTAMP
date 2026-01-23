@@ -196,7 +196,7 @@ robot_cfg:
 
       # Retract configuration (11 DOF)
       # [lift1, lift2, torso_pitch, waist_yaw, R_shoulder_p, R_shoulder_r, R_elbow_p, R_elbow_y, R_wrist_p, R_wrist_y, R_hand_r]
-      retract_config: [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.0, 1.4, 0.0, 0.0, 0.0]
+      retract_config: [0.15, 0.15, 0.0, 0.0, 0.5, 1.0, 0.0, 1.4, 0.0, 0.0, 0.0]
       
       null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]

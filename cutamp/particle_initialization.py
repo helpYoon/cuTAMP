@@ -35,10 +35,15 @@ from cutamp.utils.common import (
 )
 from cutamp.utils.shapes import MultiSphere
 
-_log = logging.getLogger(__name__)
+# T1 home configurations for retract
+try:
+    from cutamp.robots.t1 import t1_home_left, t1_home_right, NUM_SHARED_JOINTS
+except ImportError:
+    t1_home_left = None
+    t1_home_right = None
+    NUM_SHARED_JOINTS = 4  # Fallback for non-T1 robots
 
-# Number of shared joints (lift + torso) for T1 dual-arm robot
-NUM_SHARED_JOINTS = 4
+_log = logging.getLogger(__name__)
 
 
 def propagate_shared_joints(
@@ -540,6 +545,41 @@ class ParticleInitializer:
                         "ik_result": ik_result,
                         "grasp": particles[grasp],
                     }
+
+            # Retract - move arm to home configuration after pick/place
+            elif metadata.action_type == "retract":
+                # RetractHolding: obj, grasp, q_start, traj, q_retract
+                # RetractFree: q_start, traj, q_retract
+                q_retract = params[-1]  # Last param is always q_retract
+                q_start_param = params[-3]  # q_start is 3rd from last
+                
+                if q_start_param not in particles:
+                    raise ValueError(f"{q_start_param=} should already be bound")
+                if q_retract in particles:
+                    raise ValueError(f"{q_retract=} shouldn't already be bound")
+                
+                # Get home configuration based on arm
+                if arm == "left":
+                    home = torch.tensor(t1_home_left, device=world.tensor_args.device)
+                elif arm == "right":
+                    home = torch.tensor(t1_home_right, device=world.tensor_args.device)
+                else:
+                    raise ValueError(f"Retract operator requires arm, got {arm=}")
+                
+                # Initialize q_retract: home ALL joints (including lift columns)
+                # This ensures the inactive arm stays at a collision-free position
+                # when shared joints are synced during arm switch
+                q_retract_init = home.expand(num_particles, -1).clone()
+                particles[q_retract] = q_retract_init
+                
+                # Mark retract config as solved so it won't be modified by later shared joint propagation
+                solved_configs.add(q_retract)
+                
+                # Propagate shared joints from retract config to inactive arm's configs
+                if arm:
+                    propagate_shared_joints(particles, arm, particles[q_retract], solved_configs)
+                
+                log_debug(f"{header}. Initialized q_retract to full home configuration")
 
             # Unknown
             else:
