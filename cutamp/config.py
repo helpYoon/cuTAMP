@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 
 @dataclass(frozen=True)
@@ -44,8 +44,8 @@ class TAMPConfiguration:
 
     ## Soft Costs
     optimize_soft_costs: bool = False
-    # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home
-    soft_cost: Optional[str] = None
+    # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home, minimize_lift_movement
+    soft_cost: Optional[List[str]] = None
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
