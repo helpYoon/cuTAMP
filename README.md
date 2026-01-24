@@ -62,10 +62,16 @@ graph TD
   - Arm-specific accessors: `get_kin_model(arm)`, `get_tool_from_ee(arm)`, `get_ik_solver(arm)`, `get_gripper_spheres(arm)`, `get_joint_limits(arm)`
   - Dual `q_init` support (`left_q_init`, `right_q_init` properties)
   - Uses T1's `get_initial_state` for dual-arm initial state
+  - `get_motion_gen()` supports `num_trajopt_seeds` and `num_trajopt_noisy_seeds` for motion planning robustness
+
+- [`config.py`](cutamp/config.py) - TAMP configuration:
+  - `soft_cost: Optional[List[str]]` - Supports multiple soft costs (e.g., `["retract_close_to_home", "minimize_lift_movement"]`)
+  - `optimize_soft_costs: bool` - Enable soft cost optimization
 
 - [`t1_domain.py`](cutamp/t1_domain.py) - TAMP domain for T1 dual-arm robot:
-  - Arm-specific fluents: `LeftAt`, `RightAt`, `LeftHandEmpty`, `RightHandEmpty`, `LeftHolding`, `RightHolding`, `LeftCanMove`, `RightCanMove`, etc.
+  - Arm-specific fluents: `LeftAt`, `RightAt`, `LeftHandEmpty`, `RightHandEmpty`, `LeftHolding`, `RightHolding`, `LeftCanMove`, `RightCanMove`, `LeftJustPicked`, `RightJustPicked`, `LeftJustPlaced`, `RightJustPlaced`
   - Arm-specific operators: `LeftMoveFree`, `RightMoveFree`, `LeftPick`, `RightPick`, `LeftPlace`, `RightPlace`, `LeftPush`, `RightPush`, `LeftPushStick`, `RightPushStick`
+  - **Retract operators**: `LeftRetractHolding`, `RightRetractHolding`, `LeftRetractFree`, `RightRetractFree` - move arm toward home configuration after pick/place actions
   - Separate task planning for each arm
 
 - [`algorithm.py`](cutamp/algorithm.py) - Setup for dual-arm:
@@ -83,12 +89,18 @@ graph TD
   - `get_conf_to_arm()` - Maps configuration names to their arm
   - Arm-specific FK computation for each configuration
   - Arm-specific `tool_from_ee` for `world_from_ee_desired` computation
+  - `get_retract_parameters()` - Extracts retract configuration metadata for collision checking
 
 - [`cost_function.py`](cutamp/cost_function.py) - Dual-arm costs:
   - Separate self-collision cost functions per arm
   - Arm-specific joint limit checking
   - `conf_to_arm` mapping for per-configuration cost computation
   - Flexible trajectory length validation - allows trailing motion configs in `traj_length_confs`
+  - **Retract collision checking** - Hard constraints for `q_retract` configurations checking `robot_to_world` and `robot_to_movables` (excluding held object for `RetractHolding`)
+  - **Soft costs**:
+    - `retract_close_to_home` - Penalizes retract configurations far from home (torso + arm joints only)
+    - `minimize_lift_movement` - Penalizes lift column deviation from home position
+  - **Multiple soft cost support** - Can specify multiple soft costs simultaneously
 
 - [`optimize_plan.py`](cutamp/optimize_plan.py) - Dual-arm optimization:
   - Skips optimization for both `left_q0` and `right_q0`
@@ -96,12 +108,20 @@ graph TD
   - Dual-arm initial state visualization (22-DOF)
   - During optimization, constructs 22-DOF config showing active arm's IK solution + inactive arm at home
 
+- [`dual_arm_state.py`](cutamp/dual_arm_state.py) - Dual-arm state management:
+  - `DualArmState` dataclass encapsulating motion generators, joint states, and object tracking
+  - `disable_locked_arm_collision()` - Toggles collision checking for inactive arm
+  - `make_dual_arm_traj()` - Combines active arm trajectory with inactive arm state
+  - `compute_held_obj_poses()` - Computes object poses attached to gripper during motion
+  - `log_dual_arm_traj()` - Logs dual-arm trajectories with held objects to Rerun
+
 - [`motion_solver.py`](cutamp/motion_solver.py) - Dual-arm motion planning:
-  - Supports all T1 operators
+  - Supports all T1 operators including retract operations
   - Arm-specific motion generator, kinematics, and tool_from_ee
   - World-frame approach offset for consistent top-down grasping across all robots
   - T1 gripper joint values for visualization
-  - Currently requires single-arm plans (both arms in same plan not yet supported)
+  - Uses `DualArmState` for state tracking across arm switches
+  - Graph planning enabled for retract operations (`enable_graph=True`)
 
 - [`task_planning/search.py`](cutamp/task_planning/search.py) - Prefixed parameter support:
   - `_sample_param_type()` handles prefixed names (e.g., `left_q0`, `right_pose1`)
@@ -127,6 +147,28 @@ Available scripts:
 - [`gripper_sphere_editor.py`](cutamp/scripts/gripper_sphere_editor.py) - Interactive gripper sphere editor for grasp sampling
 - [`robot_sphere_editor.py`](cutamp/scripts/robot_sphere_editor.py) - Interactive robot sphere editor for cuRobo
 
+## Usage Examples
+
+### Running with Soft Costs
+
+```bash
+# Single soft cost
+python -m cutamp.scripts.run_cutamp --env blocks_t1 --robot t1 \
+    --soft_cost retract_close_to_home --optimize_soft_costs --motion_plan
+
+# Multiple soft costs
+python -m cutamp.scripts.run_cutamp --env blocks_t1 --robot t1 \
+    --soft_cost retract_close_to_home minimize_lift_movement --optimize_soft_costs --motion_plan
+```
+
+**Available soft costs:**
+- `retract_close_to_home` - Retracts arms closer to home configuration (T1 only)
+- `minimize_lift_movement` - Minimizes lift column movement (T1 only)
+- `dist_from_origin` - Maximizes object distance from origin
+- `max_obj_dist` / `min_obj_dist` - Maximizes/minimizes pairwise object distances
+- `min_y` / `max_y` - Minimizes/maximizes object Y coordinates
+- `align_yaw` - Aligns object yaw angles
+
 ## Key Design Decisions
 
 1. **11-DOF per arm model** - Each arm's cuRobo model includes the 4 shared joints (lift + torso) plus 7 arm joints
@@ -138,3 +180,9 @@ Available scripts:
 3. **Inactive arm inherits shared joints** - The inactive arm's local joints (7 DOF) remain fixed, but its EE position changes due to torso movement
 
 4. **Inactive arm locking** - cuRobo configs lock the inactive arm at home position (not zeros) to prevent collision
+
+5. **Retract after pick/place** - After each pick or place action, the arm retracts toward home:
+   - `RetractHolding` - After pick, moves arm while holding object (collision checks exclude held object)
+   - `RetractFree` - After place, moves arm with empty gripper
+   - Uses soft cost (`retract_close_to_home`) to bias toward home configuration
+   - Hard collision constraints ensure collision-free retract configurations
