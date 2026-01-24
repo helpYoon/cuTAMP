@@ -94,8 +94,9 @@ class CostFunction:
         self.is_dual_arm = world.is_dual_arm
         self.conf_to_arm = get_conf_to_arm(plan_skeleton, self.is_dual_arm)
         
-        # Track retract configurations for soft cost
-        self.retract_params = get_retract_parameters(plan_skeleton)
+        # Track retract configurations for collision checking and soft cost
+        # Returns list of (q_retract_name, is_holding, held_obj_name)
+        self.retract_info = get_retract_parameters(plan_skeleton)
 
         # Setup self-collision cost (need separate configs for dual-arm)
         if self.is_dual_arm:
@@ -449,6 +450,41 @@ class CostFunction:
                 use_aabb_check=True,
             )
 
+        # Retract collision checking - ensures retract configs are collision-free
+        # RetractFree: checks world + all movables
+        # RetractHolding: checks world + movables excluding held object
+        if self.retract_info and self._particles is not None:
+            for q_retract_name, is_holding, held_obj in self.retract_info:
+                q_retract = self._particles[q_retract_name]
+                num_particles = q_retract.shape[0]
+                
+                # Get kinematic model for appropriate arm
+                arm = self.conf_to_arm.get(q_retract_name, "left")
+                kin_model = self.world.get_kin_model(arm) if self.is_dual_arm else self.world.kin_model
+                
+                # Compute FK for retract config
+                robot_state = kin_model.get_state(q_retract)
+                retract_spheres = robot_state.get_link_spheres().unsqueeze(1)  # (b, 1, n, 4)
+                
+                # Robot to world collision - keep shape (num_particles, 1) for consistency
+                coll_values[f"{q_retract_name}_world"] = self.world.collision_fn(retract_spheres)
+                
+                # Robot to movables collision (exclude held object for RetractHolding)
+                movable_list = []
+                for obj_name, obj_spheres in obj_to_spheres.items():
+                    if is_holding and obj_name == held_obj:
+                        continue  # Skip held object for RetractHolding
+                    movable_list.append(obj_spheres[:, -1])  # Last pose timestep
+                
+                if movable_list:
+                    all_movables = torch.cat(movable_list, dim=1).unsqueeze(1)
+                    coll_values[f"{q_retract_name}_movables"] = sphere_to_sphere_overlap(
+                        retract_spheres, all_movables,
+                        activation_distance=self.config.gripper_activation_distance
+                    )
+                else:
+                    coll_values[f"{q_retract_name}_movables"] = torch.zeros((num_particles, 1), device=q_retract.device)
+
         coll_cost = {
             "type": "constraint",
             "constraints": self.cfree_constraints,
@@ -457,80 +493,85 @@ class CostFunction:
         return coll_cost
 
     def soft_costs(self, rollout: Rollout) -> dict:
-        """Soft costs defined on the goal state."""
-        # last object pose
-        last_obj_position = [v[:, -1, :3, 3] for v in rollout["obj_to_pose"].values()]
-        last_obj_position = torch.stack(last_obj_position, dim=1)
-
-        if self.config.soft_cost == "dist_from_origin":
-            dist_from_origin = last_obj_position.norm(dim=-1)
-            dist_from_origin = -dist_from_origin.sum(dim=-1)
-            values = {"dist_from_origin": dist_from_origin}
-        elif self.config.soft_cost == "max_obj_dist" or self.config.soft_cost == "min_obj_dist":
-            all_obj_dists = torch.cdist(last_obj_position, last_obj_position, p=2)  # (b, n, n)
-            mask = torch.triu(torch.ones_like(all_obj_dists), diagonal=1) == 1
-            obj_dists = all_obj_dists[mask].view(mask.shape[0], -1)  # reshape into num pairs
-            dists_sum = obj_dists.sum(-1)
-            if self.config.soft_cost == "max_obj_dist":
-                values = {"max_obj_dist": -dists_sum}
-            else:
-                values = {"min_obj_dist": dists_sum}
-        elif self.config.soft_cost == "min_y" or self.config.soft_cost == "max_y":
-            last_obj_y = last_obj_position[..., 1]
-            last_y = last_obj_y.sum(dim=-1)
-            if self.config.soft_cost == "min_y":
-                values = {"min_y": last_y}
-            else:
-                values = {"max_y": -last_y}
-        elif self.config.soft_cost == "align_yaw":
-            last_obj_mat3x3 = [v[:, -1, :3, :3] for v in rollout["obj_to_pose"].values()]
-            last_obj_mat3x3 = torch.stack(last_obj_mat3x3, dim=1)
-            last_obj_rpy = roma.rotmat_to_euler("XYZ", last_obj_mat3x3)
-            last_obj_yaw = last_obj_rpy[..., 2]
-
-            # Compute pairwise yaw differences and normalize to be between -pi and pi
+        """Soft costs defined on the goal state. Supports multiple soft costs."""
+        values = {}
+        
+        for cost_name in self.config.soft_cost:
+            cost_value = self._compute_soft_cost(cost_name, rollout)
+            values[cost_name] = cost_value
+        
+        return {"type": "cost", "constraints": [], "values": values}
+    
+    def _compute_soft_cost(self, cost_name: str, rollout: Rollout) -> torch.Tensor:
+        """Compute a single soft cost by name."""
+        device = self.world.tensor_args.device
+        num_particles = rollout["num_particles"]
+        
+        # Object position-based costs
+        if cost_name in ("dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y"):
+            last_obj_position = [v[:, -1, :3, 3] for v in rollout["obj_to_pose"].values()]
+            last_obj_position = torch.stack(last_obj_position, dim=1)
+            
+            if cost_name == "dist_from_origin":
+                return -last_obj_position.norm(dim=-1).sum(dim=-1)
+            elif cost_name in ("max_obj_dist", "min_obj_dist"):
+                all_obj_dists = torch.cdist(last_obj_position, last_obj_position, p=2)
+                mask = torch.triu(torch.ones_like(all_obj_dists), diagonal=1) == 1
+                dists_sum = all_obj_dists[mask].view(mask.shape[0], -1).sum(-1)
+                return -dists_sum if cost_name == "max_obj_dist" else dists_sum
+            else:  # min_y or max_y
+                last_y = last_obj_position[..., 1].sum(dim=-1)
+                return last_y if cost_name == "min_y" else -last_y
+        
+        # Yaw alignment cost
+        elif cost_name == "align_yaw":
+            last_obj_mat3x3 = torch.stack([v[:, -1, :3, :3] for v in rollout["obj_to_pose"].values()], dim=1)
+            last_obj_yaw = roma.rotmat_to_euler("XYZ", last_obj_mat3x3)[..., 2]
             yaw_diffs = last_obj_yaw[:, :, None] - last_obj_yaw[:, None, :]
             yaw_diffs = torch.atan2(torch.sin(yaw_diffs), torch.cos(yaw_diffs)).abs()
             mask = torch.triu(torch.ones_like(yaw_diffs), diagonal=1) == 1
-            yaw_diffs = yaw_diffs[mask].view(mask.shape[0], -1)  # reshape into num pairs
-            yaw_diffs = yaw_diffs.sum(-1)
-            values = {"align_yaw": yaw_diffs}
-        elif self.config.soft_cost == "retract_close_to_home":
-            # Compute distance from home for all retract configurations
-            # Only penalize indices 2-10 (torso + arm), not lift columns (0-1)
+            return yaw_diffs[mask].view(mask.shape[0], -1).sum(-1)
+        
+        # Retract close to home cost
+        elif cost_name == "retract_close_to_home":
             if not self.is_dual_arm:
                 raise ValueError("retract_close_to_home soft cost only supported for dual-arm robots")
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for retract_close_to_home soft cost")
             
             from cutamp.robots.t1 import t1_home_left, t1_home_right
-            
-            device = self.world.tensor_args.device
-            num_particles = rollout["num_particles"]
-            
-            # Pre-slice home configs (indices 2-10: torso + arm joints)
             home_left_slice = torch.tensor(t1_home_left[2:], device=device)
             home_right_slice = torch.tensor(t1_home_right[2:], device=device)
             
-            # Group retract params by arm for batched computation
-            left_params = [p for p in self.retract_params if self.conf_to_arm.get(p) == "left"]
-            right_params = [p for p in self.retract_params if self.conf_to_arm.get(p) == "right"]
+            retract_param_names = [info[0] for info in self.retract_info]
+            left_params = [p for p in retract_param_names if self.conf_to_arm.get(p) == "left"]
+            right_params = [p for p in retract_param_names if self.conf_to_arm.get(p) == "right"]
             
             total_dist = torch.zeros(num_particles, device=device)
-            
             if left_params:
                 left_qs = torch.stack([self._particles[p][:, 2:] for p in left_params], dim=1)
                 total_dist += (left_qs - home_left_slice).abs().sum(dim=(1, 2))
-            
             if right_params:
                 right_qs = torch.stack([self._particles[p][:, 2:] for p in right_params], dim=1)
                 total_dist += (right_qs - home_right_slice).abs().sum(dim=(1, 2))
+            return total_dist
+        
+        # Minimize lift movement cost
+        elif cost_name == "minimize_lift_movement":
+            if self._particles is None:
+                raise RuntimeError("Particles must be provided for minimize_lift_movement soft cost")
             
-            values = {"retract_close_to_home": total_dist}
+            from cutamp.robots.t1 import t1_home_left
+            home_lift = torch.tensor(t1_home_left[:2], device=device)
+            
+            config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
+            if config_params:
+                all_configs = torch.stack([self._particles[p] for p in config_params], dim=1)
+                return (all_configs[:, :, :2] - home_lift).pow(2).sum(dim=(1, 2))
+            return torch.zeros(num_particles, device=device)
+        
         else:
-            raise ValueError(f"Unsupported soft cost: {self.config.soft_cost}")
-
-        return {"type": "cost", "constraints": [], "values": values}
+            raise ValueError(f"Unsupported soft cost: {cost_name}")
 
     def __call__(self, rollout: Rollout, particles: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, dict]:
         self._validate_rollout(rollout)
@@ -577,7 +618,7 @@ class CostFunction:
         add_cost(KinematicConstraint.type, kinematic_cost)
 
         # Soft costs
-        if self.config.soft_cost is not None:
+        if self.config.soft_cost:
             soft_cost = self.soft_costs(rollout)
             add_cost("soft", soft_cost)
 

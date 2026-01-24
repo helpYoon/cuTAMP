@@ -132,15 +132,14 @@ def solve_curobo(
         enable_finetune_trajopt=True,
         time_dilation_factor=config.time_dilation_factor,
     )
-    num_trajopt_seeds = 4  # Set at MotionGen init time due to CUDA graph constraints
     accum_plans = []
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
     
     # Initialize based on robot type
     if is_dual_arm:
         state = DualArmState(
-            left_motion_gen=world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm="left", num_trajopt_seeds=num_trajopt_seeds),
-            right_motion_gen=world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm="right", num_trajopt_seeds=num_trajopt_seeds),
+            left_motion_gen=world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm="left"),
+            right_motion_gen=world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm="right"),
             left_kin_model=world.get_kin_model("left"),
             right_kin_model=world.get_kin_model("right"),
             left_tool_from_ee=world.get_tool_from_ee("left"),
@@ -156,7 +155,7 @@ def solve_curobo(
                 torch.cuda.empty_cache()
                 state.right_motion_gen.warmup()
     else:
-        motion_gen = world.get_motion_gen(collision_activation_distance=config.world_activation_distance, num_trajopt_seeds=num_trajopt_seeds)
+        motion_gen = world.get_motion_gen(collision_activation_distance=config.world_activation_distance)
         last_js = JointState.from_position(best_particle["q0"][None].clone())
         last_q_name = "q0"
         kin_model = world.kin_model

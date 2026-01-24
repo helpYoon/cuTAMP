@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import List, Dict, Literal, Optional, TypedDict
+from typing import List, Dict, Literal, Optional, Tuple, TypedDict
 
 import torch
 from jaxtyping import Float
@@ -45,22 +45,35 @@ def get_conf_parameters(plan_skeleton: PlanSkeleton, is_dual_arm: bool = False) 
     return conf_params
 
 
-def get_retract_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
-    """Get the q_retract parameters from retract operators.
+def get_retract_parameters(plan_skeleton: PlanSkeleton) -> List[Tuple[str, bool, Optional[str]]]:
+    """Get retract params with metadata.
     
-    Returns a list of unique q_retract parameter names in order.
+    Returns list of (q_retract_name, is_holding, held_obj_name)
+    - is_holding: True for RetractHolding, False for RetractFree
+    - held_obj_name: Object name if holding, None otherwise
     """
-    retract_params = []
+    retract_info = []
     for ground_op in plan_skeleton:
         metadata = ground_op.operator.metadata
         if metadata.action_type == "retract":
-            # Last param is always q_retract
-            q_retract = ground_op.values[-1]
-            retract_params.append(q_retract)
+            q_retract = ground_op.values[-1]  # Last param is always q_retract
+            
+            if "Holding" in ground_op.operator.name:
+                # RetractHolding: [obj, grasp, q_start, traj, q_retract]
+                held_obj = ground_op.values[0]
+                retract_info.append((q_retract, True, held_obj))
+            else:
+                # RetractFree: [q_start, traj, q_retract]
+                retract_info.append((q_retract, False, None))
     
-    # remove duplicates while preserving order
-    retract_params = list(dict.fromkeys(retract_params))
-    return retract_params
+    # Remove duplicates while preserving order (by q_retract name)
+    seen = set()
+    unique_info = []
+    for info in retract_info:
+        if info[0] not in seen:
+            seen.add(info[0])
+            unique_info.append(info)
+    return unique_info
 
 
 def get_conf_to_arm(plan_skeleton: PlanSkeleton, is_dual_arm: bool) -> Dict[str, Optional[Literal["left", "right"]]]:

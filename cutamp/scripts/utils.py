@@ -27,6 +27,8 @@ default_constraint_to_mult = {
         "max_obj_dist": 3e-1,
         "min_obj_dist": 1e-1,
         "align_yaw": 5e-2,
+        "retract_close_to_home": 1e-1,
+        "minimize_lift_movement": 10,  # Penalize lift column deviation from home
     },
 }
 

@@ -389,7 +389,8 @@ class TAMPWorld:
         collision_activation_distance: float,
         use_cuda_graph: bool = True,
         arm: Literal["left", "right"] = "left",
-        num_trajopt_seeds: int = 4,
+        num_trajopt_seeds: int = 1,
+        num_trajopt_noisy_seeds: int = 2,  # Lower than trajopt_seeds to save GPU memory
     ) -> MotionGen:
         """
         Get the cuRobo motion generator for the robot.
@@ -399,8 +400,10 @@ class TAMPWorld:
             use_cuda_graph: Whether to use CUDA graph optimization. Set to False for debugging.
             arm: Which arm's motion generator to get ("left" or "right").
                  For single-arm robots, this is ignored.
-            num_trajopt_seeds: Number of trajectory optimization seeds. Must be set at init time,
-                              not at plan time, due to CUDA graph constraints.
+            num_trajopt_seeds: Number of trajectory optimization seeds for Cartesian planning.
+                              Must be set at init time, not at plan time, due to CUDA graph constraints.
+            num_trajopt_noisy_seeds: Number of seeds for joint-space planning (used by retract operations).
+                                    Higher values improve retract robustness but use more GPU memory.
         
         Returns:
             MotionGen configured for the specified arm.
@@ -426,6 +429,7 @@ class TAMPWorld:
             use_cuda_graph=use_cuda_graph,
             collision_activation_distance=collision_activation_distance,
             num_trajopt_seeds=num_trajopt_seeds,
+            num_trajopt_noisy_seeds=num_trajopt_noisy_seeds,  # Seeds for joint-space planning (retract)
         )
         motion_gen = MotionGen(motion_gen_cfg)
         return motion_gen
