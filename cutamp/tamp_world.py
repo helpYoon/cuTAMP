@@ -89,8 +89,12 @@ class TAMPWorld:
             self.ik_solver = get_ur5_ik_solver(self.world_cfg)
         elif self.robot_name == "t1":
             # Dual-arm robot has two IK solvers, one for each arm
+            # Share collision checker between arms to save GPU memory
             self.ik_solver_left = get_t1_ik_solver("left", self.world_cfg)
-            self.ik_solver_right = get_t1_ik_solver("right", self.world_cfg)
+            self.ik_solver_right = get_t1_ik_solver(
+                "right", self.world_cfg,
+                world_coll_checker=self.ik_solver_left.world_coll_checker,
+            )
         else:
             raise ValueError(f"Unsupported robot: {self.robot_name}")
 

@@ -182,6 +182,7 @@ def get_t1_ik_solver(
     self_collision_opt: bool = True,
     self_collision_check: bool = True,
     use_particle_opt: bool = True,
+    world_coll_checker=None,
 ) -> IKSolver:
     """
     Create cuRobo IK solver for T1 robot.
@@ -193,6 +194,7 @@ def get_t1_ik_solver(
         self_collision_opt: Enable self-collision optimization
         self_collision_check: Enable self-collision checking
         use_particle_opt: Enable particle-based optimization
+        world_coll_checker: Shared WorldCollision instance to reuse (saves GPU memory)
         
     Returns:
         IKSolver configured for the specified arm
@@ -208,6 +210,7 @@ def get_t1_ik_solver(
         self_collision_opt=self_collision_opt,
         self_collision_check=self_collision_check,
         use_particle_opt=use_particle_opt,
+        world_coll_checker=world_coll_checker,
     )
     ik_solver = IKSolver(ik_config)
     return ik_solver
