@@ -23,7 +23,7 @@ from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to
 from cutamp.config import TAMPConfiguration
 from cutamp.dual_arm_state import (
     DualArmState,
-    disable_locked_arm_collision,
+    update_locked_arm_position,
     log_dual_arm_traj,
     compute_held_obj_poses,
     make_gripper_anim_traj,
@@ -124,10 +124,20 @@ def solve_curobo(
     plan_skeleton = plan_info["plan_skeleton"]
     is_dual_arm = world.is_dual_arm
     
+    # Config for Cartesian planning (pick/place/approach)
     plan_config = MotionGenPlanConfig(
         timeout=10.0,
-        max_attempts=60,
+        max_attempts=120,
         enable_graph=True,
+        parallel_finetune=True,
+        enable_finetune_trajopt=True,
+        time_dilation_factor=config.time_dilation_factor,
+    )
+    # Config for joint-space planning (retract) - longer timeout since it has fewer seeds
+    retract_plan_config = MotionGenPlanConfig(
+        timeout=20.0,           # Longer timeout for retract
+        max_attempts=240,       # More attempts since seeds are limited
+        enable_graph=True,      # Graph planner as fallback
         parallel_finetune=True,
         enable_finetune_trajopt=True,
         time_dilation_factor=config.time_dilation_factor,
@@ -137,9 +147,20 @@ def solve_curobo(
     
     # Initialize based on robot type
     if is_dual_arm:
+        # Create left motion gen first, then share its collision world with right motion gen
+        # This saves significant GPU memory by avoiding duplicate collision world allocation
+        left_motion_gen = world.get_motion_gen(
+            collision_activation_distance=config.world_activation_distance, arm="left"
+        )
+        _log.info("Sharing collision world between left and right arm motion generators")
+        right_motion_gen = world.get_motion_gen(
+            collision_activation_distance=config.world_activation_distance,
+            arm="right",
+            world_coll_checker=left_motion_gen.world_coll_checker,
+        )
         state = DualArmState(
-            left_motion_gen=world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm="left"),
-            right_motion_gen=world.get_motion_gen(collision_activation_distance=config.world_activation_distance, arm="right"),
+            left_motion_gen=left_motion_gen,
+            right_motion_gen=right_motion_gen,
             left_kin_model=world.get_kin_model("left"),
             right_kin_model=world.get_kin_model("right"),
             left_tool_from_ee=world.get_tool_from_ee("left"),
@@ -189,10 +210,12 @@ def solve_curobo(
             
             state.current_arm = op_arm
             motion_gen, kin_model, tool_from_ee, last_js = state.get_state(op_arm)
+            
+            # Update locked arm position for accurate collision checking
             locked_arm = state.other_arm(op_arm)
-            if state.disabled_collision_for != locked_arm:
-                disable_locked_arm_collision(motion_gen, locked_arm)
-                state.disabled_collision_for = locked_arm
+            locked_arm_js = state.get_js(locked_arm)
+            update_locked_arm_position(motion_gen, op_arm, locked_arm_js)
+            
             last_q_name = state.get_q_name(op_arm)
 
         # Motion operators - track configuration names
@@ -214,7 +237,7 @@ def solve_curobo(
             with timer.time("curobo_planning"):
                 q_retract = best_particle[q_retract_name].clone()
                 target_js = JointState.from_position(q_retract[None])
-                retract_result = motion_gen.plan_single_js(last_js, target_js, plan_config)
+                retract_result = motion_gen.plan_single_js(last_js, target_js, retract_plan_config)
                 if not retract_result.success:
                     raise RuntimeError(f"Failed to plan retract for {ground_op.name}: {retract_result.status}")
             
@@ -253,7 +276,7 @@ def solve_curobo(
                     world_from_ee = kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
                     world_from_retract = world_from_ee.clone()
                     world_from_retract[2, 3] += APPROACH_HEIGHT
-                    retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
+                    retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), retract_plan_config)
                     if not retract_result.success:
                         raise RuntimeError(f"Failed to plan retract for {ground_op.name}: {retract_result.status}")
                     retract_js = JointState.from_position(retract_result.get_interpolated_plan().position[-1:])
@@ -331,7 +354,7 @@ def solve_curobo(
                 # Retract
                 world_from_retract = world_from_ee_start.clone()
                 world_from_retract[2, 3] += APPROACH_HEIGHT
-                retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), plan_config)
+                retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), retract_plan_config)
                 if not retract_result.success:
                     raise RuntimeError(f"Failed to plan retract for {ground_op.name}: {retract_result.status}")
                 

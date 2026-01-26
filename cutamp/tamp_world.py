@@ -16,6 +16,7 @@ import torch
 from jaxtyping import Float
 
 from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
+from curobo.geom.sdf.world import WorldCollision
 from curobo.geom.types import Obstacle
 from curobo.types.base import TensorDeviceType
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
@@ -389,8 +390,9 @@ class TAMPWorld:
         collision_activation_distance: float,
         use_cuda_graph: bool = True,
         arm: Literal["left", "right"] = "left",
-        num_trajopt_seeds: int = 1,
-        num_trajopt_noisy_seeds: int = 2,  # Lower than trajopt_seeds to save GPU memory
+        num_trajopt_seeds: int = 2,
+        num_trajopt_noisy_seeds: int = 2,
+        world_coll_checker: WorldCollision = None,
     ) -> MotionGen:
         """
         Get the cuRobo motion generator for the robot.
@@ -402,8 +404,13 @@ class TAMPWorld:
                  For single-arm robots, this is ignored.
             num_trajopt_seeds: Number of trajectory optimization seeds for Cartesian planning.
                               Must be set at init time, not at plan time, due to CUDA graph constraints.
-            num_trajopt_noisy_seeds: Number of seeds for joint-space planning (used by retract operations).
-                                    Higher values improve retract robustness but use more GPU memory.
+            num_trajopt_noisy_seeds: Number of noisy seeds per trajectory seed for Cartesian planning,
+                                    and also the number of seeds for joint-space planning (retract).
+                                    Must be set at init time due to CUDA graph constraints.
+            world_coll_checker: Optional shared WorldCollision object. If provided, this collision
+                               checker will be reused instead of creating a new one. This is useful
+                               for dual-arm robots to share the same collision world between both
+                               arms, significantly reducing GPU memory usage.
         
         Returns:
             MotionGen configured for the specified arm.
@@ -422,14 +429,20 @@ class TAMPWorld:
         _log.info(f"Setting number of spheres for attachments to {max_num_spheres}")
 
         # World config needs to include movables for cuRobo
-        world_cfg = get_world_cfg(self.env, include_movables=True)
+        # If world_coll_checker is provided, we don't need to pass world_model (it will be ignored)
+        world_cfg = get_world_cfg(self.env, include_movables=True) if world_coll_checker is None else None
         motion_gen_cfg = MotionGenConfig.load_from_robot_config(
             robot_cfg=robot_cfg,
             world_model=world_cfg,
+            world_coll_checker=world_coll_checker,
             use_cuda_graph=use_cuda_graph,
             collision_activation_distance=collision_activation_distance,
-            num_trajopt_seeds=num_trajopt_seeds,
-            num_trajopt_noisy_seeds=num_trajopt_noisy_seeds,  # Seeds for joint-space planning (retract)
+            # Trajectory optimization seeds (memory vs success tradeoff)
+            num_trajopt_seeds=num_trajopt_seeds,        # Seeds for Cartesian planning
+            num_trajopt_noisy_seeds=num_trajopt_noisy_seeds,  # Seeds for joint-space (retract) + noisy augmentation
+            # IK and graph seeds (lower memory impact)
+            num_ik_seeds=64,          
+            num_graph_seeds=4,        # Graph planner seeds for fallback paths
         )
         motion_gen = MotionGen(motion_gen_cfg)
         return motion_gen

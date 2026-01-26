@@ -102,18 +102,6 @@ RIGHT_ARM_JOINT_NAMES: Tuple[str, ...] = (
     "Right_Elbow_Yaw", "Right_Wrist_Pitch", "Right_Wrist_Yaw", "Right_Hand_Roll"
 )
 
-# Collision link names for each arm (used for disabling collision in dual-arm planning)
-LEFT_ARM_COLLISION_LINKS: Tuple[str, ...] = (
-    "AL1", "AL2", "AL3", "AL4", "AL5", "AL6",
-    "left_hand_link", "left_base_link",
-    "left_Link1", "left_Link11", "left_Link2", "left_Link22",
-)
-RIGHT_ARM_COLLISION_LINKS: Tuple[str, ...] = (
-    "AR1", "AR2", "AR3", "AR4", "AR5", "AR6",
-    "right_hand_link", "right_base_link",
-    "right_Link1", "right_Link11", "right_Link2", "right_Link22",
-)
-
 # Path to T1 robot assets
 T1_ASSETS_DIR = Path(__file__).parent / "assets" / "t1_description"
 

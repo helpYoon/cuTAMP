@@ -7,7 +7,14 @@ import torch
 from curobo.types.state import JointState
 from curobo.wrap.reacher.motion_gen import MotionGen
 
-from cutamp.robots.t1 import NUM_SHARED_JOINTS, LEFT_ARM_COLLISION_LINKS, RIGHT_ARM_COLLISION_LINKS
+from cutamp.robots.t1 import (
+    NUM_SHARED_JOINTS,
+    LEFT_ARM_JOINT_NAMES,
+    RIGHT_ARM_JOINT_NAMES,
+    t1_curobo_cfg,
+    t1_home_head,
+    GRIPPER_OPEN,
+)
 from cutamp.utils.visualizer import Visualizer
 
 
@@ -36,7 +43,6 @@ class DualArmState:
     
     # Current arm being used
     current_arm: Optional[Literal["left", "right"]] = None
-    disabled_collision_for: Optional[Literal["left", "right"]] = None
     
     # Object tracking
     arm_holding: Dict[str, Optional[str]] = field(default_factory=lambda: {"left": None, "right": None})
@@ -87,16 +93,50 @@ class DualArmState:
         self.set_js(to_arm, JointState.from_position(new_pos))
 
 
-def disable_locked_arm_collision(motion_gen: MotionGen, locked_arm: Literal["left", "right"]) -> None:
-    """Disable collision checking for the locked (inactive) arm.
+def update_locked_arm_position(
+    motion_gen: MotionGen,
+    active_arm: Literal["left", "right"],
+    locked_arm_js: JointState,
+) -> None:
+    """Update the locked arm's joint positions in the motion generator.
     
-    When planning for one arm, we disable collision checking for the other arm's links
-    because the inactive arm's actual position may differ from the locked position in
-    the cuRobo YAML config. The inactive arm's collision is handled separately by
-    retract operators and shared joint synchronization.
+    When planning for one arm, cuRobo needs to know the actual position of the locked arm
+    for accurate collision checking. This function updates the locked joints in the
+    kinematics model to match the locked arm's current position.
+    
+    Args:
+        motion_gen: The motion generator for the active arm.
+        active_arm: Which arm is currently active ("left" or "right").
+        locked_arm_js: Joint state of the locked arm (11 DOF).
     """
-    links = LEFT_ARM_COLLISION_LINKS if locked_arm == "left" else RIGHT_ARM_COLLISION_LINKS
-    motion_gen.toggle_link_collision(list(links), enable_flag=False)
+    # Determine which joints are locked based on active arm
+    locked_arm = "right" if active_arm == "left" else "left"
+    locked_joint_names = RIGHT_ARM_JOINT_NAMES if locked_arm == "right" else LEFT_ARM_JOINT_NAMES
+    
+    # Extract arm joint values (indices 4-10) from the locked arm's 11-DOF state
+    locked_arm_values = locked_arm_js.position[0, NUM_SHARED_JOINTS:].tolist()
+    
+    # Build the lock_joints dict with all locked joints
+    lock_joints = {}
+    
+    # Head joints (always locked at neutral)
+    lock_joints["AAHead_yaw"] = t1_home_head[0]
+    lock_joints["Head_pitch"] = t1_home_head[1]
+    
+    # Locked arm joints (7 DOF) - update to current position
+    for name, value in zip(locked_joint_names, locked_arm_values):
+        lock_joints[name] = value
+    
+    # Gripper joints (all at open position - 0.0)
+    for prefix in ["left", "right"]:
+        for suffix in ["Link1", "Link11", "Link2", "Link22"]:
+            lock_joints[f"{prefix}_{suffix}"] = GRIPPER_OPEN[0]
+    
+    # Get the robot config for the active arm
+    robot_cfg = t1_curobo_cfg(active_arm)
+    
+    # Update the locked joints in the motion generator
+    motion_gen.update_locked_joints(lock_joints, robot_cfg)
 
 
 def make_dual_arm_traj(traj: torch.Tensor, active_arm: Literal["left", "right"], state: DualArmState) -> torch.Tensor:
