@@ -216,7 +216,7 @@ def solve_curobo(
             # Update locked arm position for accurate collision checking
             locked_arm = state.other_arm(op_arm)
             locked_arm_js = state.get_js(locked_arm)
-            update_locked_arm_position(motion_gen, op_arm, locked_arm_js)
+            update_locked_arm_position(motion_gen, op_arm, locked_arm_js, state.arm_holding)
             
             last_q_name = state.get_q_name(op_arm)
 

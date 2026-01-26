@@ -14,6 +14,7 @@ from cutamp.robots.t1 import (
     t1_curobo_cfg,
     t1_home_head,
     GRIPPER_OPEN,
+    GRIPPER_CLOSED,
 )
 from cutamp.utils.visualizer import Visualizer
 
@@ -97,6 +98,7 @@ def update_locked_arm_position(
     motion_gen: MotionGen,
     active_arm: Literal["left", "right"],
     locked_arm_js: JointState,
+    arm_holding: Dict[str, Optional[str]],
 ) -> None:
     """Update the locked arm's joint positions in the motion generator.
     
@@ -108,6 +110,7 @@ def update_locked_arm_position(
         motion_gen: The motion generator for the active arm.
         active_arm: Which arm is currently active ("left" or "right").
         locked_arm_js: Joint state of the locked arm (11 DOF).
+        arm_holding: Dictionary mapping arm names to held object names (or None if not holding).
     """
     # Determine which joints are locked based on active arm
     locked_arm = "right" if active_arm == "left" else "left"
@@ -127,10 +130,14 @@ def update_locked_arm_position(
     for name, value in zip(locked_joint_names, locked_arm_values):
         lock_joints[name] = value
     
-    # Gripper joints (all at open position - 0.0)
-    for prefix in ["left", "right"]:
-        for suffix in ["Link1", "Link11", "Link2", "Link22"]:
-            lock_joints[f"{prefix}_{suffix}"] = GRIPPER_OPEN[0]
+    # Gripper joints - set based on whether each arm is holding an object
+    # Both active and locked arms: closed if holding, open otherwise
+    gripper_suffixes = ["Link1", "Link11", "Link2", "Link22"]
+    for arm_name in ["left", "right"]:
+        is_holding = arm_holding.get(arm_name) is not None
+        gripper_state = GRIPPER_CLOSED if is_holding else GRIPPER_OPEN
+        for i, suffix in enumerate(gripper_suffixes):
+            lock_joints[f"{arm_name}_{suffix}"] = gripper_state[i]
     
     # Get the robot config for the active arm
     robot_cfg = t1_curobo_cfg(active_arm)
