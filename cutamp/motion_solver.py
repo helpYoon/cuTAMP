@@ -126,19 +126,21 @@ def solve_curobo(
     
     # Config for Cartesian planning (pick/place/approach)
     plan_config = MotionGenPlanConfig(
-        timeout=10.0,
+        timeout=20.0,
         max_attempts=120,
-        enable_graph=True,
+        enable_graph=False,
+        enable_graph_attempt=5,
         parallel_finetune=True,
         enable_finetune_trajopt=True,
         time_dilation_factor=config.time_dilation_factor,
     )
     # Config for joint-space planning (retract) - longer timeout since it has fewer seeds
     retract_plan_config = MotionGenPlanConfig(
-        timeout=20.0,           # Longer timeout for retract
+        timeout=40.0,           # Longer timeout for retract
         max_attempts=240,       # More attempts since seeds are limited
-        enable_graph=True,      # Graph planner as fallback
-        parallel_finetune=True,
+        enable_graph=False,     
+        parallel_finetune=True, # Graph planner as fallback
+        enable_graph_attempt=5,
         enable_finetune_trajopt=True,
         time_dilation_factor=config.time_dilation_factor,
     )
