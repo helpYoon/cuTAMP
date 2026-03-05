@@ -191,7 +191,7 @@
     <parent link="Waist" />
     <child link="Trunk" />
     <axis xyz="0 0 1" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-1.078" upper="1.0198" effort="100" velocity="50" />
   </joint>
 
   <link name="Trunk">
@@ -247,7 +247,7 @@
     <parent link="Trunk" />
     <child link="H1" />
     <axis xyz="0 0 1" />
-    <limit lower="-1.012" upper="1.012" effort="100" velocity="50" />
+    <limit lower="-1.02" upper="1.02" effort="7" velocity="12.56" />
   </joint>
 
   <link name="H2">
@@ -278,7 +278,7 @@
     <parent link="H1" />
     <child link="H2" />
     <axis xyz="0 1 0" />
-    <limit lower="-0.314" upper="0.82" effort="100" velocity="50" />
+    <limit lower="-0.514" upper="0.85" effort="7" velocity="12.56" />
   </joint>
 
   <!-- ==================== LEFT ARM ==================== -->
@@ -310,7 +310,7 @@
     <parent link="Trunk" />
     <child link="AL1" />
     <axis xyz="0 1 0" />
-    <limit lower="-3.28" upper="1.186" effort="100" velocity="50" />
+    <limit lower="-3.29" upper="1.18" effort="18" velocity="18.84" />
   </joint>
 
   <link name="AL2">
@@ -341,7 +341,7 @@
     <parent link="AL1" />
     <child link="AL2" />
     <axis xyz="1 0 0" />
-    <limit lower="-1.64" upper="1.535" effort="100" velocity="50" />
+    <limit lower="-1.577" upper="1.7055" effort="18" velocity="18.84" />
   </joint>
 
   <link name="AL3">
@@ -372,7 +372,7 @@
     <parent link="AL2" />
     <child link="AL3" />
     <axis xyz="0 1 0" />
-    <limit lower="-3.14" upper="3.14" effort="100" velocity="50" />
+    <limit lower="-2.234" upper="2.234" effort="100" velocity="50" />
   </joint>
 
   <link name="AL4">
@@ -403,7 +403,7 @@
     <parent link="AL3" />
     <child link="AL4" />
     <axis xyz="0 0 1" />
-    <limit lower="-3.14" upper="3.14" effort="100" velocity="50" />
+    <limit lower="-2.1402" upper="1.6844" effort="18" velocity="18.84" />
   </joint>
 
   <link name="AL5">
@@ -430,11 +430,11 @@
     </collision>
   </link>
   <joint name="Left_Wrist_Pitch" type="revolute">
-    <origin xyz="0 0.105 0.00025" rpy="0 0 0" />
+    <origin xyz="0 0.105 0.00025" rpy="0 0.19 0" />
     <parent link="AL4" />
     <child link="AL5" />
     <axis xyz="0 1 0" />
-    <limit lower="-3.14" upper="3.14" effort="100" velocity="50" />
+    <limit lower="-2.5821" upper="2.5821" effort="7" velocity="12.56" />
   </joint>
 
   <link name="AL6">
@@ -465,7 +465,7 @@
     <parent link="AL5" />
     <child link="AL6" />
     <axis xyz="0 0 1" />
-    <limit lower="-3.14" upper="3.14" effort="100" velocity="50" />
+    <limit lower="-1.8185" upper="1.4261" effort="18" velocity="18.84" />
   </joint>
 
   <!-- left_hand_link: visual removed - AL7.STL contained old gripper geometry that's now in separate gripper links -->
@@ -482,7 +482,7 @@
     <parent link="AL6" />
     <child link="left_hand_link" />
     <axis xyz="1 0 0" />
-    <limit lower="-3.14" upper="3.14" effort="100" velocity="50" />
+    <limit lower="-1.3614" upper="1.4285" effort="7" velocity="12.56" />
   </joint>
 
   <!-- ==================== LEFT GRIPPER (4-BAR PARALLEL LINKAGE) ==================== -->
@@ -534,7 +534,7 @@
     </collision>
   </link>
   <joint name="left_base_link" type="fixed">
-    <origin xyz="-0.006 0.08 0.01" rpy="0 0 1.5708" />
+    <origin xyz="0 0.08 0" rpy="0 0 1.5708" />
     <parent link="left_hand_link" />
     <child link="left_base_link" />
   </joint>
@@ -694,7 +694,7 @@
     <parent link="Trunk" />
     <child link="AR1" />
     <axis xyz="0 1 0" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-3.29" upper="1.1868" effort="18" velocity="18.84" />
   </joint>
 
   <link name="AR2">
@@ -725,7 +725,7 @@
     <parent link="AR1" />
     <child link="AR2" />
     <axis xyz="1 0 0" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-1.7055" upper="1.577" effort="18" velocity="18.84" />
   </joint>
 
   <link name="AR3">
@@ -756,7 +756,7 @@
     <parent link="AR2" />
     <child link="AR3" />
     <axis xyz="0 1 0" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-2.234" upper="2.234" effort="100" velocity="50" />
   </joint>
 
   <link name="AR4">
@@ -787,7 +787,7 @@
     <parent link="AR3" />
     <child link="AR4" />
     <axis xyz="0 0 1" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-1.6844" upper="2.1402" effort="18" velocity="18.84" />
   </joint>
 
   <link name="AR5">
@@ -814,11 +814,11 @@
     </collision>
   </link>
   <joint name="Right_Wrist_Pitch" type="revolute">
-    <origin xyz="0 -0.105 0.00025" rpy="0 0 0" />
+    <origin xyz="0 -0.105 0.00025" rpy="0 0.19 0" />
     <parent link="AR4" />
     <child link="AR5" />
     <axis xyz="0 1 0" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-2.5821" upper="2.5821" effort="7" velocity="12.56" />
   </joint>
 
   <link name="AR6">
@@ -849,7 +849,7 @@
     <parent link="AR5" />
     <child link="AR6" />
     <axis xyz="0 0 1" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-1.4261" upper="1.8185" effort="18" velocity="18.84" />
   </joint>
 
   <!-- right_hand_link: visual removed - AR7.STL contained old gripper geometry that's now in separate gripper links -->
@@ -866,7 +866,7 @@
     <parent link="AR6" />
     <child link="right_hand_link" />
     <axis xyz="1 0 0" />
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="50" />
+    <limit lower="-1.4285" upper="1.3614" effort="7" velocity="12.56" />
   </joint>
 
   <!-- ==================== RIGHT GRIPPER (4-BAR PARALLEL LINKAGE) ==================== -->
@@ -905,7 +905,7 @@
     </collision>
   </link>
   <joint name="right_base_link" type="fixed">
-    <origin xyz="-0.006 -0.084 0.01" rpy="0 0 -1.5708" />
+    <origin xyz="0 -0.084 0" rpy="0 0 -1.5708" />
     <parent link="right_hand_link" />
     <child link="right_base_link" />
   </joint>
@@ -1037,4 +1037,3 @@
   </joint>
 
 </robot>
-
