@@ -1,167 +1,166 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 
-  Booster T1 Humanoid Robot - Torso Control URDF
-  
-  This URDF enables torso pitch (bowing) and waist yaw motions for motion planning.
-  
-  Virtual Joint Mapping to Real Hardware:
-  - Torso_Pitch (Y-axis) → Left_Hip_Pitch (#11) + Right_Hip_Pitch (#17) coordinated
-  - Waist_Yaw (Z-axis)   → Waist_Yaw (#10) direct mapping
-  
-  The leg joints are present but should be LOCKED in the CuRobo config,
-  as they move together via the virtual Torso_Pitch joint.
+<!--
+  Booster T1 Humanoid Robot - Simplified URDF for cuTAMP planning.
+
+  Body chain (above the cuRobo planar base):
+    mobile_base_link  (the wheeled platform, abstracted)
+      ├─ ankle_pitch   (revolute Y)
+      ├─ shank_link    (0.28 m cylinder)
+      ├─ knee_pitch    (revolute Y)
+      ├─ thigh_link    (0.28 m cylinder)
+      ├─ Torso_Pitch   (revolute Y)
+      └─ Trunk         (mesh, carries head + arms)
+
+  ankle_pitch / knee_pitch limits are taken directly from the actual T1
+  (actual_robot.urdf: Left_Ankle_Pitch and Left_Knee_Pitch). The shank
+  length matches actual_robot.urdf as well; the thigh length is mirrored
+  (this single-leg simplification skips the multi-segment hip chain on
+  the real robot — Hip_Pitch + Hip_Roll + Hip_Yaw are intentionally
+  omitted because the planar mobile base already provides yaw and the
+  envs we plan in don't need lateral hip tilt).
 -->
 <robot name="booster_t1_torso">
 
-  <!-- ==================== BASE ON GROUND ==================== -->
-  <!-- Frame at bottom of the base (z = 0). Box is 0.25 x 0.25 x 0.05 -->
-  <link name="lifting_base_link">
+  <!-- ==================== WORLD ANCHOR ==================== -->
+  <!-- Static world frame. cuRobo's planar-base extra_links chain (base_j_x,
+       base_j_y, base_j_yaw) re-parents mobile_base_link below this anchor,
+       so the whole robot translates/rotates on the floor as a planning DOF. -->
+  <link name="world"/>
+  <joint name="world_to_mobile_base" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="world"/>
+    <child link="mobile_base_link"/>
+  </joint>
+
+  <!-- ==================== MOBILE BASE PLATFORM ==================== -->
+  <!-- The wheeled base (wheels themselves are abstracted by the planar joints).
+       0.25 x 0.25 x 0.05 box; same dimensions as the prior lifting_base_link. -->
+  <link name="mobile_base_link">
     <inertial>
-      <origin xyz="0 0 0.025" rpy="0 0 0"/>
+      <origin xyz="0 0 0.021" rpy="0 0 0"/>
       <mass value="20.0"/>
-      <!-- simple isotropic inertia placeholder -->
       <inertia ixx="0.1" ixy="0.0" ixz="0.0"
                iyy="0.1" iyz="0.0" izz="0.1"/>
     </inertial>
     <visual>
-      <origin xyz="0 0 0.025" rpy="0 0 0"/>
+      <origin xyz="0 0 0.021" rpy="0 0 0"/>
       <geometry>
-        <box size="0.25 0.25 0.05"/>
+        <box size="0.25 0.25 0.042"/>
       </geometry>
       <material name="DarkGrey">
         <color rgba="0.2 0.2 0.2 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0.025" rpy="0 0 0"/>
+      <origin xyz="0 0 0.021" rpy="0 0 0"/>
       <geometry>
-        <box size="0.25 0.25 0.05"/>
+        <box size="0.25 0.25 0.042"/>
       </geometry>
     </collision>
   </link>
 
-  <!-- ==================== LIFTING COLUMN: STAGE 1 (FIXED) ==================== -->
-  <!-- Frame at bottom of cylinder. Length = 0.25, so COM at z = 0.125 -->
-  <link name="column_stage_1">
+  <!-- ==================== ANKLE PITCH (revolute) ==================== -->
+  <!-- Mounted at the top of the mobile base (z = 0.05). Limits from
+       actual_robot.urdf:1318-1319 (Left_Ankle_Pitch).
+
+       The axis is "0 -1 0" (negated from the real URDF's "0 1 0") because
+       this chain is inverted relative to the real robot: the leg here
+       extends UP from the mobile base, while the real T1's leg extends
+       DOWN from the body. Negating the Y axis keeps the SIGN of every
+       joint value consistent with the real robot — positive ankle_pitch
+       still corresponds to dorsiflexion (body tilts backward) in both
+       URDFs, so any joint vector transferred between sim and hardware
+       produces the same physical motion. -->
+  <joint name="ankle_pitch" type="revolute">
+    <origin xyz="0 0 0.042" rpy="0 0 0"/>
+    <parent link="mobile_base_link"/>
+    <child  link="shank_link"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-0.87" upper="0" effort="12" velocity="18.8"/>
+  </joint>
+
+  <!-- ==================== SHANK (0.28 m cylinder) ==================== -->
+  <link name="shank_link">
     <inertial>
-      <origin xyz="0 0 0.125" rpy="0 0 0"/>
-      <mass value="5.0"/>
-      <!-- solid cylinder approx: m=5, r=0.08, L=0.25 -->
-      <inertia ixx="0.03404" ixy="0.0" ixz="0.0"
-               iyy="0.03404" iyz="0.0" izz="0.016"/>
+      <origin xyz="0 0 0.14" rpy="0 0 0"/>
+      <mass value="2.0"/>
+      <inertia ixx="0.01441" ixy="0.0" ixz="0.0"
+               iyy="0.01441" iyz="0.0" izz="0.0025"/>
     </inertial>
     <visual>
-      <origin xyz="0 0 0.125" rpy="0 0 0"/>
+      <origin xyz="0 0 0.14" rpy="0 0 0"/>
       <geometry>
-        <cylinder radius="0.08" length="0.25"/>
+        <cylinder radius="0.05" length="0.28"/>
       </geometry>
       <material name="Silver">
         <color rgba="0.7 0.7 0.7 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0.125" rpy="0 0 0"/>
+      <origin xyz="0 0 0.14" rpy="0 0 0"/>
       <geometry>
-        <cylinder radius="0.08" length="0.25"/>
+        <cylinder radius="0.05" length="0.28"/>
       </geometry>
     </collision>
   </link>
 
-  <!-- Stage 1 is rigidly bolted to the base top (z = 0.05) -->
-  <joint name="base_to_stage1" type="fixed">
-    <origin xyz="0 0 0.05" rpy="0 0 0"/>
-    <parent link="lifting_base_link"/>
-    <child  link="column_stage_1"/>
+  <!-- ==================== KNEE PITCH (revolute) ==================== -->
+  <!-- At the top of the shank. Limits from actual_robot.urdf:1260-1261
+       (Left_Knee_Pitch). Axis negated (see ankle_pitch above for the
+       inverted-chain rationale). -->
+  <joint name="knee_pitch" type="revolute">
+    <origin xyz="0 0 0.28" rpy="0 0 0"/>
+    <parent link="shank_link"/>
+    <child  link="thigh_link"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="0" upper="2.34" effort="60" velocity="11.7"/>
   </joint>
 
-  <!-- ==================== LIFTING COLUMN: STAGE 2 (PRISMATIC) ==================== -->
-  <!-- Frame at bottom of cylinder. Length = 0.25, COM at z = 0.125 -->
-  <link name="column_stage_2">
+  <!-- ==================== THIGH (0.236 m cylinder) ==================== -->
+  <!-- Length 0.236m absorbs the real robot's Hip_Pitch → Hip_Roll → Hip_Yaw
+       → Knee_Pitch chain (0.02 + 0.0819 + 0.134 = 0.236m) so the Trunk's
+       world-Z at home matches actual_robot.urdf (0.6735m). -->
+  <link name="thigh_link">
     <inertial>
-      <origin xyz="0 0 0.125" rpy="0 0 0"/>
-      <mass value="3.0"/>
-      <!-- solid cylinder approx: m=3, r=0.065, L=0.25 -->
-      <inertia ixx="0.01879" ixy="0.0" ixz="0.0"
-               iyy="0.01879" iyz="0.0" izz="0.00634"/>
+      <origin xyz="0 0 0.118" rpy="0 0 0"/>
+      <mass value="2.0"/>
+      <inertia ixx="0.01441" ixy="0.0" ixz="0.0"
+               iyy="0.01441" iyz="0.0" izz="0.0025"/>
     </inertial>
     <visual>
-      <origin xyz="0 0 0.125" rpy="0 0 0"/>
+      <origin xyz="0 0 0.118" rpy="0 0 0"/>
       <geometry>
-        <cylinder radius="0.065" length="0.25"/>
+        <cylinder radius="0.05" length="0.236"/>
       </geometry>
       <material name="Grey">
         <color rgba="0.5 0.5 0.5 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0.125" rpy="0 0 0"/>
+      <origin xyz="0 0 0.118" rpy="0 0 0"/>
       <geometry>
-        <cylinder radius="0.065" length="0.25"/>
+        <cylinder radius="0.05" length="0.236"/>
       </geometry>
     </collision>
   </link>
 
-  <!-- Telescoping stage 2.
-       At q1 = 0: bottom of stage2 is at base top (0.05).
-       At q1 = 0.15: bottom moves up by 0.15. -->
-  <joint name="waist_lift_1" type="prismatic">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <parent link="column_stage_1"/>
-    <child  link="column_stage_2"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="0.0" upper="0.15" effort="1000" velocity="0.5"/>
-  </joint>
-
-  <!-- ==================== LIFTING COLUMN: STAGE 3 (PRISMATIC, CARRIES WAIST) ==================== -->
-  <!-- Frame at bottom of cylinder. Length chosen so that robot height at full
-       extension is ~1.18 m. L3 = 0.212388, COM at z = 0.106194. -->
-  <link name="column_stage_3">
-    <inertial>
-      <origin xyz="0 0 0.106194" rpy="0 0 0"/>
-      <mass value="2.0"/>
-      <!-- solid cylinder approx: m=2, r=0.05, L=0.212388 -->
-      <inertia ixx="0.00877" ixy="0.0" ixz="0.0"
-               iyy="0.00877" iyz="0.0" izz="0.00250"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0.106194" rpy="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.212388"/>
-      </geometry>
-      <material name="LightGrey">
-        <color rgba="0.8 0.8 0.8 1.0"/>
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0.106194" rpy="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.05" length="0.212388"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <!-- Telescoping stage 3.
-       At q2 = 0: bottom of stage3 is at base top + q1.
-       At q2 = 0.15: it is further raised by 0.15. -->
-  <joint name="waist_lift_2" type="prismatic">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <parent link="column_stage_2"/>
-    <child  link="column_stage_3"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="0.0" upper="0.15" effort="1000" velocity="0.5"/>
-  </joint>
-
-  <!-- ==================== TORSO PITCH BETWEEN COLUMN AND WAIST ==================== -->
-  <!-- Waist is attached to the TOP of stage 3 (z = L3 = 0.212388 in the stage3 frame). -->
+  <!-- ==================== TORSO PITCH (revolute) ==================== -->
+  <!-- At the top of the thigh. Coordinated abstraction of the real T1's
+       Left_Hip_Pitch + Right_Hip_Pitch (actual_robot.urdf:1077-1093);
+       limits taken directly from Left_Hip_Pitch ([-1.8, 1.57]). Axis
+       negated (see ankle_pitch above for the inverted-chain rationale). -->
   <joint name="Torso_Pitch" type="revolute">
-    <origin xyz="0 0 0.212388" rpy="0 0 0"/>
-    <parent link="column_stage_3"/>
+    <origin xyz="0 0 0.236" rpy="0 0 0"/>
+    <parent link="thigh_link"/>
     <child  link="Waist"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="0" upper="0.7" effort="100" velocity="50"/>
+    <axis xyz="0 -1 0"/>
+    <!-- velocity=12.5 matches real T1 Left/Right_Hip_Pitch (this joint
+         abstracts both). Previously 50 was a placeholder. -->
+    <limit lower="-1.8" upper="0" effort="100" velocity="12.5"/>
   </joint>
 
-  <!-- ==================== WAIST AND TRUNK (UNCHANGED) ==================== -->
+  <!-- ==================== WAIST ==================== -->
+  <!-- Hip mounting block between Torso_Pitch and Waist_Yaw. -->
   <link name="Waist">
     <inertial>
       <origin xyz="0.002284 0.000003 0.007301" rpy="0 0 0" />
@@ -186,17 +185,38 @@
     </collision>
   </link>
 
+  <!-- ==================== WAIST YAW (revolute) ==================== -->
+  <!-- Torso yaw between Waist and Trunk. Axis + limits match the real
+       T1's Waist joint (actual_robot.urdf, axis="0 0 1"). Z-axis sign
+       convention is the same in both URDFs (no flip needed for yaw). -->
   <joint name="Waist_Yaw" type="revolute">
+    <!-- Note on frame mismatch with actual_robot.urdf: our simplified URDF
+         reverses the parent/child for this joint (parent=Waist, child=Trunk)
+         because our root is `world` and the chain reads bottom-up. The
+         reverse means the Waist_Yaw rotation axis sits at a different
+         physical point than the real URDF's, so trying to align the Trunk
+         LINK FRAME with real (by adding the -0.0625 X here) introduces an
+         off-axis rotation when Waist_Yaw is non-zero. We accept a 6.25 cm
+         offset in the Trunk frame definition (sim's Trunk is forward of
+         real's) to keep the rotation axis behavior correct. Consumers
+         transforming hand poses to real-URDF's Trunk frame must add
+         +0.0625 m to X to compensate. -->
     <origin xyz="0 0 0.1155" rpy="0 0 0" />
     <parent link="Waist" />
     <child link="Trunk" />
     <axis xyz="0 0 1" />
-    <limit lower="-1.078" upper="1.0198" effort="100" velocity="50" />
+    <limit lower="-1.57" upper="1.57" effort="30" velocity="10.88" />
   </joint>
 
+  <!-- ==================== TRUNK ==================== -->
+  <!-- Inertial / visual / collision origins all carry a -0.0625 X offset
+       to compensate for our Trunk LINK FRAME being 6.25 cm forward of the
+       real URDF's (see the Waist_Yaw note above). With these compensations,
+       the rendered geometry and mass distribution land at the correct
+       world positions even though the link frame itself is offset. -->
   <link name="Trunk">
     <inertial>
-      <origin xyz="-0.0073634598906924 -1.42058017623659E-06 0.105062332707657" rpy="0 0 0" />
+      <origin xyz="-0.0698634598906924 -1.42058017623659E-06 0.105062332707657" rpy="0 0 0" />
       <mass value="11.7" />
       <inertia ixx="0.0915287235057927" ixy="-4.25369739206781E-07" ixz="0.000646360369011163"
                iyy="0.076778716903413" iyz="5.82340020271393E-07" izz="0.0556171053368987" />
@@ -243,6 +263,9 @@
     </collision>
   </link>
   <joint name="AAHead_yaw" type="revolute">
+    <!-- x=0 in our sim (vs +0.0625 in real). Paired with the Trunk frame
+         being 6.25 cm forward of real's, this places H1 at the same world
+         position the real robot produces. -->
     <origin xyz="0 0 0.243" rpy="0 0 0" />
     <parent link="Trunk" />
     <child link="H1" />
@@ -306,6 +329,9 @@
     </collision>
   </link>
   <joint name="Left_Shoulder_Pitch" type="revolute">
+    <!-- x=-0.005 in our sim (vs +0.0575 in real). Paired with the Trunk
+         frame being 6.25 cm forward of real's, places AL1 at the same
+         world position the real robot produces. -->
     <origin xyz="-0.005 0.1063 0.219" rpy="0 0.00088113 0" />
     <parent link="Trunk" />
     <child link="AL1" />
@@ -372,7 +398,7 @@
     <parent link="AL2" />
     <child link="AL3" />
     <axis xyz="0 1 0" />
-    <limit lower="-2.234" upper="2.234" effort="100" velocity="50" />
+    <limit lower="-2.234" upper="2.234" effort="100" velocity="18.84" />
   </joint>
 
   <link name="AL4">
@@ -430,7 +456,7 @@
     </collision>
   </link>
   <joint name="Left_Wrist_Pitch" type="revolute">
-    <origin xyz="0 0.105 0.00025" rpy="0 0.19 0" />
+    <origin xyz="0 0.105 0.00025" rpy="0 0 0" />
     <parent link="AL4" />
     <child link="AL5" />
     <axis xyz="0 1 0" />
@@ -534,7 +560,7 @@
     </collision>
   </link>
   <joint name="left_base_link" type="fixed">
-    <origin xyz="0 0.08 0" rpy="0 0 1.5708" />
+    <origin xyz="0 0.084 0" rpy="0 0 1.5708" />
     <parent link="left_hand_link" />
     <child link="left_base_link" />
   </joint>
@@ -690,6 +716,9 @@
     </collision>
   </link>
   <joint name="Right_Shoulder_Pitch" type="revolute">
+    <!-- x=-0.005 in our sim (vs +0.0575 in real). Paired with the Trunk
+         frame being 6.25 cm forward of real's, places AR1 at the same
+         world position the real robot produces. -->
     <origin xyz="-0.005 -0.1063 0.219" rpy="0 0.00088113 0" />
     <parent link="Trunk" />
     <child link="AR1" />
@@ -756,7 +785,7 @@
     <parent link="AR2" />
     <child link="AR3" />
     <axis xyz="0 1 0" />
-    <limit lower="-2.234" upper="2.234" effort="100" velocity="50" />
+    <limit lower="-2.234" upper="2.234" effort="100" velocity="18.84" />
   </joint>
 
   <link name="AR4">
@@ -814,7 +843,7 @@
     </collision>
   </link>
   <joint name="Right_Wrist_Pitch" type="revolute">
-    <origin xyz="0 -0.105 0.00025" rpy="0 0.19 0" />
+    <origin xyz="0 -0.105 0.00025" rpy="0 0 0" />
     <parent link="AR4" />
     <child link="AR5" />
     <axis xyz="0 1 0" />

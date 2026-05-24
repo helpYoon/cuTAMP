@@ -7,7 +7,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import logging
 import os
+import pickle
+from pathlib import Path
 from typing import Optional
 
 from cutamp.algorithm import run_cutamp
@@ -15,56 +18,71 @@ from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
-from cutamp.envs.book_shelf import load_book_shelf_env
-from cutamp.envs.stick_button import load_stick_button_env
-from cutamp.envs.tetris import load_tetris_env
 from cutamp.envs.utils import get_env_dir, load_env
 
 from cutamp.scripts.utils import (
     default_constraint_to_mult,
     default_constraint_to_tol,
     setup_logging,
-    get_tetris_tuned_constraint_to_mult,
 )
+
+_log = logging.getLogger(__name__)
 
 
 def load_demo_env(name: str) -> TAMPEnvironment:
-    if name.startswith("tetris_"):
-        num_blocks = int(name.split("tetris_")[-1])
-        env = load_tetris_env(num_blocks, buffer_multiplier=1.0)
-    elif name == "book_shelf":
-        env = load_book_shelf_env()
-    elif name == "stick_button":
-        env = load_stick_button_env()
-    elif name == "blocks":
-        env_path = os.path.join(get_env_dir(), "obstacle_blocks_large_region.yml")
-        env = load_env(env_path)
-    elif name == "unpack":
-        env_path = os.path.join(get_env_dir(), "unpack_3.yml")
-        env = load_env(env_path)
-    elif name == "blocks_t1":
+    if name == "blocks_t1":
         env_path = os.path.join(get_env_dir(), "blocks_t1.yml")
-        env = load_env(env_path)
-    else:
-        raise ValueError(f"Unknown environment name: {name}")
-    return env
+        return load_env(env_path)
+    raise ValueError(f"Unknown environment name: {name}")
 
 
 def cutamp_demo(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
     experiment_id: Optional[str] = None,
-    use_tetris_tuned_weights: bool = False,
+    save_plan: Optional[str] = None,
 ):
+    """Run the cuTAMP demo.
+
+    ``save_plan``:
+        ``None`` — don't save the motion plan (default).
+        ``"auto"`` — save to ``<experiment_root>/<experiment_id>/motion_plan.pkl``.
+        Any other string — save to that path (parent directory auto-created).
+    """
     setup_logging()
 
-    constraint_to_mult = (
-        get_tetris_tuned_constraint_to_mult() if use_tetris_tuned_weights else default_constraint_to_mult.copy()
-    )
-    cost_reducer = CostReducer(constraint_to_mult)
+    cost_reducer = CostReducer(default_constraint_to_mult.copy())
     constraint_checker = ConstraintChecker(default_constraint_to_tol.copy())
 
-    run_cutamp(env, config, cost_reducer, constraint_checker, experiment_id=experiment_id)
+    # Resolve experiment_id up front so the --save_plan output path lines up
+    # with the directory ExperimentLogger writes its other artifacts to (it
+    # would otherwise generate its own timestamp inside run_cutamp).
+    if experiment_id is None:
+        from datetime import datetime
+        experiment_id = datetime.now().isoformat().split(".")[0]
+
+    curobo_plan, _num_satisfying = run_cutamp(
+        env, config, cost_reducer, constraint_checker, experiment_id=experiment_id,
+    )
+
+    if save_plan is not None and curobo_plan is not None:
+        if save_plan == "auto":
+            out_path = Path(config.experiment_root) / experiment_id / "motion_plan.pkl"
+        else:
+            out_path = Path(save_plan)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Process into the structured [trunk, arms, hands] schema and pickle.
+        # See cutamp/utils/plan_processor.py for the output schema.
+        from cutamp.utils.plan_processor import process_motion_plan
+        processed = process_motion_plan(curobo_plan)
+        with open(out_path, "wb") as f:
+            pickle.dump(processed, f)
+        n_traj = sum(1 for e in curobo_plan if e.get("type") == "trajectory")
+        _log.info(f"Saved processed motion plan ({n_traj} segments) to {out_path}")
+    elif save_plan is not None and curobo_plan is None:
+        _log.warning(f"--save_plan requested but no motion plan was generated (curobo_plan is None)")
+
+
 
 
 def entrypoint():
@@ -78,8 +96,8 @@ def entrypoint():
     parser.add_argument(
         "--env",
         help="Environment name to run",
-        default="tetris_3",
-        choices=["tetris_1", "tetris_2", "tetris_3", "tetris_5", "book_shelf", "stick_button", "blocks", "unpack", "blocks_t1"],
+        default="blocks_t1",
+        choices=["blocks_t1"],
     )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=1024, help="Number of particles to use (i.e. batch size)"
@@ -90,20 +108,32 @@ def entrypoint():
         "--optimize_soft_costs", action="store_true", help="Whether to optimize soft costs (default: False)"
     )
     parser.add_argument(
+        "--upstream_style_optimize", action="store_true",
+        help="Diagnostic: mimic NVlabs/cuTAMP main — Adam runs always with soft costs in loss, no Phase 2 LBFGS.",
+    )
+    parser.add_argument(
+        "--coupled_reik", action="store_true",
+        help="Re-IK-coupled Adam: outer Adam on poses/grasps, covered Confs refreshed by IK every --reik_interval steps. "
+             "Required for pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
+    )
+    parser.add_argument(
+        "--reik_interval", type=int, default=5,
+        help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
+    )
+    parser.add_argument(
         "--soft_cost",
         nargs="*",
-        choices=["dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home", "minimize_lift_movement"],
-        help="Soft cost(s) to optimize. Can specify multiple: --soft_cost retract_close_to_home minimize_lift_movement",
+        choices=["dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home", "minimize_body_movement", "com_polygon", "place_close_to_base"],
+        help="Soft cost(s) to optimize. Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
-    # Robot and grasp
-    parser.add_argument("--robot", default="t1", choices=["panda", "ur5", "t1"], help="Robot to use")
+    # Grasp
     parser.add_argument(
         "--grasp_dof",
         type=int,
         default=4,
         choices=[4, 6],
-        help="Grasp DOF to use. 6-DOF is really only supported for the book_shelf environment.",
+        help="Grasp DOF to use.",
     )
 
     # Approach
@@ -124,6 +154,13 @@ def entrypoint():
         "--num_opt_steps", type=int, default=1000, help="Number of optimization steps to run for each skeleton."
     )
     parser.add_argument(
+        "--lr", type=float, default=7e-3, help="Adam LR for non-Conf particle params (poses, grasps).",
+    )
+    parser.add_argument(
+        "--conf_lr", type=float, default=2.226e-2,
+        help="Adam LR for Conf particle params (robot q). Lowering this reduces Adam first-step destruction on T1's 21-DOF cspace.",
+    )
+    parser.add_argument(
         "--max_duration",
         type=float,
         default=None,
@@ -136,8 +173,17 @@ def entrypoint():
     parser.add_argument(
         "--motion_plan",
         action="store_true",
-        help="Whether to plan for full motions after using cuTAMP. Not supported in stick_button domain yet.",
+        help="Whether to plan for full motions after using cuTAMP.",
     )
+    parser.add_argument(
+        "--no_enable_com_polygon",
+        dest="enable_com_polygon",
+        action="store_false",
+        help="Disable the COM-over-base-polygon soft cost on the motion planner. "
+             "By default the cost is enabled (1e5 weight) and keeps the planner's "
+             "configurations from tipping over the wheelbase.",
+    )
+    parser.set_defaults(enable_com_polygon=True)
 
     # Visualization and logging
     parser.add_argument(
@@ -162,27 +208,43 @@ def entrypoint():
         default=None,
         help="Experiment ID for logging. Results will be saved in <experiment_root>/<experiment_id>",
     )
-
-    # Tetris tuned weights
     parser.add_argument(
-        "--tuned_tetris_weights", action="store_true", help="Use weights tuned on tetris_5 for constraint multipliers."
+        "--save_plan",
+        type=str,
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "Save the generated motion plan to a pickle file in a structured format. "
+            "Omit flag to skip saving. Pass with no arg to write to "
+            "<experiment_root>/<experiment_id>/motion_plan.pkl. Pass an explicit path "
+            "to write there instead. Pickle contains per-segment dicts with "
+            "position/velocity arrays for [trunk_height, trunk_pitch, trunk_yaw, "
+            "right_arm(7), left_arm(7), right_hand_xyz+quat, left_hand_xyz+quat] "
+            "plus dt and held_objs. See cutamp/utils/plan_processor.py for schema."
+        ),
     )
 
     # We only expose a subset of the full TAMPConfiguration. Check config.py for the full configuration.
     args = parser.parse_args()
     config = TAMPConfiguration(
         num_particles=args.num_particles,
-        robot=args.robot,
         grasp_dof=args.grasp_dof,
         approach=args.approach,
         num_resampling_attempts=args.num_resampling_attempts,
         num_opt_steps=args.num_opt_steps,
+        lr=args.lr,
+        conf_lr=args.conf_lr,
         max_loop_dur=args.max_duration,
         optimize_soft_costs=args.optimize_soft_costs,
+        upstream_style_optimize=args.upstream_style_optimize,
+        coupled_reik=args.coupled_reik,
+        reik_interval=args.reik_interval,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
         cache_subgraphs=args.cache_subgraphs,
         curobo_plan=args.motion_plan,
+        enable_com_polygon=args.enable_com_polygon,
         enable_visualizer=not args.disable_visualizer,
         opt_viz_interval=args.viz_interval,
         viz_robot_mesh=not args.disable_robot_mesh,
@@ -192,7 +254,7 @@ def entrypoint():
 
     # Load env and run demo
     env = load_demo_env(args.env)
-    cutamp_demo(env, config, experiment_id=args.experiment_id, use_tetris_tuned_weights=args.tuned_tetris_weights)
+    cutamp_demo(env, config, experiment_id=args.experiment_id, save_plan=args.save_plan)
 
 
 if __name__ == "__main__":

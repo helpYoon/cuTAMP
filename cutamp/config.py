@@ -16,9 +16,6 @@ class TAMPConfiguration:
     # Number of particles to initialize and optimize over
     num_particles: int = 1024
 
-    # Robot embodiment to use
-    robot: Literal["panda", "ur5", "t1"] = "t1"
-
     # Grasp and Placements
     grasp_dof: Literal[4, 6] = 4
     place_dof: Literal[4] = 4
@@ -39,13 +36,22 @@ class TAMPConfiguration:
     max_loop_dur: Optional[float] = None
     # Whether to break upon finding a satisfying particle
     break_on_satisfying: bool = True
-    # Whether we're running stick button experiment. Modifies heuristic for comparing baselines
-    stick_button_experiment: bool = False
 
     ## Soft Costs
     optimize_soft_costs: bool = False
     # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home, minimize_lift_movement
     soft_cost: Optional[List[str]] = None
+    # Diagnostic: mimic NVlabs/cuTAMP main — Adam always runs with soft costs
+    # in the loss; no Phase 2 LBFGS. Useful for pose-class soft costs that
+    # LBFGS can't refine along the IK constraint manifold.
+    upstream_style_optimize: bool = False
+    # Re-IK-coupled Adam (bilevel): outer Adam optimizes Pose/Grasp/free-Conf;
+    # covered Confs (q_pick/q_place/etc.) are dropped from the optimizer and
+    # refreshed by an exact IK call every reik_interval steps. Makes pose-class
+    # soft costs trainable on T1 by removing the kinematic-constraint coupling
+    # that destroys 21-DOF Adam runs.
+    coupled_reik: bool = False
+    reik_interval: int = 5
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
@@ -73,8 +79,19 @@ class TAMPConfiguration:
     ## Trajectories and cuRobo
     # Whether to also optimize full trajectories (not supported right now)
     enable_traj: bool = False
+    # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
+    enable_com_polygon: bool = True
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
+    # On RuntimeError from solve_curobo, retry on the next-best satisfying particle
+    # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
+    # failures that look feasible but never converge — see motion_solver retry helper.
+    motion_plan_max_retries: int = 5
+    # When True, dump per-constraint / per-timestep diagnostics on every motion-
+    # plan failure (slow: walks horizon × N FK in Python). Off by default since
+    # the outer retry usually masks transient failures; turn on when debugging
+    # cuRobo trajopt issues. See cutamp/utils/motion_diagnostics.py.
+    debug_motion_failures: bool = False
     # For slowing down cuRobo motion plans (0.5 is safe on the real robot)
     time_dilation_factor: Optional[float] = None
     # Whether to warmup IK solver
@@ -101,8 +118,6 @@ class TAMPConfiguration:
 def validate_tamp_config(config: TAMPConfiguration):
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
-    if config.robot not in {"panda", "ur5", "t1"}:
-        raise ValueError(f"Invalid embodiment: {config.robot}")
     if config.grasp_dof not in {4, 6}:
         raise ValueError(f"Invalid grasp_dof: {config.grasp_dof}")
     if config.place_dof not in {4}:
@@ -119,6 +134,8 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"Learning rate (lr) must be positive, not {config.lr}")
     if config.conf_lr <= 0:
         raise ValueError(f"Configuration learning rate (conf_lr) must be positive, not {config.conf_lr}")
+    if config.reik_interval <= 0:
+        raise ValueError(f"reik_interval must be positive, not {config.reik_interval}")
 
     # Advanced args
     if config.max_loop_dur is not None and config.max_loop_dur <= 0:
