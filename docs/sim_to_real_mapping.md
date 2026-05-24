@@ -246,3 +246,16 @@ Specific URDF changes that remain in effect:
 - Save processor / schema docstring: `cutamp/utils/plan_processor.py`
 - Save CLI flag: `cutamp/scripts/run_cutamp.py:--save_plan`
 - Sphere geometry: `cutamp/robots/assets/t1_description/t1_spheres.yml`
+
+## Pickle safety
+
+`motion_plan.pkl` uses Python pickle. Loading a pickle from any source
+executes arbitrary code inside that file — if you `scp` a teammate's
+pickle and load it, you are running their code with your permissions.
+Mitigations:
+
+- Only load from filesystems you control.
+- If you need to share plans across hosts, share the source script + CLI
+  invocation and regenerate, not the pickle itself.
+- Long-term migration to a safe format (msgpack / safetensors) is on the
+  backlog but not currently scheduled.

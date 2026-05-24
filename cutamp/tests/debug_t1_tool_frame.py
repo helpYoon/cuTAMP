@@ -26,8 +26,8 @@ import torch
 import roma
 import numpy as np
 import rerun as rr
-from curobo.types.base import TensorDeviceType
-from curobo.geom.transform import quaternion_to_matrix
+from curobo.types import DeviceCfg
+from curobo._src.geom.transform import quaternion_to_matrix
 
 np.set_printoptions(precision=4, suppress=True)
 
@@ -77,20 +77,22 @@ def main():
     rr.init("T1 Tool Frame Debug", spawn=True)
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     
-    tensor_args = TensorDeviceType()
+    tensor_args = DeviceCfg()
     
     # =========================================================================
     # 1. Load T1 models
     # =========================================================================
     print("\n[1] Loading T1 models...")
     from cutamp.robots import load_t1_container
-    from cutamp.robots.t1 import get_t1_kinematics_model, t1_home_left, load_t1_rerun
+    from cutamp.robots.t1 import get_t1_kinematics, t1_home, load_t1_rerun
     from cutamp.utils.common import action_4dof_to_mat4x4
-    
+
     container = load_t1_container(tensor_args)
-    left_kin = get_t1_kinematics_model("left")
-    rerun_robot = load_t1_rerun(load_mesh=True, arm="left")
-    rerun_robot.set_joint_positions(t1_home_left)
+    # v0.8 port: single kinematics model (no per-arm split); per-arm IK still
+    # exists via get_t1_ik_solver() further below.
+    left_kin = get_t1_kinematics()
+    rerun_robot = load_t1_rerun(load_mesh=True)
+    rerun_robot.set_joint_positions(t1_home)
     print("    Models loaded successfully")
     
     # =========================================================================
@@ -128,9 +130,10 @@ def main():
     
     try:
         from cutamp.robots.t1 import get_t1_ik_solver
-        from curobo.types.math import Pose
-        
-        ik_solver = get_t1_ik_solver("left", world_cfg=None)
+        from curobo.scene import Scene
+        from curobo.types import Pose
+
+        ik_solver = get_t1_ik_solver(Scene())
         
         # Test grasp at a reachable position
         grasp_4dof = torch.tensor([[0.5, 0.0, 0.5, 0.0]], device=tensor_args.device, dtype=torch.float32)
