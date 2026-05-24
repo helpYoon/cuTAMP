@@ -27,7 +27,7 @@ The user elected to fix all 15 in one bundle, split into 5 thematic commits so e
 | 10 | B2 | 5 | `_curobo_internals.py:74` | `cspace_plan_succeeded` squeeze loop's `> 2` should be `>= 2` |
 | 11 | D2 | 3 | `plan_processor.py:153` | `_to_active_cspace` skips reorder when DOF count matches, ignoring joint-name order |
 | 12 | C3 + S5 | 4 | `t1_state.py:110` | `_apply_pin` is non-atomic; tool-pose criteria leak on raise. `_disabled_tool_pose_frames` bookkeeping set by caller AFTER the planner mutation makes the recovery path worse. |
-| 13 | F2 | 3 | `load_motion_plan_for_mpc.py:78` | `compensate_trunk_x_offset` mutates in place with no idempotency guard |
+| 13 | F2 | 3 (OBSOLETE) | `load_motion_plan_for_mpc.py:78` | `compensate_trunk_x_offset` mutates in place with no idempotency guard — **resolved by F1 revision**: the helper is deleted entirely (compensation moves into `plan_processor.py`) |
 | 14 | F4 | 5 | `load_motion_plan_for_mpc.py:170` | `pickle.load` only catches `FileNotFoundError`; RCE risk + bad UX on corrupt pickle |
 | 15 | C2 | 4 | `t1_state.py:157` | `pin_for_movebase` lacks the "already-pinned" guard `pin_for_arm_action` has |
 
@@ -35,7 +35,9 @@ Bonus (in scope, not from the top-15): the URDF Y-asymmetry between `left_base_l
 
 ## Design decisions (locked in)
 
-- **F1 (hand frame)**: Switch the FK target in `plan_processor.py` from `*_base_link` to `*_hand_link`. Both URDFs have this link → consumer needs no extra transforms. Existing `motion_plan.pkl` files become invalid (intentional breaking change).
+- **F1 (hand frame)** [REVISED 2026-05-24 after URDF consistency check]: Switch the FK target in `plan_processor.py` from `*_base_link` to `*_hand_link` (both URDFs share this link). Additionally **emit hand poses in WORLD frame, not Trunk frame** — manipulation MPCs work in world coordinates and feeding them Trunk-frame poses created the entire 6.25 cm-offset compensation recipe in the first place. Drop the Trunk-frame hand fields entirely.
+- **F1 corollary — Trunk pose compensation moves inside the processor**: Apply `-0.0625` to `trunk_xyz_world[:, 0]` inside `plan_processor.py` so the saved `trunk_xyz_world` represents real-URDF's Trunk world pose, not sim's. End result: the saved schema is real-URDF-native, the consumer needs zero frame transforms, and `compensate_trunk_x_offset` in `examples/load_motion_plan_for_mpc.py` becomes unnecessary (delete the helper; F2 becomes moot).
+- **URDF consistency verified**: I read both URDFs end-to-end. For all shared upper-body joints (`AAHead_yaw`, all shoulder/elbow/wrist/hand joints, `Waist_Yaw`, `Torso_Pitch`↔`Hip_Pitch` broadcast), the same joint values produce the SAME world-frame hand position. The two URDFs systematically offset shoulder origins by `-0.0625` X exactly to cancel the `+0.0625` X Trunk frame difference — so joint values are 1:1 transferable, and world-frame FK matches across both. Only Trunk-frame FK differs by the 6.25 cm bias, which is the reason for switching to world-frame.
 - **A1 (coupled_reik)**: Fix the API properly + add a tiny smoke test so the feature can't silently re-break.
 - **F4 (pickle.load)**: Broaden the except clause to catch corrupt/truncated/version-mismatch errors with friendly messages; add a `# WARNING: pickle is unsafe with untrusted files` block at the load site and a paragraph in `docs/sim_to_real_mapping.md`. Keep the format (numpy/tensor round-trip stays simple).
 - **S4 (cc.add weight)**: Investigate cuRobo's built-in cost dispatch (`RobotCostManager.compute_costs`) for the pattern used by `tool_pose` / `cspace`, then mirror it in our wrapper. Investigation runs as part of Commit 2; the design doesn't commit to a specific value yet.
@@ -139,86 +141,152 @@ Bonus (in scope, not from the top-15): the URDF Y-asymmetry between `left_base_l
 
 ---
 
-## Commit 3 — `plan_processor` schema change (F1, D2, D3, F2)
+## Commit 3 — `plan_processor` schema rewrite (F1 revised, D2, D3, F2 obsoleted)
 
-**BREAKING CHANGE**: Old `motion_plan.pkl` files become invalid. Existing consumer code (anything that reads `*_hand_xyz` expecting palm frame) needs to update.
+**BREAKING CHANGE**: Schema fields rename and switch frames. Old `motion_plan.pkl` files become invalid. Add `plan["_schema_version"] = 2` for runtime detection.
 
 **Files**:
-- `cutamp/utils/plan_processor.py`: change FK target, add joint-name alignment, fix quaternion sign flip, add idempotency sentinel for `compensate_trunk_x_offset` (note: this sentinel lives in the example, not the processor — moved to commit list below).
-- `examples/load_motion_plan_for_mpc.py`: update to consume hand_link poses, add idempotency sentinel to `compensate_trunk_x_offset`.
-- `docs/sim_to_real_mapping.md`: rewrite discrepancy #4 (poses now in real-URDF-native frame).
-- `cutamp/tests/test_plan_processor.py` (NEW or amend): add small unit test for quaternion sign canonicalization.
+- `cutamp/utils/plan_processor.py`: switch FK target to `*_hand_link`, emit in WORLD frame, apply `-0.0625` X compensation to Trunk pose, drop Trunk-frame hand fields, joint-name alignment fix, quat sign canonicalization, schema-version stamp.
+- `examples/load_motion_plan_for_mpc.py`: update to consume world-frame hand poses; **delete the `compensate_trunk_x_offset` helper entirely** (its work is now done upstream). Update docstring and sanity print.
+- `docs/sim_to_real_mapping.md`: rewrite — discrepancies #1, #2, #4 are now resolved end-to-end (no consumer-side compensation needed). Update TL;DR to a much shorter recipe.
+- `cutamp/tests/test_plan_processor.py` (NEW or amend): unit tests for quaternion sign canonicalization AND world-frame hand pose roundtrip.
 
 **Changes**:
 
-1. **F1 — Switch to `*_hand_link`** (`plan_processor.py:104-105`):
+1. **F1 (revised) — Switch to `*_hand_link` + WORLD frame**:
    ```python
+   # plan_processor.py:104-105
    LEFT_TOOL_FRAME = "left_hand_link"
    RIGHT_TOOL_FRAME = "right_hand_link"
-   ```
-   Update `_build_processing_kinematics` to add `left_hand_link, right_hand_link, Trunk` to `tool_frames` (drop the `*_base_link` entries). Update the module docstring (lines 26-32): hand poses are now FK of `*_hand_link` — the link that exists in both `t1_simplified.urdf` and `actual_robot.urdf`. Rewrite `docs/sim_to_real_mapping.md` discrepancy #4 to reflect this; remove the now-stale note about palm offsets.
 
-2. **D2 — joint-name alignment check** (`plan_processor.py:153`):
+   # _build_processing_kinematics: tool_frames = [LEFT_TOOL_FRAME, RIGHT_TOOL_FRAME, TRUNK_LINK]
+
+   # process_motion_plan: stop calling _world_to_trunk on hand poses.
+   # Emit world-frame xyz/quat directly. Also delete _world_to_trunk helper
+   # (no longer used; quat ops it depends on stay for the trunk pose math).
+   ```
+   Schema becomes (per segment):
    ```python
-   # Before:
-   if tensor.shape[-1] == active_dof:
-       return tensor
-   # After:
+   "position": {
+       # World-frame Trunk pose (real-URDF-native, -0.0625 X compensated)
+       "trunk_xyz":             [T, 3],     # WORLD frame, real-URDF Trunk
+       "trunk_quat_wxyz":       [T, 4],     # WORLD frame
+       "trunk_quat_xyzw":       [T, 4],
+       "trunk_height":          [T],        # alias for trunk_xyz[:, 2]
+
+       # Joint values (unchanged, frame-independent)
+       "trunk_pitch":           [T],
+       "trunk_yaw":             [T],
+       "right_arm":             [T, 7],
+       "left_arm":              [T, 7],
+
+       # Hand poses in WORLD frame (was Trunk frame in v1)
+       "right_hand_xyz":        [T, 3],     # WORLD frame
+       "right_hand_quat_wxyz":  [T, 4],     # WORLD frame
+       "right_hand_quat_xyzw":  [T, 4],
+       "left_hand_xyz":         [T, 3],
+       "left_hand_quat_wxyz":   [T, 4],
+       "left_hand_quat_xyzw":   [T, 4],
+   },
+   "velocity": {
+       # Joint velocities (unchanged)
+       "trunk_pitch":                   [T],
+       "trunk_yaw":                     [T],
+       "right_arm":                     [T, 7],
+       "left_arm":                      [T, 7],
+       # Cartesian velocities (now ALL world-frame)
+       "trunk_xyz_dot":                 [T, 3],   # m/s, world
+       "trunk_height":                  [T],
+       "right_hand_xyz_dot":            [T, 3],   # m/s, WORLD (was trunk)
+       "left_hand_xyz_dot":             [T, 3],
+       # Angular velocities — all WORLD frame now
+       "trunk_angular_velocity_world":      [T, 3],
+       "right_hand_angular_velocity_world": [T, 3],   # renamed from _trunk
+       "left_hand_angular_velocity_world":  [T, 3],
+   },
+   ```
+
+2. **F1 corollary — Trunk pose compensation inside `plan_processor.py`**:
+   ```python
+   # After computing trunk_xyz_w from FK, before assembling `position`:
+   trunk_xyz_w_real = trunk_xyz_w.copy()
+   trunk_xyz_w_real[:, 0] -= 0.0625   # sim-Trunk → real-Trunk (see docs/sim_to_real_mapping.md #1)
+   # Use trunk_xyz_w_real in the position dict + for trunk_xyz_dot derivation.
+   ```
+   Add a named constant `SIM_TO_REAL_TRUNK_X_OFFSET_M = 0.0625` at module top, with a `# WHY` comment linking to the URDF.
+
+3. **F1 corollary — Delete `compensate_trunk_x_offset` from the example**:
+   ```python
+   # examples/load_motion_plan_for_mpc.py
+   # DELETE:  TRUNK_X_OFFSET_M, compensate_trunk_x_offset(...)
+   # DELETE:  the call to compensate_trunk_x_offset in load_for_mpc()
+   # DELETE:  the "Sanity: Trunk X at t=0 ≈ -0.0625m" check (no longer applicable)
+   ```
+   F2 (idempotency of the helper) is OBSOLETE — the helper no longer exists.
+
+4. **F1 corollary — Schema version stamp**:
+   ```python
+   # plan_processor.py process_motion_plan return:
+   return {
+       "schema_version": 2,
+       "segments": processed_segments,
+       ...
+   }
+   ```
+   Consumer can detect old v1 pickles (missing `schema_version` or =1) and raise a clear error pointing at this commit.
+
+5. **D2 — joint-name alignment check** (unchanged from prior draft):
+   ```python
+   # plan_processor.py:153
    if tensor.shape[-1] == active_dof and (
        src_joint_names is None or list(src_joint_names) == list(kin.joint_names)
    ):
        return tensor
    ```
-   Falls through to the reorder branch when names mismatch. `src_joint_names is None` short-circuits to the existing assumption (callers without names trust positional alignment).
 
-3. **D3 — Quaternion sign canonicalization** (`plan_processor.py:169-183`):
+6. **D3 — Quaternion sign canonicalization** (unchanged from prior draft):
    ```python
    def _angular_velocity_from_quat(q_seq: np.ndarray, dt: float) -> np.ndarray:
        T = q_seq.shape[0]
        if T < 2:
            return np.zeros((T, 3), dtype=q_seq.dtype)
-       # Canonicalize sign so consecutive samples are aligned. q and -q are the
-       # same rotation but element-wise FD treats them as opposite — without
-       # this, a single sign flip yields ~4/dt rad/s spurious omega spike.
+       # Sequential sign propagation: once a flip happens, subsequent samples
+       # need it too (cumulative). Single forward sweep.
        q_aligned = q_seq.copy()
-       dots = np.sum(q_aligned[1:] * q_aligned[:-1], axis=-1)
-       flip_mask = dots < 0
-       q_aligned[1:][flip_mask] *= -1
+       for t in range(1, T):
+           if np.dot(q_aligned[t], q_aligned[t-1]) < 0:
+               q_aligned[t] *= -1
        dq = (q_aligned[1:] - q_aligned[:-1]) / dt
        conj_q = _quat_conjugate_wxyz(q_aligned[:-1])
        omega_quat = 2.0 * _quat_mul_wxyz(dq, conj_q)
        omega = omega_quat[..., 1:]
        return np.concatenate([omega, omega[-1:]], axis=0)
    ```
-   Note: sign-flip detection is sequential (one flip at index `t` propagates through subsequent samples), so a single forward sweep with running propagation is technically more correct than an element-wise mask. The element-wise version above suffices when flips are isolated (the typical FK case). Spec acknowledges this — if implementer finds a case with consecutive flips, upgrade to the running-propagation version (~5 extra lines).
+   Sequential variant — handles consecutive flips correctly.
 
-   Add a unit test:
+   Unit test:
    ```python
    def test_quat_angular_velocity_robust_to_sign_flip():
        q = np.array([[1, 0, 0, 0], [-1, 0, 0, 0], [1, 0, 0, 0]], dtype=np.float64)
        omega = _angular_velocity_from_quat(q, dt=0.1)
-       assert np.allclose(omega, 0.0, atol=1e-9), f"Sign-flip yielded {omega}"
+       assert np.allclose(omega, 0.0, atol=1e-9)
    ```
 
-4. **F2 — Idempotency sentinel for `compensate_trunk_x_offset`** (`examples/load_motion_plan_for_mpc.py:70-82`):
+7. **NEW test — world-frame hand pose round-trip**:
    ```python
-   def compensate_trunk_x_offset(plan: Dict[str, Any]) -> Dict[str, Any]:
-       """..."""
-       if plan.get("_trunk_offset_applied", False):
-           warnings.warn(
-               "compensate_trunk_x_offset called on a plan that's already been "
-               "compensated; skipping to avoid double-subtraction.",
-               stacklevel=2,
-           )
-           return plan
-       for seg in plan["segments"]:
-           seg["position"]["trunk_xyz"][:, 0] -= TRUNK_X_OFFSET_M
-       plan["_trunk_offset_applied"] = True
-       return plan
+   def test_world_hand_pose_matches_actual_robot_urdf():
+       """Verify that running our saved joint values through actual_robot.urdf's
+       FK reproduces the saved world-frame hand pose."""
+       # Load plan; pick a segment; iterate timesteps.
+       # FK actual_robot.urdf on (saved trunk_xyz, trunk_quat, joints) → hand pose.
+       # Assert |fk_hand_xyz - saved_hand_xyz| < 1e-4.
    ```
-   Document the sentinel in the module docstring + add a note in `docs/sim_to_real_mapping.md`.
 
-**Success criteria**: smoke test passes (fresh pickle generated from current code is loadable by the updated example); unit test for sign-flip passes; manual check: `load_for_mpc(path)` then `compensate_trunk_x_offset(plan)` warns instead of double-subtracting.
+**Success criteria**:
+- Smoke test passes (fresh pickle generated, loadable by updated example).
+- Quat sign-flip test passes.
+- World-frame round-trip test passes — saved hand world pose matches FK on `actual_robot.urdf` to sub-mm.
+- `docs/sim_to_real_mapping.md` TL;DR shrinks from 6 steps to ~3 (load → broadcast Torso_Pitch → solve leg IK).
 
 ---
 
