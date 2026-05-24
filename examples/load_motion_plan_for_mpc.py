@@ -164,7 +164,11 @@ def load_for_mpc(path: Path) -> List[Dict[str, Any]]:
             f"motion_plan.pkl at {path} appears corrupt or incomplete "
             f"({type(e).__name__}: {e}). Regenerate with --save_plan."
         )
-    except AttributeError as e:
+    except (AttributeError, ModuleNotFoundError) as e:
+        # AttributeError fires when the pickled class's module still exists
+        # but the class itself was renamed/removed; ModuleNotFoundError
+        # (a subclass of ImportError) fires when the module itself was
+        # deleted/renamed, which is the more common case during refactors.
         raise RuntimeError(
             f"motion_plan.pkl at {path} references a class that's been "
             f"renamed/removed ({e}). Schema likely evolved; regenerate the plan."
