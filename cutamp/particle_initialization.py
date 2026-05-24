@@ -7,16 +7,30 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+"""Particle initialization under cuRobo v0.8 single-MotionPlanner architecture.
+
+Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single 21-DOF
+vector in T1's full cspace order.
+"""
+
 import logging
-from typing import Literal, Optional
+from typing import Optional
 
 import roma
 import torch
-from curobo.geom.types import Cuboid
-from curobo.types.math import Pose
 
+from curobo.scene import Cuboid
+from curobo.types import GoalToolPose, JointState, Pose
+
+from cutamp._curobo_internals import (
+    inactive_arm_cspace_weights,
+    restore_cspace_target_dof_weight,
+    snapshot_cspace_target_dof_weight,
+    write_cspace_target_dof_weight,
+)
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
+from cutamp.grasp_planning import _build_multi_frame_goal
 from cutamp.samplers import (
     grasp_4dof_sampler,
     grasp_6dof_sampler,
@@ -35,55 +49,88 @@ from cutamp.utils.common import (
 )
 from cutamp.utils.shapes import MultiSphere
 
-# T1 home configurations for retract
 try:
-    from cutamp.robots.t1 import t1_home_left, t1_home_right, NUM_SHARED_JOINTS
+    from cutamp.robots.t1 import t1_home
 except ImportError:
-    t1_home_left = None
-    t1_home_right = None
-    NUM_SHARED_JOINTS = 4  # Fallback for non-T1 robots
+    t1_home = None
 
 _log = logging.getLogger(__name__)
 
 
-def propagate_shared_joints(
-    particles: Particles, 
-    active_arm: Literal["left", "right"], 
-    solved_q: torch.Tensor,
-    solved_configs: set = None,
-) -> None:
+def _ik_for_pose(
+    world: TAMPWorld,
+    world_from_ee: torch.Tensor,
+    arm: Optional[str],
+    *,
+    current_state_q: Optional[torch.Tensor] = None,
+    num_seeds: Optional[int] = None,
+):
+    """Solve IK for a batch of EE poses, targeting the active arm's tool frame.
+
+    Uses the same multi-frame-goal + cspace-pin pattern the motion planner
+    applies during arm operators: the inactive frame is targeted at its
+    current FK pose, and its joints are pinned via ``cspace_target_dof_weight``.
+    Without this, IK leaves the inactive arm unconstrained and it drifts to
+    arbitrary joint values, polluting downstream particle optimization.
+
+    ``current_state_q`` (full-cspace ``[B, len(world.kinematics.joint_names)]``)
+    seeds IK from a non-home pose — used by the coupled-reIK refresh during
+    Adam to warm-start from the current best particle's q. When ``None``,
+    seeds from ``world.q_init`` as before.
+
+    ``num_seeds`` overrides the IK solver's seed count. Set to 1 for warm-start
+    refresh (~10-20x faster than the default multi-seed); leave ``None`` for
+    initial IK from home (which needs the default for reliability).
     """
-    Propagate shared joints from active arm's IK solution to unsolved inactive arm's configurations.
-    
-    T1 robot has 4 shared joints (lift + torso) that appear in both arms' 11-DOF configs.
-    When IK solves for one arm, we update ALL of the other arm's configurations to match,
-    ensuring shared joint consistency throughout the plan.
-    
-    Args:
-        particles: Current particle dictionary containing configurations like 
-                   left_q0, left_q1, right_q0, right_q1, etc.
-        active_arm: Which arm just solved IK ("left" or "right")
-        solved_q: The IK solution for the active arm, shape (num_particles, 11)
-        solved_configs: Set of configuration names that have already been solved by IK
-                        which will not be updated.
+    ik = world.ik_solver
+    active_frame = world.tool_frame_for_arm(arm)
+    if active_frame not in ik.kinematics.tool_frames:
+        raise RuntimeError(
+            f"IK solver does not expose tool frame {active_frame!r}; "
+            f"available: {ik.kinematics.tool_frames}"
+        )
+    target_pose = Pose.from_matrix(world_from_ee)
+    batch_size = world_from_ee.shape[0]
+    full_names = list(world.kinematics.joint_names)
+    if current_state_q is None:
+        seed_full = world.q_init.unsqueeze(0).expand(batch_size, -1)
+    else:
+        # Caller passes full-cspace q; trust their batch shape.
+        seed_full = current_state_q
+    full_js = JointState.from_position(seed_full, joint_names=full_names)
+    current_state = ik.kinematics.get_active_js(full_js)
+    goal = _build_multi_frame_goal(ik, active_frame, target_pose, current_state)
+
+    snapshot = snapshot_cspace_target_dof_weight([ik])
+    try:
+        if arm is not None:
+            write_cspace_target_dof_weight(
+                [ik], inactive_arm_cspace_weights(ik, arm),
+            )
+        solve_kwargs = {"goal_tool_poses": goal, "current_state": current_state}
+        if num_seeds is not None:
+            solve_kwargs["num_seeds"] = num_seeds
+        return ik.solve_pose(**solve_kwargs)
+    finally:
+        restore_cspace_target_dof_weight([ik], snapshot)
+
+
+def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
+    """Build a full-cspace ``[B, len(world.kinematics.joint_names)]`` tensor
+    from an IK result. Locked-out joints (e.g. mobile base) are filled from
+    the IK kinematics' own ``lock_jointstate`` — same source the planner uses,
+    so values stay consistent without an external ``t1_home`` reference.
     """
-    if solved_configs is None:
-        solved_configs = set()
-    
-    # Get the shared joint values from the active arm's solution
-    shared_joints = solved_q[:, :NUM_SHARED_JOINTS]  # First 4 joints are shared
-    
-    # Determine the prefix for the inactive arm's configurations
-    inactive_prefix = "right_q" if active_arm == "left" else "left_q"
-    
-    # Update unsolved configurations belonging to the inactive arm
-    for key in particles.keys():
-        if key.startswith(inactive_prefix) and key not in solved_configs:
-            # Clone to avoid modifying in-place
-            inactive_q = particles[key].clone()
-            # Update shared joints while keeping arm-specific joints unchanged
-            inactive_q[:, :NUM_SHARED_JOINTS] = shared_joints
-            particles[key] = inactive_q
+    ik = world.ik_solver
+    sol_js = JointState.from_position(
+        ik_result.solution[:, 0], joint_names=list(ik.kinematics.joint_names),
+    )
+    return ik.kinematics.get_full_js(sol_js).reorder(list(world.kinematics.joint_names)).position
+
+
+def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: Optional[str]) -> None:
+    """Store the IK result's q under ``q_name``, reordered to the full kin's joint order."""
+    particles[q_name] = _ik_solution_to_full_q(ik_result, world)
 
 
 class ParticleInitializer:
@@ -91,58 +138,71 @@ class ParticleInitializer:
         if config.enable_traj:
             raise NotImplementedError("Trajectory initialization not yet supported")
         if config.place_dof != 4:
-            raise NotImplementedError(f"Only 4-DOF grasp and placement supported for now, not {config.place_dof}")
-        if config.grasp_dof != 4 and config.grasp_dof != 6:
-            raise NotImplementedError(f"Only 4-DOF or 6-DOF grasp supported for now, not {config.grasp_dof}")
+            raise NotImplementedError(f"Only 4-DOF placement supported, not {config.place_dof}")
+        if config.grasp_dof not in (4, 6):
+            raise NotImplementedError(f"Only 4-DOF or 6-DOF grasp supported, not {config.grasp_dof}")
+
         self.world = world
         self.config = config
-        if world.is_dual_arm:
-            self.left_q_init = world.left_q_init.repeat(config.num_particles, 1)
-            self.right_q_init = world.right_q_init.repeat(config.num_particles, 1)
-        else:
-            self.q_init = world.q_init.repeat(config.num_particles, 1)
+        self.q_init = world.q_init.repeat(config.num_particles, 1)
 
-        # Sampler caching
         self.pick_cache = {}
         self.place_cache = {}
         self.push_button_cache = {}
         self.push_stick_cache = {}
         self.failed_push = set()
 
+    def _initial_particles(self, num_particles: int) -> Particles:
+        return {
+            "left_q0": self.q_init.clone(),
+            "right_q0": self.q_init.clone(),
+        }
+
+    def _apply_cached(
+        self, cache_entry: dict, sampled: dict, q: str, arm: Optional[str],
+        particles: dict, deferred_params: set, move_free_deferred: dict,
+        grasp_check: Optional[tuple] = None,
+        log_msg: Optional[str] = None, log_debug=None,
+    ) -> None:
+        if grasp_check is not None:
+            grasp_name, err_msg = grasp_check
+            if not (particles[grasp_name] == cache_entry["grasp"]).all():
+                raise RuntimeError(err_msg)
+        for particle_name, cache_field in sampled.items():
+            particles[particle_name] = cache_entry[cache_field].clone()
+        ik_result = cache_entry["ik_result"]
+        _store_ik_q(particles, q, ik_result, self.world, arm)
+        deferred_params.discard(q)
+        move_free_deferred.pop(q, None)
+        if log_msg is not None and log_debug is not None:
+            log_debug(f"{log_msg} {ik_result.success.sum()}/{self.config.num_particles} success")
+
     def __call__(self, plan_skeleton: PlanSkeleton, verbose: bool = True) -> Optional[Particles]:
         config = self.config
-        num_particles = self.config.num_particles
+        num_particles = config.num_particles
         world = self.world
-        if world.is_dual_arm:
-            particles = {"left_q0": self.left_q_init.clone(), "right_q0": self.right_q_init.clone()}
-        else:
-            particles = {"q0": self.q_init.clone()}
-        deferred_params = set()
-        # move_free at the end of plan skeleton don't need IK resolution
+        device = world.device
+
+        particles = self._initial_particles(num_particles)
+        deferred_params: set[str] = set()
         move_free_deferred: dict[str, str] = {}
-        # track conf solved by IK
-        solved_configs = set()
         log_debug = _log.debug if verbose else lambda *args, **kwargs: None
 
-        # Note: we don't consider state after executing earlier samples
-        # Iterate through each ground operator in the plan skeleton and initialize and build up particles
         for idx, ground_op in enumerate(plan_skeleton):
             metadata = ground_op.operator.metadata
             params = ground_op.values
             header = f"{idx + 1}. {ground_op}"
-            arm = metadata.arm  # None for single-arm, "left"/"right" for dual-arm
+            arm = metadata.arm
 
-            # MoveFree (single-arm and dual-arm) - motion operators without holding
             if metadata.is_motion and metadata.action_type is None:
-                # Check if it's MoveFree (3 params) vs MoveHolding (5 params)
-                if len(params) == 3:  # MoveFree: q_start, traj, q_end
+                if len(params) == 3:
                     q_start, _traj, q_end = params
                     if q_start not in particles:
                         raise ValueError(f"{q_start=} should already be bound")
                     deferred_params.add(q_end)
                     move_free_deferred[q_end] = q_start
                     log_debug(f"{header}. Deferred {q_end}")
-                else:  # MoveHolding: obj, grasp, q_start, traj, q_end
+                else:
                     obj, grasp, q_start, _traj, q_end = params
                     if not world.has_object(obj):
                         raise ValueError(f"{obj=} not found in world")
@@ -153,10 +213,8 @@ class ParticleInitializer:
                     deferred_params.add(q_end)
                     log_debug(f"{header}. Deferred {q_end}")
 
-            # Pick (single-arm and dual-arm)
             elif metadata.action_type == "pick":
                 obj, grasp, q = params
-                
                 if not world.has_object(obj):
                     raise ValueError(f"{obj=} not found in world")
                 if grasp in particles:
@@ -164,38 +222,28 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                # Get arm-specific resources
-                gripper_spheres = world.get_gripper_spheres(arm) if arm else world.robot_container.gripper_spheres
-                joint_limits = world.get_joint_limits(arm) if arm else world.robot_container.joint_limits
-                tool_from_ee = world.get_tool_from_ee(arm) if arm else world.tool_from_ee
-                ik_solver = world.get_ik_solver(arm) if arm else world.ik_solver
+                tool_frame = world.tool_frame_for_arm(arm)
+                gripper_spheres = world.gripper_spheres[tool_frame]
+                joint_limits = world.joint_limits
+                tool_from_ee = world.tool_from_ee[tool_frame]
 
-                # Note: pick cache currently assumes object is at same pose as when sampled
-                # For dual-arm, include arm in cache key
                 cache_key = (obj, arm) if arm else obj
                 if cache_key in self.pick_cache:
-                    # important, we need to clone here
-                    particles[grasp] = self.pick_cache[cache_key]["sampled_grasps"].clone()
-                    ik_result = self.pick_cache[cache_key]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
-                    solved_configs.add(q)
-                    deferred_params.remove(q)
-                    # clean up deferred params
-                    move_free_deferred.pop(q, None)
-                    # Propagate shared joints for dual-arm
-                    if arm:
-                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
-                    log_debug(
-                        f"{header}. Using cached grasp poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
+                    self._apply_cached(
+                        self.pick_cache[cache_key],
+                        sampled={grasp: "sampled_grasps"},
+                        q=q, arm=arm, particles=particles,
+                        deferred_params=deferred_params,
+                        move_free_deferred=move_free_deferred,
+                        log_msg=f"{header}. Using cached grasp poses for {obj}.",
+                        log_debug=log_debug,
                     )
                     continue
 
-                # Sample grasps
                 obj_curobo = world.get_object(obj)
                 obj_spheres = world.get_collision_spheres(obj)
                 num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
 
-                # Sample 4 times as many grasps as particles
                 if config.grasp_dof == 4:
                     sampled_grasps = grasp_4dof_sampler(num_particles * 4, obj_curobo, obj_spheres, num_faces=num_faces)
                     obj_from_grasp = action_4dof_to_mat4x4(sampled_grasps)
@@ -203,45 +251,32 @@ class ParticleInitializer:
                     sampled_grasps = grasp_6dof_sampler(num_particles * 4, obj_curobo, num_faces=num_faces)
                     obj_from_grasp = action_6dof_to_mat4x4(sampled_grasps)
 
-                # Select the grasps that are not in collision with the object
                 grasp_spheres = transform_spheres(gripper_spheres, obj_from_grasp)
                 grasp_coll = sphere_to_sphere_overlap(obj_spheres, grasp_spheres)
                 good_idxs = grasp_coll.topk(num_particles, largest=False).indices
                 particles[grasp] = sampled_grasps[good_idxs]
 
-                # Transform grasps to hand frame
                 if config.random_init:
-                    q_sample = sample_between_bounds(num_particles, joint_limits)
-                    particles[q] = q_sample
+                    particles[q] = sample_between_bounds(num_particles, joint_limits)
                 else:
                     obj_from_grasp = obj_from_grasp[good_idxs]
-                    world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(world.tensor_args.device)
-                    world_from_grasp = world_from_obj @ obj_from_grasp
-                    world_from_ee = world_from_grasp @ tool_from_ee
-
-                    # Solve IK with cuRobo
-                    world_from_ee = Pose.from_matrix(world_from_ee)
-                    ik_result = ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                    world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
+                    world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
+                    ik_result = _ik_for_pose(world, world_from_ee, arm)
                     log_debug(
-                        f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
+                        f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
                     )
-                    particles[q] = ik_result.solution[:, 0]
-                solved_configs.add(q)
-                deferred_params.remove(q)
+                    _store_ik_q(particles, q, ik_result, world, arm)
+                deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
-                # Propagate shared joints for dual-arm
-                if arm:
-                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
+                if config.cache_subgraphs and not config.random_init:
+                    self.pick_cache[cache_key] = {
+                        "sampled_grasps": particles[grasp], "ik_result": ik_result,
+                    }
 
-                # Store in cache
-                if config.cache_subgraphs:
-                    self.pick_cache[cache_key] = {"sampled_grasps": particles[grasp], "ik_result": ik_result}
-
-            # Place (single-arm and dual-arm)
             elif metadata.action_type == "place":
                 obj, grasp, placement, surface, q = params
-                
                 if not world.has_object(obj):
                     raise ValueError(f"{obj=} not found in world")
                 if grasp not in particles:
@@ -253,42 +288,28 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                # Get arm-specific resources
-                joint_limits = world.get_joint_limits(arm) if arm else world.robot_container.joint_limits
-                tool_from_ee = world.get_tool_from_ee(arm) if arm else world.tool_from_ee
-                ik_solver = world.get_ik_solver(arm) if arm else world.ik_solver
+                tool_frame = world.tool_frame_for_arm(arm)
+                joint_limits = world.joint_limits
+                tool_from_ee = world.tool_from_ee[tool_frame]
 
-                # For dual-arm, include arm in cache key
                 cache_key = (obj, surface, arm) if arm else (obj, surface)
                 if cache_key in self.place_cache:
-                    # need to make sure the grasps match what is cached
-                    actual_grasp = particles[grasp]
-                    cached_grasp = self.place_cache[cache_key]["grasp"]
-                    if not (actual_grasp == cached_grasp).all():
-                        raise RuntimeError(f"Grasps don't match for {obj} on {surface}")
-
-                    # important, we need to clone here
-                    sampled_placements = self.place_cache[cache_key]["sampled_placements"].clone()
-                    particles[placement] = sampled_placements
-                    ik_result = self.place_cache[cache_key]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
-                    solved_configs.add(q)
-                    deferred_params.remove(q)
-                    # clean up deferred params
-                    move_free_deferred.pop(q, None)
-                    # Propagate shared joints for dual-arm
-                    if arm:
-                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
-                    log_debug(
-                        f"{header}. Using cached placement poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
+                    self._apply_cached(
+                        self.place_cache[cache_key],
+                        sampled={placement: "sampled_placements"},
+                        q=q, arm=arm, particles=particles,
+                        deferred_params=deferred_params,
+                        move_free_deferred=move_free_deferred,
+                        grasp_check=(grasp, f"Grasps don't match for {obj} on {surface}"),
+                        log_msg=f"{header}. Using cached placement for {obj}.",
+                        log_debug=log_debug,
                     )
                     continue
 
-                # Sample placements pose of object (in world frame)
                 obj_curobo = world.get_object(obj)
                 obj_spheres = world.get_collision_spheres(obj)
                 if config.random_init:
-                    yaw = sample_yaw(num_particles * 4, None, self.world.tensor_args.device)
+                    yaw = sample_yaw(num_particles * 4, None, device)
                     aabb = world.world_aabb.clone()
                     aabb[0, 2] = 0.0
                     aabb[1, 2] = max(aabb[1, 2], 0.2)
@@ -296,57 +317,44 @@ class ParticleInitializer:
                     sampled_placements = torch.cat([xyz, yaw.unsqueeze(-1)], dim=1)
                 else:
                     surface_curobo = world.get_object(surface)
-                    sampled_placements = place_4dof_sampler(num_particles * 4, obj_curobo, obj_spheres, surface_curobo)
+                    sampled_placements = place_4dof_sampler(
+                        num_particles * 4, obj_curobo, obj_spheres, surface_curobo,
+                    )
 
-                # Select the placements that are not in collision with the object
-                world_from_obj = action_4dof_to_mat4x4(sampled_placements)  # desired placement pose
+                world_from_obj = action_4dof_to_mat4x4(sampled_placements)
                 obj_place_spheres = transform_spheres(obj_spheres, world_from_obj)
+                # WorldCollisionCost returns [B, H] summed across spheres.
                 place_coll = world.collision_fn(obj_place_spheres[:, None].contiguous())[:, 0]
                 best_idxs = place_coll.topk(num_particles, largest=False).indices
                 sampled_placements = sampled_placements[best_idxs]
                 world_from_obj = world_from_obj[best_idxs]
 
-                # Set particles and then solve for robot configurations
                 particles[placement] = sampled_placements
                 if config.random_init:
-                    q_sample = sample_between_bounds(num_particles, joint_limits)
-                    particles[q] = q_sample
+                    particles[q] = sample_between_bounds(num_particles, joint_limits)
                 else:
-                    # Get the hand pose given the placement pose in world frame.
-                    # Need to take grasp into account to transform into hand frame.
                     if config.grasp_dof == 4:
                         obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
                     else:
                         obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
-                    world_from_grasp = world_from_obj @ obj_from_grasp
-                    world_from_ee = world_from_grasp @ tool_from_ee
-
-                    # Solve IK
-                    world_from_ee = Pose.from_matrix(world_from_ee)
-                    ik_result = ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding?
+                    world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
+                    ik_result = _ik_for_pose(world, world_from_ee, arm)
                     log_debug(
-                        f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
+                        f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
                     )
-                    particles[q] = ik_result.solution[:, 0]
-                solved_configs.add(q)
-                deferred_params.remove(q)
+                    _store_ik_q(particles, q, ik_result, world, arm)
+                deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
-                # Propagate shared joints for dual-arm
-                if arm:
-                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
-                # Store in cache
-                if config.cache_subgraphs:
+                if config.cache_subgraphs and not config.random_init:
                     self.place_cache[cache_key] = {
                         "sampled_placements": sampled_placements,
                         "ik_result": ik_result,
                         "grasp": particles[grasp],
                     }
 
-            # Push Button (without stick) - single-arm and dual-arm
             elif metadata.action_type == "push":
                 button, push_pose, q = params
-                
                 assert not config.random_init, "Random initialization not supported for pushing"
                 if not world.has_object(button):
                     raise ValueError(f"{button=} not found in world")
@@ -355,190 +363,116 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                # Get arm-specific resources
-                tool_from_ee = world.get_tool_from_ee(arm) if arm else world.tool_from_ee
-                ik_solver = world.get_ik_solver(arm) if arm else world.ik_solver
+                tool_frame = world.tool_frame_for_arm(arm)
+                tool_from_ee = world.tool_from_ee[tool_frame]
 
-                # For dual-arm, include arm in cache key
                 cache_key = (button, arm) if arm else button
-                failed_key = (button, arm) if arm else button
-                
-                # Pruning failed subgraphs (i.e., we couldn't push this button at all)
-                if failed_key in self.failed_push and config.skip_failed_subgraphs:
+                if cache_key in self.failed_push and config.skip_failed_subgraphs:
                     return None
-
                 if cache_key in self.push_button_cache:
-                    # important, we need to clone here
-                    sampled_push = self.push_button_cache[cache_key]["sampled_push"].clone()
-                    particles[push_pose] = sampled_push
-                    ik_result = self.push_button_cache[cache_key]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
-                    solved_configs.add(q)
-                    deferred_params.remove(q)
-                    move_free_deferred.pop(q, None)
-                    # Propagate shared joints for dual-arm
-                    if arm:
-                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
-                    log_debug(
-                        f"{header}. Using cached push poses for {button}. {ik_result.success.sum()}/{num_particles} success"
+                    self._apply_cached(
+                        self.push_button_cache[cache_key],
+                        sampled={push_pose: "sampled_push"},
+                        q=q, arm=arm, particles=particles,
+                        deferred_params=deferred_params,
+                        move_free_deferred=move_free_deferred,
                     )
                     continue
 
-                # Sample 4-DOF push poses for the button
                 aabb = world.get_aabb(button).clone()
-                surface_z = aabb[1, 2]  # top of the button aabb
-                # add 1cm buffer
+                surface_z = aabb[1, 2]
                 lower_xy, upper_xy = aabb[:, :2]
                 lower_xy += 0.01
                 upper_xy -= 0.01
-
-                sampled_xy = lower_xy + torch.rand(num_particles, 2, device=world.tensor_args.device) * (
-                    upper_xy - lower_xy
-                )
-                sampled_z = (
-                    surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
-                )  # 2cm above button for now
-                sampled_yaw = sample_yaw(num_particles, num_faces=None, device=world.tensor_args.device)
+                sampled_xy = lower_xy + torch.rand(num_particles, 2, device=device) * (upper_xy - lower_xy)
+                sampled_z = surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
+                sampled_yaw = sample_yaw(num_particles, num_faces=None, device=device)
                 sampled_push = torch.cat([sampled_xy, sampled_z[:, None], sampled_yaw[:, None]], dim=1)
                 particles[push_pose] = sampled_push
 
-                # Transform from tool to hand frame
                 world_from_push = action_4dof_to_mat4x4(sampled_push)
                 world_from_ee = world_from_push @ tool_from_ee
-
-                # Solve IK with cuRobo
-                world_from_ee = Pose.from_matrix(world_from_ee)
-                ik_result = ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
-                log_debug(
-                    f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
-                )
-                particles[q] = ik_result.solution[:, 0]
-                solved_configs.add(q)
-                deferred_params.remove(q)
+                ik_result = _ik_for_pose(world, world_from_ee, arm)
+                log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
+                _store_ik_q(particles, q, ik_result, world, arm)
+                deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
-                # Propagate shared joints for dual-arm
-                if arm:
-                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
-                # Failed subgraph!
                 if not ik_result.success.any():
-                    self.failed_push.add(failed_key)
-
-                # Cache the push poses
+                    self.failed_push.add(cache_key)
                 if config.cache_subgraphs:
-                    self.push_button_cache[cache_key] = {"sampled_push": sampled_push, "ik_result": ik_result}
+                    self.push_button_cache[cache_key] = {
+                        "sampled_push": sampled_push, "ik_result": ik_result,
+                    }
 
-            # Push Button with Stick - single-arm and dual-arm
             elif metadata.action_type == "push_stick":
                 button, stick_name, grasp, push_pose, q = params
-                
                 assert not config.random_init, "Random initialization not supported for pushing"
                 if not world.has_object(button):
                     raise ValueError(f"{button=} not found in world")
                 if not world.has_object(stick_name):
                     raise ValueError(f"{stick_name=} not found in world")
                 if grasp not in particles:
-                    raise ValueError(f"{grasp=} should already be binded")
+                    raise ValueError(f"{grasp=} should already be bound")
                 if push_pose in particles:
-                    raise ValueError(f"{push_pose=} shouldn't already be binded")
+                    raise ValueError(f"{push_pose=} shouldn't already be bound")
                 if q in particles:
-                    raise ValueError(f"{q=} shouldn't already be binded")
+                    raise ValueError(f"{q=} shouldn't already be bound")
 
-                # Get arm-specific resources
-                tool_from_ee = world.get_tool_from_ee(arm) if arm else world.tool_from_ee
-                ik_solver = world.get_ik_solver(arm) if arm else world.ik_solver
+                tool_frame = world.tool_frame_for_arm(arm)
+                tool_from_ee = world.tool_from_ee[tool_frame]
 
-                # For dual-arm, include arm in cache key
                 cache_key = (button, stick_name, arm) if arm else (button, stick_name)
                 if cache_key in self.push_stick_cache:
-                    # need to make sure the grasps match what is cached
-                    actual_grasp = particles[grasp]
-                    cached_grasp = self.push_stick_cache[cache_key]["grasp"]
-                    if not (actual_grasp == cached_grasp).all():
-                        raise RuntimeError(f"Grasps don't match for {button} with {stick_name}")
-
-                    # important, we need to clone here
-                    sampled_push = self.push_stick_cache[cache_key]["sampled_push"].clone()
-                    particles[push_pose] = sampled_push
-                    ik_result = self.push_stick_cache[cache_key]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
-                    solved_configs.add(q)
-                    deferred_params.remove(q)
-                    move_free_deferred.pop(q, None)
-                    # Propagate shared joints for dual-arm
-                    if arm:
-                        propagate_shared_joints(particles, arm, particles[q], solved_configs)
-
-                    log_debug(
-                        f"{header}. Using cached push for {button} with {stick_name}. "
-                        f"{ik_result.success.sum()}/{num_particles} success"
+                    self._apply_cached(
+                        self.push_stick_cache[cache_key],
+                        sampled={push_pose: "sampled_push"},
+                        q=q, arm=arm, particles=particles,
+                        deferred_params=deferred_params,
+                        move_free_deferred=move_free_deferred,
+                        grasp_check=(grasp, f"Grasps don't match for {button}/{stick_name}"),
                     )
                     continue
 
-                # Sample pushes for the button, this will be in the stick frame
                 aabb = world.get_aabb(button).clone()
-                surface_z = aabb[1, 2]  # top of the button aabb
-                # add 1cm buffer
+                surface_z = aabb[1, 2]
                 lower_xy, upper_xy = aabb[:, :2]
                 lower_xy += 0.01
                 upper_xy -= 0.01
-
-                sampled_xy = lower_xy + torch.rand(num_particles, 2, device=world.tensor_args.device) * (
-                    upper_xy - lower_xy
-                )
-                sampled_z = (
-                    surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
-                )  # 2cm above button for now
-                sampled_yaw = sample_yaw(num_particles, num_faces=None, device=world.tensor_args.device)
+                sampled_xy = lower_xy + torch.rand(num_particles, 2, device=device) * (upper_xy - lower_xy)
+                sampled_z = surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
+                sampled_yaw = sample_yaw(num_particles, num_faces=None, device=device)
                 sampled_push = torch.cat([sampled_xy, sampled_z[:, None], sampled_yaw[:, None]], dim=1)
 
-                # Sample somewhere along the stick for the push
                 stick: MultiSphere = world.get_object("stick")
                 spheres = stick.spheres
                 if not (spheres[:, 1:3] == 0.0).all():
-                    raise ValueError("Expected stick spheres to have y and z positions of 0")
+                    raise ValueError("Expected stick spheres to have y, z = 0")
                 sphere_x = spheres[:, 0]
                 x_idxs = torch.randint(0, len(sphere_x), (num_particles,), device=spheres.device)
                 sampled_x = sphere_x[x_idxs]
-
-                stick_from_tip = torch.eye(4, device=world.tensor_args.device).repeat(num_particles, 1, 1)
+                stick_from_tip = torch.eye(4, device=device).repeat(num_particles, 1, 1)
                 stick_from_tip[:, 0, 3] = -sampled_x
 
-                # Where we are pushing the button with the stick - i.e., the pose of the stick
                 world_from_push = action_4dof_to_mat4x4(sampled_push)
                 world_from_stick = world_from_push @ stick_from_tip
-
-                # Push pose is pose of stick in world frame
                 rpy = roma.rotmat_to_euler("XYZ", world_from_stick[:, :3, :3])
-                assert (rpy[:, :2] == 0.0).all(), "roll and pitch should be 0"
+                assert (rpy[:, :2] == 0.0).all(), "stick roll/pitch should be 0"
                 pos = world_from_stick[:, :3, 3]
                 yaw = rpy[:, 2]
-                action_4dof = torch.cat([pos, yaw[:, None]], dim=1)
-                particles[push_pose] = action_4dof
+                particles[push_pose] = torch.cat([pos, yaw[:, None]], dim=1)
 
-                # Convert to tool frame
                 if config.grasp_dof == 4:
                     obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
                 else:
                     obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
-                world_from_grasp = world_from_stick @ obj_from_grasp
-                world_from_ee = world_from_grasp @ tool_from_ee
-
-                # Solve IK with cuRobo
-                world_from_ee = Pose.from_matrix(world_from_ee)
-                ik_result = ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
-                log_debug(
-                    f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
-                )
-                particles[q] = ik_result.solution[:, 0]
-                solved_configs.add(q)
-                deferred_params.remove(q)
+                world_from_ee = world_from_stick @ obj_from_grasp @ tool_from_ee
+                ik_result = _ik_for_pose(world, world_from_ee, arm)
+                log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
+                _store_ik_q(particles, q, ik_result, world, arm)
+                deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
-                # Propagate shared joints for dual-arm
-                if arm:
-                    propagate_shared_joints(particles, arm, particles[q], solved_configs)
 
-                # Store in cache
                 if config.cache_subgraphs:
                     self.push_stick_cache[cache_key] = {
                         "sampled_push": sampled_push,
@@ -546,56 +480,29 @@ class ParticleInitializer:
                         "grasp": particles[grasp],
                     }
 
-            # Retract - move arm to home configuration after pick/place
             elif metadata.action_type == "retract":
                 # RetractHolding: obj, grasp, q_start, traj, q_retract
                 # RetractFree: q_start, traj, q_retract
-                q_retract = params[-1]  # Last param is always q_retract
-                q_start_param = params[-3]  # q_start is 3rd from last
-                
+                q_retract = params[-1]
+                q_start_param = params[-3]
                 if q_start_param not in particles:
                     raise ValueError(f"{q_start_param=} should already be bound")
                 if q_retract in particles:
                     raise ValueError(f"{q_retract=} shouldn't already be bound")
-                
-                # Get home configuration based on arm
-                if arm == "left":
-                    home = torch.tensor(t1_home_left, device=world.tensor_args.device)
-                elif arm == "right":
-                    home = torch.tensor(t1_home_right, device=world.tensor_args.device)
-                else:
-                    raise ValueError(f"Retract operator requires arm, got {arm=}")
-                
-                # Initialize q_retract: home ALL joints (including lift columns)
-                # This ensures the inactive arm stays at a collision-free position
-                # when shared joints are synced during arm switch
-                q_retract_init = home.expand(num_particles, -1).clone()
-                particles[q_retract] = q_retract_init
-                
-                # Mark retract config as solved so it won't be modified by later shared joint propagation
-                solved_configs.add(q_retract)
-                
-                # Propagate shared joints from retract config to inactive arm's configs
-                if arm:
-                    propagate_shared_joints(particles, arm, particles[q_retract], solved_configs)
-                
-                log_debug(f"{header}. Initialized q_retract to full home configuration")
+                home = torch.tensor(t1_home, device=device)
+                particles[q_retract] = home.expand(num_particles, -1).clone()
+                log_debug(f"{header}. Initialized q_retract to t1_home")
 
-            # Unknown
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
-        
-        # Handle unresolved deferred parameters
-        # MoveFree params that weren't resolved are trailing moves (no Pick/Place after them)
-        # We can use the source config as a fallback since we don't need IK for trailing moves
-        unresolved_move_free = deferred_params & set(move_free_deferred.keys())
-        for q_end in unresolved_move_free:
+
+        # Resolve trailing MoveFree configs by copying the source.
+        unresolved = deferred_params & set(move_free_deferred.keys())
+        for q_end in unresolved:
             q_start = move_free_deferred[q_end]
             particles[q_end] = particles[q_start].clone()
             deferred_params.remove(q_end)
-            log_debug(f"Resolved trailing MoveFree config {q_end} using {q_start}")
-            
-        # There should not be any deferred parameters left
+
         if deferred_params:
             raise RuntimeError(f"Deferred parameters not resolved: {deferred_params}")
 

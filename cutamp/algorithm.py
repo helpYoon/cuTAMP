@@ -15,7 +15,7 @@ from typing import Dict, List, Union, Optional, Tuple
 from unittest.mock import Mock
 
 import torch
-from curobo.types.base import TensorDeviceType
+from curobo.types import DeviceCfg as TensorDeviceType
 
 from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
@@ -28,7 +28,6 @@ from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
 from cutamp.robots import get_q_home, load_robot_container
 from cutamp.rollout import RolloutFunction
-from cutamp.tamp_domain import all_tamp_operators
 from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
 from cutamp.task_planning import PlanSkeleton, task_plan_generator
@@ -65,9 +64,12 @@ def heuristic_fn(
 
             # replace zeros with -num_particles
             satisfying[satisfying == 0] = -num_particles
-            successes.extend(satisfying.tolist())
+            sat_list = satisfying.tolist()
+            if not isinstance(sat_list, list):
+                sat_list = [sat_list]
+            successes.extend(sat_list)
             if verbose:
-                _log.debug(f"{con_type} {name} {satisfying.tolist()}")
+                _log.debug(f"{con_type} {name} {sat_list}")
     success_mean = sum(successes) / len(successes)
     success_rate = success_mean / num_particles
     failure_rate = 1 - success_rate
@@ -99,6 +101,31 @@ def get_best_particle(
     best_idx = indices[satisfying_mask][best_satisfying_idx]
     best_particle = {k: v[best_idx].detach().clone() for k, v in particles.items()}
     return best_particle
+
+
+def get_top_satisfying_particles(
+    plan_info: dict,
+    config: TAMPConfiguration,
+    constraint_checker: ConstraintChecker,
+    cost_reducer: CostReducer,
+    n: int,
+) -> List[dict]:
+    """Top-N satisfying particles ranked by ascending soft cost. May return < n
+    if fewer particles satisfy constraints. Used by the motion-plan retry loop:
+    if solve_curobo fails on the best particle, retry on the next-best.
+    """
+    particles = plan_info["particles"]
+    with torch.no_grad():
+        rollout = plan_info["rollout_fn"](particles)
+        cost_dict = plan_info["cost_fn"](rollout, particles)
+    satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
+    if not satisfying_mask.any():
+        raise RuntimeError("No satisfying particles found")
+    soft_costs = cost_reducer.soft_costs(cost_dict)
+    sat_indices = torch.arange(config.num_particles, device=soft_costs.device)[satisfying_mask]
+    order = torch.argsort(soft_costs[satisfying_mask])
+    top = sat_indices[order[: min(n, order.numel())]]
+    return [{k: v[i].detach().clone() for k, v in particles.items()} for i in top]
 
 
 def sample_plan_skeleton(
@@ -137,11 +164,6 @@ def sample_plan_skeleton(
     with timer.time("get_satisfying_mask"):
         satisfying_mask = constraint_checker.get_mask(cost_dict)
     num_satisfying = satisfying_mask.sum().item()
-
-    if config.stick_button_experiment and num_satisfying > 0:
-        # Custom logic in stick button for breaking early for sampling baseline
-        heuristic -= 100
-        print(f"Found satisfying plan: {plan_str} heuristic -= 100")
 
     # Best cost initially
     with timer.time("compute_best_cost"):
@@ -195,7 +217,7 @@ def resample_plan_info(
     # Rollout new particles and compute costs
     with timer.time("measure_heuristic"), torch.no_grad():
         rollout = plan_info["rollout_fn"](plan_particles)
-        cost_dict = plan_info["cost_fn"](rollout)
+        cost_dict = plan_info["cost_fn"](rollout, plan_particles)
         heuristic = heuristic_fn(plan_info["plan_skeleton"], cost_dict, constraint_checker, verbose=False)
 
     # Number of satisfying particles
@@ -233,6 +255,54 @@ def resample_plan_info(
     return num_satisfying
 
 
+def _motion_plan_with_retries(
+    plan_info: dict,
+    candidates: list,
+    world: TAMPWorld,
+    config: TAMPConfiguration,
+    timer: TorchTimer,
+    visualizer,
+) -> Tuple[Optional[dict], bool]:
+    """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
+
+    cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
+    its internal retries; a different particle gives a different pair and
+    usually succeeds.
+
+    Returns ``(curobo_plan, skip_plan)``:
+      - ``curobo_plan``: the successful plan, or ``None`` if all candidates
+        failed.
+      - ``skip_plan``: ``True`` if a ``NotImplementedError`` was raised — the
+        caller should skip this plan_skeleton entirely and move on.
+    """
+    last_err = None
+    for rank, particle in enumerate(candidates):
+        try:
+            curobo_plan = solve_curobo(
+                plan_info, particle, world, config, timer, visualizer,
+            )
+            if rank > 0:
+                _log.warning(
+                    f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
+                )
+            return curobo_plan, False
+        except NotImplementedError as e:
+            _log.warning(
+                f"Motion planning not supported for this plan: {e}. Trying next plan..."
+            )
+            return None, True
+        except RuntimeError as e:
+            _log.warning(
+                f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
+            )
+            last_err = e
+    _log.error(
+        f"Exhausted {len(candidates)} particle retries; giving up on this plan. "
+        f"Last error: {last_err}"
+    )
+    return None, False
+
+
 def setup_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
@@ -249,34 +319,13 @@ def setup_cutamp(
 
     # Loading robot can be done offline, so doesn't count towards timing
     tensor_args = TensorDeviceType()
-    robot_container = load_robot_container(config.robot, tensor_args)
-    
-    # Handle initial configurations - dual-arm (T1) vs single-arm robots
-    is_dual_arm = config.robot == "t1"
-    if is_dual_arm:
-        # Dual-arm robot needs both left and right configurations
-        from cutamp.robots import robot_to_fns
-        if q_init is None:
-            q_init = {
-                "left": tensor_args.to_device(robot_to_fns["t1"]["q_home_left"]),
-                "right": tensor_args.to_device(robot_to_fns["t1"]["q_home_right"]),
-            }
-        elif isinstance(q_init, dict):
-            q_init = {
-                "left": tensor_args.to_device(q_init["left"]),
-                "right": tensor_args.to_device(q_init["right"]),
-            }
-        else:
-            raise ValueError("For T1 robot, q_init must be a dict with 'left' and 'right' keys")
-        # For visualizer, concatenate left and right configs (22-DOF total)
-        # The T1RerunRobot will convert this to full 28-DOF URDF format
-        q_init_for_visualizer = torch.cat([q_init["left"], q_init["right"]])
-    else:
-        # Single-arm robot
-        if q_init is None:
-            q_init = get_q_home(config.robot)
-        q_init = tensor_args.to_device(q_init)
-        q_init_for_visualizer = q_init
+    robot_container = load_robot_container(device_cfg=tensor_args)
+
+    # v0.8 single-MotionPlanner: q_init is a single full-DOF vector for every robot.
+    if q_init is None:
+        q_init = get_q_home()
+    q_init = tensor_args.to_device(q_init)
+    q_init_for_visualizer = q_init
 
     # Load TAMP world and warmup IK solver
     timer = TorchTimer()
@@ -294,12 +343,7 @@ def setup_cutamp(
 
     if config.warmup_ik:
         with timer.time("warmup_ik_solver", log_callback=_log.info):
-            if is_dual_arm:
-                # Warmup both left and right IK solvers for dual-arm robots
-                world.warmup_ik_solver(config.num_particles, arm="left")
-                world.warmup_ik_solver(config.num_particles, arm="right")
-            else:
-                world.warmup_ik_solver(config.num_particles)
+            world.warmup_ik_solver(config.num_particles)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -327,8 +371,7 @@ def run_cutamp(
     # Task plan generator
     _log.info(f"Initial State: {world.initial_state}")
     _log.info(f"Goal State: {world.goal_state}")
-    # Select operators based on robot type
-    all_operators = all_t1_operators if config.robot == "t1" else all_tamp_operators
+    all_operators = all_t1_operators
     with timer.time("get_plan_generator", log_callback=_log.info):
         plan_gen = task_plan_generator(
             world.initial_state,
@@ -521,18 +564,15 @@ def run_cutamp(
         overall_metrics["num_optimized_plans"] += 1
         if has_satisfying:
             if config.curobo_plan:
-                try:
-                    curobo_plan = solve_curobo(
-                        plan_info,
-                        best_particle,
-                        world,
-                        config,
-                        timer,
-                        visualizer,
-                    )
-                except NotImplementedError as e:
-                    _log.warning(f"Motion planning not supported for this plan: {e}. Trying next plan...")
-                    continue  # Skip to next plan
+                candidates = get_top_satisfying_particles(
+                    plan_info, config, constraint_checker, cost_reducer,
+                    n=config.motion_plan_max_retries,
+                )
+                curobo_plan, skip_plan = _motion_plan_with_retries(
+                    plan_info, candidates, world, config, timer, visualizer,
+                )
+                if skip_plan or curobo_plan is None:
+                    continue
             found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
