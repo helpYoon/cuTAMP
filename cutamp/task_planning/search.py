@@ -240,6 +240,12 @@ def breadth_first_search(
         Whether to check if a state has been explored before adding it to the frontier.
     verbose: bool
         Whether to log debugging information. We have a flag so the log doesn't become polluted.
+    ground_op_priority_fn: Optional[Callable[[GroundOperator], float]]
+        Optional priority function for biased BFS sibling ordering.
+        When provided, ground operators returned at each expansion are
+        sorted ascending by priority. Used by the arm-affinity feature
+        to prefer same-side picks. Does not affect search correctness —
+        all valid ground ops are still enumerated, just in priority order.
 
     Returns
     -------

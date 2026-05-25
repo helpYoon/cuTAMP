@@ -82,18 +82,25 @@ def test_get_valid_ground_operators_sorts_by_priority_fn():
     world = TAMPWorld(env=env, device_cfg=device_cfg, robot=robot, q_init=q_init)
     initial_node = _Node(state=world.initial_state, parent=None, operator=None, depth=0)
 
-    # Priority: rank by reverse alphabetic order of the ground_op's repr.
-    # This guarantees a non-trivial reordering vs the un-sorted default.
+    # Priority: deterministic lexicographic reverse of repr. Distinct
+    # reprs give distinct priorities, so the sort assertion has real
+    # discriminating power. Reverse-lex order is guaranteed different
+    # from the BFS default (which is forward enumeration order),
+    # provided there are >=2 ground ops with distinct first chars.
     def priority(ground_op):
-        return -ord(repr(ground_op)[0])  # negate so it sorts reverse-alphabetic
+        return [-ord(c) for c in repr(ground_op)]
 
     unsorted = get_valid_ground_operators(initial_node, all_t1_operators)
     sorted_ops = get_valid_ground_operators(
         initial_node, all_t1_operators, priority_fn=priority,
     )
-    # Must return the same set
+    # Same set, no drops or duplicates.
     assert set(map(repr, unsorted)) == set(map(repr, sorted_ops))
-    # And the sorted version must be in non-decreasing priority order
+    # Sort must have actually reordered (would catch a no-op implementation).
+    assert [repr(o) for o in unsorted] != [repr(o) for o in sorted_ops], (
+        "sort did not reorder ground_ops — implementation may be a no-op"
+    )
+    # And the sorted version must be in ascending priority order.
     priorities = [priority(op) for op in sorted_ops]
     assert priorities == sorted(priorities), (
         f"ground_ops not sorted by priority: {priorities}"
