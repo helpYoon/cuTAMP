@@ -8,12 +8,12 @@
 # its affiliates is strictly prohibited.
 
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 import rerun as rr
 import torch
-from curobo.geom.types import Mesh
+from curobo.scene import Mesh
 from jaxtyping import Float
 
 from cutamp.config import TAMPConfiguration
@@ -45,14 +45,14 @@ class Visualizer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def log_joint_trajectory_with_mat4x4(
+    def log_joint_trajectory_with_mat4x4s(
         self,
         traj: Float[torch.Tensor, "n d"],
-        mat4x4_key: str,
-        mat4x4: Float[torch.Tensor, "n 4 4"],
+        mat4x4s: Dict[str, Float[torch.Tensor, "n 4 4"]],
         timeline: str,
         start_time: float,
         dt: float,
+        arm: str = None,
     ):
         pass
 
@@ -96,14 +96,14 @@ class MockVisualizer(Visualizer):
     def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float, arm: str = None):
         pass
 
-    def log_joint_trajectory_with_mat4x4(
+    def log_joint_trajectory_with_mat4x4s(
         self,
         traj: Float[torch.Tensor, "n d"],
-        mat4x4_key: str,
-        mat4x4: Float[torch.Tensor, "n 4 4"],
+        mat4x4s: Dict[str, Float[torch.Tensor, "n 4 4"]],
         timeline: str,
         start_time: float,
         dt: float,
+        arm: str = None,
     ):
         pass
 
@@ -132,7 +132,7 @@ class RerunVisualizer(Visualizer):
         spawn: bool,
     ):
         rr.init(application_id, recording_id=recording_id, spawn=spawn)
-        self.robot = load_rerun_robot(config.robot, load_mesh=config.viz_robot_mesh)
+        self.robot = load_rerun_robot(load_mesh=config.viz_robot_mesh)
         super().__init__(config, q_init)
 
     def set_time_sequence(self, timeline: str, val: int):
@@ -162,25 +162,32 @@ class RerunVisualizer(Visualizer):
             rr.send_columns(key, indexes=times * len(columns), columns=columns)
         return end_time
 
-    def log_joint_trajectory_with_mat4x4(
+    def log_joint_trajectory_with_mat4x4s(
         self,
         traj: Float[torch.Tensor, "n d"],
-        mat4x4_key: str,
-        mat4x4: Float[torch.Tensor, "n 4 4"],
+        mat4x4s: Dict[str, Float[torch.Tensor, "n 4 4"]],
         timeline: str,
         start_time: float,
         dt: float,
+        arm: str = None,
     ):
-        if traj.shape[0] != mat4x4.shape[0]:
-            raise ValueError("Trajectory and mat4x4 must have the same length.")
+        for key, mat in mat4x4s.items():
+            if traj.shape[0] != mat.shape[0]:
+                raise ValueError(f"Trajectory and mat4x4 for {key} must have the same length.")
         end_time = start_time + len(traj) * dt
         times = [rr.TimeColumn(timeline, duration=np.linspace(start_time, end_time, len(traj)))]
-        key_to_columns = self.robot.get_rr_columns(traj)
+        if arm is not None and hasattr(self.robot, 'get_rr_columns'):
+            key_to_columns = self.robot.get_rr_columns(traj, arm=arm)
+        else:
+            key_to_columns = self.robot.get_rr_columns(traj)
 
-        if mat4x4_key in key_to_columns:
-            raise ValueError(f"Key {mat4x4_key} already exists in key_to_components.")
-        mat4x4 = mat4x4.detach().cpu()
-        key_to_columns[mat4x4_key] = rr.Transform3D.columns(mat3x3=mat4x4[:, :3, :3], translation=mat4x4[:, :3, 3])
+        for mat4x4_key, mat in mat4x4s.items():
+            if mat4x4_key in key_to_columns:
+                raise ValueError(f"Key {mat4x4_key} already exists in key_to_components.")
+            mat = mat.detach().cpu()
+            key_to_columns[mat4x4_key] = rr.Transform3D.columns(
+                mat3x3=mat[:, :3, :3], translation=mat[:, :3, 3],
+            )
 
         for key, columns in key_to_columns.items():
             rr.send_columns(key, indexes=times * len(columns), columns=columns)

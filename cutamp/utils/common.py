@@ -12,14 +12,14 @@ from typing import Dict
 
 import roma
 import torch
-from curobo.geom.types import (
+from curobo.scene import (
     Capsule,
     Cuboid,
     Cylinder,
     Mesh,
     Obstacle,
+    Scene,
     Sphere,
-    WorldConfig,
 )
 from einops import einsum
 from jaxtyping import Float
@@ -153,8 +153,8 @@ def approximate_goal_aabb(goal: Obstacle) -> Float[torch.Tensor, "2 3"]:
     return aabb
 
 
-def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> WorldConfig:
-    """Get the cuRobo WorldConfig from the TAMP environment."""
+def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene:
+    """Build a cuRobo v0.8 Scene from the TAMP environment's obstacles."""
     geoms = defaultdict(list)
     obstacles = env.movables if include_movables else []
     obstacles += env.statics
@@ -168,8 +168,7 @@ def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> World
         elif isinstance(obj, Capsule):
             geoms["capsule"].append(obj)
         elif isinstance(obj, (MultiSphere, Mesh)):
-            # Need to use mesh for MultiSphere
             geoms["mesh"].append(obj)
         else:
             raise ValueError(f"Unknown object type: {type(obj)}")
-    return WorldConfig(**geoms)
+    return Scene(**geoms)

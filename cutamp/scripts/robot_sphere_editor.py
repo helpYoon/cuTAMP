@@ -11,7 +11,7 @@ Usage:
     python -m cutamp.scripts.yaml_sphere_editor \
         --urdf path/to/robot.urdf \
         --yaml path/to/robot.yml \
-        --links lifting_base_link column_stage_1 column_stage_2 column_stage_3
+        --links mobile_base_link shank_link thigh_link
 
 Key Controls:
     L           - Cycle through links
@@ -40,7 +40,7 @@ import yaml
 from yourdfpy import URDF
 
 # cuRobo imports for mesh sphere fitting
-from curobo.geom.sphere_fit import SphereFitType, fit_spheres_to_mesh
+from curobo.sphere_fit import SphereFitType, fit_spheres_to_mesh
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ def fit_spheres_to_mesh_file(
             mesh,
             n_spheres=n_spheres,
             surface_sphere_radius=surface_sphere_radius,
-            fit_type=SphereFitType.VOXEL_VOLUME_SAMPLE_SURFACE,
+            fit_type=SphereFitType.VOXEL,
             voxelize_method="subdivide",
         )
         
@@ -766,7 +766,7 @@ def main():
         "--add-links",
         type=str,
         nargs="+",
-        default=["lifting_base_link", "column_stage_1", "column_stage_2", "column_stage_3"],
+        default=["mobile_base_link", "shank_link", "thigh_link"],
         help="Additional links to add for editing (even if empty in YAML)",
     )
     

@@ -13,9 +13,8 @@ from typing import Dict, List, ClassVar, Set, Tuple
 
 import torch
 import yaml
-from curobo.geom.types import Cuboid, Obstacle, Cylinder, Mesh
+from curobo.scene import Cuboid, Obstacle, Cylinder, Mesh
 
-from cutamp.tamp_domain import all_tamp_fluents
 from cutamp.t1_domain import all_t1_fluents
 from cutamp.utils.shapes import MultiSphere
 from cutamp.task_planning.base_structs import State
@@ -129,7 +128,7 @@ def load_env(env_path: str) -> TAMPEnvironment:
             statics.append(obj)
 
     # Parse goal states
-    name_to_fluent = {fluent.name: fluent for fluent in all_tamp_fluents + all_t1_fluents}
+    name_to_fluent = {fluent.name: fluent for fluent in all_t1_fluents}
     goal_state = set()
     for atom_dict in env_dict["goal"]:
         if not (isinstance(atom_dict, dict) and len(atom_dict) == 1):

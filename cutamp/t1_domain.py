@@ -75,6 +75,11 @@ IsStick = Fluent("IsStick", [Parameter("obj", Movable)])
 HasNotPickedUp = Fluent("HasNotPickedUp", [Parameter("obj", Movable)])
 On = Fluent("On", [Parameter("obj", Movable), Parameter("surface", Surface)])
 
+# Tracks that the planar base is positioned within reach of the named target.
+# Added by MoveBaseTo(target). Pick/Place can require this in a follow-up pass
+# to force the planner to navigate before reaching.
+BaseNearby = Fluent("BaseNearby", [Parameter("target", Movable)])
+
 all_t1_fluents = [
     LeftAt,
     RightAt,
@@ -101,6 +106,7 @@ all_t1_fluents = [
     IsStick,
     HasNotPickedUp,
     On,
+    BaseNearby,
 ]
 
 
@@ -412,6 +418,41 @@ RightRetractFree = TAMPOperator(
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
 )
 
+# MoveBaseTo: planar-base navigation bound to a target object.
+#
+# Both arms must be at the same starting config (LeftAt(q_start) AND
+# RightAt(q_start)) — initially this is satisfied via shared "q0" in
+# get_initial_state. After MoveBaseTo, both LeftAt and RightAt point to the
+# same q_end (which differs from q_start only in base[0:3]). Subsequent arm
+# operators may diverge LeftAt/RightAt as before (this is fine — once the base
+# is positioned, arm ops do not move it).
+#
+# The "Bound to target" semantics: q_end's base must place the target object
+# within reach of either tool frame. The cost function enforces reachability
+# via a BaseReachable check (added separately).
+MoveBaseTo = TAMPOperator(
+    "MoveBaseTo",
+    [obj, q_start, traj, q_end],
+    preconditions=[
+        LeftAt(q_start), RightAt(q_start),
+        LeftCanMove(), RightCanMove(),
+        IsMovable(obj),  # binds `obj` to an existing movable literal
+    ],
+    add_effects=[
+        LeftAt(q_end), RightAt(q_end),
+        LeftJustMoved(), RightJustMoved(),
+        BaseNearby(obj),
+    ],
+    del_effects=[LeftAt(q_start), RightAt(q_start)],
+    constraints=[
+        CollisionFree(q_start, traj, q_end),
+        Motion(q_start, traj, q_end),
+    ],
+    costs=[TrajectoryLength(q_start, traj, q_end)],
+    metadata=OperatorMetadata(is_motion=True, action_type="navigate", arm=None),
+)
+
+
 all_t1_operators = [
     LeftMoveFree, RightMoveFree,
     LeftMoveHolding, RightMoveHolding,
@@ -421,6 +462,7 @@ all_t1_operators = [
     LeftRetractFree, RightRetractFree,
     LeftPush, RightPush,
     LeftPushStick, RightPushStick,
+    MoveBaseTo,
 ]
 
 

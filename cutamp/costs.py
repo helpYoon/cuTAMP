@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 from jaxtyping import Float
 
-from curobo.types.math import Pose
+from curobo.types import Pose
 
 
 def trajectory_length(
@@ -125,20 +125,29 @@ def sphere_to_sphere_overlap(
 def curobo_pose_error(
     pose_a_mat4x4: Float[torch.Tensor, "b *h 4 4"], pose_b_mat4x4: Float[torch.Tensor, "b *h 4 4"]
 ) -> (Float[torch.Tensor, "b *h"], Float[torch.Tensor, "b *h"]):
-    """
-    Compute the translational and rotational errors between two poses using curobo. Thanks Bala.
-    """
-    # Flatten
-    pose_a_flat = pose_a_mat4x4.view(-1, 4, 4)
-    pose_b_flat = pose_b_mat4x4.view(-1, 4, 4)
+    """Translational and rotational errors between two batched 4x4 pose tensors.
 
-    # Create curobo pose
-    pose_a = Pose.from_matrix(pose_a_flat)
-    pose_b = Pose.from_matrix(pose_b_flat)
+    Computes element-wise distances. Avoids ``curobo.types.Pose.distance``
+    because v0.8's ``angular_distance_axis_angle`` has a broadcast bug that
+    produces an ``[N, N]`` pairwise tensor for matching ``[N, 4]`` inputs.
+    """
+    # Translation: L2 distance in [b, *h]
+    p_dist = torch.linalg.norm(pose_a_mat4x4[..., :3, 3] - pose_b_mat4x4[..., :3, 3], dim=-1)
 
-    # Compute distance and unflatten
-    p_dist_flat, quat_dist_flat = pose_a.distance(pose_b)
-    p_dist = p_dist_flat.view(pose_a_mat4x4.shape[:-2])
-    quat_dist = quat_dist_flat.view(pose_b_mat4x4.shape[:-2])
+    # Rotation: angle of relative rotation R_a^T @ R_b. Use the
+    # ``angle = atan2(||skew_part||, (trace-1)/2)`` formulation, which is
+    # numerically stable near identity (where arccos has infinite gradient).
+    R_a = pose_a_mat4x4[..., :3, :3]
+    R_b = pose_b_mat4x4[..., :3, :3]
+    R_rel = torch.matmul(R_a.transpose(-1, -2), R_b)
+    trace = R_rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cos_part = (trace - 1.0) * 0.5
+    # off-diagonal vector that captures sin(angle) * axis
+    skew_x = R_rel[..., 2, 1] - R_rel[..., 1, 2]
+    skew_y = R_rel[..., 0, 2] - R_rel[..., 2, 0]
+    skew_z = R_rel[..., 1, 0] - R_rel[..., 0, 1]
+    sin_part = 0.5 * torch.sqrt(skew_x * skew_x + skew_y * skew_y + skew_z * skew_z + 1e-12)
+    quat_dist = torch.atan2(sin_part, cos_part)
+
     assert p_dist.shape == quat_dist.shape
     return p_dist, quat_dist

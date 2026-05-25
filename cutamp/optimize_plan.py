@@ -9,26 +9,102 @@
 
 import logging
 import time
-from typing import Tuple, TypedDict
+from dataclasses import dataclass
+from typing import Callable, List, Literal, Tuple, TypedDict
 
 import torch
 from torch.optim import Adam
 from tqdm import tqdm
 
-from cutamp.utils.common import Particles
+from cutamp.conf_locking import apply_grad_masks, build_grad_masks
+from cutamp.utils.common import (
+    Particles,
+    action_4dof_to_mat4x4,
+    action_6dof_to_mat4x4,
+)
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
+from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q
 from cutamp.rollout import RolloutFunction
-from cutamp.tamp_domain import Conf, Grasp, Pose, Traj
+from cutamp.t1_domain import Conf, Grasp, Pose, Traj
+from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
-from cutamp.robots.t1 import t1_home_left, t1_home_right
+from cutamp.robots.t1 import t1_home
 
 _log = logging.getLogger(__name__)
 _known_types = {Conf, Grasp, Pose, Traj}
+
+
+@dataclass
+class IKDep:
+    """Re-IK dependency: which Conf to refresh and how to rebuild its IK target.
+
+    ``target_fn(particles)`` rebuilds ``world_from_ee`` from the current
+    particle state. ``q_name`` is the Conf to overwrite (in-place) with the
+    IK solution. ``arm`` selects the active tool frame and the inactive-arm
+    cspace pin (matching ``_ik_for_pose``'s contract).
+    """
+    q_name: str
+    arm: Literal["left", "right"]
+    target_fn: Callable[[dict], torch.Tensor]
+
+
+def _build_ik_deps(
+    plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration,
+) -> List[IKDep]:
+    """Walk the plan skeleton and emit one IKDep per actionable op whose Conf
+    is determined by Pose / Grasp particles via IK.
+
+    Mirrors ``ParticleInitializer``'s init-time IK targets (Pick /
+    Place / Push / PushStick) so re-IK reproduces what was done at init,
+    just from updated particle values. Operators with no IK target
+    (Retract, MoveFree, MoveHolding, Navigate) are skipped.
+    """
+    deps: List[IKDep] = []
+    grasp_to_mat = action_4dof_to_mat4x4 if config.grasp_dof == 4 else action_6dof_to_mat4x4
+    for ground_op in plan_skeleton:
+        meta = ground_op.operator.metadata
+        if not getattr(meta, "is_actionable", False):
+            continue
+        action_type = meta.action_type
+        arm = meta.arm
+        if arm is None:
+            continue
+        params = ground_op.values
+        tool_frame = world.tool_frame_for_arm(arm)
+        tool_from_ee = world.tool_from_ee[tool_frame]
+
+        if action_type == "pick":
+            obj, grasp_name, q_name = params
+            # Snapshot the object's INITIAL pose. If the skeleton ever picks
+            # the same object after a place (Pick A → Place A → Pick A), the
+            # IK target should follow A's placed pose, not its initial one —
+            # not handled today; blocks_t1 has no such re-grasp pattern.
+            world_from_obj = world.get_object_pose(obj)
+            def target_fn(p, _wo=world_from_obj, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
+                return _wo @ _gm(p[_g]) @ _t
+            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
+        elif action_type == "place":
+            obj, grasp_name, placement, surface, q_name = params
+            def target_fn(p, _pl=placement, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
+                return action_4dof_to_mat4x4(p[_pl]) @ _gm(p[_g]) @ _t
+            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
+        elif action_type == "push":
+            button, push_pose, q_name = params
+            def target_fn(p, _pp=push_pose, _t=tool_from_ee):
+                return action_4dof_to_mat4x4(p[_pp]) @ _t
+            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
+        elif action_type == "push_stick":
+            button, stick_name, grasp_name, push_pose, q_name = params
+            def target_fn(p, _pp=push_pose, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
+                return action_4dof_to_mat4x4(p[_pp]) @ _gm(p[_g]) @ _t
+            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
+        # action_type in {"retract", "navigate", None}: no IK target, skip.
+    return deps
 
 
 class PlanContainer(TypedDict):
@@ -51,6 +127,124 @@ class ParticleOptimizer:
         # Types to optimize
         self.types_to_optimize = {Pose, Conf}
         self.opt_counter = 0
+
+    def _run_phase2_lbfgs_refinement(
+        self,
+        particles: dict,
+        sat_mask: torch.Tensor,
+        rollout_fn,
+        cost_fn,
+        *,
+        barrier_weight: float = 1e6,
+        max_iter: int = 20,
+    ) -> None:
+        """Refine soft costs on satisfying particles via LBFGS + line search.
+
+        Operates on a SUBSET of particles (those that already satisfy hard
+        constraints). The barrier term ``barrier_weight * mean(hard_costs)``
+        spikes the loss whenever a step would break satisfaction, so the
+        strong-Wolfe line search backtracks before destruction. Refined
+        values are written back into ``particles[*][sat_mask]``.
+        """
+        n_sat = int(sat_mask.sum().item())
+        if n_sat == 0:
+            return
+        # Detach + clone so LBFGS owns the parameter tape independent of any
+        # outer optimizer state (Adam, grad_masks, etc.).
+        refined = {
+            k: v[sat_mask].detach().clone().requires_grad_(True)
+            for k, v in particles.items()
+        }
+        params = list(refined.values())
+        lbfgs = torch.optim.LBFGS(
+            params,
+            lr=1.0,
+            max_iter=max_iter,
+            line_search_fn="strong_wolfe",
+            tolerance_grad=1e-6,
+            tolerance_change=1e-9,
+        )
+
+        def closure():
+            lbfgs.zero_grad()
+            rollout = rollout_fn(refined)
+            cost_dict = cost_fn(rollout, refined)
+            soft = self.cost_reducer.soft_costs(cost_dict).mean()
+            hard = self.cost_reducer.hard_costs(cost_dict).mean()
+            loss = soft + barrier_weight * hard
+            loss.backward()
+            return loss
+
+        with torch.no_grad():
+            soft_before = self.cost_reducer.soft_costs(
+                cost_fn(rollout_fn(refined), refined)
+            ).mean().item()
+        try:
+            lbfgs.step(closure)
+        except Exception as e:
+            _log.warning(f"Phase 2 LBFGS refinement failed: {e}; keeping pre-Phase-2 particles.")
+            return
+        with torch.no_grad():
+            soft_after = self.cost_reducer.soft_costs(
+                cost_fn(rollout_fn(refined), refined)
+            ).mean().item()
+            post_sat = self.get_satisfying_mask(
+                cost_fn(rollout_fn(refined), refined), verbose=False,
+            )
+        kept = int(post_sat.sum().item())
+        _log.info(
+            f"Phase 2 LBFGS: refined {n_sat} particles; soft {soft_before:.4f} → "
+            f"{soft_after:.4f}; {kept}/{n_sat} still satisfying after refinement."
+        )
+        # Write refined values back. Particles that became unsatisfying during
+        # refinement (rare with the barrier, but possible if Wolfe couldn't
+        # find a backtracking step) get their original values restored.
+        with torch.no_grad():
+            for k in particles:
+                # Build the refined-or-original tensor for the sat_mask slice.
+                sub = refined[k].detach()
+                # Restore to pre-refinement values where post_sat is False.
+                if (~post_sat).any():
+                    pre = particles[k][sat_mask]
+                    sub = torch.where(
+                        post_sat.view(-1, *([1] * (sub.dim() - 1))).expand_as(sub),
+                        sub, pre,
+                    )
+                particles[k][sat_mask] = sub
+
+    def _refresh_ik_deps(
+        self,
+        particles: dict,
+        ik_deps: List[IKDep],
+        world: TAMPWorld,
+    ) -> None:
+        """Re-solve IK for each ``IKDep`` and write the result into the
+        corresponding Conf particle in-place. Failed particles keep their
+        previous q (per-particle masked write).
+
+        cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
+        so the IK call cannot run under ``torch.no_grad``; only the in-place
+        ``copy_`` is wrapped. The ``copy_`` preserves tensor identity, which
+        ``grad_masks`` and Adam state both depend on.
+        """
+        if not ik_deps:
+            return
+        for dep in ik_deps:
+            # Detach the target so IK's backward doesn't try to flow into
+            # Pose / Grasp particles (which are leaves in our autograd graph).
+            world_from_ee = dep.target_fn(particles).detach()
+            current_state_q = particles[dep.q_name].detach()
+            ik_result = _ik_for_pose(
+                world, world_from_ee, dep.arm,
+                current_state_q=current_state_q,
+            )
+            new_q = _ik_solution_to_full_q(ik_result, world).detach()
+            success = ik_result.success.view(-1, 1)
+            with torch.no_grad():
+                merged = torch.where(success, new_q, particles[dep.q_name])
+                particles[dep.q_name].copy_(merged)
+                # Dropped from the optimizer, so .grad has no consumer.
+                particles[dep.q_name].grad = None
 
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
         """
@@ -77,6 +271,16 @@ class ParticleOptimizer:
             for param_name, param_type in zip(param_names, types):
                 param_to_type[param_name] = param_type
 
+        # Re-IK-coupled Adam: build the IK dependency map and drop covered
+        # Confs from the optimizer (they're refreshed by IK every K steps
+        # instead of trained by gradient descent).
+        world = rollout_fn.world
+        ik_deps: List[IKDep] = (
+            _build_ik_deps(plan_skeleton, world, self.config)
+            if self.config.coupled_reik else []
+        )
+        dropped_conf_names = {dep.q_name for dep in ik_deps}
+
         param_groups = []
         param_msg = []
         # Initial configurations that we don't optimize
@@ -90,6 +294,12 @@ class ParticleOptimizer:
                 continue
             if param in initial_confs:
                 continue  # we don't optimize the initial configuration(s)
+            if param in dropped_conf_names:
+                # Coupled re-IK: q is determined by IK from current Pose/Grasp.
+                # requires_grad stays True so cost evaluation differentiates
+                # through it; we just don't update it via Adam.
+                val.requires_grad = True
+                continue
             param_msg.append(f"(param: {param} = {tuple(val.shape)})")
             group = {"params": val}
             if param_type == Conf:
@@ -103,6 +313,13 @@ class ParticleOptimizer:
 
         # Setup optimizer
         optimizer = Adam(params=param_groups, lr=self.config.lr)
+
+        # Per-conf gradient mask: hard-zero DOFs that should not move during
+        # this operator (e.g., base + inactive arm during arm operations).
+        # See cutamp/conf_locking.py for the policy.
+        grad_masks = build_grad_masks(
+            plan_skeleton, particles, param_to_type, Conf,
+        )
         num_total_params = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
         opt_metrics["optimizer"] = {
             "optimizer_cls": optimizer.__class__.__name__,
@@ -115,8 +332,21 @@ class ParticleOptimizer:
         _log.debug(f"Total DOF for each particle: {total_dof}")
 
         indices = torch.arange(self.config.num_particles, device="cuda")
+        # Adam only ever minimizes hard-constraint penalties (Phase 1).
+        # ``--optimize_soft_costs`` engages a separate Phase 2 (LBFGS with
+        # strong-Wolfe line search + barrier on hard constraints) that
+        # refines satisfying particles for soft costs without breaking
+        # constraint satisfaction.
         consider_types = {"constraint"}
-        if self.config.optimize_soft_costs:
+        # Upstream-style fallback: when set, mimic NVlabs/cuTAMP main —
+        # Adam runs always with soft costs in the loss (statistical
+        # exploration), no Phase 2. Useful for pose-class soft costs that
+        # have no constraint-manifold tangent for LBFGS to refine along.
+        upstream_style = getattr(self.config, "upstream_style_optimize", False)
+        # Coupled re-IK breaks the KinematicConstraint coupling that destroys
+        # vanilla Adam on pose-class soft costs, so soft costs can safely
+        # join the Adam loss. Phase 2 LBFGS still runs for q-class refinement.
+        if self.config.optimize_soft_costs and (upstream_style or self.config.coupled_reik):
             consider_types.add("cost")
         found_solution = False
         timer.stop("setup_optimizer")
@@ -132,8 +362,45 @@ class ParticleOptimizer:
         num_steps = self.config.num_opt_steps
         opt_metrics["num_steps"] = num_steps
 
-        # Now we optimize!
-        pbar = tqdm(range(num_steps))
+        # Phase 1 (Adam): find satisfying particles by minimizing the
+        # hard-constraint penalty. Skip Adam entirely if the IK-init
+        # already produced satisfying particles — Adam's bias-corrected
+        # first step has magnitude ``lr`` per non-zero-gradient DOF,
+        # independent of gradient size, which destroys near-optimal
+        # initializations.
+        # When coupled_reik is on, run Adam even if init satisfied, since
+        # the goal is to actively move Pose particles for the soft cost.
+        with torch.no_grad():
+            init_rollout = rollout_fn(particles)
+            init_cost_dict = cost_fn(init_rollout, particles)
+            init_satisfying = self.get_satisfying_mask(init_cost_dict, verbose=False)
+            init_num = init_satisfying.sum().item()
+        skip_adam = (
+            (init_num > 0) and not upstream_style and not self.config.coupled_reik
+        )
+        if skip_adam:
+            _log.info(
+                f"IK-init already produced {init_num}/{self.config.num_particles} satisfying "
+                f"particles; skipping Adam Phase 1."
+            )
+            if timer.has_timer("first_solution"):
+                timer.stop("first_solution")
+            opt_metrics["num_satisfying"].append(init_num)
+            opt_metrics["loss"].append(
+                self.cost_reducer(init_cost_dict, consider_types=consider_types).mean().item()
+            )
+            opt_metrics["elapsed"].append(0.0)
+            opt_metrics["opt_start_to_first_sol"] = 0.0
+        elif init_num > 0 and self.config.coupled_reik:
+            # First-solution timing semantics: we already have a solution
+            # from IK init, so stamp 0.0 even though Adam is about to run.
+            if timer.has_timer("first_solution"):
+                timer.stop("first_solution")
+            opt_metrics["opt_start_to_first_sol"] = 0.0
+            found_solution = True
+
+        # Phase 1 (Adam): only run when IK init didn't already satisfy.
+        pbar = tqdm(range(num_steps)) if not skip_adam else []
         start_time = time.perf_counter()
         time_exceeded = False
         for step in pbar:
@@ -187,24 +454,9 @@ class ParticleOptimizer:
                 q_last = rollout["confs"][best_idx, -1].tolist()
                 
                 # For T1, construct 22-DOF config with active arm + inactive arm at home
-                # 22-DOF format: left[11] + right[11], where each 11 = shared(4) + arm(7)
-                if self.config.robot == "t1":
-                    last_conf_name = rollout["conf_params"][-1]
-                    shared_joints = q_last[:4]  # lift (2) + torso (2)
-                    arm_joints = q_last[4:11]   # 7 arm joints
-                    
-                    if last_conf_name.startswith("left_"):
-                        # Left arm active: left = active config, right = home with same shared
-                        q_left_11 = shared_joints + arm_joints
-                        q_right_11 = shared_joints + list(t1_home_right[4:11])
-                    else:
-                        # Right arm active: left = home with same shared, right = active config
-                        q_left_11 = shared_joints + list(t1_home_left[4:11])
-                        q_right_11 = shared_joints + arm_joints
-                    q_22dof = q_left_11 + q_right_11
-                    visualizer.set_joint_positions(q_22dof)
-                else:
-                    visualizer.set_joint_positions(q_last)
+                # v0.8: configs are full 21-DOF (T1) or single chain DOF (others).
+                # T1RerunRobot maps 21 → 28 URDF actuated joints internally.
+                visualizer.set_joint_positions(q_last)
                 for obj in rollout["obj_to_pose"]:
                     mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]
                     visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
@@ -213,13 +465,43 @@ class ParticleOptimizer:
                 visualizer.log_scalar("loss", loss.item())
                 timer.stop("visualize_opt_rollout")
 
-            # Compute gradients and step the optimizer
+            # Compute gradients and step the optimizer.
+            # Skip per-conf gradient masking in upstream-style mode so the
+            # comparison is honest (upstream has no grad masking).
             loss.backward()
+            if not upstream_style:
+                apply_grad_masks(optimizer.param_groups, grad_masks)
             optimizer.step()
+            # Counts from 1 so the first refresh lands at step K-1 (after
+            # the first batch of pose updates), not step 0.
+            if ik_deps and (step + 1) % self.config.reik_interval == 0:
+                self._refresh_ik_deps(particles, ik_deps, world)
             timer.stop("optimization_step")
             pbar.set_description(
                 f"Loss: {loss:.3f}, Min: {costs.min():.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
             )
+
+        # Final re-IK before downstream satisfaction checks: Adam may have
+        # moved poses since the last periodic refresh.
+        if ik_deps:
+            self._refresh_ik_deps(particles, ik_deps, world)
+
+        # Phase 2 (LBFGS soft-cost refinement): when --optimize_soft_costs is
+        # set, refine the satisfying particles' soft costs with LBFGS +
+        # strong-Wolfe line search. A large barrier on the hard-constraint
+        # penalty makes any step that breaks satisfaction increase the loss,
+        # so LBFGS's line search backtracks before taking it. Result:
+        # soft cost monotonically decreases on satisfying particles, and
+        # hard-constraint satisfaction is preserved by construction.
+        if self.config.optimize_soft_costs and not upstream_style:
+            with torch.no_grad():
+                pre_p2_rollout = rollout_fn(particles)
+                pre_p2_cost_dict = cost_fn(pre_p2_rollout, particles)
+                pre_p2_sat = self.get_satisfying_mask(pre_p2_cost_dict, verbose=False)
+            if pre_p2_sat.any():
+                self._run_phase2_lbfgs_refinement(
+                    particles, pre_p2_sat, rollout_fn, cost_fn,
+                )
 
         # Now we've finished the optimization loop. Check the satisfying particles and compute soft/hard costs.
         with torch.no_grad():
@@ -261,13 +543,7 @@ class ParticleOptimizer:
         timer.start("visualize_rollout")
         world = rollout_fn.world
         visualizer.set_time_sequence(f"rollout_{self.opt_counter}", 0)
-        if world.is_dual_arm:
-            # For dual-arm, concatenate left and right configs (22-DOF total)
-            # The T1RerunRobot will convert this to full 28-DOF URDF format
-            q_init_concat = world.left_q_init.tolist() + world.right_q_init.tolist()
-            visualizer.set_joint_positions(q_init_concat)
-        else:
-            visualizer.set_joint_positions(world.q_init.tolist())
+        visualizer.set_joint_positions(world.q_init.tolist())
         for obj in world.movables:
             obj_pose = world.get_object_pose(obj).cpu()
             visualizer.log_mat4x4(f"world/{obj.name}", obj_pose)
@@ -278,23 +554,11 @@ class ParticleOptimizer:
             conf_name = rollout["conf_params"][ts]
 
             gripper_close = rollout["gripper_close"][ts]
-            if self.config.robot == "ur5":
-                gripper_joints = [0.4] if gripper_close else [0.0]
-            elif self.config.robot == "panda":
-                gripper_joints = [0.01, 0.01] if gripper_close else [0.04, 0.04]
-            elif self.config.robot == "t1":
-                # T1 gripper: 4-bar parallel linkage, 4 joints per hand
-                # GRIPPER_OPEN = (0.0, 0.0, 0.0, 0.0), GRIPPER_CLOSED = (1.0, -1.0, -1.0, 1.0)
-                gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
-            else:
-                gripper_joints = []
-            
-            # For T1, determine which arm this configuration belongs to and pass it
-            if self.config.robot == "t1":
-                arm = "left" if conf_name.startswith("left_") else "right"
-                visualizer.set_joint_positions(q.tolist() + gripper_joints, arm=arm)
-            else:
-                visualizer.set_joint_positions(q.tolist() + gripper_joints)
+            # T1 gripper: 4-bar parallel linkage, 4 joints per hand.
+            # GRIPPER_OPEN = (0,0,0,0), GRIPPER_CLOSED = (1,-1,-1,1).
+            gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
+            arm = "left" if conf_name.startswith("left_") else "right"
+            visualizer.set_joint_positions(q.tolist() + gripper_joints, arm=arm)
 
             world_from_ee = rollout["world_from_ee"][best_idx, ts].cpu()
             visualizer.log_mat4x4("rollout/ee_pose", world_from_ee)

@@ -20,7 +20,7 @@ import numpy as np
 import rerun as rr
 import trimesh
 
-from curobo.geom.types import Mesh as CuroboMesh, Obstacle
+from curobo.scene import Mesh as CuroboMesh, Obstacle
 
 AXIS_LENGTH = 0.075
 

@@ -2,187 +2,242 @@
 
 ## Quick Links
 
-The full README with installation instructions, examples, and detailed documentation can be found in [README_DETAILED.md](README_DETAILED.md).
+The full README with installation instructions, examples, and detailed
+documentation can be found in [README_DETAILED.md](README_DETAILED.md). Notes
+on the cuRobo v0.8 port that defines this branch's architecture are in
+[docs/curobo_v08_port.md](docs/curobo_v08_port.md).
 
-## T1 Dual-Arm Architecture
+## T1 Single-Planner Architecture (cuRobo v0.8)
 
-The T1 robot has **4 shared joints** (lift + torso) that appear in both arms' 11-DOF kinematic chains. When either arm moves, these shared joints can change, affecting the other arm's end-effector position.
+This branch (`curobo_v2`) plans for the T1 humanoid through a **single 21-DOF
+MotionPlanner** built from `t1_planar_base.yml`. The cspace is:
+
+```
+3 base (planar: base_j_x, base_j_y, base_j_yaw)   ← locked at IK time, free during navigate
+2 leg  (ankle_pitch, knee_pitch)
+2 torso (Torso_Pitch, Waist_Yaw)
+7 left arm  (Left_Shoulder_Pitch ... Left_Hand_Roll)
+7 right arm (Right_Shoulder_Pitch ... Right_Hand_Roll)
+= 21 DOF
+```
+
+The mobile base is added as a virtual chain via `extra_links`
+(`world → base_j_x → base_j_y → base_j_yaw → mobile_base_link`) and locked at
+IK / motion-planner construction time, leaving an 18-DOF active cspace for arm
+operators. Two tool frames (`left_base_link`, `right_base_link`) are exposed
+on the same kinematics; per-arm IK uses `GoalToolPose` to target one frame at
+a time.
 
 ```mermaid
 graph TD
-    subgraph StateTracking [State Tracking]
-        SharedJoints["Shared Joints (4)<br/>waist_lift_1, waist_lift_2<br/>Torso_Pitch, Waist_Yaw"]
-        LeftArm["Left Arm Joints (7)"]
-        RightArm["Right Arm Joints (7)"]
+    subgraph Planner [Single 21-DOF MotionPlanner]
+        Base["Planar base (3, locked at IK)"]
+        Body["Leg + Torso (4, always free)"]
+        L["Left arm (7)"]
+        R["Right arm (7)"]
     end
-    
-    subgraph Operations [Operations]
-        LeftOp[LeftMoveFree/LeftPick/etc]
-        RightOp[RightMoveFree/RightPick/etc]
+
+    subgraph Pinning [Cspace pinning per operator]
+        ArmOp["pin_for_arm_action(active_arm)<br/>→ inactive arm pinned to start;<br/>active arm + body free"]
+        Nav["pin_for_movebase()<br/>→ both arms + body pinned;<br/>only base DOFs free"]
     end
-    
-    LeftOp -->|"IK solves 11-DOF"| SharedJoints
-    LeftOp -->|"Updates"| LeftArm
-    RightOp -->|"IK solves 11-DOF"| SharedJoints
-    RightOp -->|"Updates"| RightArm
-    
-    SharedJoints -->|"Propagate to inactive arm"| LeftArm
-    SharedJoints -->|"Propagate to inactive arm"| RightArm
+
+    subgraph Tools [Tool frames]
+        LT["left_base_link"]
+        RT["right_base_link"]
+    end
+
+    Planner --> ArmOp
+    Planner --> Nav
+    Planner --> LT
+    Planner --> RT
 ```
 
-## Modifications
+There is no per-arm "shared joint" propagation — the body joints are
+genuinely shared in one cspace, so trajopt updates them coherently. The
+inactive arm's tool moves through world during single-arm planning because
+the body translates; the visualizer tracks both arms' held objects through
+every trajectory (see `T1State.compute_all_held_obj_poses`).
 
-### 📁 **[Robots Folder](cutamp/robots/)**
+## Layout
 
-- **t1_description/** - T1 robot assets and configuration files:
-  - `t1_simplified.urdf` - Simplified URDF model for T1 dual-arm humanoid robot
-  - `t1_left_11dof.yml` / `t1_right_11dof.yml` - cuRobo configuration files for left/right arm (11 DOF each: 2 lift + 2 torso + 7 arm). Includes `lock_joints` set to home positions for the inactive arm.
-  - `t1_spheres.yml` - Collision sphere definitions for motion planning
-  - `left_gripper_spheres.pt` / `right_gripper_spheres.pt` - Pre-computed gripper collision spheres for grasp planning
-  - `meshes/` - STL mesh files for robot visualization and collision checking
+### 📁 [`cutamp/robots/`](cutamp/robots/)
 
-- [`__init__.py`](cutamp/robots/__init__.py) - Robot container factory and registry:
-  - `DualArmRobotContainer` dataclass for dual-arm robots
-  - `load_robot_container()` with T1 support
-  - Tool frame transformations (`tool_from_ee`) for top-down grasping:
-    - **T1**: Uses `Ry(+90°)` rotation because T1's EE frame has +X toward fingertips
+- **[`assets/t1_description/`](cutamp/robots/assets/t1_description/)**:
+  - `t1_simplified.urdf` — URDF the planner loads (adds the `world` link the
+    planar-base chain attaches to). `actual_robot.urdf` is the unmodified
+    upstream URDF kept for reference.
+  - `t1_planar_base.yml` — single cuRobo robot config: kinematics, cspace,
+    `lock_joints` (head + grippers), `collision_link_names`, planar-base
+    `extra_links`, and the two tool frames.
+  - `t1_spheres.yml` — collision spheres in each link's local frame; finger
+    spheres are consolidated into `left_base_link` / `right_base_link` since
+    the gripper joints are locked open.
+  - `left_gripper_spheres.pt`, `right_gripper_spheres.pt` — pre-fit gripper
+    spheres used by grasp sampling.
+  - `meshes/` — STL meshes referenced by the URDF.
 
-- [`t1.py`](cutamp/robots/t1.py) - T1 dual-arm humanoid robot module:
-  - cuRobo integration (kinematics, IK solvers, collision spheres)
-  - `curobo_to_urdf_joints()` - Maps 11-DOF or 15-DOF (11 arm + 4 gripper) cuRobo config to 28-DOF URDF
-  - `curobo_dual_arm_to_urdf_joints()` - Combines both arms' configs (22-DOF → 28-DOF) for visualization
-  - `T1RerunRobot` class for Rerun visualization:
-    - Handles 11-DOF (single arm), 15-DOF (arm + gripper), 22-DOF (dual arm), 30-DOF (dual arm + grippers)
-    - Automatically adds head joints at home position
+- [`__init__.py`](cutamp/robots/__init__.py) — `RobotContainer` factory and
+  `load_robot_container("t1")`. T1 exposes two tool frames; tool↔EE transforms
+  account for T1's +X-toward-fingertips EE convention.
 
-### 📁 **[Core Modifications](cutamp/)**
+- [`t1.py`](cutamp/robots/t1.py) — T1 module:
+  - cuRobo loaders: `get_t1_kinematics`, `get_t1_ik_solver(scene, arm=…)`
+    (one IK per arm, scoped to its tool frame), `get_t1_motion_planner` (the
+    single planner with the base lock applied).
+  - Joint-name + index constants: `JOINT_NAMES_FULL`, `BASE_INDICES`,
+    `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`,
+    `t1_home`.
+  - `T1RerunRobot` for visualization: maps the planner's cspace (18 active or
+    21 full) into the URDF's joint count, splices in head + per-arm gripper
+    state.
 
-- [`tamp_world.py`](cutamp/tamp_world.py) - Dual-arm world support:
-  - `is_dual_arm` property
-  - Arm-specific accessors: `get_kin_model(arm)`, `get_tool_from_ee(arm)`, `get_ik_solver(arm)`, `get_gripper_spheres(arm)`, `get_joint_limits(arm)`
-  - Dual `q_init` support (`left_q_init`, `right_q_init` properties)
-  - Uses T1's `get_initial_state` for dual-arm initial state
-  - `get_motion_gen()` supports `num_trajopt_seeds` and `num_trajopt_noisy_seeds` for motion planning robustness
+### 📁 [`cutamp/`](cutamp/) — core
 
-- [`config.py`](cutamp/config.py) - TAMP configuration:
-  - `soft_cost: Optional[List[str]]` - Supports multiple soft costs (e.g., `["retract_close_to_home", "minimize_lift_movement"]`)
-  - `optimize_soft_costs: bool` - Enable soft cost optimization
+- [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a TAMPEnvironment
+  with the collision Scene, the single `Kinematics`, two per-arm
+  `InverseKinematics` solvers (keyed by tool-frame name), and a
+  `MotionPlanner` factory. `q_init` is one 21-DOF tensor.
 
-- [`t1_domain.py`](cutamp/t1_domain.py) - TAMP domain for T1 dual-arm robot:
-  - Arm-specific fluents: `LeftAt`, `RightAt`, `LeftHandEmpty`, `RightHandEmpty`, `LeftHolding`, `RightHolding`, `LeftCanMove`, `RightCanMove`, `LeftJustPicked`, `RightJustPicked`, `LeftJustPlaced`, `RightJustPlaced`
-  - Arm-specific operators: `LeftMoveFree`, `RightMoveFree`, `LeftPick`, `RightPick`, `LeftPlace`, `RightPlace`, `LeftPush`, `RightPush`, `LeftPushStick`, `RightPushStick`
-  - **Retract operators**: `LeftRetractHolding`, `RightRetractHolding`, `LeftRetractFree`, `RightRetractFree` - move arm toward home configuration after pick/place actions
-  - Separate task planning for each arm
+- [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner,
+  kinematics, current joint state, and per-arm `arm_holding` /
+  `arm_grasp_transform`. Cspace pinning lives here:
+  - `pin_for_arm_action(arm)` — pin inactive arm; body + active arm free.
+  - `pin_for_movebase()` — pin both arms + body; only base free.
+  - `unpin()` — restore original weights.
+  - `compute_held_obj_poses(arm, plan)` — per-timestep `world_from_obj` for a
+    held object along a planner trajectory.
+  - `compute_all_held_obj_poses(plan)` — `{arm: (obj_name, poses)}` for every
+    arm currently holding (visualization needs both because the inactive
+    arm's tool still translates with the body).
 
-- [`algorithm.py`](cutamp/algorithm.py) - Setup for dual-arm:
-  - `setup_cutamp()` loads both `q_home_left` and `q_home_right` for T1
-  - Warmups IK solvers for both arms
-  - Passes dual configs to visualizer (22-DOF concatenated)
+- [`_curobo_internals.py`](cutamp/_curobo_internals.py) — every cuRobo
+  private-API workaround in one file (with `# TODO: file upstream issue`
+  markers): `get_attachment_manager`, `cspace_plan_succeeded`,
+  `write_cspace_target_dof_weight` / `snapshot…` / `restore…` for the
+  per-rollout target-weight tensors.
 
-- [`particle_initialization.py`](cutamp/particle_initialization.py) - Dual-arm particle sampling:
-  - `get_arm_from_operator()` - Extracts arm from operator name (e.g., "LeftPick" → "left")
-  - `propagate_shared_joints()` - Syncs 4 shared joints between arms after IK solve
-  - All operators (Pick, Place, Push, PushStick) support T1 variants
-  - Arm-specific resource access (gripper spheres, joint limits, tool_from_ee, IK solver)
+- [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
+  through the single planner. Per-operator: pin the cspace, plan, append a
+  trajectory entry to `accum_plans` (with `held_objs` for both arms), then
+  attach/detach via the AttachmentManager. Playback walks `accum_plans` and
+  hands each entry to the visualizer.
 
-- [`rollout.py`](cutamp/rollout.py) - Dual-arm forward kinematics:
-  - `get_conf_to_arm()` - Maps configuration names to their arm
-  - Arm-specific FK computation for each configuration
-  - Arm-specific `tool_from_ee` for `world_from_ee_desired` computation
-  - `get_retract_parameters()` - Extracts retract configuration metadata for collision checking
+- [`grasp_planning.py`](cutamp/grasp_planning.py) — `plan_single_arm_grasp` /
+  `plan_single_arm_pose` adapt v0.8's `plan_grasp` / `plan_pose` to a single
+  active tool frame while disabling the inactive frame's pose criterion.
 
-- [`cost_function.py`](cutamp/cost_function.py) - Dual-arm costs:
-  - Separate self-collision cost functions per arm
-  - Arm-specific joint limit checking
-  - `conf_to_arm` mapping for per-configuration cost computation
-  - Flexible trajectory length validation - allows trailing motion configs in `traj_length_confs`
-  - **Retract collision checking** - Hard constraints for `q_retract` configurations checking `robot_to_world` and `robot_to_movables` (excluding held object for `RetractHolding`)
-  - **Soft costs**:
-    - `retract_close_to_home` - Penalizes retract configurations far from home (torso + arm joints only)
-    - `minimize_lift_movement` - Penalizes lift column deviation from home position
-  - **Multiple soft cost support** - Can specify multiple soft costs simultaneously
+- [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
+  particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. Cache
+  hits route through `_apply_cached`.
 
-- [`optimize_plan.py`](cutamp/optimize_plan.py) - Dual-arm optimization:
-  - Skips optimization for both `left_q0` and `right_q0`
-  - T1 gripper joint handling for visualization (4-bar linkage: open/closed states)
-  - Dual-arm initial state visualization (22-DOF)
-  - During optimization, constructs 22-DOF config showing active arm's IK solution + inactive arm at home
+- [`t1_domain.py`](cutamp/t1_domain.py) — TAMP domain (fluents + operators)
+  for T1: `LeftAt` / `RightAt`, `LeftHolding` / `RightHolding`,
+  `LeftMoveFree` / `RightMoveFree`, `LeftPick` / `RightPick`, `LeftPlace` /
+  `RightPlace`, `LeftPush` / `RightPush`, `LeftPushStick` / `RightPushStick`,
+  and the `RetractHolding` / `RetractFree` family.
 
-- [`dual_arm_state.py`](cutamp/dual_arm_state.py) - Dual-arm state management:
-  - `DualArmState` dataclass encapsulating motion generators, joint states, and object tracking
-  - `disable_locked_arm_collision()` - Toggles collision checking for inactive arm
-  - `make_dual_arm_traj()` - Combines active arm trajectory with inactive arm state
-  - `compute_held_obj_poses()` - Computes object poses attached to gripper during motion
-  - `log_dual_arm_traj()` - Logs dual-arm trajectories with held objects to Rerun
+- [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported);
+  `soft_cost: Optional[List[str]]`, `optimize_soft_costs`,
+  `debug_motion_failures`.
 
-- [`motion_solver.py`](cutamp/motion_solver.py) - Dual-arm motion planning:
-  - Supports all T1 operators including retract operations
-  - Arm-specific motion generator, kinematics, and tool_from_ee
-  - World-frame approach offset for consistent top-down grasping across all robots
-  - T1 gripper joint values for visualization
-  - Uses `DualArmState` for state tracking across arm switches
-  - Graph planning enabled for retract operations (`enable_graph=True`)
+- [`algorithm.py`](cutamp/algorithm.py) — `setup_cutamp` + `run_cutamp`
+  outer loop. The motion-plan retry sweep lives in `_motion_plan_with_retries`.
 
-- [`task_planning/search.py`](cutamp/task_planning/search.py) - Prefixed parameter support:
-  - `_sample_param_type()` handles prefixed names (e.g., `left_q0`, `right_pose1`)
-  - Extracts prefix and number from parameter names using regex
+- [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
+  particles; respects `left_q0` / `right_q0` as fixed initial-state.
 
-- [`utils/visualizer.py`](cutamp/utils/visualizer.py) - Visualization:
-  - Optional `q_init` for dual-arm flexibility
-  - `set_joint_positions(arm=...)` parameter for arm-specific visualization in dual-arm robots
+- [`cost_function.py`](cutamp/cost_function.py) — single-arm soft costs
+  (`retract_close_to_home`, `minimize_body_movement`) + the multi-object
+  costs from `costs.py`. Hard collision constraints over each `q_*`.
 
-### 📁 **[Tests](cutamp/tests/)**
+- [`rollout.py`](cutamp/rollout.py) — FK rollout helpers used by the cost
+  graph (forward kinematics on the full 21-DOF cspace).
 
-- [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) - T1 robot module tests
-- [`test_tamp_world_dual_arm.py`](cutamp/tests/test_tamp_world_dual_arm.py) - Dual-arm helper method tests
-- [`test_shared_joint_consistency.py`](cutamp/tests/test_shared_joint_consistency.py) - Shared joint propagation tests:
-  - Tests for `get_arm_from_operator()`
-  - Tests for `propagate_shared_joints()` across sequential operations
-  - Verifies arm-specific joints remain unchanged during propagation
-- [`debug_t1_tool_frame.py`](cutamp/tests/debug_t1_tool_frame.py) - Tool frame transformation debug script
+- [`conf_locking.py`](cutamp/conf_locking.py) — utility for freezing a
+  configuration during optimization (e.g., already-satisfied IKs).
 
-### 📁 **[Scripts Folder](cutamp/scripts/)**
+- [`utils/motion_diagnostics.py`](cutamp/utils/motion_diagnostics.py) —
+  cspace-failure diagnostic helpers (gated behind
+  `config.debug_motion_failures`; not on the hot path by default).
 
-Available scripts:
-- [`gripper_sphere_editor.py`](cutamp/scripts/gripper_sphere_editor.py) - Interactive gripper sphere editor for grasp sampling
-- [`robot_sphere_editor.py`](cutamp/scripts/robot_sphere_editor.py) - Interactive robot sphere editor for cuRobo
+- [`utils/visualizer.py`](cutamp/utils/visualizer.py) — Rerun visualizer.
+  `log_joint_trajectory_with_mat4x4s(traj, mat4x4s, …)` accepts any number
+  of held-object transforms per trajectory.
 
-## Usage Examples
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 12 tests
 
-### Running with Soft Costs
+- [`test_t1_config.py`](cutamp/tests/test_t1_config.py) — YAML schema /
+  cspace / lock-joints / DOF-constant checks for `t1_planar_base.yml`.
+- [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) —
+  RobotContainer, both tool frames, joint-limit shape, kinematics
+  smoke-test.
+
+Run with: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -v`.
+
+### 📁 [`cutamp/scripts/`](cutamp/scripts/)
+
+- [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point.
+  T1 / `blocks_t1` only (no `--robot` flag, no other envs in this branch).
+- [`gripper_sphere_editor.py`](cutamp/scripts/gripper_sphere_editor.py) —
+  interactive gripper-sphere editor.
+- [`robot_sphere_editor.py`](cutamp/scripts/robot_sphere_editor.py) —
+  interactive robot-sphere editor.
+
+## Usage
 
 ```bash
-# Single soft cost
-python -m cutamp.scripts.run_cutamp --env blocks_t1 --robot t1 \
-    --soft_cost retract_close_to_home --optimize_soft_costs --motion_plan
+# Smoke test (no motion plan)
+python -m cutamp.scripts.run_cutamp --env blocks_t1 -n 16 --num_opt_steps 50
 
-# Multiple soft costs
-python -m cutamp.scripts.run_cutamp --env blocks_t1 --robot t1 \
-    --soft_cost retract_close_to_home minimize_lift_movement --optimize_soft_costs --motion_plan
+# Full run with motion planning, no visualizer
+PYTORCH_ALLOC_CONF=expandable_segments:True python -m cutamp.scripts.run_cutamp \
+    --env blocks_t1 --motion_plan -n 64 --disable_visualizer
+
+# With Rerun visualizer
+PYTORCH_ALLOC_CONF=expandable_segments:True python -m cutamp.scripts.run_cutamp \
+    --env blocks_t1 --motion_plan -n 64
+
+# Soft-cost optimization
+python -m cutamp.scripts.run_cutamp --env blocks_t1 --motion_plan \
+    --soft_cost retract_close_to_home minimize_body_movement --optimize_soft_costs
 ```
 
-**Available soft costs:**
-- `retract_close_to_home` - Retracts arms closer to home configuration (T1 only)
-- `minimize_lift_movement` - Minimizes lift column movement (T1 only)
-- `dist_from_origin` - Maximizes object distance from origin
-- `max_obj_dist` / `min_obj_dist` - Maximizes/minimizes pairwise object distances
-- `min_y` / `max_y` - Minimizes/maximizes object Y coordinates
-- `align_yaw` - Aligns object yaw angles
+**Available soft costs** (T1-only ones marked):
+- `retract_close_to_home` *(T1)* — penalize retract configs far from `t1_home`.
+- `minimize_body_movement` *(T1)* — penalize body (leg/torso/waist) drift.
+- `dist_from_origin`, `max_obj_dist` / `min_obj_dist`, `min_y` / `max_y`,
+  `align_yaw` — multi-object placement costs.
+
+VRAM at `-n 64`: ~4.2 GiB above baseline (peaks at the end of motion
+planning). Comfortably fits a 24 GB GPU.
 
 ## Key Design Decisions
 
-1. **11-DOF per arm model** - Each arm's cuRobo model includes the 4 shared joints (lift + torso) plus 7 arm joints
+1. **Single 21-DOF MotionPlanner** — cuRobo v0.8's `GoalToolPose` lets us
+   plan for one tool frame at a time on a kinematics that exposes both arms,
+   so we no longer need two MotionGens or per-arm "shared joint" propagation.
 
-2. **State tracking approach** - Track full robot state and propagate shared joints across operations:
-   - When left arm IK solves → update ALL right arm configs' shared joints
-   - When right arm IK solves → update ALL left arm configs' shared joints
+2. **Planar base via `extra_links`** — `world → base_j_x → base_j_y →
+   base_j_yaw → mobile_base_link` adds 3 virtual DOFs that get hard-locked at
+   IK / motion-planner construction time for arm operators (so the base
+   doesn't drift while reaching), and unlocked for `MoveBaseTo`.
 
-3. **Inactive arm inherits shared joints** - The inactive arm's local joints (7 DOF) remain fixed, but its EE position changes due to torso movement
+3. **Cspace pinning replaces per-arm planners** — `pin_for_arm_action` /
+   `pin_for_movebase` write into each rollout's
+   `cspace_target_dof_weight` to keep the inactive joints at the start
+   state. Restored by `unpin()`.
 
-4. **Inactive arm locking** - cuRobo configs lock the inactive arm at home position (not zeros) to prevent collision
+4. **Both arms tracked through every trajectory** — body joints are unlocked
+   during single-arm planning, so an inactive arm holding a block will still
+   translate that block through world. `compute_all_held_obj_poses` returns
+   poses for every holding arm so the visualizer renders both correctly.
 
-5. **Retract after pick/place** - After each pick or place action, the arm retracts toward home:
-   - `RetractHolding` - After pick, moves arm while holding object (collision checks exclude held object)
-   - `RetractFree` - After place, moves arm with empty gripper
-   - Uses soft cost (`retract_close_to_home`) to bias toward home configuration
-   - Hard collision constraints ensure collision-free retract configurations
+5. **Retract after pick/place** — `RetractHolding` (collision checks exclude
+   held object) and `RetractFree` (empty gripper) move toward `t1_home` after
+   each manipulation. Hard collision constraints + the
+   `retract_close_to_home` soft cost shape the result.
+
+6. **cuRobo internals isolated** — every reach into cuRobo's private API
+   lives in [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py) so a
+   future cuRobo upgrade has one place to audit.

@@ -7,54 +7,104 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+"""Generic-sphere world-collision cost for cuTAMP (cuRobo v0.8).
+
+The old API (``PrimitiveCollisionCost`` from ``curobo.rollout.cost.*``) is gone
+in v0.8. We now wrap the lower-level ``SceneCollision`` + ``CollisionChecker``
+to expose a callable ``cost(spheres) -> distance`` matching the prior cuTAMP
+contract: input ``spheres`` is ``[batch, horizon, num_spheres, 4]``, output is
+``[batch, horizon, num_spheres]`` collision distance.
+
+NOTE: pulls from ``curobo._src.geom.collision`` (private) until cuRobo exposes
+a public sphere-vs-scene query.
+"""
+
 import logging
 
-from curobo.geom.sdf.utils import create_collision_checker
-from curobo.geom.sdf.world import WorldPrimitiveCollision, WorldCollisionConfig
-from curobo.geom.types import WorldConfig
-from curobo.rollout.cost.primitive_collision_cost import PrimitiveCollisionCost, PrimitiveCollisionCostConfig
-from curobo.types.base import TensorDeviceType
+import torch
 
+from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+from curobo._src.geom.collision.collision_scene import SceneCollision, SceneCollisionCfg
+from curobo.scene import Scene
+from curobo.types import DeviceCfg
 
 _log = logging.getLogger(__name__)
 
 
-def get_collision_checker(
-    world_config: WorldConfig, tensor_args: TensorDeviceType, max_distance: float | None = 0.1
-) -> WorldPrimitiveCollision:
-    """Create primitive cuRobo collision checker"""
-    # We use cuRobo's cuboid collision checker which is a lot faster (i.e., sacrifice precision for speed)
-    # This mean's we need to convert the world into oriented bounding boxes (obb)
-    cuboid_world = WorldConfig.create_obb_world(world_config)
-    _log.debug(f"Created cuboid world for WorldConfig with {len(world_config)} objects")
-    coll_dict = {"checker_type": "PRIMITIVE"}
-    if max_distance is not None:
-        coll_dict["max_distance"] = max_distance
+class WorldCollisionCost:
+    """Callable: ``cost(spheres) -> [batch, horizon]`` collision cost
+    (non-negative, summed across spheres).
+    """
 
-    collision_config = WorldCollisionConfig.load_from_dict(coll_dict, cuboid_world, tensor_args)
-    collision_checker = create_collision_checker(collision_config)
-    _log.debug(f"Created {collision_checker.__class__.__name__} collision checker")
-    return collision_checker
+    def __init__(
+        self,
+        scene: Scene,
+        device_cfg: DeviceCfg,
+        activation_distance: float,
+        weight: float = 1.0,
+    ):
+        if activation_distance < 0.0:
+            raise ValueError(f"Collision activation distance must be >= 0.0, got {activation_distance}")
+        cfg = SceneCollisionCfg(device_cfg=device_cfg, scene_model=scene)
+        self.scene_collision = SceneCollision.from_config(cfg)
+        self.device_cfg = device_cfg
+        self.weight = device_cfg.to_device([weight])
+        self.activation_distance = device_cfg.to_device([activation_distance])
+
+    def __call__(
+        self, spheres: torch.Tensor, return_loss: bool = True,
+    ) -> torch.Tensor:
+        """Query collision cost for a batch of spheres.
+
+        Args:
+            spheres: Query spheres ``[batch, horizon, num_spheres, 4]``.
+            return_loss: True if caller will scale the result before backward.
+        """
+        if spheres.ndim != 4 or spheres.shape[-1] != 4:
+            raise ValueError(
+                f"spheres must be [batch, horizon, num_spheres, 4], got {tuple(spheres.shape)}"
+            )
+
+        # Fresh buffer per call: the saved-for-backward `gradient` tensor inside
+        # CollisionBuffer is mutated in-place by the underlying autograd
+        # Function, which trips PyTorch's saved-tensor checks if a single
+        # buffer is reused across forward passes.
+        buffer = CollisionBuffer.from_shape(spheres.shape, self.device_cfg)
+
+        per_sphere = self.scene_collision.checker.get_sphere_distance(
+            scene=self.scene_collision.data,
+            query_sphere=spheres,
+            collision_buffer=buffer,
+            weight=self.weight,
+            activation_distance=self.activation_distance,
+            return_loss=return_loss,
+        )
+        return per_sphere.clamp(min=0.0).sum(dim=-1)
 
 
 def get_world_collision_cost(
-    world_config: WorldConfig, tensor_args: TensorDeviceType, collision_activation_distance: float, weight: float = 1.0
-) -> PrimitiveCollisionCost:
-    """
-    Get the PrimitiveCollisionCost for a given world config. The activation distance is the distance from which the SDF
-    query will return a positive value. This can be used for "safer" trajectories.
-    """
-    if collision_activation_distance < 0.0:
-        raise ValueError(f"Collision activation distance must be >= 0.0, not {collision_activation_distance}")
+    scene: Scene,
+    device_cfg: DeviceCfg,
+    activation_distance: float,
+    weight: float = 1.0,
+) -> WorldCollisionCost:
+    """Build a callable world-collision cost for the given Scene."""
+    return WorldCollisionCost(scene, device_cfg, activation_distance, weight)
 
-    world_collision_checker = get_collision_checker(world_config, tensor_args)
-    collision_cost_config = PrimitiveCollisionCostConfig(
-        tensor_args.to_device([weight]),
-        tensor_args,
-        return_loss=True,
-        world_coll_checker=world_collision_checker,
-        activation_distance=collision_activation_distance,
+
+def get_collision_checker(
+    scene: Scene,
+    device_cfg: DeviceCfg,
+    max_distance: float = 0.1,
+) -> SceneCollision:
+    """Build a SceneCollision (low-level handle) for the given Scene.
+
+    Use the higher-level ``WorldCollisionCost`` when possible; this is exposed
+    for code paths that want direct access to the scene checker.
+    """
+    cfg = SceneCollisionCfg(
+        device_cfg=device_cfg,
+        scene_model=scene,
+        max_distance=max_distance,
     )
-    world_collision_cost = PrimitiveCollisionCost(collision_cost_config)
-    _log.debug(f"Created {world_collision_cost} with activation distance {collision_activation_distance}")
-    return world_collision_cost
+    return SceneCollision.from_config(cfg)

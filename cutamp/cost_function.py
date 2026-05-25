@@ -8,13 +8,14 @@
 # its affiliates is strictly prohibited.
 
 import itertools
-import warnings
 from collections import defaultdict
 from typing import Dict, Literal, Optional, Union
 
 import roma
 import torch
-from curobo.rollout.cost.self_collision_cost import SelfCollisionCost, SelfCollisionCostConfig
+from curobo._src.cost.cost_self_collision import SelfCollisionCost
+from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
+from curobo.types import JointState
 from jaxtyping import Float
 
 from cutamp.config import TAMPConfiguration
@@ -74,65 +75,33 @@ class CostFunction:
             ValidPushStick.type: self.valid_push_stick_constraints,
             TrajectoryLength.type: self.traj_length_costs,
         }
-        warning_co = {GraspCost.type, RetractCost.type}
+        # GraspCost / RetractCost are recognized but contribute zero (covered
+        # by IK convergence + retract-init at t1_home). Skip silently.
+        ignored_co = {GraspCost.type, RetractCost.type}
         for ground_op in plan_skeleton:
             for co in [*ground_op.constraints, *ground_op.costs]:
-                if co.type not in type_to_list:
-                    if co.type in warning_co:
-                        warnings.warn(f"Cost {co} is not handled in the cost function")
-                    else:
-                        raise NotImplementedError(f"Unhandled constraint or cost: {co}")
-                else:
+                if co.type in type_to_list:
                     type_to_list[co.type].append(co)
+                elif co.type not in ignored_co:
+                    raise NotImplementedError(f"Unhandled constraint or cost: {co}")
 
         # All conf parameters for motion constraints, we check rollout is subset
         self.motion_conf_params = set(
             iter(itertools.chain.from_iterable(con.params for con in self.motion_constraints))
         )
 
-        # Track dual-arm status and build conf_to_arm mapping
-        self.is_dual_arm = world.is_dual_arm
-        self.conf_to_arm = get_conf_to_arm(plan_skeleton, self.is_dual_arm)
-        
-        # Track retract configurations for collision checking and soft cost
-        # Returns list of (q_retract_name, is_holding, held_obj_name)
+        # Tag confs by arm so soft costs / book-keeping can dispatch per-arm.
+        self.conf_to_arm = get_conf_to_arm(plan_skeleton)
         self.retract_info = get_retract_parameters(plan_skeleton)
 
-        # Setup self-collision cost (need separate configs for dual-arm)
-        if self.is_dual_arm:
-            # For dual-arm, create self-collision costs for each arm
-            left_self_collision_config = SelfCollisionCostConfig(
-                self.world.tensor_args.to_device([1.0]),
-                self.world.tensor_args,
-                return_loss=True,
-                self_collision_kin_config=self.world.get_kin_model("left").get_self_collision_config(),
-            )
-            self.left_self_collision_cost_fn = SelfCollisionCost(left_self_collision_config)
-            
-            right_self_collision_config = SelfCollisionCostConfig(
-                self.world.tensor_args.to_device([1.0]),
-                self.world.tensor_args,
-                return_loss=True,
-                self_collision_kin_config=self.world.get_kin_model("right").get_self_collision_config(),
-            )
-            self.right_self_collision_cost_fn = SelfCollisionCost(right_self_collision_config)
-            
-            # Should be using experimental kernel by default
-            if not self.left_self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
-                raise ValueError("Expected left self-collision cost to use experimental kernel")
-            if not self.right_self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
-                raise ValueError("Expected right self-collision cost to use experimental kernel")
-        else:
-            self_collision_config = SelfCollisionCostConfig(
-                self.world.tensor_args.to_device([1.0]),
-                self.world.tensor_args,
-                return_loss=True,
-                self_collision_kin_config=self.world.kin_model.get_self_collision_config(),
-            )
-            self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
-            # Should be using experimental kernel by default
-            if not self.self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
-                raise ValueError("Expected self-collision cost to use experimental kernel")
+        # Single self-collision cost over the whole robot — both arms in one
+        # kinematic chain, so one cost per query covers both.
+        self_collision_config = SelfCollisionCostCfg(
+            weight=self.world.device_cfg.to_device([1.0]),
+            device_cfg=self.world.device_cfg,
+            self_collision_kin_config=self.world.kinematics.get_self_collision_config(),
+        )
+        self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
 
         # Conf parameters for kinematic constraints, order in rollout should match
         self.kinematic_confs, self.kinematic_actions = zip(*(con.params for con in self.kinematic_constraints))
@@ -207,15 +176,10 @@ class CostFunction:
             self.traj_length_confs.append(q_start)
             self.traj_length_confs.append(q_end)
         self.traj_length_confs = list(dict.fromkeys(self.traj_length_confs))  # remove duplicates
-        
-        # Remove initial configuration(s) from traj_length_confs
-        if self.is_dual_arm:
-            # For dual-arm, remove both left_q0 and right_q0
-            self.traj_length_confs = [c for c in self.traj_length_confs if c not in ("left_q0", "right_q0")]
-        else:
-            if self.traj_length_confs and self.traj_length_confs[0] != "q0":
-                raise ValueError("Expected q0 to be the first conf")
-            self.traj_length_confs = self.traj_length_confs[1:] if self.traj_length_confs else []
+
+        # Drop T1's per-arm initial confs; trajectory length only counts movement
+        # between actionable confs.
+        self.traj_length_confs = [c for c in self.traj_length_confs if c not in ("left_q0", "right_q0")]
 
     def _validate_rollout(self, rollout: Rollout):
         """Checks structure of the rollout conforms to the assumptions we make in the cost function implementation."""
@@ -255,50 +219,17 @@ class CostFunction:
         return kinematic_cost
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Motion constraints - valid motions don't exceed joint limits or self-collide."""
+        """Motion constraints — joint-limit violation + self-collision cost."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
-        conf_params = rollout["conf_params"]
-        
-        if self.is_dual_arm:
-            # For dual-arm, compute joint limits and self-collision separately for each arm
-            # then combine based on which arm each configuration belongs to
-            num_particles = confs.shape[0]
-            num_timesteps = confs.shape[1]
-            
-            # Process each configuration's joint limit based on its arm
-            dist_from_joint_lims_list = []
-            self_coll_vals_list = []
-            
-            for t, conf_name in enumerate(conf_params):
-                arm = self.conf_to_arm.get(conf_name, "left")  # default to left if unknown
-                joint_limits = self.world.get_joint_limits(arm)
-                conf_t = confs[:, t]  # (num_particles, dof)
-                
-                # Joint limits for this timestep
-                dist_t = dist_from_bounds_jit(
-                    conf_t.unsqueeze(1), joint_limits[0], joint_limits[1]
-                ).squeeze(1)  # (num_particles,)
-                dist_from_joint_lims_list.append(dist_t)
-                
-                # Self-collision for this timestep
-                spheres_t = robot_spheres[:, t].contiguous()  # (num_particles, num_spheres, 4)
-                if arm == "left":
-                    self_coll_t = self.left_self_collision_cost_fn(spheres_t.unsqueeze(1)).squeeze(1)
-                else:
-                    self_coll_t = self.right_self_collision_cost_fn(spheres_t.unsqueeze(1)).squeeze(1)
-                self_coll_vals_list.append(self_coll_t)
-            
-            dist_from_joint_lims = torch.stack(dist_from_joint_lims_list, dim=1)
-            self_coll_vals = torch.stack(self_coll_vals_list, dim=1)
-        else:
-            # Single-arm: original logic
-            dist_from_joint_lims = dist_from_bounds_jit(
-                confs, self.world.robot_container.joint_limits[0], self.world.robot_container.joint_limits[1]
-            )
 
-            # Self collisions
-            self_coll_vals = self.self_collision_cost_fn(robot_spheres)
+        joint_limits = self.world.joint_limits
+        dist_from_joint_lims = dist_from_bounds_jit(confs, joint_limits[0], joint_limits[1])
+
+        # Single self-collision cost: setup once per shape, then evaluate.
+        b, h = robot_spheres.shape[0], robot_spheres.shape[1]
+        self.self_collision_cost_fn.setup_batch_tensors(b, h)
+        self_coll_vals = self.self_collision_cost_fn.forward(robot_spheres).squeeze(-1)
 
         motion_cost = {
             "type": "constraint",
@@ -458,13 +389,10 @@ class CostFunction:
                 q_retract = self._particles[q_retract_name]
                 num_particles = q_retract.shape[0]
                 
-                # Get kinematic model for appropriate arm
-                arm = self.conf_to_arm.get(q_retract_name, "left")
-                kin_model = self.world.get_kin_model(arm) if self.is_dual_arm else self.world.kin_model
-                
-                # Compute FK for retract config
-                robot_state = kin_model.get_state(q_retract)
-                retract_spheres = robot_state.get_link_spheres().unsqueeze(1)  # (b, 1, n, 4)
+                # Single kinematics covers all arms in v0.8.
+                kin_model = self.world.kinematics
+                robot_state = kin_model.compute_kinematics(JointState.from_position(q_retract))
+                retract_spheres = robot_state.robot_spheres  # already (b, h, n, 4) in v0.8
                 
                 # Robot to world collision - keep shape (num_particles, 1) for consistency
                 coll_values[f"{q_retract_name}_world"] = self.world.collision_fn(retract_spheres)
@@ -504,7 +432,7 @@ class CostFunction:
     
     def _compute_soft_cost(self, cost_name: str, rollout: Rollout) -> torch.Tensor:
         """Compute a single soft cost by name."""
-        device = self.world.tensor_args.device
+        device = self.world.device
         num_particles = rollout["num_particles"]
         
         # Object position-based costs
@@ -532,44 +460,85 @@ class CostFunction:
             mask = torch.triu(torch.ones_like(yaw_diffs), diagonal=1) == 1
             return yaw_diffs[mask].view(mask.shape[0], -1).sum(-1)
         
-        # Retract close to home cost
+        # Retract close to home — penalize body slice (post-base) deviation
+        # from the configured T1 home pose.
         elif cost_name == "retract_close_to_home":
-            if not self.is_dual_arm:
-                raise ValueError("retract_close_to_home soft cost only supported for dual-arm robots")
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for retract_close_to_home soft cost")
-            
-            from cutamp.robots.t1 import t1_home_left, t1_home_right
-            home_left_slice = torch.tensor(t1_home_left[2:], device=device)
-            home_right_slice = torch.tensor(t1_home_right[2:], device=device)
-            
+
+            from cutamp.robots.t1 import BASE_DOF, t1_home
+            home_t = torch.tensor(t1_home, device=device)
+            # Penalize body (leg+torso+arms) deviation; ignore base x/y/yaw.
+            body_slice = slice(BASE_DOF, len(t1_home))
+            home_body = home_t[body_slice]
+
             retract_param_names = [info[0] for info in self.retract_info]
-            left_params = [p for p in retract_param_names if self.conf_to_arm.get(p) == "left"]
-            right_params = [p for p in retract_param_names if self.conf_to_arm.get(p) == "right"]
-            
             total_dist = torch.zeros(num_particles, device=device)
-            if left_params:
-                left_qs = torch.stack([self._particles[p][:, 2:] for p in left_params], dim=1)
-                total_dist += (left_qs - home_left_slice).abs().sum(dim=(1, 2))
-            if right_params:
-                right_qs = torch.stack([self._particles[p][:, 2:] for p in right_params], dim=1)
-                total_dist += (right_qs - home_right_slice).abs().sum(dim=(1, 2))
+            if retract_param_names:
+                qs = torch.stack([self._particles[p][:, body_slice] for p in retract_param_names], dim=1)
+                total_dist += (qs - home_body).abs().sum(dim=(1, 2))
             return total_dist
-        
-        # Minimize lift movement cost
-        elif cost_name == "minimize_lift_movement":
+
+        # Minimize body movement — keep leg + torso joints close to home values.
+        elif cost_name == "minimize_body_movement":
             if self._particles is None:
-                raise RuntimeError("Particles must be provided for minimize_lift_movement soft cost")
-            
-            from cutamp.robots.t1 import t1_home_left
-            home_lift = torch.tensor(t1_home_left[:2], device=device)
-            
+                raise RuntimeError("Particles must be provided for minimize_body_movement soft cost")
+
+            from cutamp.robots.t1 import BODY_INDICES, t1_home
+            home_body = torch.tensor(
+                t1_home[BODY_INDICES.start:BODY_INDICES.stop], device=device
+            )
+
             config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
             if config_params:
                 all_configs = torch.stack([self._particles[p] for p in config_params], dim=1)
-                return (all_configs[:, :, :2] - home_lift).pow(2).sum(dim=(1, 2))
+                return (all_configs[:, :, BODY_INDICES] - home_body).pow(2).sum(dim=(1, 2))
             return torch.zeros(num_particles, device=device)
-        
+
+        # COM-over-base-polygon — penalize particle configurations whose
+        # mass-weighted COM projects outside the mobile-base support rectangle.
+        # Same shape as the cuRobo-side cost (cutamp/com_polygon_cost.py); the
+        # penalty math is shared via com_polygon_penalty.
+        elif cost_name == "com_polygon":
+            if self._particles is None:
+                raise RuntimeError("Particles must be provided for com_polygon soft cost")
+
+            from cutamp.com_polygon_cost import com_polygon_penalty
+            kin = self.world.kinematics_with_com
+            half_extents = torch.tensor([0.10, 0.15], device=device, dtype=torch.float32)
+            inside_margin = 0.02
+            inside_weight = 1.0
+            base_link = "mobile_base_link"
+
+            config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
+            if not config_params:
+                return torch.zeros(num_particles, device=device)
+            penalty = torch.zeros(num_particles, device=device)
+            for p in config_params:
+                # compute_kinematics expects [B, T, dof]; particles are [B, dof].
+                js = JointState.from_position(self._particles[p].unsqueeze(1))
+                ks = kin.compute_kinematics(js)
+                com_world = ks.robot_com[..., :3].reshape(-1, 3)
+                base_T = (
+                    ks.tool_poses.get_link_pose(base_link, make_contiguous=True)
+                    .get_matrix()
+                    .reshape(-1, 4, 4)
+                )
+                penalty = penalty + com_polygon_penalty(
+                    com_world, base_T, half_extents, inside_margin, inside_weight,
+                )
+            return penalty
+
+        # Place close to base — sum of placed-object XY distances from world
+        # origin (= base center for T1 with the planar base locked at zero).
+        # Operates directly on placement-pose particles so the gradient is
+        # well-behaved and Adam-friendly.
+        elif cost_name == "place_close_to_base":
+            last_obj_xy = torch.stack(
+                [v[:, -1, :2, 3] for v in rollout["obj_to_pose"].values()], dim=1
+            )  # [num_particles, num_objs, 2]
+            return last_obj_xy.norm(dim=-1).sum(dim=-1)
+
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
 

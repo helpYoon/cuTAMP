@@ -14,8 +14,6 @@ from cutamp.task_planning.constraints import KinematicConstraint, StablePlacemen
 from cutamp.task_planning.costs import TrajectoryLength
 
 
-_log = logging.getLogger(__name__)
-
 default_constraint_to_mult = {
     KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0},
     StablePlacement.type: {"goal_support": 2.0},
@@ -28,37 +26,11 @@ default_constraint_to_mult = {
         "min_obj_dist": 1e-1,
         "align_yaw": 5e-2,
         "retract_close_to_home": 1e-1,
-        "minimize_lift_movement": 10,  # Penalize lift column deviation from home
+        "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
+        "com_polygon": 10,  # Penalize COM projection outside the base rectangle
+        "place_close_to_base": 5e-1,  # Pull placement targets toward the base center
     },
 }
-
-
-def get_tetris_tuned_constraint_to_mult() -> dict:
-    """Get the constraint multipliers which were tuned on the Tetris domain."""
-    _log.info("Using tuned constraint multipliers for Tetris 5 blocks environment!")
-    constraint_to_mult = default_constraint_to_mult.copy()
-
-    tuned_weights = {
-        KinematicConstraint.type: {"pos_err": 0.5383957038575471, "rot_err": 4.032239601210173},
-        StablePlacement.type: {"goal_in_xy": 5.310038661250338, "goal_support": 6.2847790432507065},
-        Motion.type: {"joint_limit": 1.6547222772077097, "self_collision": 4.1145249992626365},
-        Collision.type: {
-            "movable_to_world": 2.644636513410409,
-            "robot_to_world": 1.743618183450385,
-        },
-    }
-
-    # Set or overwrite the multipliers in the default constraint_to_mult
-    for con_type, con_info in tuned_weights.items():
-        if con_type in constraint_to_mult:
-            for name, mult in con_info.items():
-                if name in constraint_to_mult[con_type]:
-                    constraint_to_mult[con_type][name] = mult
-                else:
-                    constraint_to_mult[con_type][name] = mult
-        else:
-            constraint_to_mult[con_type] = con_info
-    return constraint_to_mult
 
 
 default_constraint_to_tol = {

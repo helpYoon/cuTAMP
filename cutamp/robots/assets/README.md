@@ -1,12 +1,12 @@
-## Robot Assets Notes:
+## Robot Assets
 
-- [`robotiq_description/`](robotiq_description/) contains the URDF and meshes for the Robotiq grippers. Taken from:
-  https://github.com/NVIDIA-ISAAC-ROS/ros2_robotiq_gripper
-- `*_gripper_spheres.pt` contain serialized PyTorch tensors that represent the collision spheres for the gripper of
-  different robots. We use this for approximate collision checking when perforing particle initialization.
-- [`ur5e_robotiq_2f_85.urdf`](ur5e_robotiq_2f_85.urdf) is modified from cuMotion:
-https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_cumotion/blob/main/isaac_ros_cumotion_robot_description/urdf/ur5e_robotiq_2f_85.urdf
-- [`ur5e_robotiq_2f_85.yml`](ur5e_robotiq_2f_85.yml) contains the cuRobo config for the UR5e with Robotiq 2F-85 gripper
-and modeling the camera mount as collision spheres in the `wrist_3` link.
-- [`ur5e_robotiq_2f_85_wo_camera.yml`](ur5e_robotiq_2f_85_wo_camera.yml) contains the cuRobo config for the UR5e with Robotiq 2F-85 gripper
-but without the camera mount collision spheres.
+T1 humanoid (the only supported robot) lives under
+[`t1_description/`](t1_description/):
+
+- `t1_simplified.urdf` — URDF used for planning + visualization.
+- `actual_robot.urdf` — Booster T1 reference URDF (sim/real reference; not used at runtime).
+- `t1_planar_base.yml` — cuRobo robot config (kinematics, cspace, lock_joints, extra_links for the planar base).
+- `t1_spheres.yml` — collision spheres per link, in each link's local frame.
+- `left_gripper_spheres.pt` / `right_gripper_spheres.pt` — serialized PyTorch tensors of gripper collision spheres
+  (used by particle initialization for approximate collision checking).
+- `meshes/`, `actual_meshes/` — visual + collision STLs.

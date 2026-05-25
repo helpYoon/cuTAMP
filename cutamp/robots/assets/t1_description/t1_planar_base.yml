@@ -1,0 +1,252 @@
+##############################################################################
+# CuRobo v0.8 Configuration for Booster T1 - Single-Planner with Planar Base
+##############################################################################
+#
+# Single 21-DOF MotionPlanner.
+#
+# Active joints (21 DOF, in cspace order):
+#   - Planar base:  3 DOF (base_j_x, base_j_y, base_j_yaw) - virtual via extra_links
+#   - Leg:          2 DOF (ankle_pitch, knee_pitch)
+#   - Torso:        2 DOF (Torso_Pitch, Waist_Yaw)
+#   - Left arm:     7 DOF (Left_Shoulder_Pitch ... Left_Hand_Roll)
+#   - Right arm:    7 DOF (Right_Shoulder_Pitch ... Right_Hand_Roll)
+#
+# Locked joints (10 DOF):
+#   - Head:         2 DOF (AAHead_yaw, Head_pitch)
+#   - Left gripper: 4 DOF (left_Link{1,11,2,22})
+#   - Right gripper:4 DOF (right_Link{1,11,2,22})
+#
+# Tool frames: left_base_link, right_base_link
+#
+# Planar base: virtual chain world -> base_j_x -> base_j_y -> base_j_yaw,
+# re-parents mobile_base_link via child_link_name. Requires the URDF to
+# expose a `world` link (added via t1_simplified.urdf).
+##############################################################################
+
+robot_cfg:
+  kinematics:
+    format_version: 2.0
+    asset_root_path: ""
+    urdf_path: "t1_simplified.urdf"
+
+    base_link: "world"
+    tool_frames:
+      - "left_base_link"
+      - "right_base_link"
+      # mobile_base_link tracked so the COM-over-base cost can read its
+      # world pose from state.tool_poses (no extra FK call inside the cost).
+      - "mobile_base_link"
+
+    grasp_contact_link_names:
+      - "left_hand_link"
+      - "left_base_link"
+      - "left_Link1"
+      - "left_Link11"
+      - "left_Link2"
+      - "left_Link22"
+      - "right_hand_link"
+      - "right_base_link"
+      - "right_Link1"
+      - "right_Link11"
+      - "right_Link2"
+      - "right_Link22"
+      - "attached_object_left"
+      - "attached_object_right"
+
+    collision_link_names:
+      - "mobile_base_link"
+      - "shank_link"
+      - "thigh_link"
+      - "Waist"
+      - "Trunk"
+      - "H1"
+      - "H2"
+      - "AL1"
+      - "AL2"
+      - "AL3"
+      - "AL4"
+      - "AL5"
+      - "AL6"
+      - "left_hand_link"
+      - "left_base_link"
+      - "left_Link1"
+      - "left_Link11"
+      - "left_Link2"
+      - "left_Link22"
+      - "AR1"
+      - "AR2"
+      - "AR3"
+      - "AR4"
+      - "AR5"
+      - "AR6"
+      - "right_hand_link"
+      - "right_base_link"
+      - "right_Link1"
+      - "right_Link11"
+      - "right_Link2"
+      - "right_Link22"
+      - "attached_object_left"
+      - "attached_object_right"
+
+    collision_spheres: "t1_spheres.yml"
+    collision_sphere_buffer: {}
+
+    extra_collision_spheres:
+      attached_object_left: 50
+      attached_object_right: 50
+
+    extra_links:
+      base_link_x:
+        parent_link_name: "world"
+        link_name: "base_link_x"
+        joint_name: "base_j_x"
+        joint_type: "X_PRISM"
+        fixed_transform: [0, 0, 0, 1, 0, 0, 0]
+        joint_limits: [-2.0, 2.0]
+        joint_velocity_limits: [-1.0, 1.0]
+      base_link_y:
+        parent_link_name: "base_link_x"
+        link_name: "base_link_y"
+        joint_name: "base_j_y"
+        joint_type: "Y_PRISM"
+        fixed_transform: [0, 0, 0, 1, 0, 0, 0]
+        joint_limits: [-2.0, 2.0]
+        joint_velocity_limits: [-1.0, 1.0]
+      base_link_yaw:
+        parent_link_name: "base_link_y"
+        child_link_name: "mobile_base_link"
+        link_name: "base_link_yaw"
+        joint_name: "base_j_yaw"
+        joint_type: "Z_ROT"
+        fixed_transform: [0, 0, 0, 1, 0, 0, 0]
+        joint_limits: [-3.14159, 3.14159]
+        joint_velocity_limits: [-0.5, 0.5]
+      attached_object_left:
+        parent_link_name: "left_base_link"
+        link_name: "attached_object_left"
+        joint_name: "attach_joint_left"
+        joint_type: "FIXED"
+        fixed_transform: [0, 0, 0, 1, 0, 0, 0]
+      attached_object_right:
+        parent_link_name: "right_base_link"
+        link_name: "attached_object_right"
+        joint_name: "attach_joint_right"
+        joint_type: "FIXED"
+        fixed_transform: [0, 0, 0, 1, 0, 0, 0]
+
+    # Joints removed from cspace (cuRobo treats them as constants at the
+    # given values). The base is locked separately at IK / motion-planner
+    # construction time (see cutamp/robots/t1.py:_lock_mobile_base).
+    lock_joints:
+      # Head (no head motion is planned).
+      AAHead_yaw: 0.0
+      Head_pitch: 0.0
+      # Left gripper (4-bar parallel linkage, locked open).
+      left_Link1: 0.0
+      left_Link11: 0.0
+      left_Link2: 0.0
+      left_Link22: 0.0
+      # Right gripper (4-bar parallel linkage, locked open).
+      right_Link1: 0.0
+      right_Link11: 0.0
+      right_Link2: 0.0
+      right_Link22: 0.0
+
+    use_global_cumul: true
+    mesh_link_names: null
+    self_collision_buffer: {}
+
+    self_collision_ignore:
+      # Body chain: mobile_base -> shank -> thigh -> Waist -> Trunk
+      mobile_base_link: ["shank_link"]
+      shank_link: ["mobile_base_link", "thigh_link"]
+      thigh_link: ["shank_link", "Waist", "Trunk"]
+      Waist: ["thigh_link", "Trunk", "H1", "H2", "AL1", "AL2", "AL3", "AR1", "AR2", "AR3"]
+      Trunk: ["Waist", "thigh_link", "H1", "H2", "AL1", "AL2", "AL3", "AL4", "AR1", "AR2", "AR3", "AR4"]
+      H1: ["H2", "Trunk", "Waist", "AL1", "AL2", "AL3", "AR1", "AR2", "AR3"]
+      H2: ["H1", "Trunk", "Waist", "AL1", "AL2", "AL3", "AL4", "AR1", "AR2", "AR3", "AR4"]
+      # Left arm chain
+      AL1: ["AL2", "AL3", "AL4", "Trunk", "Waist", "H1", "H2", "AR1"]
+      AL2: ["AL1", "AL3", "AL4", "AL5", "Trunk", "Waist", "H1", "H2", "AR1", "AR2"]
+      AL3: ["AL1", "AL2", "AL4", "AL5", "AL6", "Trunk", "Waist", "H2"]
+      AL4: ["AL2", "AL3", "AL5", "AL6", "left_hand_link", "Trunk", "H2"]
+      AL5: ["AL3", "AL4", "AL6", "left_hand_link", "left_base_link"]
+      AL6: ["AL4", "AL5", "left_hand_link", "left_base_link", "left_Link1", "left_Link11"]
+      left_hand_link: ["AL5", "AL6", "left_base_link", "left_Link1", "left_Link11", "left_Link2", "left_Link22", "attached_object_left"]
+      left_base_link: ["AL6", "left_hand_link", "left_Link1", "left_Link11", "left_Link2", "left_Link22", "attached_object_left"]
+      left_Link1: ["left_Link11", "left_Link2", "left_Link22", "left_base_link", "left_hand_link", "attached_object_left"]
+      left_Link11: ["left_Link1", "left_Link2", "left_Link22", "left_base_link", "left_hand_link", "attached_object_left"]
+      left_Link2: ["left_Link1", "left_Link11", "left_Link22", "left_base_link", "left_hand_link", "attached_object_left"]
+      left_Link22: ["left_Link1", "left_Link11", "left_Link2", "left_base_link", "left_hand_link", "attached_object_left"]
+      # Right arm chain
+      AR1: ["AR2", "AR3", "AR4", "Trunk", "Waist", "H1", "H2", "AL1"]
+      AR2: ["AR1", "AR3", "AR4", "AR5", "Trunk", "Waist", "H1", "H2", "AL1", "AL2"]
+      AR3: ["AR1", "AR2", "AR4", "AR5", "AR6", "Trunk", "Waist", "H2"]
+      AR4: ["AR2", "AR3", "AR5", "AR6", "right_hand_link", "Trunk", "H2"]
+      AR5: ["AR3", "AR4", "AR6", "right_hand_link", "right_base_link"]
+      AR6: ["AR4", "AR5", "right_hand_link", "right_base_link", "right_Link1", "right_Link11"]
+      right_hand_link: ["AR5", "AR6", "right_base_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22", "attached_object_right"]
+      right_base_link: ["AR6", "right_hand_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22", "attached_object_right"]
+      right_Link1: ["right_Link11", "right_Link2", "right_Link22", "right_base_link", "right_hand_link", "attached_object_right"]
+      right_Link11: ["right_Link1", "right_Link2", "right_Link22", "right_base_link", "right_hand_link", "attached_object_right"]
+      right_Link2: ["right_Link1", "right_Link11", "right_Link22", "right_base_link", "right_hand_link", "attached_object_right"]
+      right_Link22: ["right_Link1", "right_Link11", "right_Link2", "right_base_link", "right_hand_link", "attached_object_right"]
+
+    cspace:
+      joint_names:
+        - "base_j_x"
+        - "base_j_y"
+        - "base_j_yaw"
+        - "ankle_pitch"
+        - "knee_pitch"
+        - "Torso_Pitch"
+        - "Waist_Yaw"
+        - "Left_Shoulder_Pitch"
+        - "Left_Shoulder_Roll"
+        - "Left_Elbow_Pitch"
+        - "Left_Elbow_Yaw"
+        - "Left_Wrist_Pitch"
+        - "Left_Wrist_Yaw"
+        - "Left_Hand_Roll"
+        - "Right_Shoulder_Pitch"
+        - "Right_Shoulder_Roll"
+        - "Right_Elbow_Pitch"
+        - "Right_Elbow_Yaw"
+        - "Right_Wrist_Pitch"
+        - "Right_Wrist_Yaw"
+        - "Right_Hand_Roll"
+
+      # Uniform per-DOF weights (revolute leg joints don't need the
+      # outsized weighting that the old prismatic lift columns required).
+      cspace_distance_weight:
+        [1.0, 1.0, 1.0,
+         1.0, 1.0,
+         1.0, 1.0,
+         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+      null_space_weight:
+        [1.0, 1.0, 1.0,
+         1.0, 1.0,
+         1.0, 1.0,
+         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+      acceleration_scale:
+        [1.0, 1.0, 1.0,
+         1.0, 1.0,
+         1.0, 1.0,
+         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+      # Default 21-DOF pose: base at origin; leg standing straight (max height);
+      # torso pitch + yaw neutral; arms in neutral pre-grasp.
+      default_joint_position:
+        [0.0, 0.0, 0.0,
+         0.0, 0.0,
+         0.0, 0.0,
+         0.5, -1.0, 0.0, -1.4, 0.0, 0.0, 0.0,
+         0.5, 1.0, 0.0, 1.4, 0.0, 0.0, 0.0]
+
+      max_acceleration: 15.0
+      max_jerk: 100.0

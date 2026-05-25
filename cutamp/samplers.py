@@ -10,7 +10,7 @@
 from typing import Optional
 
 import torch
-from curobo.geom.types import Obstacle, Cuboid, Mesh
+from curobo.scene import Cuboid, Mesh, Obstacle
 from jaxtyping import Float
 
 from cutamp.utils.common import approximate_goal_aabb, pose_list_to_mat4x4, transform_points
@@ -77,11 +77,11 @@ def grasp_4dof_sampler(
         obj_half_z = max_z - 0.02  # 2cm from top of obejct
 
     # Assume zero translation for now in x and y-axes
-    translation = torch.zeros(num_samples, 3, device=obj.tensor_args.device)
+    translation = torch.zeros(num_samples, 3, device=obj.device_cfg.device)
     translation[:, 2] = obj_half_z
 
     # Sample yaw
-    yaw = sample_yaw(num_samples, num_faces, obj.tensor_args.device)
+    yaw = sample_yaw(num_samples, num_faces, obj.device_cfg.device)
 
     # Form full 4-DOF grasp
     grasp_4dof = torch.cat([translation, yaw.unsqueeze(-1)], dim=1)
@@ -97,31 +97,31 @@ def grasp_6dof_sampler(num_samples: int, obj: Obstacle, num_faces: Optional[int]
     # Sample roll from discrete choices
     roll_choices = torch.tensor(
         [-torch.pi / 2, -torch.pi / 3, -torch.pi / 4, torch.pi / 4, torch.pi / 3, torch.pi / 2],
-        device=obj.tensor_args.device,
+        device=obj.device_cfg.device,
     )
-    roll_idxs = torch.randint(0, len(roll_choices), (num_samples,), device=obj.tensor_args.device)
+    roll_idxs = torch.randint(0, len(roll_choices), (num_samples,), device=obj.device_cfg.device)
     roll = roll_choices[roll_idxs]
 
     # Let pitch be zero for now
-    pitch = torch.zeros(num_samples, device=obj.tensor_args.device)
+    pitch = torch.zeros(num_samples, device=obj.device_cfg.device)
 
     # Sample yaw from discrete choices
-    yaw_choices = torch.tensor([-torch.pi / 2, torch.pi / 2], device=obj.tensor_args.device)
-    yaw_idxs = torch.randint(0, 2, (num_samples,), device=obj.tensor_args.device)
+    yaw_choices = torch.tensor([-torch.pi / 2, torch.pi / 2], device=obj.device_cfg.device)
+    yaw_idxs = torch.randint(0, 2, (num_samples,), device=obj.device_cfg.device)
     yaw = yaw_choices[yaw_idxs]
 
     # Stack rpy
     rpy = torch.stack([roll, pitch, yaw], dim=1)
 
     # Compute offsets for gripper translation in object frame
-    half_extents = obj.tensor_args.to_device([dim / 2 for dim in obj.dims])
+    half_extents = obj.device_cfg.to_device([dim / 2 for dim in obj.dims])
     gripper_offset = 0.01
     upper = (half_extents - gripper_offset).clamp(min=0.0)
-    lower = (obj.tensor_args.to_device(3 * [gripper_offset])).clamp(max=upper)
+    lower = (obj.device_cfg.to_device(3 * [gripper_offset])).clamp(max=upper)
     lower[0] = upper[0] = 0.0  # remove translation in x-axis
 
     # Sample translation between bounds
-    translation = torch.rand(num_samples, 3, device=obj.tensor_args.device)
+    translation = torch.rand(num_samples, 3, device=obj.device_cfg.device)
     translation = lower + (upper - lower) * translation
 
     # Form 6-DOF grasps
@@ -143,35 +143,35 @@ def place_4dof_sampler(
 
     # Assume the surface is a cuboid, sample xy positions within AABB in local frame
     if isinstance(surface, Cuboid):
-        aabb_xy = surface.tensor_args.to_device(
+        aabb_xy = surface.device_cfg.to_device(
             [[-surface.dims[0] / 2, -surface.dims[1] / 2], [surface.dims[0] / 2, surface.dims[1] / 2]]
         )
         surface_z = surface.dims[2] / 2
     else:
         # Note: this was only used for the Rummy demos in the past, so not tested extensively.
-        aabb = approximate_goal_aabb(surface).to(obj.tensor_args.device)
+        aabb = approximate_goal_aabb(surface).to(obj.device_cfg.device)
         aabb_xy = aabb[:, :2]
         surface_z = aabb[1, 2]
 
-    xy = torch.rand(num_samples, 2, device=obj.tensor_args.device)
+    xy = torch.rand(num_samples, 2, device=obj.device_cfg.device)
     xy = aabb_xy[0] + xy * (aabb_xy[1] - aabb_xy[0])
 
     # TODO: consider collision activation distance
     # Sample z-offset and combine with xy
     z_lower, z_upper = 1e-3, 1e-2
-    z = torch.rand(num_samples, 1, device=obj.tensor_args.device)
+    z = torch.rand(num_samples, 1, device=obj.device_cfg.device)
     z = z_lower + (z_upper - z_lower) * z
     z += obj_z_delta + surface_z
     xyz = torch.cat([xy, z], dim=1)
 
     # Transform to surface coordinate frame
     if isinstance(surface, Cuboid):
-        surface_mat4x4 = pose_list_to_mat4x4(surface.pose).to(obj.tensor_args.device)
+        surface_mat4x4 = pose_list_to_mat4x4(surface.pose).to(obj.device_cfg.device)
         xyz_surface = transform_points(xyz, surface_mat4x4)
     else:
         xyz_surface = xyz
 
     # Sample yaw
-    yaw = sample_yaw(num_samples, None, obj.tensor_args.device)
+    yaw = sample_yaw(num_samples, None, obj.device_cfg.device)
     place_4dof = torch.cat([xyz_surface, yaw.unsqueeze(-1)], dim=1)
     return place_4dof

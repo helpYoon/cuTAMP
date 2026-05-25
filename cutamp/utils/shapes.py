@@ -19,10 +19,10 @@ import trimesh
 from _heapq import heappush, heappop
 from jaxtyping import Float
 
-from curobo.geom.sphere_fit import SphereFitType
-from curobo.geom.types import Obstacle, Sphere
-from curobo.types.base import TensorDeviceType
-from curobo.types.math import Pose
+from curobo.sphere_fit import SphereFitType
+from curobo.scene import Obstacle, Sphere
+from curobo.types import DeviceCfg as TensorDeviceType
+from curobo.types import Pose
 
 _log = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class MultiSphere(Obstacle):
 
     def __post_init__(self):
         # Check spheres is not empty and (n, 4)
-        self.spheres = self.spheres.to(self.tensor_args.device)
+        self.spheres = self.spheres.to(self.device_cfg.device)
         if len(self.spheres) == 0:
             raise ValueError("Spheres must not be empty")
         if self.spheres.ndim != 2 or self.spheres.shape[1] != 4:
@@ -92,7 +92,7 @@ class MultiSphere(Obstacle):
         self,
         n_spheres: int = 1,
         surface_sphere_radius: float = 0.002,
-        fit_type: SphereFitType = SphereFitType.VOXEL_VOLUME_SAMPLE_SURFACE,
+        fit_type: SphereFitType = SphereFitType.VOXEL,
         voxelize_method: str = "ray",
         pre_transform_pose: Optional[Pose] = None,
         tensor_args: TensorDeviceType = TensorDeviceType(),
@@ -126,7 +126,7 @@ def sample_collision_spheres(
     obj: Obstacle,
     n_spheres: int = 50,
     surface_sphere_radius: float = 0.005,
-    fit_type: SphereFitType = SphereFitType.VOXEL_VOLUME_SAMPLE_SURFACE,
+    fit_type: SphereFitType = SphereFitType.VOXEL,
     voxelize_method: str = "subdivide",
 ) -> Float[torch.Tensor, "n 4"]:
     """Sample spheres for collision checking using cuRobo. Note the spheres will be in the object's frame."""

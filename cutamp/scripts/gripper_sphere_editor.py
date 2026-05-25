@@ -38,7 +38,7 @@ import yaml
 from yourdfpy import URDF
 
 # cuRobo imports for mesh sphere fitting
-from curobo.geom.sphere_fit import SphereFitType, fit_spheres_to_mesh
+from curobo.sphere_fit import SphereFitType, fit_spheres_to_mesh
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ def fit_spheres_to_mesh_file(
             mesh,
             n_spheres=n_spheres,
             surface_sphere_radius=surface_sphere_radius,
-            fit_type=SphereFitType.VOXEL_VOLUME_SAMPLE_SURFACE,
+            fit_type=SphereFitType.VOXEL,
             voxelize_method="subdivide",
         )
         
