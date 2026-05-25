@@ -12,7 +12,7 @@ import itertools
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Generator, List, Optional, Sequence
+from typing import Callable, Generator, List, Optional, Sequence
 
 from cutamp.task_planning import Atom, GroundOperator, Operator, State
 
@@ -70,11 +70,19 @@ def _extract_prefix(s: str, param_type: str) -> str:
     return s[:idx] if idx > 0 else ""
 
 def get_valid_ground_operators(
-    node: _Node, operators: Sequence[Operator], verbose: bool = False
+    node: _Node,
+    operators: Sequence[Operator],
+    verbose: bool = False,
+    priority_fn: Optional["Callable[[GroundOperator], float]"] = None,
 ) -> list[GroundOperator]:
     """
     Get all valid ground operators by testing the operators, binding samples for the unspecified variables, and
     checking preconditions are satisfied.
+
+    When ``priority_fn`` is provided, the returned ground operators are
+    sorted ascending by priority (smaller = explored first by BFS). This
+    biases BFS exploration without changing search correctness — all valid
+    ground ops are still returned, just in a different order.
     """
     ground_ops = []
     state = node.state
@@ -202,6 +210,9 @@ def get_valid_ground_operators(
                 if verbose:
                     _log.debug(f"Grounded operator {operator} with substitutions {substitutions} to get {ground_op}")
 
+    if priority_fn is not None:
+        # Stable sort: equal-priority groundings preserve declaration order.
+        ground_ops.sort(key=priority_fn)
     return ground_ops
 
 
@@ -212,6 +223,7 @@ def breadth_first_search(
     continue_branch_after_goal: bool = False,
     explored_state_check: bool = True,
     verbose: bool = False,
+    ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
 ) -> Generator[List[GroundOperator], None, None]:
     """
     Performs a breadth-first search to find a solution to the given planning problem.
@@ -259,7 +271,9 @@ def breadth_first_search(
                 continue  # stop exploring this branch as we already satisfied the goal
 
         # Get successor and add to frontier
-        ground_ops = get_valid_ground_operators(node, operators, verbose=verbose)
+        ground_ops = get_valid_ground_operators(
+            node, operators, verbose=verbose, priority_fn=ground_op_priority_fn,
+        )
         for ground_op in ground_ops:
             successor_state = ground_op.apply(node.state)
 
