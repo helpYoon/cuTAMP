@@ -109,6 +109,26 @@ class TAMPWorld:
 
         self._obj_to_aabb: Dict[str, Float[torch.Tensor, "2 3"]] = {}
 
+        # Arm-home end-effector positions in world frame. Used by the
+        # arm-affinity priority function in plan-skeleton search to rank
+        # which arm should pick which object. Uses palm frames (*_base_link)
+        # because they're already in tool_frames per t1_planar_base.yml;
+        # exact frame doesn't affect ranking, only LEFT-vs-RIGHT direction
+        # matters.
+        from curobo.types import JointState
+        home_js = JointState.from_position(
+            self._q_init.to(self.kinematics.device_cfg.device).unsqueeze(0)
+        )
+        home_ks = self.kinematics.compute_kinematics(home_js)
+        self.arm_home_ee_world: Dict[str, torch.Tensor] = {
+            "left":  home_ks.tool_poses.get_link_pose(
+                "left_base_link", make_contiguous=True,
+            ).position.flatten().detach().cpu(),
+            "right": home_ks.tool_poses.get_link_pose(
+                "right_base_link", make_contiguous=True,
+            ).position.flatten().detach().cpu(),
+        }
+
     # ---- Container delegates ------------------------------------------------
 
     @property
