@@ -134,3 +134,57 @@ def test_task_plan_generator_accepts_priority_fn():
     plan = next(gen)
     assert plan is not None
     assert len(plan) > 0
+
+
+@needs_cuda
+def test_arm_affinity_priority_orders_closer_arm_first():
+    """priority(LeftPick(block_on_left)) < priority(LeftPick(block_on_right))."""
+    from cutamp.algorithm import make_arm_affinity_priority_fn
+    world = _make_world()
+
+    # Find the two blocks and their world Y values.
+    block_ys = {obj.name: obj.pose[1] for obj in world.env.movables}
+    blocks_pos_y = [n for n, y in block_ys.items() if y > 0]
+    blocks_neg_y = [n for n, y in block_ys.items() if y < 0]
+    assert blocks_pos_y, "Test env must have a block at +Y for this test"
+    assert blocks_neg_y, "Test env must have a block at -Y for this test"
+
+    priority = make_arm_affinity_priority_fn(world)
+
+    from cutamp.t1_domain import LeftPick
+    block_left = blocks_pos_y[0]   # T1 facing +X; +Y is its left
+    block_right = blocks_neg_y[0]
+    op_left_close  = LeftPick.ground({"obj": block_left, "grasp": "grasp0", "q": "left_q0"})
+    op_left_far    = LeftPick.ground({"obj": block_right, "grasp": "grasp0", "q": "left_q0"})
+
+    pri_close = priority(op_left_close)
+    pri_far   = priority(op_left_far)
+    assert pri_close < pri_far, (
+        f"Expected priority(LeftPick(close)) < priority(LeftPick(far)); "
+        f"got {pri_close} vs {pri_far}"
+    )
+
+
+@needs_cuda
+def test_arm_affinity_priority_zero_for_non_pick():
+    """Non-pick operators return 0 priority (preserves original BFS order)."""
+    from cutamp.algorithm import make_arm_affinity_priority_fn
+    from cutamp.t1_domain import LeftMoveFree
+    world = _make_world()
+    priority = make_arm_affinity_priority_fn(world)
+    # LeftMoveFree params are [q_start, traj, q_end] — none are picks.
+    op = LeftMoveFree.ground(
+        {"q_start": "left_q0", "traj": "traj0", "q_end": "left_q1"}
+    )
+    assert priority(op) == 0.0
+
+
+@needs_cuda
+def test_arm_affinity_priority_zero_for_missing_block():
+    """Pick with an unknown block name returns 0 (graceful degradation)."""
+    from cutamp.algorithm import make_arm_affinity_priority_fn
+    from cutamp.t1_domain import LeftPick
+    world = _make_world()
+    priority = make_arm_affinity_priority_fn(world)
+    op = LeftPick.ground({"obj": "nonexistent_block", "grasp": "grasp0", "q": "left_q0"})
+    assert priority(op) == 0.0

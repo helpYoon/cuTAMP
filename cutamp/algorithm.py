@@ -11,9 +11,10 @@
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Union, Optional, Tuple
+from typing import Callable, Dict, List, Union, Optional, Tuple
 from unittest.mock import Mock
 
+import numpy as np
 import torch
 from curobo.types import DeviceCfg as TensorDeviceType
 
@@ -78,6 +79,38 @@ def heuristic_fn(
     # We have a preference for shorter plans
     heuristic += len(plan_skeleton)
     return heuristic
+
+
+def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
+    """Build a priority function for BFS sibling ordering.
+
+    For pick operators, returns the 3D Euclidean distance from the arm's
+    home end-effector position to the block's world pose. Closer = lower
+    priority = explored first by biased BFS. For non-pick operators or
+    pick operators whose block doesn't resolve (e.g., placeholder name
+    not yet bound to a real scene object), returns 0.0.
+
+    Same-side picks bubble to the top of the BFS exploration order, so
+    the first satisfying plan skeleton tends to be the same-side assignment.
+    Cross-body groundings are still enumerated (just later); BFS naturally
+    backtracks if same-side fails feasibility.
+    """
+    def priority(ground_op) -> float:
+        meta = ground_op.operator.metadata
+        if meta.action_type != "pick" or meta.arm is None:
+            return 0.0
+        # LeftPick/RightPick parameter order is (obj, grasp, q). Block is values[0].
+        block_name = ground_op.values[0]
+        try:
+            obj = world.get_object(block_name)
+        except (KeyError, ValueError):
+            return 0.0
+        if obj is None or obj.pose is None:
+            return 0.0
+        block_xyz = np.asarray(obj.pose[:3], dtype=np.float64)
+        arm_home_xyz = world.arm_home_ee_world[meta.arm].cpu().numpy().astype(np.float64)
+        return float(np.linalg.norm(block_xyz - arm_home_xyz))
+    return priority
 
 
 def get_best_particle(
@@ -373,11 +406,13 @@ def run_cutamp(
     _log.info(f"Goal State: {world.goal_state}")
     all_operators = all_t1_operators
     with timer.time("get_plan_generator", log_callback=_log.info):
+        arm_affinity_priority = make_arm_affinity_priority_fn(world)
         plan_gen = task_plan_generator(
             world.initial_state,
             world.goal_state,
             operators=all_operators,
             explored_state_check=config.explored_state_check,
+            ground_op_priority_fn=arm_affinity_priority,
         )
 
     # Sample initial plans and particles
