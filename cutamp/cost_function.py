@@ -424,33 +424,31 @@ class CostFunction:
     def com_polygon_constraint(self) -> Union[dict, None]:
         """Hard COM-over-base-polygon filter, per conf.
 
-        Mirrors how Collision works: per-conf 0/1 violation values, ANDed
-        into the overall satisfying mask by ``ConstraintChecker.get_mask``.
-        Values are 0.0 (COM inside polygon) or 1.0 (outside); tolerance is
-        0.5 (see ``default_constraint_to_tol[ComPolygon.type]``), so any
-        particle with a single COM-violating conf is filtered out.
+        Mirrors how Collision works: per-conf continuous penalty values
+        (units: m²), ANDed into the overall satisfying mask by
+        ``ConstraintChecker.get_mask``. The penalty is the same
+        differentiable inside-barrier function used by the soft cost
+        (sharing the FK computation via
+        ``self._com_polygon_penalties_cache``), so Adam receives a real
+        gradient toward COM-feasibility instead of a dead-weight 0/1
+        Boolean.
         """
         if not self.config.enable_com_polygon or self._particles is None:
             return None
 
-        from cutamp.com_polygon_cost import compute_com_polygon_mask
-
-        config_params = [
-            p for p in self._particles
-            if p.startswith(("left_q", "right_q", "q")) and self._particles[p].ndim == 2
-        ]
-        if not config_params:
+        if self._com_polygon_penalties_cache is None:
+            from cutamp.com_polygon_cost import compute_com_polygon_penalties
+            self._com_polygon_penalties_cache = compute_com_polygon_penalties(
+                self.world, self._particles,
+            )
+        pens = self._com_polygon_penalties_cache
+        if not pens:
             return None
-
-        values = {}
-        for p in config_params:
-            inside = compute_com_polygon_mask(self.world, self._particles[p])
-            values[p] = (~inside).float()
 
         return {
             "type": "constraint",
             "constraints": [],
-            "values": values,
+            "values": dict(pens),  # shallow copy: ConstraintChecker iterates this dict
         }
 
     def soft_costs(self, rollout: Rollout) -> dict:
@@ -575,6 +573,11 @@ class CostFunction:
         
         # Store particles for soft cost computation
         self._particles = particles
+        # Reset per-call cache for the shared COM-polygon penalty helper.
+        # com_polygon_constraint() and _compute_soft_cost("com_polygon")
+        # both consult this; lazy-populated on first use so we only run
+        # the FK once per __call__ even when both are active.
+        self._com_polygon_penalties_cache: Optional[Dict[str, torch.Tensor]] = None
 
         def add_cost(k_, v_):
             if v_ is not None:
