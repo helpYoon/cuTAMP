@@ -143,7 +143,12 @@ def compute_com_polygon_mask(
     """
     from curobo.types import JointState
     if half_extents is None:
-        half_extents = [0.05, 0.10]
+        # Two-foot support hull per actual_robot.urdf: 22.3cm foot length
+        # × 31.2cm stance width (left foot Y=+0.106 ± 0.05, right Y=-0.106 ± 0.05).
+        # Must match the cost-side polygon set in get_t1_motion_planner /
+        # get_t1_ik_solver so the post-IK verification agrees with the
+        # gradient pull.
+        half_extents = [0.1115, 0.156]
     kin = world.kinematics_with_com
     device = kin.device_cfg.device
     q_batch = q_batch.to(device)

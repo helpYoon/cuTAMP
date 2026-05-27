@@ -237,7 +237,7 @@ def get_t1_motion_planner(
             ComOverBasePolygonCostCfg,
         )
         # COM-polygon cost is a SAFETY BARRIER: zero cost anywhere inside
-        # the [0.05, 0.10] support rectangle, quadratic-in-distance penalty
+        # the two-foot support rectangle, quadratic-in-distance penalty
         # outside. ``body_home_posture`` is what keeps the body near upright
         # at the joint level — having COM ALSO try to pull toward center
         # produced fighting costs (COM "lean back to recenter" vs body "stay
@@ -249,7 +249,7 @@ def get_t1_motion_planner(
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
-            half_extents=[0.05, 0.10],   # 10×20 cm support
+            half_extents=[0.1115, 0.156],  # two-foot support hull: foot length (22.3cm) × stance width (31.2cm), per actual_robot.urdf
             inside_margin=0.0,            # no inside barrier
             inside_weight=0.0,            # disable barrier term entirely
         )
@@ -314,7 +314,7 @@ def get_t1_ik_solver(
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
-            half_extents=[0.05, 0.10],   # 10×20 cm support
+            half_extents=[0.1115, 0.156],  # two-foot support hull: foot length (22.3cm) × stance width (31.2cm), per actual_robot.urdf
             inside_margin=0.0,            # no inside barrier
             inside_weight=0.0,            # disable barrier term entirely
         )
