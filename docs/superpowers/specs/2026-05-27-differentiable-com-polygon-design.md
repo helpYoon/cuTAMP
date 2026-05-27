@@ -253,3 +253,25 @@ These are diagnosed problems that are NOT addressed by this design:
 - **Tolerance set wrong relative to penalty magnitudes**: Mitigated by parity test (verification 5). If `(penalties <= 4e-4) == mask` holds for representative particles, tolerance is correct.
 - **Cache invalidation**: Cache is keyed on `self._particles` identity, reset to `None` at the top of each `CostFunction.__call__`. If `_compute_soft_cost` is called outside `__call__` (it shouldn't be — `_compute_soft_cost` is `self.`-prefixed and called only from `soft_costs()` which is called only from `__call__`), the cache could be stale. No current call path bypasses `__call__`, so the invariant holds.
 - **Adam first-step destruction persists**: Acknowledged in "Out of scope". This fix alone may not get the smoke test to "≥1 satisfying" — it removes a necessary blocker (no gradient) but the lr/destruction issue may still dominate. Verification 4 will reveal whether this fix alone is sufficient.
+
+## Implementation outcome
+
+Smoke runs after the implementation tasks completed (commit `bb8fda4`):
+
+**No-regression smoke** (`--no_enable_com_polygon`, n=64, 50 steps): **29/64 satisfying** — same baseline as before this PR. ✓
+
+**Differentiable-ComPolygon smoke** (n=128, 200 steps, `--optimize_soft_costs --soft_cost com_polygon`):
+
+| Metric | Pre-PR (diagnostic) | Post-PR |
+| --- | --- | --- |
+| Total satisfying | 0/128 across 4 plans | **2/128 on plan 1** (algorithm terminated successfully) |
+| `[ComPolygon] left_q1` | 0/128 (never improved) | **118/128** (Adam actively pulled in) |
+| `[ComPolygon] right_q1` | 0/128 (never improved) | 11/128 (hardest reach, still improved) |
+| `[ComPolygon] left_q3` | n/a | 84/128 |
+| `[ComPolygon] right_q3` | n/a | 80/128 |
+| Best cost | inf | 0.0902 (soft 0.0154) |
+| Tracebacks | n/a | 0 |
+
+The differentiable gradient alone was sufficient to recover satisfying particles. Adam now actively reduces ComPolygon penalty (most dramatically: `left_q1` 0→118/128, `right_q1` 0→11/128) rather than random-walking from the IK init. Plan 1 produced a satisfying solution; subsequent plans were not needed.
+
+`right_q1` at 11/128 remains the hardest conf (far reach pushing torso past polygon edge); follow-up tuning of either polygon size or IK retries could lift this. The `skip_adam` / `conf_lr` follow-up work documented as "Out of scope" is not necessary for this PR.
