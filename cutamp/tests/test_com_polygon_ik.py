@@ -107,3 +107,26 @@ def test_compute_com_polygon_mask_excludes_extreme_lean():
     assert mask.shape == (2,)
     assert bool(mask[0]),    f"home should be inside polygon; mask[0]={mask[0]}"
     assert not bool(mask[1]), f"deeply-bent pose should be OUTSIDE polygon; mask[1]={mask[1]}"
+
+
+@needs_cuda
+def test_ik_for_pose_com_safe_returns_valid_result():
+    """End-to-end smoke check: _ik_for_pose_com_safe returns an IK result
+    with the expected shape on a real grasp target. We don't assert
+    everything-in-polygon (Layer 1 should help, but hard targets may
+    still fail) — just that the wrapper runs without error and returns
+    a usable result."""
+    import torch
+    from cutamp.particle_initialization import _ik_for_pose_com_safe
+    world = _make_world(enable_com_polygon=True)
+    # Build a [B=4, 4, 4] batch of reachable left-hand targets.
+    # Pose: hand at (0.4, +0.2, 0.5) world — well within left arm reach.
+    B = 4
+    target = torch.eye(4, device=world.kinematics.device_cfg.device).unsqueeze(0).expand(B, 4, 4).contiguous()
+    target[..., 0, 3] = 0.4
+    target[..., 1, 3] = 0.2
+    target[..., 2, 3] = 0.5
+    result = _ik_for_pose_com_safe(world, target, "left", max_retries=2)
+    # Result must have success + solution fields with batch dim B.
+    assert hasattr(result, "success") and result.success.shape[0] == B
+    assert hasattr(result, "solution") and result.solution.shape[0] == B

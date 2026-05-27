@@ -115,6 +115,71 @@ def _ik_for_pose(
         restore_cspace_target_dof_weight([ik], snapshot)
 
 
+def _splice_ik_result(orig, retry, idx: torch.Tensor):
+    """Replace ``orig``'s per-batch fields at ``idx`` with values from ``retry``.
+
+    cuRobo's IKSolverResult (subclass of BaseSolverResult) has per-batch
+    fields ``success``, ``solution``, ``position_error``, ``rotation_error``,
+    ``js_solution``, ``goalset_index``. Scalar fields (``solve_time``,
+    ``debug_info``) are not per-batch and are not spliced.
+
+    Mutates ``orig`` in place; returns it for chaining.
+    """
+    for field_name in (
+        "success", "solution", "position_error", "rotation_error",
+        "js_solution", "goalset_index",
+    ):
+        orig_val = getattr(orig, field_name, None)
+        retry_val = getattr(retry, field_name, None)
+        if orig_val is None or retry_val is None:
+            continue
+        # All per-batch fields are tensors indexable on dim 0.
+        orig_val[idx] = retry_val
+    return orig
+
+
+def _ik_for_pose_com_safe(
+    world: TAMPWorld,
+    world_from_ee: torch.Tensor,
+    arm: Optional[str],
+    *,
+    max_retries: int = 3,
+):
+    """Call ``_ik_for_pose``; verify COM-in-polygon; retry failed particles.
+
+    Layer 2 of the two-layer COM defense. Layer 1 (cost registered on
+    IK rollouts) makes IK natively COM-aware; this wrapper catches the
+    LBFGS-didn't-converge-to-COM-feasible edge case by re-calling IK
+    on the failed-particle subset. cuRobo's seed sampler has internal
+    randomization so retries may converge to different (feasible)
+    solutions.
+
+    Returns the last batch result (best effort). Logs final failure count
+    at WARNING level so persistent failures are visible.
+    """
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    result = _ik_for_pose(world, world_from_ee, arm)
+    for _attempt in range(max_retries):
+        q_batch = _ik_solution_to_full_q(result, world)
+        in_polygon = compute_com_polygon_mask(world, q_batch)
+        if bool(in_polygon.all()):
+            return result
+        fail_idx = (~in_polygon).nonzero(as_tuple=True)[0]
+        retry_targets = world_from_ee[fail_idx]
+        retry_result = _ik_for_pose(world, retry_targets, arm)
+        result = _splice_ik_result(result, retry_result, fail_idx)
+    # Final check for logging.
+    q_batch_final = _ik_solution_to_full_q(result, world)
+    in_polygon_final = compute_com_polygon_mask(world, q_batch_final)
+    n_fail = int((~in_polygon_final).sum().item())
+    if n_fail > 0:
+        _log.warning(
+            f"_ik_for_pose_com_safe: {n_fail}/{len(q_batch_final)} particles "
+            f"still out of COM polygon after {max_retries} retries"
+        )
+    return result
+
+
 def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
     """Build a full-cspace ``[B, len(world.kinematics.joint_names)]`` tensor
     from an IK result. Locked-out joints (e.g. mobile base) are filled from
@@ -262,7 +327,7 @@ class ParticleInitializer:
                     obj_from_grasp = obj_from_grasp[good_idxs]
                     world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
                     world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                    ik_result = _ik_for_pose(world, world_from_ee, arm)
+                    ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
                     )
@@ -338,7 +403,7 @@ class ParticleInitializer:
                     else:
                         obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
                     world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                    ik_result = _ik_for_pose(world, world_from_ee, arm)
+                    ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
                     )
@@ -392,7 +457,7 @@ class ParticleInitializer:
 
                 world_from_push = action_4dof_to_mat4x4(sampled_push)
                 world_from_ee = world_from_push @ tool_from_ee
-                ik_result = _ik_for_pose(world, world_from_ee, arm)
+                ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
                 log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
                 _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
@@ -467,7 +532,7 @@ class ParticleInitializer:
                 else:
                     obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
                 world_from_ee = world_from_stick @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose(world, world_from_ee, arm)
+                ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
                 log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
                 _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
