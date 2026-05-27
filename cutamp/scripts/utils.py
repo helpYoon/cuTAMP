@@ -28,7 +28,6 @@ default_constraint_to_mult = {
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
         "com_polygon": 10,  # Penalize COM projection outside the base rectangle
-        "place_close_to_base": 5e-1,  # Pull placement targets toward the base center
     },
 }
 

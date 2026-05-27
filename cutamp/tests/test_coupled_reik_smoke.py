@@ -20,7 +20,7 @@ def test_coupled_reik_runs_without_error(tmp_path):
         coupled_reik=True,
         reik_interval=2,
         optimize_soft_costs=True,
-        soft_cost=["place_close_to_base"],
+        soft_cost=["com_polygon"],
         enable_visualizer=False,
         curobo_plan=False,  # skip motion plan to keep test fast
         experiment_root=str(tmp_path),

@@ -533,16 +533,6 @@ class CostFunction:
                 )
             return penalty
 
-        # Place close to base — sum of placed-object XY distances from world
-        # origin (= base center for T1 with the planar base locked at zero).
-        # Operates directly on placement-pose particles so the gradient is
-        # well-behaved and Adam-friendly.
-        elif cost_name == "place_close_to_base":
-            last_obj_xy = torch.stack(
-                [v[:, -1, :2, 3] for v in rollout["obj_to_pose"].values()], dim=1
-            )  # [num_particles, num_objs, 2]
-            return last_obj_xy.norm(dim=-1).sum(dim=-1)
-
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
 

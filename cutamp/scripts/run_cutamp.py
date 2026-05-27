@@ -114,7 +114,7 @@ def entrypoint():
     parser.add_argument(
         "--coupled_reik", action="store_true",
         help="Re-IK-coupled Adam: outer Adam on poses/grasps, covered Confs refreshed by IK every --reik_interval steps. "
-             "Required for pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
+             "Required for pose-class soft costs (dist_from_origin, align_yaw, ...) on T1's 21-DOF cspace.",
     )
     parser.add_argument(
         "--reik_interval", type=int, default=5,
@@ -123,7 +123,7 @@ def entrypoint():
     parser.add_argument(
         "--soft_cost",
         nargs="*",
-        choices=["dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home", "minimize_body_movement", "com_polygon", "place_close_to_base"],
+        choices=["dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home", "minimize_body_movement", "com_polygon"],
         help="Soft cost(s) to optimize. Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
