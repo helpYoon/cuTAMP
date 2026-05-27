@@ -10,7 +10,14 @@
 import logging
 import sys
 
-from cutamp.task_planning.constraints import KinematicConstraint, StablePlacement, Collision, Motion, ValidPush
+from cutamp.task_planning.constraints import (
+    ComPolygon,
+    KinematicConstraint,
+    StablePlacement,
+    Collision,
+    Motion,
+    ValidPush,
+)
 from cutamp.task_planning.costs import TrajectoryLength
 
 
@@ -54,6 +61,10 @@ default_constraint_to_tol = {
         "stove_support": 1e-2,
     },
     ValidPush.type: {"dist_from_button": 0.0},
+    # ComPolygon per-conf values are 0 (inside) or 1 (outside); tol 0.5
+    # accepts inside, rejects outside. "default" applies to every conf name
+    # (left_q0, right_q1, ...) since they're plan-skeleton-dependent.
+    ComPolygon.type: {"default": 0.5},
 }
 
 

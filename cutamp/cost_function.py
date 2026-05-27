@@ -29,6 +29,7 @@ from cutamp.task_planning.constraints import (
     CollisionFreeGrasp,
     CollisionFreeHolding,
     CollisionFreePlacement,
+    ComPolygon,
     KinematicConstraint,
     Motion,
     StablePlacement,
@@ -420,6 +421,38 @@ class CostFunction:
         }
         return coll_cost
 
+    def com_polygon_constraint(self) -> Union[dict, None]:
+        """Hard COM-over-base-polygon filter, per conf.
+
+        Mirrors how Collision works: per-conf 0/1 violation values, ANDed
+        into the overall satisfying mask by ``ConstraintChecker.get_mask``.
+        Values are 0.0 (COM inside polygon) or 1.0 (outside); tolerance is
+        0.5 (see ``default_constraint_to_tol[ComPolygon.type]``), so any
+        particle with a single COM-violating conf is filtered out.
+        """
+        if not self.config.enable_com_polygon or self._particles is None:
+            return None
+
+        from cutamp.com_polygon_cost import compute_com_polygon_mask
+
+        config_params = [
+            p for p in self._particles
+            if p.startswith(("left_q", "right_q", "q")) and self._particles[p].ndim == 2
+        ]
+        if not config_params:
+            return None
+
+        values = {}
+        for p in config_params:
+            inside = compute_com_polygon_mask(self.world, self._particles[p])
+            values[p] = (~inside).float()
+
+        return {
+            "type": "constraint",
+            "constraints": [],
+            "values": values,
+        }
+
     def soft_costs(self, rollout: Rollout) -> dict:
         """Soft costs defined on the goal state. Supports multiple soft costs."""
         values = {}
@@ -579,6 +612,10 @@ class CostFunction:
         # Kinematic costs
         kinematic_cost = self.kinematic_costs(rollout)
         add_cost(KinematicConstraint.type, kinematic_cost)
+
+        # COM-over-base-polygon hard filter (mirrors Collision)
+        com_polygon_cost = self.com_polygon_constraint()
+        add_cost(ComPolygon.type, com_polygon_cost)
 
         # Soft costs
         if self.config.soft_cost:

@@ -132,6 +132,35 @@ def test_ik_for_pose_com_safe_returns_valid_result():
     assert hasattr(result, "solution") and result.solution.shape[0] == B
 
 
+def test_constraint_checker_filters_com_violators():
+    """ComPolygon registered as hard constraint must filter violating
+    particles from the satisfying mask. No CUDA needed — exercises
+    ConstraintChecker on a synthetic cost dict."""
+    import torch
+    from cutamp.constraint_checker import ConstraintChecker
+    from cutamp.scripts.utils import default_constraint_to_tol
+    from cutamp.task_planning.constraints import ComPolygon
+
+    checker = ConstraintChecker(default_constraint_to_tol.copy())
+    # 4 particles: 0 and 2 inside polygon on every conf; 1 fails on
+    # left_q1; 3 fails on right_q3.
+    cost_dict = {
+        ComPolygon.type: {
+            "type": "constraint",
+            "constraints": [],
+            "values": {
+                "left_q1":  torch.tensor([0.0, 1.0, 0.0, 0.0]),
+                "right_q3": torch.tensor([0.0, 0.0, 0.0, 1.0]),
+                "left_q0":  torch.tensor([0.0, 0.0, 0.0, 0.0]),
+            },
+        },
+    }
+    mask = checker.get_mask(cost_dict, verbose=False)
+    assert mask.tolist() == [True, False, True, False], (
+        f"Expected COM-violators (idx 1, 3) filtered; got mask={mask.tolist()}"
+    )
+
+
 @needs_cuda
 def test_curobo_batched_com_kernel_returns_per_batch_distinct():
     """Regression test for bundled cuRobo's batched COM kernel bug.
