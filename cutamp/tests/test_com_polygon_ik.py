@@ -130,3 +130,62 @@ def test_ik_for_pose_com_safe_returns_valid_result():
     # Result must have success + solution fields with batch dim B.
     assert hasattr(result, "success") and result.success.shape[0] == B
     assert hasattr(result, "solution") and result.solution.shape[0] == B
+
+
+@needs_cuda
+def test_curobo_batched_com_kernel_returns_per_batch_distinct():
+    """Regression test for bundled cuRobo's batched COM kernel bug.
+
+    Pre-fix (kinematics_forward_kernel.cuh: passing local_batch_offset
+    instead of 0 as matAddrBase): only batch index 0 of robot_com was
+    populated correctly; subsequent slots returned zeros or aliased
+    garbage. Affected any robot with num_spheres ≥ 100 (T1=164, G1=674).
+
+    The fix is at
+    curobo/_src/curobolib/kernels/kinematics/kinematics_forward_kernel.cuh
+    lines 316 and 396 (passing 0 instead of local_batch_offset to
+    process_center_of_mass). This test asserts that a B=4 batched COM
+    call returns the SAME per-batch COMs as four separate B=1 calls."""
+    import torch
+    from curobo.types import JointState
+    world = _make_world(enable_com_polygon=True)
+    kin = world.kinematics_with_com
+    full_names = list(world.kinematics.joint_names)
+    name_to_idx = {n: i for i, n in enumerate(full_names)}
+
+    # Build four distinct configurations spanning the COM excursion range.
+    home = world.q_init.detach().clone()
+    bent_forward = home.clone()
+    bent_forward[name_to_idx["Torso_Pitch"]] = -1.5
+    bent_forward[name_to_idx["knee_pitch"]] = +0.6
+    twisted = home.clone()
+    twisted[name_to_idx["Waist_Yaw"]] = +0.8
+    reach = home.clone()
+    reach[name_to_idx["Left_Shoulder_Pitch"]] = -1.2
+
+    configs = [home, bent_forward, twisted, reach]
+
+    # Reference: per-sample B=1 COMs (always correct).
+    ref_coms = []
+    for q in configs:
+        js = JointState.from_position(q.unsqueeze(0), joint_names=full_names)
+        ks = kin.compute_kinematics(kin.get_active_js(js))
+        ref_coms.append(ks.robot_com[..., :3].reshape(3).clone())
+    ref_coms = torch.stack(ref_coms, dim=0)  # [4, 3]
+
+    # Batched: all 4 in one call.
+    q_batch = torch.stack(configs, dim=0)
+    js_batch = JointState.from_position(q_batch, joint_names=full_names)
+    ks_batch = kin.compute_kinematics(kin.get_active_js(js_batch))
+    batched_coms = ks_batch.robot_com[..., :3].reshape(-1, 3)  # [4, 3]
+
+    # Each batch slot's COM must match its single-call reference.
+    max_diff = (batched_coms - ref_coms).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"Batched COM kernel returned non-matching COMs (max diff {max_diff:.6f}).\n"
+        f"  ref (B=1 stacked):\n{ref_coms.cpu().numpy()}\n"
+        f"  batched (B=4):\n{batched_coms.cpu().numpy()}\n"
+        f"Bundled cuRobo's batched COM kernel may have regressed — see "
+        f"curobo/_src/curobolib/kernels/kinematics/kinematics_forward_kernel.cuh "
+        f"lines 316 and 396 (process_center_of_mass matAddrBase arg)."
+    )
