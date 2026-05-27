@@ -505,7 +505,11 @@ class CostFunction:
 
             from cutamp.com_polygon_cost import com_polygon_penalty
             kin = self.world.kinematics_with_com
-            half_extents = torch.tensor([0.10, 0.15], device=device, dtype=torch.float32)
+            # Match the cost-side polygon in get_t1_motion_planner /
+            # get_t1_ik_solver and the verification mask default in
+            # compute_com_polygon_mask — two-foot support hull per
+            # actual_robot.urdf (22.3cm foot length × 31.2cm stance width).
+            half_extents = torch.tensor([0.1115, 0.156], device=device, dtype=torch.float32)
             inside_margin = 0.02
             inside_weight = 1.0
             base_link = "mobile_base_link"
