@@ -220,7 +220,6 @@ def compute_com_polygon_penalties(
     kin = world.kinematics_with_com
     device = kin.device_cfg.device
     joint_names = list(world.kinematics.joint_names)
-    half = torch.tensor(half_extents, device=device, dtype=torch.float32)
 
     conf_names = [
         p for p in particles
@@ -229,6 +228,7 @@ def compute_com_polygon_penalties(
     out: "dict[str, torch.Tensor]" = {}
     for name in conf_names:
         q = particles[name].to(device)
+        half = torch.tensor(half_extents, device=device, dtype=q.dtype)
         js = JointState.from_position(q, joint_names=joint_names)
         active_js = kin.get_active_js(js)
         ks = kin.compute_kinematics(active_js)
