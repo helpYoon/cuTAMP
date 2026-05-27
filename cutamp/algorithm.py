@@ -364,13 +364,14 @@ def setup_cutamp(
     timer = TorchTimer()
     with timer.time("load_tamp_world", log_callback=_log.info):
         world = TAMPWorld(
-            env,
-            tensor_args,
+            env=env,
+            device_cfg=tensor_args,
             robot=robot_container,
             q_init=q_init,
             collision_activation_distance=config.world_activation_distance,
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
+            enable_com_polygon=config.enable_com_polygon,
         )
         check_tamp_world_not_in_collision(world)
 

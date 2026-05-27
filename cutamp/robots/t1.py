@@ -172,6 +172,22 @@ def _trajopt_transition_dict_with_compute_com() -> dict:
     return d
 
 
+def _ik_transition_dict_with_compute_com() -> dict:
+    """Default IK transition YAML with ``compute_com=True`` injected.
+
+    cuRobo's IK kernel template is fixed at IK-build time (analogous to
+    the motion planner). We inject ``compute_com=True`` so
+    ``state.cuda_robot_model_state.robot_com`` is populated during the
+    LBFGS refinement stage, where the COM-over-base soft cost reads it.
+    """
+    from curobo._src.util.config_io import resolve_config, join_path
+    from curobo.content import get_task_configs_path
+
+    d = resolve_config(join_path(get_task_configs_path(), "ik/transition_ik.yml"))
+    d["transition_model_cfg"]["compute_com"] = True
+    return d
+
+
 def get_t1_motion_planner(
     scene: Scene,
     *,
@@ -247,6 +263,7 @@ def get_t1_ik_solver(
     num_seeds: int = 32,
     self_collision_check: bool = True,
     max_batch_size: int = 64,
+    enable_com_polygon: bool = True,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
     """InverseKinematics solver for T1 with the mobile base locked.
@@ -259,6 +276,13 @@ def get_t1_ik_solver(
     The 3 base DOFs (``base_j_x``, ``base_j_y``, ``base_j_yaw``) are pinned
     at 0 — IK cannot drift the base during particle init. Legs / torso /
     waist / arms remain free.
+
+    When ``enable_com_polygon`` is True (default), the IK solver gets the
+    same COM-over-base-polygon soft cost as the motion planner. Without
+    this, IK produces extreme leaning configurations whose COM projects
+    outside the wheelbase rectangle — the Adam-side soft cost can't
+    recover from these because pulling the body back would violate the
+    KinematicConstraint.
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
@@ -277,8 +301,25 @@ def get_t1_ik_solver(
         # ("CUDA graph reset is not available."). Disable so each call
         # accepts arbitrary current_state shapes.
         use_cuda_graph=False,
+        transition_model=_ik_transition_dict_with_compute_com(),
     )
-    return InverseKinematics(cfg)
+    ik_solver = InverseKinematics(cfg)
+    if enable_com_polygon:
+        from cutamp._curobo_internals import add_extra_cost, iter_rollouts
+        from cutamp.com_polygon_cost import (
+            ComOverBasePolygonCost,
+            ComOverBasePolygonCostCfg,
+        )
+        rollout_device_cfg = iter_rollouts(ik_solver)[0].device_cfg
+        cost_cfg = ComOverBasePolygonCostCfg(
+            weight=[5.0e5],
+            device_cfg=rollout_device_cfg,
+            half_extents=[0.05, 0.10],   # 10×20 cm support
+            inside_margin=0.0,            # no inside barrier
+            inside_weight=0.0,            # disable barrier term entirely
+        )
+        add_extra_cost(ik_solver, "com_polygon", ComOverBasePolygonCost(cost_cfg))
+    return ik_solver
 
 
 # =============================================================================

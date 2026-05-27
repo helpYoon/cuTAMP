@@ -62,6 +62,7 @@ class TAMPWorld:
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
+        enable_com_polygon: bool = True,
     ):
         self.env = env
         self.device_cfg = device_cfg
@@ -97,6 +98,7 @@ class TAMPWorld:
         # so a "single-arm Pick" doesn't drift the other arm.
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.world_cfg, device_cfg=device_cfg, max_batch_size=512,
+            enable_com_polygon=enable_com_polygon,
         )
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).
