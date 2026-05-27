@@ -123,8 +123,9 @@ def _splice_ik_result(orig, retry, idx: torch.Tensor):
     solver_base_result.py:212-237) so any consumer of the returned IK
     result sees consistent state across all fields.
 
-    ``orig`` has batch dim B; ``retry`` has batch dim ``len(idx)`` (the
-    failed-particle subset). Mutates ``orig`` in place; returns it.
+    Both ``orig`` and ``retry`` have batch dim B (the full batch).
+    ``idx`` selects which entries to copy from ``retry`` into ``orig``.
+    Mutates ``orig`` in place; returns it.
     """
     # Per-batch tensor fields on BaseSolverResult (IKSolverResult inherits).
     for attr in (
@@ -136,8 +137,8 @@ def _splice_ik_result(orig, retry, idx: torch.Tensor):
         src = getattr(retry, attr, None)
         if dst is None or src is None:
             continue
-        # retry.attr has batch dim len(idx); assign into orig.attr[idx].
-        dst[idx] = src
+        # Both dst and src have batch dim B; index src[idx] to match dst[idx].
+        dst[idx] = src[idx]
 
     # js_solution is a JointState — splice its sub-attrs individually.
     js_orig = getattr(orig, "js_solution", None)
@@ -148,7 +149,7 @@ def _splice_ik_result(orig, retry, idx: torch.Tensor):
             src = getattr(js_retry, sub_attr, None)
             if dst is None or src is None:
                 continue
-            dst[idx] = src
+            dst[idx] = src[idx]
     return orig
 
 
@@ -179,9 +180,13 @@ def _ik_for_pose_com_safe(
         in_polygon = compute_com_polygon_mask(world, q_batch)
         if bool(in_polygon.all()):
             return result
+        # Retry on the FULL batch (cuRobo's IK seeder randomizes internally,
+        # so re-calling with the same targets produces different solutions).
+        # We then splice only the still-failing indices from the retry
+        # result into orig. Avoids cuRobo's _goal_buffer size-mismatch
+        # when the retry batch shape differs from the initial call.
         fail_idx = (~in_polygon).nonzero(as_tuple=True)[0]
-        retry_targets = world_from_ee[fail_idx]
-        retry_result = _ik_for_pose(world, retry_targets, arm)
+        retry_result = _ik_for_pose(world, world_from_ee, arm)
         result = _splice_ik_result(result, retry_result, fail_idx)
     # Final check for logging.
     q_batch_final = _ik_solution_to_full_q(result, world)
