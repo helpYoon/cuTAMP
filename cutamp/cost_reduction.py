@@ -26,7 +26,14 @@ class CostReducer:
         }
 
     def _get_multiplier(self, cost_type: str, name: str) -> Optional[float]:
-        return self.cost_to_multiplier.get((cost_type, name))
+        direct = self.cost_to_multiplier.get((cost_type, name))
+        if direct is not None:
+            return direct
+        # Mirror ConstraintChecker._get_tol's "default" fallback so
+        # constraints with plan-skeleton-dependent inner names (e.g.
+        # ComPolygon's per-conf entries left_q0, right_q3, ...) can
+        # share a single weight without enumerating every possible name.
+        return self.cost_to_multiplier.get((cost_type, "default"))
 
     def get_cost(self, cost_dict: Dict[str, dict], consider_types: Set[str]) -> Float[torch.Tensor, "num_particles"]:
         """Returns total cost per particle by taking weighted sum of considered cost types."""
