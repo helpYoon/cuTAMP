@@ -63,3 +63,47 @@ def test_ik_solver_no_com_polygon_when_disabled():
         "IK solver should NOT have com_polygon registered when "
         "enable_com_polygon=False"
     )
+
+
+@needs_cuda
+def test_compute_com_polygon_mask_basic():
+    """Verify batched COM-in-polygon check returns the expected shape +
+    correctly classifies a home-pose batch as inside the polygon."""
+    import torch
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    world = _make_world(enable_com_polygon=True)
+    # At home pose all DOFs are 0; COM is directly above the wheelbase
+    # center → inside polygon for sure. Build a [B=4, full_dof] batch all
+    # at home and assert all four come back True.
+    home = world.q_init.detach().clone()
+    B = 4
+    q_batch = home.unsqueeze(0).expand(B, -1).contiguous()
+    mask = compute_com_polygon_mask(world, q_batch)
+    assert mask.shape == (B,), f"expected shape ({B},), got {mask.shape}"
+    assert bool(mask.all()), (
+        f"home pose should be inside polygon; got mask={mask}"
+    )
+
+
+@needs_cuda
+def test_compute_com_polygon_mask_excludes_extreme_lean():
+    """A bent-far-forward configuration should be classified as OUTSIDE
+    the polygon. Constructs a synthetic q_batch with deeply-bent
+    Torso_Pitch + ankle_pitch + knee_pitch (mimicking the teetering pose
+    we observed pre-fix)."""
+    import torch
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    world = _make_world(enable_com_polygon=True)
+    full_names = list(world.kinematics.joint_names)
+    home = world.q_init.detach().clone()
+    # Build a configuration with deep forward bend.
+    name_to_idx = {n: i for i, n in enumerate(full_names)}
+    bent = home.clone()
+    bent[name_to_idx["Torso_Pitch"]]  = -1.7
+    bent[name_to_idx["ankle_pitch"]]  = -0.5
+    bent[name_to_idx["knee_pitch"]]   = +0.8
+    q_batch = torch.stack([home, bent], dim=0)  # [2, full_dof]
+    mask = compute_com_polygon_mask(world, q_batch)
+    assert mask.shape == (2,)
+    assert bool(mask[0]),    f"home should be inside polygon; mask[0]={mask[0]}"
+    assert not bool(mask[1]), f"deeply-bent pose should be OUTSIDE polygon; mask[1]={mask[1]}"

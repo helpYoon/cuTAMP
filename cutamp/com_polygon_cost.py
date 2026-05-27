@@ -112,3 +112,69 @@ class ComOverBasePolygonCost(BaseCost):
 
 
 ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
+
+
+def compute_com_polygon_mask(
+    world,
+    q_batch: torch.Tensor,
+    *,
+    half_extents: Optional[List[float]] = None,
+) -> torch.Tensor:
+    """Batched COM-in-polygon check.
+
+    Computes per-link mass-weighted world COM via ``world.kinematics_with_com``
+    (which is built with ``compute_com=True``), projects it into the
+    ``mobile_base_link`` frame, and returns a boolean mask of which batch
+    elements have their COM inside an axis-aligned rectangle around the
+    base origin.
+
+    Args:
+        world: TAMPWorld instance. Must have ``kinematics_with_com``
+            available (cached property — first call builds it lazily).
+        q_batch: ``[B, full_dof]`` joint positions in
+            ``world.kinematics.joint_names`` order.
+        half_extents: ``[2]``-list of (X, Y) half-sizes in meters. Default
+            ``[0.05, 0.10]`` matches the safety rectangle used by the
+            planner-side COM cost.
+
+    Returns:
+        ``[B]`` bool tensor; True where the projected COM is inside the
+        rectangle (per-axis ``abs(com_in_base[i]) <= half_extents[i]``).
+    """
+    from curobo.types import JointState
+    if half_extents is None:
+        half_extents = [0.05, 0.10]
+    kin = world.kinematics_with_com
+    device = kin.device_cfg.device
+    q_batch = q_batch.to(device)
+    if q_batch.ndim == 1:
+        q_batch = q_batch.unsqueeze(0)
+    B = q_batch.shape[0]
+
+    half = torch.tensor(half_extents, device=device, dtype=q_batch.dtype)
+
+    # NOTE: bundled cuRobo's batched COM CUDA kernel has a correctness bug —
+    # only batch index 0 of ``robot_com`` is populated reliably; subsequent
+    # slots come back as zeros or garbage from buffer-reuse aliasing. Until
+    # the kernel is fixed upstream we iterate per-sample with B=1 calls,
+    # which always produces a correct COM. The retry wrapper that consumes
+    # this helper operates over small candidate batches (≤ a handful), so
+    # the perf hit is negligible.
+    mask = torch.empty(B, dtype=torch.bool, device=device)
+    joint_names = list(world.kinematics.joint_names)
+    for i in range(B):
+        q_i = q_batch[i:i + 1]  # [1, dof]
+        js = JointState.from_position(q_i, joint_names=joint_names)
+        active_js = kin.get_active_js(js)
+        ks = kin.compute_kinematics(active_js)
+        com = ks.robot_com[..., :3].reshape(1, 3)
+        base_T = (
+            ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
+            .get_matrix()
+            .reshape(1, 4, 4)
+        )
+        R = base_T[:, :3, :3]
+        t = base_T[:, :3, 3]
+        com_in_base = (R.transpose(-1, -2) @ (com - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+        mask[i] = (torch.abs(com_in_base) <= half).all(dim=-1)[0]
+    return mask
