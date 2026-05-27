@@ -531,6 +531,30 @@ class ParticleOptimizer:
         opt_metrics["best_soft_cost"] = best_soft_cost
         opt_metrics["best_hard_cost"] = best_hard_cost
 
+        # Post-optimization COM-polygon visibility: report per-conf how many
+        # final particles' configurations are inside the foot-realistic
+        # support polygon. Useful diagnostic — COM is a soft cost (not in
+        # the constraint_checker output) so without this you'd only see the
+        # aggregate soft cost number.
+        try:
+            from cutamp.com_polygon_cost import compute_com_polygon_mask
+            conf_names = sorted(
+                p for p in particles
+                if p.startswith(("left_q", "right_q", "q")) and particles[p].ndim == 2
+            )
+            if conf_names:
+                com_summary = []
+                for cn in conf_names:
+                    mask = compute_com_polygon_mask(rollout_fn.world, particles[cn])
+                    com_summary.append(f"{cn} {int(mask.sum().item())}/{mask.shape[0]}")
+                _log.info("COM-in-polygon (per conf): " + ", ".join(com_summary))
+                opt_metrics["com_in_polygon_per_conf"] = {
+                    cn: int(compute_com_polygon_mask(rollout_fn.world, particles[cn]).sum().item())
+                    for cn in conf_names
+                }
+        except Exception as e:
+            _log.debug(f"COM-in-polygon summary skipped: {e}")
+
         # Visualize rollout of the best particle in terms of soft costs, which is just trajectory length if no
         # other soft costs are specified. If no satisfying particles, just visualize lowest overall cost particle.
         if num_satisfying > 0:
