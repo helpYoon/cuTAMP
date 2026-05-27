@@ -149,8 +149,10 @@ def test_constraint_checker_filters_com_violators():
             "type": "constraint",
             "constraints": [],
             "values": {
-                "left_q1":  torch.tensor([0.0, 1.0, 0.0, 0.0]),
-                "right_q3": torch.tensor([0.0, 0.0, 0.0, 1.0]),
+                # Penalty values: 0.0 = inside polygon; 1e-2 ≈ 1cm outside.
+                # tol from default_constraint_to_tol[ComPolygon.type] = 4e-4.
+                "left_q1":  torch.tensor([0.0, 1e-2, 0.0, 0.0]),
+                "right_q3": torch.tensor([0.0, 0.0, 0.0, 1e-2]),
                 "left_q0":  torch.tensor([0.0, 0.0, 0.0, 0.0]),
             },
         },
