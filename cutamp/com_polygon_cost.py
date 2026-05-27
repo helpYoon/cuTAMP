@@ -170,3 +170,75 @@ def compute_com_polygon_mask(
     com_in_base = (R.transpose(-1, -2) @ (com - t).unsqueeze(-1)).squeeze(-1)[:, :2]
     half = torch.tensor(half_extents, device=device, dtype=q_batch.dtype)
     return (torch.abs(com_in_base) <= half).all(dim=-1)
+
+
+def compute_com_polygon_penalties(
+    world,
+    particles: "dict[str, torch.Tensor]",
+    *,
+    half_extents: Optional[List[float]] = None,
+    inside_margin: float = 0.02,
+    inside_weight: float = 1.0,
+) -> "dict[str, torch.Tensor]":
+    """Per-conf differentiable COM-polygon penalty.
+
+    For every Conf-shaped particle in ``particles`` (name starts with
+    ``left_q``/``right_q``/``q`` and ``ndim == 2``), runs
+    ``world.kinematics_with_com.compute_kinematics`` once and computes
+    the per-particle COM-over-polygon penalty via
+    :func:`com_polygon_penalty`. Returns a dict mapping conf name to a
+    ``[B]`` tensor of penalties in m². Tensors are differentiable
+    through cuRobo's FK chain — calling ``.backward()`` on a function of
+    these values populates ``.grad`` on the input Conf particles.
+
+    Used by both the hard ``ComPolygon`` constraint (via
+    :meth:`CostFunction.com_polygon_constraint`) and the soft
+    ``--soft_cost com_polygon`` path (via
+    :meth:`CostFunction._compute_soft_cost`). When both are active in
+    the same ``CostFunction.__call__``, the result is cached on the
+    ``CostFunction`` instance so the FK runs once per conf.
+
+    Args:
+        world: TAMPWorld instance. ``world.kinematics_with_com`` must
+            be available (cached property — first call builds it).
+        particles: dict mapping particle name to ``[B, full_dof]``
+            tensor. Non-Conf particles (poses, grasps) are skipped.
+        half_extents: ``[2]``-list of (X, Y) half-sizes in meters.
+            Default ``[0.1115, 0.156]`` matches the cost-side polygon.
+        inside_margin: width of the inside-edge barrier band (meters).
+        inside_weight: relative scale of the inside barrier vs the
+            outside quadratic.
+
+    Returns:
+        ``{conf_name: [B] float tensor}`` of penalty values in m².
+        Empty dict if no Conf particles are in ``particles``.
+    """
+    from curobo.types import JointState
+    if half_extents is None:
+        half_extents = [0.1115, 0.156]
+
+    kin = world.kinematics_with_com
+    device = kin.device_cfg.device
+    joint_names = list(world.kinematics.joint_names)
+    half = torch.tensor(half_extents, device=device, dtype=torch.float32)
+
+    conf_names = [
+        p for p in particles
+        if p.startswith(("left_q", "right_q", "q")) and particles[p].ndim == 2
+    ]
+    out: "dict[str, torch.Tensor]" = {}
+    for name in conf_names:
+        q = particles[name].to(device)
+        js = JointState.from_position(q, joint_names=joint_names)
+        active_js = kin.get_active_js(js)
+        ks = kin.compute_kinematics(active_js)
+        com_world = ks.robot_com[..., :3].reshape(-1, 3)
+        base_T = (
+            ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
+            .get_matrix()
+            .reshape(-1, 4, 4)
+        )
+        out[name] = com_polygon_penalty(
+            com_world, base_T, half, inside_margin, inside_weight,
+        )
+    return out

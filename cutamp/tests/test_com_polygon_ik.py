@@ -218,3 +218,78 @@ def test_curobo_batched_com_kernel_returns_per_batch_distinct():
         f"curobo/_src/curobolib/kernels/kinematics/kinematics_forward_kernel.cuh "
         f"lines 316 and 396 (process_center_of_mass matAddrBase arg)."
     )
+
+
+@needs_cuda
+def test_compute_com_polygon_penalties_is_differentiable():
+    """The shared helper must return tensors that carry an autograd
+    connection back to the input joint positions. This is the property
+    that makes the hard ComPolygon constraint actually usable as an
+    Adam gradient source (the prior (~mask).float() lost this)."""
+    import torch
+    from cutamp.com_polygon_cost import compute_com_polygon_penalties
+
+    world = _make_world(enable_com_polygon=True)
+    full_names = list(world.kinematics.joint_names)
+    name_to_idx = {n: i for i, n in enumerate(full_names)}
+    home = world.q_init.detach().clone()
+
+    # Use a configuration with the COM outside the support polygon so the
+    # penalty is non-zero and the gradient is non-trivially non-zero.
+    # Torso_Pitch=-1.5 shifts com_base[x] to ~0.1146 > half_extents[x]=0.1115.
+    leaning = home.clone()
+    leaning[name_to_idx["Torso_Pitch"]] = -1.5
+
+    B = 4
+    q = leaning.unsqueeze(0).expand(B, -1).contiguous().clone().requires_grad_(True)
+    particles = {"left_q1": q}
+
+    pens = compute_com_polygon_penalties(world, particles)
+    assert "left_q1" in pens, f"Expected 'left_q1' key in result; got {list(pens.keys())}"
+    p = pens["left_q1"]
+    assert p.shape == (B,), f"Expected shape ({B},), got {p.shape}"
+    assert p.requires_grad, "Penalty tensor must carry an autograd connection."
+
+    # Backward through the sum; q.grad must be populated and non-trivial.
+    p.sum().backward()
+    assert q.grad is not None, "Expected q.grad to be populated after backward."
+    # Leaning configuration has COM outside the polygon, so the gradient
+    # through the FK chain and penalty function is non-zero.
+    assert q.grad.abs().sum().item() > 0, (
+        f"Expected non-zero gradient on q (COM is outside polygon); got all-zero grad."
+    )
+
+
+@needs_cuda
+def test_compute_com_polygon_penalties_matches_mask_at_tolerance():
+    """Parity between the mask helper and the penalty helper: a
+    particle's penalty <= inside_weight * inside_margin^2 iff its COM
+    is inside the polygon. Calibrates the hard constraint's tolerance
+    (4e-4) against the mask's definition of 'inside'."""
+    import torch
+    from cutamp.com_polygon_cost import (
+        compute_com_polygon_mask,
+        compute_com_polygon_penalties,
+    )
+
+    world = _make_world(enable_com_polygon=True)
+    full_names = list(world.kinematics.joint_names)
+    name_to_idx = {n: i for i, n in enumerate(full_names)}
+    home = world.q_init.detach().clone()
+    bent = home.clone()
+    bent[name_to_idx["Torso_Pitch"]] = -1.5  # COM far forward -> outside polygon
+    bent[name_to_idx["knee_pitch"]] = +0.6
+
+    q = torch.stack([home, bent], dim=0)  # [2, full_dof]
+
+    mask = compute_com_polygon_mask(world, q)  # [B] Bool
+    pens = compute_com_polygon_penalties(world, {"left_q1": q})
+    p = pens["left_q1"]  # [B] float
+    tol = 1.0 * (0.02) ** 2  # inside_weight * inside_margin^2 = 4e-4
+
+    # mask True <-> COM inside polygon <-> penalty <= tol
+    inside_mask = (p <= tol)
+    assert torch.equal(mask, inside_mask), (
+        f"Penalty-vs-mask disagree.\n  mask={mask.tolist()}\n"
+        f"  penalties={p.tolist()}  tol={tol}\n  inside_mask={inside_mask.tolist()}"
+    )
