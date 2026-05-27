@@ -118,23 +118,37 @@ def _ik_for_pose(
 def _splice_ik_result(orig, retry, idx: torch.Tensor):
     """Replace ``orig``'s per-batch fields at ``idx`` with values from ``retry``.
 
-    cuRobo's IKSolverResult (subclass of BaseSolverResult) has per-batch
-    fields ``success``, ``solution``, ``position_error``, ``rotation_error``,
-    ``js_solution``, ``goalset_index``. Scalar fields (``solve_time``,
-    ``debug_info``) are not per-batch and are not spliced.
+    Mirrors the field coverage of cuRobo's
+    ``BaseSolverResult.copy_at_batch_indices`` (curobo/_src/solver/
+    solver_base_result.py:212-237) so any consumer of the returned IK
+    result sees consistent state across all fields.
 
-    Mutates ``orig`` in place; returns it for chaining.
+    ``orig`` has batch dim B; ``retry`` has batch dim ``len(idx)`` (the
+    failed-particle subset). Mutates ``orig`` in place; returns it.
     """
-    for field_name in (
+    # Per-batch tensor fields on BaseSolverResult (IKSolverResult inherits).
+    for attr in (
         "success", "solution", "position_error", "rotation_error",
-        "js_solution", "goalset_index",
+        "cspace_error", "goalset_index", "feasible", "optimized_seeds",
+        "total_cost_reshaped", "seed_rank", "seed_cost",
     ):
-        orig_val = getattr(orig, field_name, None)
-        retry_val = getattr(retry, field_name, None)
-        if orig_val is None or retry_val is None:
+        dst = getattr(orig, attr, None)
+        src = getattr(retry, attr, None)
+        if dst is None or src is None:
             continue
-        # All per-batch fields are tensors indexable on dim 0.
-        orig_val[idx] = retry_val
+        # retry.attr has batch dim len(idx); assign into orig.attr[idx].
+        dst[idx] = src
+
+    # js_solution is a JointState — splice its sub-attrs individually.
+    js_orig = getattr(orig, "js_solution", None)
+    js_retry = getattr(retry, "js_solution", None)
+    if js_orig is not None and js_retry is not None:
+        for sub_attr in ("position", "velocity", "acceleration", "jerk", "dt"):
+            dst = getattr(js_orig, sub_attr, None)
+            src = getattr(js_retry, sub_attr, None)
+            if dst is None or src is None:
+                continue
+            dst[idx] = src
     return orig
 
 
@@ -144,6 +158,7 @@ def _ik_for_pose_com_safe(
     arm: Optional[str],
     *,
     max_retries: int = 3,
+    context: str = "",
 ):
     """Call ``_ik_for_pose``; verify COM-in-polygon; retry failed particles.
 
@@ -173,8 +188,9 @@ def _ik_for_pose_com_safe(
     in_polygon_final = compute_com_polygon_mask(world, q_batch_final)
     n_fail = int((~in_polygon_final).sum().item())
     if n_fail > 0:
+        prefix = f"[{context}] " if context else ""
         _log.warning(
-            f"_ik_for_pose_com_safe: {n_fail}/{len(q_batch_final)} particles "
+            f"{prefix}_ik_for_pose_com_safe: {n_fail}/{len(q_batch_final)} particles "
             f"still out of COM polygon after {max_retries} retries"
         )
     return result
@@ -327,7 +343,11 @@ class ParticleInitializer:
                     obj_from_grasp = obj_from_grasp[good_idxs]
                     world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
                     world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                    ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
+                    ik_result = _ik_for_pose_com_safe(
+                        world, world_from_ee, arm,
+                        max_retries=self.config.ik_com_retry_max,
+                        context=f"pick({arm})",
+                    )
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
                     )
@@ -403,7 +423,11 @@ class ParticleInitializer:
                     else:
                         obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
                     world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                    ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
+                    ik_result = _ik_for_pose_com_safe(
+                        world, world_from_ee, arm,
+                        max_retries=self.config.ik_com_retry_max,
+                        context=f"place({arm})",
+                    )
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
                     )
@@ -457,7 +481,11 @@ class ParticleInitializer:
 
                 world_from_push = action_4dof_to_mat4x4(sampled_push)
                 world_from_ee = world_from_push @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
+                ik_result = _ik_for_pose_com_safe(
+                    world, world_from_ee, arm,
+                    max_retries=self.config.ik_com_retry_max,
+                    context=f"push({arm})",
+                )
                 log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
                 _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
@@ -532,7 +560,11 @@ class ParticleInitializer:
                 else:
                     obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
                 world_from_ee = world_from_stick @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(world, world_from_ee, arm, max_retries=self.config.ik_com_retry_max)
+                ik_result = _ik_for_pose_com_safe(
+                    world, world_from_ee, arm,
+                    max_retries=self.config.ik_com_retry_max,
+                    context=f"push_stick({arm})",
+                )
                 log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
                 _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
