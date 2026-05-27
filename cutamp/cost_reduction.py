@@ -33,6 +33,8 @@ class CostReducer:
         # constraints with plan-skeleton-dependent inner names (e.g.
         # ComPolygon's per-conf entries left_q0, right_q3, ...) can
         # share a single weight without enumerating every possible name.
+        # Returning None when neither is found is intentional — it means
+        # "no multiplier, pass value through" (no implicit default-for-all).
         return self.cost_to_multiplier.get((cost_type, "default"))
 
     def get_cost(self, cost_dict: Dict[str, dict], consider_types: Set[str]) -> Float[torch.Tensor, "num_particles"]:
