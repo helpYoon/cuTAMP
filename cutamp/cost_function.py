@@ -533,36 +533,16 @@ class CostFunction:
         elif cost_name == "com_polygon":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for com_polygon soft cost")
-
-            from cutamp.com_polygon_cost import com_polygon_penalty
-            kin = self.world.kinematics_with_com
-            # Match the cost-side polygon in get_t1_motion_planner /
-            # get_t1_ik_solver and the verification mask default in
-            # compute_com_polygon_mask — two-foot support hull per
-            # actual_robot.urdf (22.3cm foot length × 31.2cm stance width).
-            half_extents = torch.tensor([0.1115, 0.156], device=device, dtype=torch.float32)
-            inside_margin = 0.02
-            inside_weight = 1.0
-            base_link = "mobile_base_link"
-
-            config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
-            if not config_params:
+            if self._com_polygon_penalties_cache is None:
+                from cutamp.com_polygon_cost import compute_com_polygon_penalties
+                self._com_polygon_penalties_cache = compute_com_polygon_penalties(
+                    self.world, self._particles,
+                )
+            pens = self._com_polygon_penalties_cache
+            if not pens:
                 return torch.zeros(num_particles, device=device)
-            penalty = torch.zeros(num_particles, device=device)
-            for p in config_params:
-                # compute_kinematics expects [B, T, dof]; particles are [B, dof].
-                js = JointState.from_position(self._particles[p].unsqueeze(1))
-                ks = kin.compute_kinematics(js)
-                com_world = ks.robot_com[..., :3].reshape(-1, 3)
-                base_T = (
-                    ks.tool_poses.get_link_pose(base_link, make_contiguous=True)
-                    .get_matrix()
-                    .reshape(-1, 4, 4)
-                )
-                penalty = penalty + com_polygon_penalty(
-                    com_world, base_T, half_extents, inside_margin, inside_weight,
-                )
-            return penalty
+            # Sum over confs to match the prior per-particle scalar shape.
+            return torch.stack(list(pens.values()), dim=0).sum(dim=0)
 
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
