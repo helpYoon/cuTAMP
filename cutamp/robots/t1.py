@@ -246,12 +246,21 @@ def get_t1_motion_planner(
         # dictate posture; COM only intervenes if the body actually drifts
         # to a tipping configuration. Bumped weight 1e5 → 5e5 to push back
         # harder on excursions without re-introducing the inside barrier.
+        # Inside-barrier ON for the planner rollouts too: keyframe-only COM
+        # filter (Adam side) is satisfied, but the saved trajectory's mid-
+        # waypoint COM was excursing up to 5cm out of polygon (89% inside,
+        # ~58/528 frames out, peak penalty 2.4e-3 in place segments). Adding
+        # the inside-barrier here gives the trajopt LBFGS a gradient pull
+        # from inside the polygon edge band toward center, flattening the
+        # mid-trajectory bumps. The earlier concern (this fighting
+        # body_home_posture) is validated by retesting; if trunk pitches
+        # back too much we lower inside_weight from 1.0.
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
             half_extents=[0.1115, 0.156],  # two-foot support hull: foot length (22.3cm) × stance width (31.2cm), per actual_robot.urdf
-            inside_margin=0.0,            # no inside barrier
-            inside_weight=0.0,            # disable barrier term entirely
+            inside_margin=0.02,           # 2cm band inside edge gets center-pulling gradient
+            inside_weight=1.0,            # same scale as outside-quadratic; tunable
         )
         add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     return planner
