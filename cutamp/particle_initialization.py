@@ -175,18 +175,35 @@ def _ik_for_pose_com_safe(
     """
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     result = _ik_for_pose(world, world_from_ee, arm)
+    full_dof = world.q_init.shape[-1]
+    device = world.q_init.device
+    batch_size = world_from_ee.shape[0]
     for _attempt in range(max_retries):
         q_batch = _ik_solution_to_full_q(result, world)
         in_polygon = compute_com_polygon_mask(world, q_batch)
         if bool(in_polygon.all()):
             return result
-        # Retry on the FULL batch (cuRobo's IK seeder randomizes internally,
-        # so re-calling with the same targets produces different solutions).
-        # We then splice only the still-failing indices from the retry
-        # result into orig. Avoids cuRobo's _goal_buffer size-mismatch
-        # when the retry batch shape differs from the initial call.
         fail_idx = (~in_polygon).nonzero(as_tuple=True)[0]
-        retry_result = _ik_for_pose(world, world_from_ee, arm)
+        # Diversify the LBFGS starting region across retries: each retry
+        # perturbs the home seed with gaussian noise whose stddev grows
+        # with attempt count. cuRobo's internal seed sampler adds its own
+        # noise on top of `current_state`, but if every retry hands it
+        # the SAME home pose, all attempts explore the same neighbourhood
+        # and find the same COM-infeasible local minimum (the "lean
+        # forward + tip" basin). Larger perturbations push seeds into
+        # the leaned-back / squatted basins where COM-feasible solutions
+        # live. Noise scales 0.1, 0.2, 0.3, ... rad and is masked to
+        # body + active arm only (base & inactive arm stay locked).
+        noise_std = 0.1 * (_attempt + 1)
+        seed = world.q_init.unsqueeze(0).expand(batch_size, -1).clone()
+        noise = torch.randn(batch_size, full_dof, device=device) * noise_std
+        noise[:, :3] = 0.0  # base locked
+        if arm == "left":
+            noise[:, 14:21] = 0.0  # right arm locked
+        elif arm == "right":
+            noise[:, 7:14] = 0.0  # left arm locked
+        seed = seed + noise
+        retry_result = _ik_for_pose(world, world_from_ee, arm, current_state_q=seed)
         result = _splice_ik_result(result, retry_result, fail_idx)
     # Final check for logging.
     q_batch_final = _ik_solution_to_full_q(result, world)
