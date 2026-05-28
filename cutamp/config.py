@@ -81,7 +81,7 @@ class TAMPConfiguration:
     enable_traj: bool = False
     # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
     enable_com_polygon: bool = True
-    ik_com_retry_max: int = 3   # Layer 2: max retries when post-IK COM check fails.
+    ik_com_retry_max: int = 15   # Layer 2: max retries when post-IK COM check fails.
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
     # On RuntimeError from solve_curobo, retry on the next-best satisfying particle

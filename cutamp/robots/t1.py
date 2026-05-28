@@ -311,12 +311,19 @@ def get_t1_ik_solver(
             ComOverBasePolygonCostCfg,
         )
         rollout_device_cfg = iter_rollouts(ik_solver)[0].device_cfg
+        # Inside-barrier ON for IK rollouts: gives LBFGS a gradient pull from
+        # inside the band toward the center, broadening the COM-feasible
+        # convergence basin so unlucky-seed IK runs still land inside the
+        # polygon. The planner-side cost (above) keeps barrier OFF because
+        # cspace pulls toward home — adding a center-pull there fights
+        # posture and trunk pitches backward. IK has no such cspace pull on
+        # body DOFs (only inactive-arm pin), so the trade is favorable.
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
             half_extents=[0.1115, 0.156],  # two-foot support hull: foot length (22.3cm) × stance width (31.2cm), per actual_robot.urdf
-            inside_margin=0.0,            # no inside barrier
-            inside_weight=0.0,            # disable barrier term entirely
+            inside_margin=0.02,           # 2cm band inside edge gets center-pulling gradient
+            inside_weight=1.0,            # same scale as outside-quadratic; tunable
         )
         add_extra_cost(ik_solver, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     return ik_solver
