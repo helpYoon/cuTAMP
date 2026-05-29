@@ -68,3 +68,22 @@ def test_no_multiplier_when_neither_exact_nor_default_exists():
     assert torch.allclose(cost, torch.tensor([1.0, 2.0, 3.0])), (
         f"Unmultiplied passthrough expected; got cost={cost}"
     )
+
+
+def test_get_cost_zero_tensor_when_no_matching_type():
+    # cost_dict has only a 'cost' entry; asking for 'constraint' must yield a
+    # zero tensor shaped to the particle batch, not None (so the optimizer's
+    # hard_costs(...) + soft_costs(...) never hits None + tensor).
+    reducer = CostReducer({})
+    cost_dict = {"traj": {"type": "cost", "values": {"traj_length": torch.ones(5)}}}
+    out = reducer.get_cost(cost_dict, consider_types={"constraint"})
+    assert out is not None
+    assert out.shape == (5,)
+    assert torch.equal(out, torch.zeros(5))
+
+
+def test_get_cost_normal_path_unchanged():
+    reducer = CostReducer({"soft": {"traj_length": 2.0}})
+    cost_dict = {"soft": {"type": "cost", "values": {"traj_length": torch.ones(5)}}}
+    out = reducer.get_cost(cost_dict, consider_types={"cost"})
+    assert torch.equal(out, torch.full((5,), 2.0))

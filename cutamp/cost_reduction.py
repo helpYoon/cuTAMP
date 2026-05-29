@@ -51,6 +51,16 @@ class CostReducer:
                 if multiplier is not None:
                     values = values * multiplier
                 cost = values if cost is None else cost + values
+        if cost is None:
+            # No entry matched consider_types. Return a zero objective shaped
+            # to the particle batch (inferred from any entry) so callers can
+            # safely do hard_costs(...) + soft_costs(...) without hitting
+            # None + tensor. Falls through to None only if cost_dict is empty.
+            for entry in cost_dict.values():
+                for values in entry["values"].values():
+                    return torch.zeros(
+                        values.shape[0], device=values.device, dtype=values.dtype
+                    )
         return cost
 
     def soft_costs(self, cost_dict: Dict[str, dict]) -> Float[torch.Tensor, "num_particles"]:
