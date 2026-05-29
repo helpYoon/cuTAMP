@@ -232,12 +232,6 @@ def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     ], axis=-1)
 
 
-def _quat_rotate_wxyz(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate vector v by quaternion q (q wxyz, v 3-vec; broadcasts)."""
-    v_quat = np.concatenate([np.zeros_like(v[..., :1]), v], axis=-1)
-    return _quat_mul_wxyz(_quat_mul_wxyz(q, v_quat), _quat_conjugate_wxyz(q))[..., 1:]
-
-
 def process_motion_plan(
     curobo_plan: List[Dict[str, Any]],
     kinematics: Optional[Kinematics] = None,
