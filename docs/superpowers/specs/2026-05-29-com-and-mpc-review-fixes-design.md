@@ -204,11 +204,16 @@ pose, directly usable.
 ### Tests
 
 Doc/comment-only; no behavior change. Verify by `grep -rn 0.0625 cutamp
-examples docs` returning **zero** matches after the change.
+examples docs` returning **only** the lines that *quote the URDF joint origins*
+for explanation (`docs/sim_to_real_mapping.md` lines like
+`<origin xyz="0.0625 0 -0.1155"/>` — those remain true and load-bearing). No
+match may state the offset as a *required consumer action* or *applied
+compensation*. (Do not blindly drive grep to zero — that would delete real
+explanation of why the sim joint origin is shaped the way it is.)
 
 ---
 
-## C — Fix the double finite-difference tail (findings 8, 13)
+## C — Derive plan velocities/accelerations correctly (findings 8, 13)
 
 ### Problem
 
@@ -222,52 +227,102 @@ return np.concatenate([diff, diff[-1:]], axis=0)
 
 Acceleration is this function applied twice (velocity = FD(position),
 acceleration = FD(velocity)). Each FD duplicates its tail, so the **last two
-samples of every acceleration channel collapse toward a flat/zero value**.
-This is unconditional for Cartesian accel (`trunk_xyz_ddot`, hand accels,
-angular accels — velocities there are always FD'd, lines 343-351 → 371-382) and
-also hits joint accel when `JointState.velocity`/`.acceleration` are unpopulated
-(lines 361-367, 391-397). An MPC feedforwarding torque from accel gets a wrong
-(flattened) feedforward at every segment boundary.
+samples of every acceleration channel collapse toward 0** — the duplicate makes
+`v[T-1] == v[T-2]`, so `a[T-2] = (v[T-1]-v[T-2])/dt = 0`, and `a[T-1] = a[T-2]`
+is the second duplicate. An MPC feedforwarding torque from accel gets zero
+feedforward at every segment **boundary** — the worst place for it.
 
-`_angular_velocity_from_quat` (`:219`) has the same tail-duplication, so angular
-acceleration double-FDs too.
+**What cuRobo provides (verified against source):**
 
-### Fix (forward-diff, fixed tail — minimal value change)
+- **Joint space — native.** `JointState` carries `velocity`/`acceleration`/`jerk`
+  (`curobo/.../state/state_joint.py:73-76`); trajopt fills them from its B-spline
+  parameterization and the interpolation kernel resamples all four with correct
+  `dt`-scaling (`curobo/.../util/warp_interpolation.py:95-116`). So the joint FD
+  branches (`plan_processor.py:361-367, 391-397`) are a *fallback*.
+- **Cartesian space — NOT native.** FK (`KinematicsState`) returns only poses,
+  `tool_jacobians`, spheres, and COM — **no link velocity/acceleration**
+  (`curobo/.../robot/kinematics/kinematics_state.py:8-18`). The hand/trunk world
+  velocity must be derived; today that is FD-of-pose then FD-again.
+- **Jacobian IS available.** `KinematicsState.tool_jacobians`
+  (`[batch, horizon, num_links, 6, dof]`) is populated when the kinematics is
+  built with `compute_jacobian=True` (`kinematics.py:52,136,167`). This is a
+  cuTAMP-side constructor flag on our **own** `_build_processing_kinematics`
+  (`plan_processor.py:130`) — **no cuRobo edit, no fork.**
 
-Keep forward differences (preserve today's interior convention) but replace the
-tail **duplication** with **linear extrapolation** of the final sample, so a
-second FD no longer collapses to zero:
+**Empirical confirmation (loaded `data/motion_plan.pkl`, schema v3, 8 segs):**
 
-```python
-def _forward_finite_diff(values, dt):
-    if values.shape[0] < 2:
-        return np.zeros_like(values)
-    diff = np.diff(values, axis=0) / dt          # T-1 samples
-    if diff.shape[0] < 2:
-        tail = diff[-1:]                          # T==2: cannot extrapolate, duplicate
-    else:
-        tail = 2 * diff[-1:] - diff[-2:-1]        # linear (constant-jerk) extrapolation
-    return np.concatenate([diff, tail], axis=0)
-```
+- Cartesian accel tails are the exact double-FD signature —
+  `right_hand_xyz_ddot` last-5 per-row norms `[2.4e-4, 2.4e-4, 2.4e-4, 0, 0]`;
+  same for `trunk_xyz_ddot`, `trunk_angular_acceleration_world` (three real
+  values then **two zeros**).
+- Joint channels also show the alternating-zero FD-duplicate pattern
+  (`0.0` at `[-3]` and `[-1]`), which means **trajopt's native joint derivatives
+  are NOT reaching `plan_processor`** for this plan — the joint FD fallback is
+  firing when it shouldn't. (See C3.)
 
-Apply the same tail-extrapolation in `_angular_velocity_from_quat` (`:219`) for
-consistency. Only the final 1-2 samples change vs today; all interior values
-are identical (forward-diff preserved).
+### Fix
 
-Effect: after a double FD, the last accel samples become a constant-jerk
-extrapolation rather than 0 — no zero feedforward at boundaries.
+Three sub-fixes — Cartesian via Jacobian, joints prefer-native, and the
+underlying finite-difference made endpoint-correct.
+
+**C1 — Cartesian velocity via the Jacobian (`J·q̇`).** Build
+`_build_processing_kinematics` with `compute_jacobian=True`. For each link,
+`tool_jacobians[..., link, :, :]` is the `[6, dof]` spatial Jacobian; with the
+joint velocity `q̇` (native from the plan, else C3's central diff), the link
+spatial velocity is the analytic `v = J · q̇` (rows 0-2 linear, 3-5 angular).
+This replaces FD-of-pose for `*_hand_xyz_dot`, `trunk_xyz_dot`, and the angular
+velocities — no finite difference, no endpoint fabrication, physically exact.
+(Angular velocity from `J·q̇` also retires `_angular_velocity_from_quat` and its
+quaternion-FD entirely.)
+
+**C2 — Cartesian acceleration.** No second analytic option (cuRobo exposes no
+`J̇` and no native link accel), so accel stays one differentiation of the *exact*
+C1 velocity — but via C3's endpoint-correct central difference, not the tail-
+duplicating forward diff. Result: `v̇` from a clean `v`, last samples genuine.
+
+**C3 — Joints: prefer native, central-diff fallback, and fix the helper.**
+- Replace `_forward_finite_diff` with `np.gradient(x, dt, axis=0, edge_order=2)`
+  (central diff interior, 2nd-order one-sided at both ends, never duplicates).
+  Used for any remaining FD (joint fallback + Cartesian accel in C2).
+- Keep the "native if populated" branches (`vel_active`/`acc_active`) — native
+  B-spline derivatives are higher quality than any FD.
+
+**C4 — Investigate why native joint derivatives are missing (root-cause).**
+The pkl shows the joint FD fallback firing, meaning `plan_js.velocity` /
+`.acceleration` are `None` (or get dropped) by the time `plan_processor` runs.
+Trace the path from trajopt result → `_interp_plan`
+(`motion_solver.py:141-171`, `get_interpolated_plan`) → `entry["plan"]` →
+`_to_active_cspace`. Candidates: (a) the planner returns `js_solution` (no
+derivatives) rather than the interpolated trajectory on some branches;
+(b) `get_full_dof_from_solution` / `augment_joint_state` re-augments locked DOFs
+in a way that returns position-only; (c) `_to_active_cspace` only reprojects
+`.position`. Fix at the source so native joint vel/accel survive to the
+processor; if a branch genuinely lacks them, C3's central-diff fallback is the
+correct backstop. **This sub-task is investigation-first** (systematic-debugging:
+find the layer that drops the derivatives before changing code).
 
 ### Files
 
-- `cutamp/utils/plan_processor.py`
+- `cutamp/utils/plan_processor.py` — `compute_jacobian=True` in
+  `_build_processing_kinematics`; `J·q̇` Cartesian velocity (C1); accel from
+  central diff of it (C2); `_forward_finite_diff` → `np.gradient` (C3); remove
+  `_angular_velocity_from_quat` if fully superseded by C1.
+- `cutamp/motion_solver.py` and/or the trajopt-result path — only if C4 finds
+  the derivative drop there (scope confirmed during investigation).
 
 ### Tests (new test module or extend an existing one)
 
-- Known-curvature trajectory `x(t) = 0.5·a·t²` (constant accel `a`):
-  `_forward_finite_diff` twice → assert **all** samples, including the last two,
-  are `≈ a` (not 0). The old code fails this on the last two.
-- Linear trajectory: second derivative `≈ 0` everywhere (sanity).
-- T==2 edge case: returns finite values, no crash.
+- **C1 Jacobian velocity:** a trajectory moving one joint at known `q̇` → assert
+  `J·q̇` link linear velocity matches an analytic FK-difference to tight tol, at
+  **all** timesteps including endpoints.
+- **C2/C3 endpoint correctness:** constant-acceleration joint trajectory
+  `q(t)=0.5·a·t²` → `np.gradient` twice yields `≈ a` at **every** sample
+  including the last two (the old code returns 0 there).
+- **C3 native passthrough:** a plan JointState *with* populated velocity/accel →
+  processor emits those values verbatim (no FD applied).
+- **C4 regression:** after the source fix, a freshly generated plan's joint
+  vel/accel tails are non-degenerate (no alternating-zero FD signature).
+- Linear trajectory: second derivative `≈ 0` (sanity). T==2: finite, no crash.
 
 ---
 
