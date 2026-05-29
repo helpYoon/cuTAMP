@@ -36,13 +36,14 @@ Output schema per segment::
             "left_hand_quat_xyzw":   [T, 4],
         },
         "velocity": {
-            # Joint velocities (from JointState.velocity if populated, else FD)
+            # Joint velocities: native cuRobo JointState.velocity (required)
             "trunk_pitch":                     [T],
             "trunk_yaw":                       [T],
             "ankle_pitch":                     [T],
             "knee_pitch":                      [T],
             "right_arm":                       [T, 7],
             "left_arm":                        [T, 7],
+            # Cartesian velocity from the analytic Jacobian J·q̇ (WORLD frame)
             "trunk_xyz_dot":                     [T, 3],   # m/s, world
             "trunk_height":                      [T],
             "right_hand_xyz_dot":                [T, 3],   # m/s, WORLD
@@ -52,21 +53,21 @@ Output schema per segment::
             "left_hand_angular_velocity_world":  [T, 3],
         },
         "acceleration": {
-            # Joint accelerations (from JointState.acceleration if populated,
-            # else FD on velocity). cuRobo's bspline trajopt produces
-            # smoother accelerations than position-FD-FD, so prefer it.
+            # Joint accelerations: native cuRobo JointState.acceleration
+            # (required; cuRobo's bspline trajopt populates it). A missing
+            # native derivative raises rather than fabricating an FD.
             "trunk_pitch":                     [T],
             "trunk_yaw":                       [T],
             "ankle_pitch":                     [T],
             "knee_pitch":                      [T],
             "right_arm":                       [T, 7],
             "left_arm":                        [T, 7],
-            # Cartesian linear acceleration (FD on velocity arrays above)
+            # Cartesian linear accel: central diff (np.gradient) of J·q̇ vel
             "trunk_xyz_ddot":                       [T, 3],   # m/s^2, world
             "trunk_height":                         [T],
             "right_hand_xyz_ddot":                  [T, 3],   # m/s^2, WORLD
             "left_hand_xyz_ddot":                   [T, 3],
-            # Angular acceleration (FD on the sign-canonicalized ω)
+            # Angular accel: central diff (np.gradient) of the J·q̇ ω
             "trunk_angular_acceleration_world":     [T, 3],   # rad/s^2
             "right_hand_angular_acceleration_world": [T, 3],
             "left_hand_angular_acceleration_world":  [T, 3],
@@ -99,12 +100,18 @@ angular velocity fields in v2 are in WORLD frame. Units: rad/s.
   side (Hip_Roll, Hip_Yaw, Ankle_Roll) are NOT emitted — the MPC chooses
   them for balance, matching the saved Trunk world pose.
 
-Velocity sources:
+Velocity / acceleration sources:
 
-* Joint velocities (trunk_pitch / trunk_yaw / arms) come from
-  ``JointState.velocity`` which trajopt populates alongside positions.
-* Cartesian velocities are first-order forward finite differences with
-  the segment's ``dt``.
+* Joint velocities AND accelerations (trunk_pitch / trunk_yaw / arms / legs)
+  come from the native ``JointState.velocity`` / ``.acceleration`` that
+  trajopt populates alongside positions. They are required — a ``None``
+  native derivative raises ``RuntimeError`` rather than being fabricated.
+* Cartesian velocities are the exact analytic Jacobian product ``J·q̇``
+  (WORLD frame: linear rows ``[0:3]``, angular rows ``[3:6]``), using the
+  ``tool_jacobians`` populated by ``compute_jacobian=True``.
+* Cartesian accelerations are one 2nd-order central difference
+  (``np.gradient(..., edge_order=2)``) of that exact velocity — genuine
+  endpoint values, no fabricated 2-zero tail at segment boundaries.
 """
 
 from __future__ import annotations
@@ -143,7 +150,10 @@ def _build_processing_kinematics(device_cfg: Optional[DeviceCfg] = None) -> Kine
         LEFT_TOOL_FRAME, RIGHT_TOOL_FRAME, TRUNK_LINK,
     ]
     kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg_dict, device_cfg=device_cfg)
-    return Kinematics(kin_cfg)
+    # compute_jacobian=True populates KinematicsState.tool_jacobians
+    # ([batch, horizon, num_links, 6, dof]) so Cartesian velocity can be
+    # derived exactly as J·q̇ instead of finite-differencing the FK pose.
+    return Kinematics(kin_cfg, compute_jacobian=True)
 
 
 def _to_active_cspace(
@@ -182,39 +192,20 @@ def _to_active_cspace(
     return kin.get_active_js(src_js).position
 
 
-def _forward_finite_diff(values: np.ndarray, dt: float) -> np.ndarray:
-    """Forward FD along axis 0; last sample duplicated to preserve shape."""
-    if values.shape[0] < 2:
-        return np.zeros_like(values)
-    diff = np.diff(values, axis=0) / dt
-    return np.concatenate([diff, diff[-1:]], axis=0)
+def _central_diff(values: np.ndarray, dt: float) -> np.ndarray:
+    """Central-difference along axis 0 with genuine endpoint values.
 
-
-def _angular_velocity_from_quat(q_seq: np.ndarray, dt: float) -> np.ndarray:
-    """Angular velocity (rad/s) from a wxyz quaternion sequence via FD.
-
-    Returns ω in the REFERENCE frame in which q_seq is defined
-    (q_seq = world_q_link → ω in world).
-    Math: ω = 2·(dq/dt) ⊗ conj(q), imaginary part. Last sample duplicated.
+    Uses 2nd-order one-sided stencils at the endpoints (``edge_order=2``)
+    so the last two samples are NOT fabricated/duplicated — this is what
+    fixes the old double-FD 2-zero acceleration tail. ``edge_order=2``
+    needs >= 3 samples; degrade to 1 for shorter segments (T==2) and
+    return zeros for a single sample.
     """
-    T = q_seq.shape[0]
+    T = values.shape[0]
     if T < 2:
-        return np.zeros((T, 3), dtype=q_seq.dtype)
-    # Canonicalize sign so consecutive samples are aligned. q and -q encode
-    # the same rotation, but element-wise FD treats them as opposite — one
-    # uncanonicalized flip yields ~4/dt rad/s spurious omega spike. Sequential
-    # propagation: once a flip happens, every subsequent sample needs the flip
-    # too. WHY sequential not element-wise: a single forward sweep handles
-    # consecutive flips correctly.
-    q_aligned = q_seq.copy()
-    for t in range(1, T):
-        if np.dot(q_aligned[t], q_aligned[t - 1]) < 0:
-            q_aligned[t] *= -1
-    dq = (q_aligned[1:] - q_aligned[:-1]) / dt
-    conj_q = _quat_conjugate_wxyz(q_aligned[:-1])
-    omega_quat = 2.0 * _quat_mul_wxyz(dq, conj_q)
-    omega = omega_quat[..., 1:]
-    return np.concatenate([omega, omega[-1:]], axis=0)
+        return np.zeros_like(values)
+    edge_order = 2 if T >= 3 else 1
+    return np.gradient(values, dt, axis=0, edge_order=edge_order)
 
 
 def _xyzw_from_wxyz(q: np.ndarray) -> np.ndarray:
@@ -283,12 +274,29 @@ def process_motion_plan(
                 f"{len(kinematics.joint_names)} and joint_names is None."
             )
         vel_active = _to_active_cspace(plan_js.velocity, src_names, kinematics)
-        # cuRobo trajopt's bspline parameterization gives smoother acceleration
-        # than FD on (already-FD) position. Prefer it when populated; fall
-        # back to FD on velocity if not.
         acc_active = _to_active_cspace(
             getattr(plan_js, "acceleration", None), src_names, kinematics,
         )
+        # cuRobo's trajopt always populates native joint velocity AND
+        # acceleration alongside positions (B-spline parameterization).
+        # A None here means the plan lost its native derivatives upstream —
+        # we refuse to fabricate a finite difference and surface it loudly.
+        # vel_active is also required by C1 (J·q̇) for the Cartesian channels,
+        # so this gate covers both joint and Cartesian velocity.
+        if vel_active is None:
+            raise RuntimeError(
+                "Motion plan segment lacks native joint velocity "
+                "(JointState.velocity is None); cuRobo trajopt should always "
+                "provide it. Refusing to fabricate a finite-difference "
+                "velocity — regenerate the plan with derivatives populated."
+            )
+        if acc_active is None:
+            raise RuntimeError(
+                "Motion plan segment lacks native joint acceleration "
+                "(JointState.acceleration is None); cuRobo trajopt should "
+                "always provide it. Refusing to fabricate a finite-difference "
+                "acceleration — regenerate the plan with derivatives populated."
+            )
         T = pos_active.shape[0]
 
         # FK over the segment to get tool-frame WORLD poses for both hands + Trunk.
@@ -331,64 +339,78 @@ def process_motion_plan(
             "left_hand_quat_xyzw": _xyzw_from_wxyz(left_quat_w),
         }
 
-        velocity: Dict[str, Any] = {
-            # Trunk linear velocity is unchanged by the X offset (constant
-            # subtraction has zero derivative).
-            "trunk_xyz_dot": _forward_finite_diff(trunk_xyz_w, dt),
-            "trunk_height": _forward_finite_diff(trunk_xyz_w[:, 2], dt),
-            # Hand linear velocities now in WORLD frame
-            "right_hand_xyz_dot": _forward_finite_diff(right_xyz_w, dt),
-            "left_hand_xyz_dot": _forward_finite_diff(left_xyz_w, dt),
-            # Angular velocities — all WORLD frame
-            "trunk_angular_velocity_world": _angular_velocity_from_quat(trunk_quat_w, dt),
-            "right_hand_angular_velocity_world": _angular_velocity_from_quat(right_quat_w, dt),
-            "left_hand_angular_velocity_world": _angular_velocity_from_quat(left_quat_w, dt),
-        }
-        if vel_active is not None:
-            vel_np = vel_active.cpu().numpy()
-            velocity["trunk_pitch"] = vel_np[:, torso_pitch_idx]
-            velocity["trunk_yaw"] = vel_np[:, waist_yaw_idx]
-            velocity["ankle_pitch"] = vel_np[:, ankle_pitch_idx]
-            velocity["knee_pitch"] = vel_np[:, knee_pitch_idx]
-            velocity["right_arm"] = vel_np[:, right_arm_idxs]
-            velocity["left_arm"] = vel_np[:, left_arm_idxs]
-        else:
-            velocity["trunk_pitch"] = _forward_finite_diff(position["trunk_pitch"], dt)
-            velocity["trunk_yaw"] = _forward_finite_diff(position["trunk_yaw"], dt)
-            velocity["ankle_pitch"] = _forward_finite_diff(position["ankle_pitch"], dt)
-            velocity["knee_pitch"] = _forward_finite_diff(position["knee_pitch"], dt)
-            velocity["right_arm"] = _forward_finite_diff(position["right_arm"], dt)
-            velocity["left_arm"] = _forward_finite_diff(position["left_arm"], dt)
+        # --- C1: Cartesian velocity via the analytic Jacobian (J·q̇). ---
+        # ks.tool_jacobians is [batch, horizon, num_links, 6, dof]; rows
+        # [0:3] are WORLD-frame LINEAR velocity, rows [3:6] are WORLD-frame
+        # ANGULAR velocity (probe-verified — no rotation needed). vel_active
+        # is q̇ in kinematics.joint_names order, which equals the Jacobian's
+        # dof order. Link indices are resolved by name (not hard-coded) so a
+        # future tool_frames reorder cannot silently mis-index.
+        tool_jac = ks.tool_jacobians
+        if tool_jac is None:
+            raise RuntimeError(
+                "Processing kinematics did not produce tool_jacobians; "
+                "_build_processing_kinematics must use compute_jacobian=True "
+                "for analytic Cartesian velocity (J·q̇)."
+            )
+        tf = list(kinematics.tool_frames)
+        left_idx = tf.index(LEFT_TOOL_FRAME)
+        right_idx = tf.index(RIGHT_TOOL_FRAME)
+        trunk_idx = tf.index(TRUNK_LINK)
 
-        acceleration: Dict[str, Any] = {
-            # Cartesian linear acceleration (FD on the velocity arrays above).
-            "trunk_xyz_ddot": _forward_finite_diff(velocity["trunk_xyz_dot"], dt),
-            "trunk_height": _forward_finite_diff(velocity["trunk_height"], dt),
-            "right_hand_xyz_ddot": _forward_finite_diff(velocity["right_hand_xyz_dot"], dt),
-            "left_hand_xyz_ddot": _forward_finite_diff(velocity["left_hand_xyz_dot"], dt),
-            # Angular acceleration (FD on the sign-canonicalized angular velocity).
-            "trunk_angular_acceleration_world":
-                _forward_finite_diff(velocity["trunk_angular_velocity_world"], dt),
-            "right_hand_angular_acceleration_world":
-                _forward_finite_diff(velocity["right_hand_angular_velocity_world"], dt),
-            "left_hand_angular_acceleration_world":
-                _forward_finite_diff(velocity["left_hand_angular_velocity_world"], dt),
+        def _link_twist(link_idx: int):
+            """Return (world_linear [T,3], world_angular [T,3]) for a link."""
+            J = tool_jac[0, :, link_idx, :, :]            # [T, 6, dof]
+            Jq = torch.einsum("tij,tj->ti", J, vel_active)  # [T, 6]
+            twist = Jq.cpu().numpy()
+            return twist[:, 0:3], twist[:, 3:6]
+
+        trunk_lin_w, trunk_ang_w = _link_twist(trunk_idx)
+        right_lin_w, right_ang_w = _link_twist(right_idx)
+        left_lin_w, left_ang_w = _link_twist(left_idx)
+
+        velocity: Dict[str, Any] = {
+            # World-frame linear/angular velocity from J·q̇ (exact, no FD).
+            "trunk_xyz_dot": trunk_lin_w,
+            "trunk_height": trunk_lin_w[:, 2],
+            "right_hand_xyz_dot": right_lin_w,
+            "left_hand_xyz_dot": left_lin_w,
+            "trunk_angular_velocity_world": trunk_ang_w,
+            "right_hand_angular_velocity_world": right_ang_w,
+            "left_hand_angular_velocity_world": left_ang_w,
         }
-        if acc_active is not None:
-            acc_np = acc_active.cpu().numpy()
-            acceleration["trunk_pitch"] = acc_np[:, torso_pitch_idx]
-            acceleration["trunk_yaw"] = acc_np[:, waist_yaw_idx]
-            acceleration["ankle_pitch"] = acc_np[:, ankle_pitch_idx]
-            acceleration["knee_pitch"] = acc_np[:, knee_pitch_idx]
-            acceleration["right_arm"] = acc_np[:, right_arm_idxs]
-            acceleration["left_arm"] = acc_np[:, left_arm_idxs]
-        else:
-            acceleration["trunk_pitch"] = _forward_finite_diff(velocity["trunk_pitch"], dt)
-            acceleration["trunk_yaw"] = _forward_finite_diff(velocity["trunk_yaw"], dt)
-            acceleration["ankle_pitch"] = _forward_finite_diff(velocity["ankle_pitch"], dt)
-            acceleration["knee_pitch"] = _forward_finite_diff(velocity["knee_pitch"], dt)
-            acceleration["right_arm"] = _forward_finite_diff(velocity["right_arm"], dt)
-            acceleration["left_arm"] = _forward_finite_diff(velocity["left_arm"], dt)
+        # Native joint velocity passthrough (no fabrication; gated above).
+        vel_np = vel_active.cpu().numpy()
+        velocity["trunk_pitch"] = vel_np[:, torso_pitch_idx]
+        velocity["trunk_yaw"] = vel_np[:, waist_yaw_idx]
+        velocity["ankle_pitch"] = vel_np[:, ankle_pitch_idx]
+        velocity["knee_pitch"] = vel_np[:, knee_pitch_idx]
+        velocity["right_arm"] = vel_np[:, right_arm_idxs]
+        velocity["left_arm"] = vel_np[:, left_arm_idxs]
+
+        # --- C2: Cartesian acceleration = ONE central diff of the exact
+        # C1 velocity (np.gradient, 2nd-order interior + one-sided endpoints).
+        # Never duplicates the tail, so there is no 2-zero accel boundary.
+        acceleration: Dict[str, Any] = {
+            "trunk_xyz_ddot": _central_diff(velocity["trunk_xyz_dot"], dt),
+            "trunk_height": _central_diff(velocity["trunk_height"], dt),
+            "right_hand_xyz_ddot": _central_diff(velocity["right_hand_xyz_dot"], dt),
+            "left_hand_xyz_ddot": _central_diff(velocity["left_hand_xyz_dot"], dt),
+            "trunk_angular_acceleration_world":
+                _central_diff(velocity["trunk_angular_velocity_world"], dt),
+            "right_hand_angular_acceleration_world":
+                _central_diff(velocity["right_hand_angular_velocity_world"], dt),
+            "left_hand_angular_acceleration_world":
+                _central_diff(velocity["left_hand_angular_velocity_world"], dt),
+        }
+        # Native joint acceleration passthrough (no fabrication; gated above).
+        acc_np = acc_active.cpu().numpy()
+        acceleration["trunk_pitch"] = acc_np[:, torso_pitch_idx]
+        acceleration["trunk_yaw"] = acc_np[:, waist_yaw_idx]
+        acceleration["ankle_pitch"] = acc_np[:, ankle_pitch_idx]
+        acceleration["knee_pitch"] = acc_np[:, knee_pitch_idx]
+        acceleration["right_arm"] = acc_np[:, right_arm_idxs]
+        acceleration["left_arm"] = acc_np[:, left_arm_idxs]
 
         held_objs_np = {}
         for arm, (obj_name, poses) in (entry.get("held_objs") or {}).items():
