@@ -106,7 +106,7 @@ def segment_to_mpc_commands(seg: Dict[str, Any]) -> Dict[str, Any]:
     A = seg["acceleration"]
 
     trunk_world_pose = {
-        "xyz": P["trunk_xyz"],
+        "xyz": P["trunk_xyz"].copy(),
         "quat_xyzw": P["trunk_quat_xyzw"],
         "xyz_dot": V["trunk_xyz_dot"],
         "xyz_ddot": A["trunk_xyz_ddot"],
@@ -128,9 +128,9 @@ def segment_to_mpc_commands(seg: Dict[str, Any]) -> Dict[str, Any]:
             joint_accelerations[rn] = A[sim_field].copy()
     for sim_field in ("left_arm", "right_arm"):
         for i, rn in enumerate(JOINT_MAP[sim_field]):
-            joint_commands[rn] = P[sim_field][:, i]
-            joint_velocities[rn] = V[sim_field][:, i]
-            joint_accelerations[rn] = A[sim_field][:, i]
+            joint_commands[rn] = P[sim_field][:, i].copy()
+            joint_velocities[rn] = V[sim_field][:, i].copy()
+            joint_accelerations[rn] = A[sim_field][:, i].copy()
 
     hand_targets_in_world = {
         "right": {
