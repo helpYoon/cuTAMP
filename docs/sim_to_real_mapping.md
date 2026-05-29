@@ -17,9 +17,10 @@ exactly what to do.
 
 ## 1. Trunk link frame is offset 6.25 cm in +X between the two URDFs
 
-**Status**: ✅ Resolved by Commit 3 (schema_version=2): plan_processor.py
-applies -0.0625 X to saved trunk_xyz and emits hand poses in WORLD frame.
-Consumer needs no compensation.
+**Status**: ✅ Resolved — the on-robot `actual_robot.urdf` was modified to
+share the sim Trunk origin, so the saved (raw sim FK) `trunk_xyz` is the
+real Trunk world pose directly. No compensation in plan_processor.py and none
+on the consumer side.
 
 **What**: The `Waist_Yaw` joint's origin convention places the Trunk link
 frame at a different physical point in each URDF.
@@ -64,9 +65,10 @@ matching `-0.0625` X compensation so the rendered geometry and mass
 distribution land at the right world positions. Likewise, the Trunk
 spheres in `t1_spheres.yml` have `-0.0625` X compensations baked in.
 
-**What changed in schema v2**: plan_processor.py subtracts `0.0625` from
-saved `trunk_xyz[:, 0]` so the value represents real-URDF's Trunk world
-pose. Hand poses are now emitted in WORLD frame directly (FK target
+**What changed**: the on-robot `actual_robot.urdf` was updated to use the sim
+Trunk origin, so the URDFs now share the Trunk origin and no subtraction is
+applied or required — the saved raw sim FK `trunk_xyz` is the real-URDF Trunk
+world pose directly. Hand poses are emitted in WORLD frame directly (FK target
 switched from `*_base_link` to `*_hand_link`), so a "place hand 0.30 m in
 front" target now refers to the real-URDF world frame with no consumer
 math.
@@ -75,9 +77,9 @@ math.
 
 ## 2. World frame doesn't exist on the real robot
 
-**Status**: ✅ Resolved by Commit 3 (schema_version=2): plan_processor.py
-applies -0.0625 X to saved trunk_xyz and emits hand poses in WORLD frame.
-Consumer needs no compensation.
+**Status**: ✅ Resolved — plan_processor.py emits hand poses (and the Trunk
+pose) in WORLD frame. The URDFs share the Trunk origin, so the saved Trunk
+pose is real-native. Consumer needs no compensation.
 
 **What**: Sim planner uses `world` as root with virtual planar-base joints
 locked at zero; mobile_base bottom sits at world z=0. The real URDF is
@@ -98,15 +100,16 @@ The MPC anchors via its world estimator (IMU + leg odometry).
 (`[T, 4]`, world) are now in the schema. `trunk_height` kept as a
 convenience alias for `trunk_xyz[:, 2]`.
 
-In schema v2 the saved `trunk_xyz` is **real-URDF-native** (the 6.25 cm
-X offset from #1 is already subtracted in plan_processor.py).
+The saved `trunk_xyz` is **real-URDF-native**: the URDFs share the Trunk
+origin (see #1), so the raw sim FK value is the real Trunk world pose directly
+(no subtraction in plan_processor.py).
 
 ---
 
 ## 4. Hand poses now in WORLD frame
 
-**Status**: ✅ Resolved by Commit 3 (schema_version=2): plan_processor.py
-applies -0.0625 X to saved trunk_xyz and emits hand poses in WORLD frame.
+**Status**: ✅ Resolved — plan_processor.py emits hand poses in WORLD frame.
+The URDFs share the Trunk origin, so the saved Trunk pose is real-native too.
 Consumer needs no compensation.
 
 `right_hand_xyz`, `right_hand_quat_wxyz`, `left_hand_xyz`,
@@ -216,10 +219,10 @@ Specific URDF changes that remain in effect:
 
 | # | Item | Status | Action required |
 |---|---|---|---|
-| 1 | Trunk frame +6.25 cm X offset | ✅ resolved (Commit 3) | None — applied in plan_processor.py |
-| 2 | No world frame on real | ✅ resolved (Commit 3) | None — hand poses are world-frame, real-URDF-native |
+| 1 | Trunk frame +6.25 cm X offset | ✅ resolved | None — URDFs share Trunk origin; saved value is real-native |
+| 2 | No world frame on real | ✅ resolved | None — hand poses are world-frame, real-URDF-native |
 | 3 | Trunk full world pose exposed | ✅ done | — |
-| 4 | Hand poses in WORLD frame | ✅ resolved (Commit 3) | None — emitted in world directly |
+| 4 | Hand poses in WORLD frame | ✅ resolved | None — emitted in world directly |
 | 5 | Missing 3 leg DOFs | 🛠 accepted | MPC chooses Hip_Roll / Hip_Yaw / Ankle_Roll |
 | 6 | `ankle_pitch`/`knee_pitch` not saved | 🛠 accepted | MPC solves leg IK from Trunk world pose |
 | 7 | `Torso_Pitch` broadcast | ✅ documented | — |
@@ -229,10 +232,11 @@ Specific URDF changes that remain in effect:
 
 ---
 
-## TL;DR for the MPC consumer (schema_version=2)
+## TL;DR for the MPC consumer (schema_version=3)
 
-1. Load `motion_plan.pkl` (schema_version=2). Hand poses are world-frame,
-   real-URDF-native — no compensation needed.
+1. Load `motion_plan.pkl` (schema_version=3). Hand poses and `trunk_xyz` are
+   world-frame and real-URDF-native — no compensation needed, because the
+   on-robot `actual_robot.urdf` shares the sim Trunk origin.
 2. Broadcast `trunk_pitch` to both `Left_Hip_Pitch` and `Right_Hip_Pitch`.
 3. Solve your own leg IK (Hip_Roll, Hip_Yaw, Ankle_Pitch, Ankle_Roll,
    Knee_Pitch) from the saved `trunk_xyz` + `trunk_quat_wxyz`.

@@ -5,11 +5,10 @@ structured form for MPC tracking on the real T1.
 ``plan["schema_version"]``. Older pickles will be rejected by the consumer
 example with a clear regenerate-with-current-code message.
 
-v3 vs v2: removes the -0.0625 X compensation on ``trunk_xyz``. Saved
-``trunk_xyz`` is now the raw sim FK output (sim ``t1_simplified.urdf``
-Trunk world pose). Consumers using ``t1_simplified.urdf`` (or a matching
-URDF) read it directly. Consumers using ``actual_robot.urdf`` must
-subtract 0.0625 from ``trunk_xyz[:, 0]`` themselves.
+v3 stores ``trunk_xyz`` as the raw sim FK output (sim ``t1_simplified.urdf``
+Trunk world pose). The on-robot ``actual_robot.urdf`` now shares the same
+Trunk origin, so the saved value is the real Trunk world pose directly —
+no compensation needed on the consumer side.
 
 Output schema per segment::
 
@@ -89,17 +88,16 @@ angular velocity fields in v2 are in WORLD frame. Units: rad/s.
   can use them directly without any frame transform. ``*_hand_link`` is
   used as the FK target since it exists in both URDFs (``*_base_link`` is
   sim-only).
-* ``trunk_xyz`` has the +0.0625 m X offset (sim vs real URDF, see
-  docs/sim_to_real_mapping.md #1) **already subtracted** so the saved
-  value represents real-URDF's Trunk world pose. No compensation needed
-  downstream.
+* ``trunk_xyz`` is the Trunk world pose, directly usable on the real robot:
+  the sim and on-robot URDFs share the Trunk origin (see
+  docs/sim_to_real_mapping.md #1), so no X compensation is needed.
 * ``trunk_pitch`` and ``trunk_yaw`` are JOINT VALUES (Torso_Pitch and
   Waist_Yaw in our simplified URDF), not Trunk-link Euler angles. Joint
   values are frame-independent.
-* We don't emit ankle_pitch, knee_pitch, or any other leg joint —
-  expectation is that the MPC solves leg IK to match the saved Trunk
-  world pose, choosing the missing 3 DOFs (Hip_Roll, Hip_Yaw, Ankle_Roll)
-  for balance per its own logic.
+* We emit ``ankle_pitch`` and ``knee_pitch`` (each a single sim joint,
+  broadcast to both legs on the real robot). The remaining 3 leg DOFs per
+  side (Hip_Roll, Hip_Yaw, Ankle_Roll) are NOT emitted — the MPC chooses
+  them for balance, matching the saved Trunk world pose.
 
 Velocity sources:
 
@@ -309,13 +307,9 @@ def process_motion_plan(
         trunk_xyz_w = trunk_pose.position.reshape(T, 3).cpu().numpy()
         trunk_quat_w = trunk_pose.quaternion.reshape(T, 4).cpu().numpy()
 
-        # Apply -0.0625 X compensation to Trunk world pose: saved value
-        # represents real-URDF's Trunk world pose (not sim's), so the MPC
-        # consumer needs no compensation.
-
         pos_np = pos_active.cpu().numpy()
         position = {
-            # Trunk world pose (real-URDF-native)
+            # Trunk world pose (raw sim FK; URDFs share Trunk origin → real-native)
             "trunk_xyz": trunk_xyz_w,
             "trunk_quat_wxyz": trunk_quat_w,
             "trunk_quat_xyzw": _xyzw_from_wxyz(trunk_quat_w),

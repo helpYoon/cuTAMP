@@ -12,13 +12,13 @@ Usage::
 If the path is omitted, defaults to ``data/motion_plan.pkl`` in this repo.
 
 This example expects ``schema_version=3`` pickles. Older plans (v1 with
-Trunk-frame hand poses, v2 with -0.0625 X compensation on trunk_xyz)
+Trunk-frame hand poses, v2 with a -0.0625 X compensation on trunk_xyz)
 will be rejected with a regenerate-with-current-code message.
 
 v3 saves ``trunk_xyz`` as the raw sim FK output (sim
-``t1_simplified.urdf`` Trunk world pose). If your MPC uses
-``actual_robot.urdf`` instead, subtract 0.0625 from
-``trunk_xyz[:, 0]`` on the consumer side.
+``t1_simplified.urdf`` Trunk world pose). The on-robot ``actual_robot.urdf``
+shares the same Trunk origin, so this value is the real Trunk world pose
+directly — no compensation needed.
 """
 
 from __future__ import annotations
