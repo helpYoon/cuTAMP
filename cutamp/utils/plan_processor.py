@@ -79,9 +79,11 @@ Output schema per segment::
 Eigen / MuJoCo) variants are emitted side-by-side. Pick whichever matches
 your stack — they encode the same rotation.
 
-**Angular velocity convention**: ``ω = 2 · (dq/dt) ⊗ conj(q)`` (take imag
-part). For ``q = world_q_link`` this yields ω in **world** frame. All
-angular velocity fields in v2 are in WORLD frame. Units: rad/s.
+**Angular velocity convention**: emitted ω is the analytic Jacobian
+(``J·q̇`` rows ``[3:6]``), already in the **world** frame. It equals the
+quaternion-derivative identity ``ω = 2 · (dq/dt) ⊗ conj(q)`` (imag part) for
+``q = world_q_link`` — the cross-check the derivatives test uses. All angular
+velocity fields are in WORLD frame. Units: rad/s.
 
 **Why this schema for MPC tracking on ``actual_robot.urdf``**:
 
@@ -126,7 +128,7 @@ from curobo.kinematics import Kinematics, KinematicsCfg
 from curobo.types import DeviceCfg, JointState
 
 
-# Frame names for the two end-effectors. Must match URDF link names.
+# FK target link names (both hands + Trunk). Must match URDF link names.
 LEFT_TOOL_FRAME = "left_hand_link"
 RIGHT_TOOL_FRAME = "right_hand_link"
 TRUNK_LINK = "Trunk"
@@ -324,7 +326,7 @@ def process_motion_plan(
             # Arms (per-side joint values, names match real URDF)
             "right_arm": pos_np[:, right_arm_idxs],
             "left_arm": pos_np[:, left_arm_idxs],
-            # Hand poses in WORLD frame (was Trunk in v1)
+            # Hand poses in WORLD frame
             "right_hand_xyz": right_xyz_w,
             "right_hand_quat_wxyz": right_quat_w,
             "right_hand_quat_xyzw": _xyzw_from_wxyz(right_quat_w),
