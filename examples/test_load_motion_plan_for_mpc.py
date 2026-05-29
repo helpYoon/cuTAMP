@@ -72,8 +72,15 @@ def test_missing_schema_version_distinct_message(tmp_path):
     p = tmp_path / "plan.pkl"
     with open(p, "wb") as f:
         pickle.dump({"segments": []}, f)  # no schema_version key
-    with pytest.raises(RuntimeError, match="(?i)schema_version.*(absent|missing|no )"):
+    # Assert on the exception message directly (not via `match`, whose regex
+    # would otherwise spuriously match the tmp_path that contains this test's
+    # own function name). The absent-key branch must say the key is missing and
+    # must NOT report a bogus "got 1".
+    with pytest.raises(RuntimeError) as excinfo:
         mpc.load_for_mpc(p)
+    msg = str(excinfo.value)
+    assert "no 'schema_version' key" in msg
+    assert "got 1" not in msg
 
 
 def test_wrong_schema_version_says_got(tmp_path):
