@@ -19,6 +19,7 @@ from cutamp.task_planning.constraints import (
     ValidPush,
 )
 from cutamp.task_planning.costs import TrajectoryLength
+from cutamp.com_polygon_cost import COM_TOL
 
 
 default_constraint_to_mult = {
@@ -66,13 +67,13 @@ default_constraint_to_tol = {
         "stove_support": 1e-2,
     },
     ValidPush.type: {"dist_from_button": 0.0},
-    # ComPolygon per-conf values are now continuous penalty in m² from
-    # compute_com_polygon_penalties (inside_margin=0.02, inside_weight=1.0):
-    # at the polygon edge, penalty = inside_weight * inside_margin² = 4e-4.
-    # tol 4e-4 ⇒ "at the edge or inside" satisfies; any excursion past
-    # the edge fails (1mm outside has penalty ≈ 4.4e-4). "default"
-    # applies to every per-conf name (left_q0, right_q1, ...).
-    ComPolygon.type: {"default": 4e-4},
+    # ComPolygon per-conf values are continuous penalty in m² from
+    # compute_com_polygon_penalties. With the max-over-axes barrier, the
+    # on-boundary penalty (edge OR corner) == COM_TOL == inside_weight *
+    # inside_margin² = 4e-4, so "at the boundary or inside" satisfies and any
+    # excursion past an edge fails. "default" applies to every per-conf name
+    # (left_q0, right_q1, ...).
+    ComPolygon.type: {"default": COM_TOL},
 }
 
 

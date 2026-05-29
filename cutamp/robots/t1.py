@@ -235,6 +235,9 @@ def get_t1_motion_planner(
         from cutamp.com_polygon_cost import (
             ComOverBasePolygonCost,
             ComOverBasePolygonCostCfg,
+            COM_HALF_EXTENTS,
+            COM_INSIDE_MARGIN,
+            COM_INSIDE_WEIGHT,
         )
         # COM-polygon cost is a SAFETY BARRIER: zero cost anywhere inside
         # the two-foot support rectangle, quadratic-in-distance penalty
@@ -258,9 +261,9 @@ def get_t1_motion_planner(
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
-            half_extents=[0.1115, 0.156],  # two-foot support hull: foot length (22.3cm) × stance width (31.2cm), per actual_robot.urdf
-            inside_margin=0.02,           # 2cm band inside edge gets center-pulling gradient
-            inside_weight=1.0,            # same scale as outside-quadratic; tunable
+            half_extents=list(COM_HALF_EXTENTS),
+            inside_margin=COM_INSIDE_MARGIN,
+            inside_weight=COM_INSIDE_WEIGHT,
         )
         add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     return planner
@@ -318,6 +321,9 @@ def get_t1_ik_solver(
         from cutamp.com_polygon_cost import (
             ComOverBasePolygonCost,
             ComOverBasePolygonCostCfg,
+            COM_HALF_EXTENTS,
+            COM_INSIDE_MARGIN,
+            COM_INSIDE_WEIGHT,
         )
         rollout_device_cfg = iter_rollouts(ik_solver)[0].device_cfg
         # Inside-barrier ON for IK rollouts: gives LBFGS a gradient pull from
@@ -330,9 +336,9 @@ def get_t1_ik_solver(
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
-            half_extents=[0.1115, 0.156],  # two-foot support hull: foot length (22.3cm) × stance width (31.2cm), per actual_robot.urdf
-            inside_margin=0.02,           # 2cm band inside edge gets center-pulling gradient
-            inside_weight=1.0,            # same scale as outside-quadratic; tunable
+            half_extents=list(COM_HALF_EXTENTS),
+            inside_margin=COM_INSIDE_MARGIN,
+            inside_weight=COM_INSIDE_WEIGHT,
         )
         add_extra_cost(ik_solver, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     return ik_solver

@@ -47,8 +47,8 @@ COM_TOL = 4e-4                       # == COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN*
 @dataclass
 class ComOverBasePolygonCostCfg(BaseCostCfg):
     #: Half-extents of the rectangle in ``mobile_base_link`` frame (X, Y) in
-    #: meters. Default ``(0.10, 0.15)`` matches a 20 cm fore/aft × 30 cm
-    #: lateral support polygon.
+    #: meters. Default ``COM_HALF_EXTENTS`` = ``(0.1115, 0.156)`` — the two-foot
+    #: support hull per actual_robot.urdf (22.3 cm fore/aft × 31.2 cm lateral).
     half_extents: Optional[Union[torch.Tensor, List[float]]] = None
     #: Distance inside the edge at which the soft barrier starts (meters).
     #: ``0`` disables the barrier (outside-only penalization).
@@ -63,7 +63,7 @@ class ComOverBasePolygonCostCfg(BaseCostCfg):
     def __post_init__(self):
         super().__post_init__()
         if self.half_extents is None:
-            self.half_extents = [0.10, 0.15]
+            self.half_extents = list(COM_HALF_EXTENTS)
         if isinstance(self.half_extents, list):
             self.half_extents = torch.tensor(self.half_extents)
         self.half_extents = self.half_extents.to(
@@ -149,8 +149,8 @@ def compute_com_polygon_mask(
         q_batch: ``[B, full_dof]`` joint positions in
             ``world.kinematics.joint_names`` order.
         half_extents: ``[2]``-list of (X, Y) half-sizes in meters. Default
-            ``[0.05, 0.10]`` matches the safety rectangle used by the
-            planner-side COM cost.
+            ``COM_HALF_EXTENTS`` = ``[0.1115, 0.156]`` — the same two-foot
+            support hull the cost and per-conf penalties use.
 
     Returns:
         ``[B]`` bool tensor; True where the COM-over-polygon penalty is
@@ -159,12 +159,7 @@ def compute_com_polygon_mask(
     """
     from curobo.types import JointState
     if half_extents is None:
-        # Two-foot support hull per actual_robot.urdf: 22.3cm foot length
-        # × 31.2cm stance width (left foot Y=+0.106 ± 0.05, right Y=-0.106 ± 0.05).
-        # Must match the cost-side polygon set in get_t1_motion_planner /
-        # get_t1_ik_solver so the post-IK verification agrees with the
-        # gradient pull.
-        half_extents = [0.1115, 0.156]
+        half_extents = COM_HALF_EXTENTS
     kin = world.kinematics_with_com
     device = kin.device_cfg.device
     q_batch = q_batch.to(device)
@@ -194,8 +189,8 @@ def compute_com_polygon_penalties(
     particles: "dict[str, torch.Tensor]",
     *,
     half_extents: Optional[List[float]] = None,
-    inside_margin: float = 0.02,
-    inside_weight: float = 1.0,
+    inside_margin: float = COM_INSIDE_MARGIN,
+    inside_weight: float = COM_INSIDE_WEIGHT,
 ) -> "dict[str, torch.Tensor]":
     """Per-conf differentiable COM-polygon penalty.
 
@@ -232,7 +227,7 @@ def compute_com_polygon_penalties(
     """
     from curobo.types import JointState
     if half_extents is None:
-        half_extents = [0.1115, 0.156]
+        half_extents = COM_HALF_EXTENTS
 
     kin = world.kinematics_with_com
     device = kin.device_cfg.device
