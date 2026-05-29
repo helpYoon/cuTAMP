@@ -63,7 +63,6 @@ def heuristic_fn(
             else:
                 assert num_particles == mask.shape[0]
 
-            # replace zeros with -num_particles
             satisfying[satisfying == 0] = -num_particles
             sat_list = satisfying.tolist()
             if not isinstance(sat_list, list):
@@ -399,7 +398,6 @@ def run_cutamp(
     experiment_id: Optional[str] = None,
 ):
     """Overall cuTAMP algorithm implementation."""
-    # Setup all the things and load the world
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id)
     particle_initializer = ParticleInitializer(world, config)
 
@@ -441,7 +439,6 @@ def run_cutamp(
                 break
             plan_count += 1
 
-    # Sort plans by heuristic
     def sort_plans():
         with timer.time("sort_plans"):
             plan_queue.sort(key=lambda x: x["heuristic"])
