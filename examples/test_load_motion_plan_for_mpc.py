@@ -62,3 +62,23 @@ def test_outputs_do_not_alias_source_segment():
     assert np.all(seg["position"]["trunk_xyz"] == 0.0)
     assert np.all(seg["position"]["left_arm"] == 0.0)
     assert np.all(seg["position"]["right_arm"] == 0.0)
+
+
+import pickle
+import pytest
+
+
+def test_missing_schema_version_distinct_message(tmp_path):
+    p = tmp_path / "plan.pkl"
+    with open(p, "wb") as f:
+        pickle.dump({"segments": []}, f)  # no schema_version key
+    with pytest.raises(RuntimeError, match="(?i)schema_version.*(absent|missing|no )"):
+        mpc.load_for_mpc(p)
+
+
+def test_wrong_schema_version_says_got(tmp_path):
+    p = tmp_path / "plan.pkl"
+    with open(p, "wb") as f:
+        pickle.dump({"schema_version": 2, "segments": []}, f)
+    with pytest.raises(RuntimeError, match="got 2"):
+        mpc.load_for_mpc(p)

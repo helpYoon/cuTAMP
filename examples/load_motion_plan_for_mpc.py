@@ -192,7 +192,14 @@ def load_for_mpc(path: Path) -> List[Dict[str, Any]]:
             f"renamed/removed ({e}). Schema likely evolved; regenerate the plan."
         )
 
-    schema_version = plan.get("schema_version", 1)
+    schema_version = plan.get("schema_version")
+    if schema_version is None:
+        raise RuntimeError(
+            f"motion_plan.pkl at {path} has no 'schema_version' key — it is a "
+            f"legacy/unversioned or corrupt plan, not a versioned one. "
+            f"Regenerate with the current code:\n"
+            f"  python -m cutamp.scripts.run_cutamp --motion_plan --save_plan {path}"
+        )
     if schema_version != 3:
         raise RuntimeError(
             f"This example expects schema_version=3, got {schema_version}. "
