@@ -569,7 +569,7 @@ class CostFunction:
 
         # Get collision spheres for movable objects
         obj_to_spheres = {}
-        for idx, obj in enumerate(self.world.movables):
+        for obj in self.world.movables:
             if obj.name in obj_to_spheres:
                 raise RuntimeError(f"Object {obj.name} already in obj_to_spheres")
             obj_pose = rollout["obj_to_pose"][obj.name]

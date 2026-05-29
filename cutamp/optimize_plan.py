@@ -28,15 +28,13 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q
 from cutamp.rollout import RolloutFunction
-from cutamp.t1_domain import Conf, Grasp, Pose, Traj
+from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
-from cutamp.robots.t1 import t1_home
 
 _log = logging.getLogger(__name__)
-_known_types = {Conf, Grasp, Pose, Traj}
 
 
 @dataclass
