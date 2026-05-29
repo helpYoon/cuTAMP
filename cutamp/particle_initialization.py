@@ -203,6 +203,14 @@ def _ik_for_pose_com_safe(
         elif arm == "right":
             noise[:, 7:14] = 0.0  # left arm locked
         seed = seed + noise
+        # Clamp the perturbed seed to joint limits so large-sigma retries don't
+        # hand cuRobo an out-of-limits current_state. Limits come from the same
+        # full-cspace kinematics that defines world.q_init's joint order
+        # (JointLimits.joint_names == kinematics.joint_names, verified [2, full_dof]).
+        _limits = world.kinematics.get_joint_limits().position  # [2, full_dof]
+        _lower = _limits[0].to(seed.device, seed.dtype)
+        _upper = _limits[1].to(seed.device, seed.dtype)
+        seed = torch.clamp(seed, min=_lower, max=_upper)
         retry_result = _ik_for_pose(world, world_from_ee, arm, current_state_q=seed)
         result = _splice_ik_result(result, retry_result, fail_idx)
     # Final check for logging.
