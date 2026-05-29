@@ -421,6 +421,20 @@ class CostFunction:
         }
         return coll_cost
 
+    def _com_polygon_penalties(self) -> Dict[str, torch.Tensor]:
+        """Lazily compute and cache the COM-polygon penalties dict.
+
+        Shared by ``com_polygon_constraint`` and the ``com_polygon`` soft cost
+        so the (expensive) FK-based computation runs at most once per cost
+        evaluation.
+        """
+        if self._com_polygon_penalties_cache is None:
+            from cutamp.com_polygon_cost import compute_com_polygon_penalties
+            self._com_polygon_penalties_cache = compute_com_polygon_penalties(
+                self.world, self._particles,
+            )
+        return self._com_polygon_penalties_cache
+
     def com_polygon_constraint(self) -> Union[dict, None]:
         """Hard COM-over-base-polygon filter, per conf.
 
@@ -436,12 +450,7 @@ class CostFunction:
         if not self.config.enable_com_polygon or self._particles is None:
             return None
 
-        if self._com_polygon_penalties_cache is None:
-            from cutamp.com_polygon_cost import compute_com_polygon_penalties
-            self._com_polygon_penalties_cache = compute_com_polygon_penalties(
-                self.world, self._particles,
-            )
-        pens = self._com_polygon_penalties_cache
+        pens = self._com_polygon_penalties()
         if not pens:
             return None
 
