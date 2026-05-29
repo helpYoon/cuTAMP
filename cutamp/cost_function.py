@@ -560,7 +560,6 @@ class CostFunction:
         self._validate_rollout(rollout)
         cost_dict = {}
         
-        # Store particles for soft cost computation
         self._particles = particles
         # Reset per-call cache for the shared COM-polygon penalty helper.
         # com_polygon_constraint() and _compute_soft_cost("com_polygon")
@@ -572,7 +571,6 @@ class CostFunction:
             if v_ is not None:
                 cost_dict[k_] = v_
 
-        # Trajectory cost
         traj_cost = self.trajectory_costs(rollout)
         add_cost(TrajectoryLength.type, traj_cost)
 
@@ -585,15 +583,12 @@ class CostFunction:
             obj_spheres = transform_spheres(self.world.get_collision_spheres(obj), obj_pose)
             obj_to_spheres[obj.name] = obj_spheres
 
-        # Collision costs
         collision_cost = self.collision_costs(rollout, obj_to_spheres)
         add_cost(Collision.type, collision_cost)
 
-        # Valid Push constraints
         valid_push_cost = self.valid_push_costs(rollout, obj_to_spheres)
         add_cost(ValidPush.type, valid_push_cost)
 
-        # Stable placement cost
         stable_placement_cost = self.stable_placement_costs(rollout, obj_to_spheres)
         add_cost(StablePlacement.type, stable_placement_cost)
 
@@ -601,7 +596,6 @@ class CostFunction:
         motion_cost = self.motion_costs(rollout)
         add_cost(Motion.type, motion_cost)
 
-        # Kinematic costs
         kinematic_cost = self.kinematic_costs(rollout)
         add_cost(KinematicConstraint.type, kinematic_cost)
 

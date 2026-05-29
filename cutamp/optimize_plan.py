@@ -245,9 +245,9 @@ class ParticleOptimizer:
                 particles[dep.q_name].grad = None
 
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
-        """
-        Optimize the particles for the given plan skeleton in the plan_info container.
-        Returns a tuple of (whether a solution was found, optimization metrics, time exceeded flag).
+        """Optimize particles for the plan skeleton.
+
+        Returns ``(solution_found, opt_metrics, time_exceeded)``.
         """
         plan_skeleton = plan_info["plan_skeleton"]
         particles = plan_info["particles"]
@@ -309,7 +309,6 @@ class ParticleOptimizer:
         if not param_groups:
             raise RuntimeError(f"No parameters to optimize! For plan skeleton: {plan_skeleton}")
 
-        # Setup optimizer
         optimizer = Adam(params=param_groups, lr=self.config.lr)
 
         # Per-conf gradient mask: hard-zero DOFs that should not move during
