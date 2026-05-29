@@ -19,9 +19,6 @@ from cutamp.t1_domain import all_t1_fluents
 from cutamp.utils.shapes import MultiSphere
 from cutamp.task_planning.base_structs import State
 
-unit_quat = [1.0, 0.0, 0.0, 0.0]
-unit_pose = [0.0, 0.0, 0.0, *unit_quat]
-
 
 class TAMPEnvironment:
     _known_types: ClassVar[Set[str]] = {"Movable", "Surface", "Button", "Stick"}
@@ -209,56 +206,3 @@ def get_env_dir() -> str:
     return os.path.join(os.path.dirname(__file__), "assets")
 
 
-def create_walls_for_cuboid(
-    cuboid: Cuboid, wall_height: float, wall_thickness: float, wall_color: List[int]
-) -> List[Cuboid]:
-    if cuboid.pose[3:] != unit_quat:
-        raise NotImplementedError("Only cuboids with unit quaternion are supported.")
-
-    walls = [
-        Cuboid(
-            name=f"wall_1_{cuboid.name}",
-            dims=[cuboid.dims[0], wall_thickness, wall_height],
-            pose=[
-                cuboid.pose[0],
-                cuboid.pose[1] + cuboid.dims[1] / 2 + wall_thickness / 2,
-                cuboid.pose[2] + wall_height / 2,
-                *unit_quat,
-            ],
-            color=list(wall_color),
-        ),
-        Cuboid(
-            name=f"wall_2_{cuboid.name}",
-            dims=[cuboid.dims[0], 0.02, wall_height],
-            pose=[
-                cuboid.pose[0],
-                cuboid.pose[1] - cuboid.dims[1] / 2 - wall_thickness / 2,
-                cuboid.pose[2] + wall_height / 2,
-                *unit_quat,
-            ],
-            color=list(wall_color),
-        ),
-        Cuboid(
-            name=f"wall_3_{cuboid.name}",
-            dims=[0.02, cuboid.dims[1], wall_height],
-            pose=[
-                cuboid.pose[0] - cuboid.dims[0] / 2 - wall_thickness / 2,
-                cuboid.pose[1],
-                cuboid.pose[2] + wall_height / 2,
-                *unit_quat,
-            ],
-            color=list(wall_color),
-        ),
-        Cuboid(
-            name=f"wall_4_{cuboid.name}",
-            dims=[0.02, cuboid.dims[1], wall_height],
-            pose=[
-                cuboid.pose[0] + cuboid.dims[0] / 2 + wall_thickness / 2,
-                cuboid.pose[1],
-                cuboid.pose[2] + wall_height / 2,
-                *unit_quat,
-            ],
-            color=list(wall_color),
-        ),
-    ]
-    return walls
