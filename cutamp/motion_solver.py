@@ -37,59 +37,6 @@ from cutamp.grasp_planning import plan_single_arm_grasp, plan_single_arm_pose
 from cutamp.optimize_plan import PlanContainer
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.t1_state import T1State
-
-
-def _log_com_along_traj(state: "T1State", plan, label: str) -> None:
-    """Diagnostic: compute per-timestep COM-in-base-frame for ``plan`` and
-    log which timesteps violate the support rectangle.
-
-    Re-runs FK on the trajectory through the planner's compute-com kinematics
-    so we see the actual ground-truth COM of the FINAL motion-plan output.
-    """
-    try:
-        from cutamp.com_polygon_cost import com_polygon_penalty
-        import torch
-        # Get a [T, dof] trajectory in planner active cspace.
-        pos = plan.position
-        while pos.dim() > 2:
-            pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
-        active_dof = len(state.planner.kinematics.joint_names)
-        if pos.shape[-1] != active_dof:
-            traj_js = JointState.from_position(pos, joint_names=plan.joint_names)
-            pos = state.planner.trajopt_solver.get_active_js(traj_js).position
-        # compute_kinematics needs [B, H, dof]; treat T as horizon.
-        js = JointState.from_position(pos.unsqueeze(0))
-        ks = state.planner.kinematics.compute_kinematics(js)
-        rc = getattr(ks, "robot_com", None)
-        if rc is None:
-            _log.warning("[com-traj %s] robot_com is None on planner.kinematics", label)
-            return
-        n = pos.shape[0]
-        com_world = rc[..., :3].reshape(n, 3)
-        base_T = (
-            ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
-            .get_matrix().reshape(n, 4, 4)
-        )
-        # Project COM into base frame manually (cost cfg's half_extents is on device).
-        R = base_T[:, :3, :3]
-        t = base_T[:, :3, 3]
-        com_in_base = (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
-        # Cost-side rectangle: half_extents [0.05, 0.10], inside_margin 0.05 → barrier always active
-        violations = (com_in_base.abs() > torch.tensor([0.05, 0.10], device=com_in_base.device)).any(dim=1)
-        n_viol = int(violations.sum())
-        max_xy = com_in_base.abs().max(dim=0).values
-        _log.info(
-            "[com-traj %s] T=%d violators=%d/%d max|x,y|=(%.3f, %.3f)",
-            label, n, n_viol, n, max_xy[0].item(), max_xy[1].item(),
-        )
-        if n_viol > 0:
-            worst = com_in_base.abs().max(dim=1).values.argmax()
-            _log.info(
-                "[com-traj %s] worst t=%d com_in_base=(%.3f, %.3f)",
-                label, int(worst), com_in_base[worst, 0].item(), com_in_base[worst, 1].item(),
-            )
-    except Exception as e:
-        _log.warning("[com-traj %s] probe failed: %r", label, e)
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.common import (
     Particles,
@@ -173,6 +120,13 @@ def _interp_plan(result, interp=None, last_tstep=None):
 
 APPROACH_HEIGHT = 0.05
 
+# attached_object_{left,right} extra_link names from t1_planar_base.yml.
+# Each has 50 reserved sphere slots; we use only ~6 via VOXEL fit.
+_ATTACH_LINK_FOR_ARM = {
+    "left": "attached_object_left",
+    "right": "attached_object_right",
+}
+
 # Retry budgets ported from the v0.7-era MotionGenPlanConfig that made the
 # T1 blocks demo robust (commit b45a4bc — graph planner fallback). v0.8
 # defaults are 5 attempts / graph at attempt 1, which is far too tight for
@@ -182,6 +136,13 @@ CSPACE_ENABLE_GRAPH_ATTEMPT = 1   # v0.8 default: attempt 0 unseeded, attempts 1
 POSE_MAX_ATTEMPTS = 120           # Cartesian (place, grasp goalset)
 POSE_ENABLE_GRAPH_ATTEMPT = 5
 GRASP_RETRY = 4                   # outer retry around plan_grasp (since plan_grasp itself doesn't expose attempts)
+
+
+def _plan_dt(result, default=0.05):
+    """Extract the trajectory dt from a v0.8 planner result, falling back to
+    ``default`` when no joint-space solution / dt is available."""
+    js = getattr(result, "js_solution", None)
+    return float(js.dt.item()) if js is not None and js.dt is not None else default
 
 
 def _last_timestep_js(plan, planner=None) -> JointState:
@@ -302,15 +263,6 @@ def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
         _log.warning(f"update_obstacle_pose({name}) failed: {e}")
 
 
-# attached_object_{left,right} extra_link names from t1_planar_base.yml.
-# Each has 50 reserved sphere slots; we use only ~6 via VOXEL fit.
-_ATTACH_LINK_FOR_ARM = {
-    "left": "attached_object_left",
-    "right": "attached_object_right",
-}
-
-
-
 def solve_curobo(
     plan_info: PlanContainer,
     best_particle: Particles,
@@ -407,7 +359,7 @@ def solve_curobo(
                 if not _cspace_plan_succeeded(result, target_js):
                     raise RuntimeError(f"MoveBaseTo plan failed for {ground_op}")
                 plan = _interp_plan(result)
-                dt = float(result.js_solution.dt.item()) if result.js_solution is not None and result.js_solution.dt is not None else 0.05
+                dt = _plan_dt(result)
                 accum_plans.append({
                     "type": "trajectory", "plan": plan, "dt": dt, "arm": None,
                     "held_objs": state.compute_all_held_obj_poses(plan),
@@ -439,7 +391,7 @@ def solve_curobo(
                         )
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
                 plan = _interp_plan(result)
-                dt = float(result.js_solution.dt.item()) if result.js_solution is not None and result.js_solution.dt is not None else 0.05
+                dt = _plan_dt(result)
 
                 accum_plans.append({
                     "type": "trajectory", "plan": plan, "dt": dt, "arm": arm,
@@ -484,12 +436,7 @@ def solve_curobo(
                 # point uses inverse(obj_from_grasp) since the gripper is
                 # actually at the planner's intended grasp pose.
                 grasp_plan = _interp_plan(grasp_result)
-                dt = (
-                    float(grasp_result.js_solution.dt.item())
-                    if grasp_result.js_solution is not None
-                    and grasp_result.js_solution.dt is not None
-                    else 0.05
-                )
+                dt = _plan_dt(grasp_result)
                 accum_plans.append({
                     "type": "trajectory", "plan": grasp_plan, "dt": dt, "arm": arm,
                     "held_objs": state.compute_all_held_obj_poses(grasp_plan),
@@ -531,8 +478,7 @@ def solve_curobo(
                     raise RuntimeError(f"Place plan failed for {ground_op}")
 
                 plan = _interp_plan(place_result)
-                dt_t = getattr(place_result, "js_solution", None)
-                dt = float(dt_t.dt.item()) if dt_t is not None and dt_t.dt is not None else 0.05
+                dt = _plan_dt(place_result)
 
                 accum_plans.append({
                     "type": "trajectory", "plan": plan, "dt": dt, "arm": arm,
