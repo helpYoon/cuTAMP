@@ -1,9 +1,15 @@
 """Reshape a raw ``solve_curobo`` motion plan into a compact, downstream-friendly
 structured form for MPC tracking on the real T1.
 
-**Schema version: 2** (BREAKING change from v1). Stored as
-``plan["schema_version"]``. v1 pickles will be rejected by the consumer
+**Schema version: 3** (BREAKING change from v2). Stored as
+``plan["schema_version"]``. Older pickles will be rejected by the consumer
 example with a clear regenerate-with-current-code message.
+
+v3 vs v2: removes the -0.0625 X compensation on ``trunk_xyz``. Saved
+``trunk_xyz`` is now the raw sim FK output (sim ``t1_simplified.urdf``
+Trunk world pose). Consumers using ``t1_simplified.urdf`` (or a matching
+URDF) read it directly. Consumers using ``actual_robot.urdf`` must
+subtract 0.0625 from ``trunk_xyz[:, 0]`` themselves.
 
 Output schema per segment::
 
@@ -12,12 +18,14 @@ Output schema per segment::
         "dt": float,
         "T": int,
         "position": {
-            "trunk_xyz":             [T, 3],     # WORLD, REAL-URDF Trunk (-0.0625 X applied)
+            "trunk_xyz":             [T, 3],     # WORLD, sim t1_simplified.urdf Trunk pose
             "trunk_quat_wxyz":       [T, 4],     # WORLD
             "trunk_quat_xyzw":       [T, 4],
             "trunk_height":          [T],        # alias for trunk_xyz[:, 2]
-            "trunk_pitch":           [T],
+            "trunk_pitch":           [T],     # sim Torso_Pitch == both Hip_Pitches on real (broadcast)
             "trunk_yaw":             [T],
+            "ankle_pitch":           [T],     # single sim joint; broadcast to both ankles on real
+            "knee_pitch":            [T],     # single sim joint; broadcast to both knees on real
             "right_arm":             [T, 7],
             "left_arm":              [T, 7],
             # Hand poses in WORLD frame (real-URDF-native)
@@ -29,9 +37,11 @@ Output schema per segment::
             "left_hand_quat_xyzw":   [T, 4],
         },
         "velocity": {
-            # Joint velocities (from JointState.velocity, frame-independent)
+            # Joint velocities (from JointState.velocity if populated, else FD)
             "trunk_pitch":                     [T],
             "trunk_yaw":                       [T],
+            "ankle_pitch":                     [T],
+            "knee_pitch":                      [T],
             "right_arm":                       [T, 7],
             "left_arm":                        [T, 7],
             "trunk_xyz_dot":                     [T, 3],   # m/s, world
@@ -39,8 +49,28 @@ Output schema per segment::
             "right_hand_xyz_dot":                [T, 3],   # m/s, WORLD
             "left_hand_xyz_dot":                 [T, 3],
             "trunk_angular_velocity_world":      [T, 3],
-            "right_hand_angular_velocity_world": [T, 3],   # renamed from _trunk
+            "right_hand_angular_velocity_world": [T, 3],
             "left_hand_angular_velocity_world":  [T, 3],
+        },
+        "acceleration": {
+            # Joint accelerations (from JointState.acceleration if populated,
+            # else FD on velocity). cuRobo's bspline trajopt produces
+            # smoother accelerations than position-FD-FD, so prefer it.
+            "trunk_pitch":                     [T],
+            "trunk_yaw":                       [T],
+            "ankle_pitch":                     [T],
+            "knee_pitch":                      [T],
+            "right_arm":                       [T, 7],
+            "left_arm":                        [T, 7],
+            # Cartesian linear acceleration (FD on velocity arrays above)
+            "trunk_xyz_ddot":                       [T, 3],   # m/s^2, world
+            "trunk_height":                         [T],
+            "right_hand_xyz_ddot":                  [T, 3],   # m/s^2, WORLD
+            "left_hand_xyz_ddot":                   [T, 3],
+            # Angular acceleration (FD on the sign-canonicalized ω)
+            "trunk_angular_acceleration_world":     [T, 3],   # rad/s^2
+            "right_hand_angular_acceleration_world": [T, 3],
+            "left_hand_angular_acceleration_world":  [T, 3],
         },
         "held_objs": {arm: (obj_name, [T, 4, 4] world_from_obj)},
     }
@@ -95,12 +125,6 @@ from curobo.types import DeviceCfg, JointState
 LEFT_TOOL_FRAME = "left_hand_link"
 RIGHT_TOOL_FRAME = "right_hand_link"
 TRUNK_LINK = "Trunk"
-
-# sim's Trunk frame sits +0.0625m in X of where actual_robot.urdf places it
-# (see docs/sim_to_real_mapping.md #1). We subtract this from saved
-# trunk_xyz before pickling so the saved value is real-URDF-native — the
-# consumer needs no compensation.
-SIM_TO_REAL_TRUNK_X_OFFSET_M = 0.0625
 
 
 def _build_processing_kinematics(device_cfg: Optional[DeviceCfg] = None) -> Kinematics:
@@ -239,6 +263,8 @@ def process_motion_plan(
     idx = {n: i for i, n in enumerate(active_names)}
     torso_pitch_idx = idx["Torso_Pitch"]
     waist_yaw_idx = idx["Waist_Yaw"]
+    ankle_pitch_idx = idx["ankle_pitch"]
+    knee_pitch_idx = idx["knee_pitch"]
     left_arm_idxs = [idx[n] for n in LEFT_ARM_JOINT_NAMES]
     right_arm_idxs = [idx[n] for n in RIGHT_ARM_JOINT_NAMES]
 
@@ -259,6 +285,12 @@ def process_motion_plan(
                 f"{len(kinematics.joint_names)} and joint_names is None."
             )
         vel_active = _to_active_cspace(plan_js.velocity, src_names, kinematics)
+        # cuRobo trajopt's bspline parameterization gives smoother acceleration
+        # than FD on (already-FD) position. Prefer it when populated; fall
+        # back to FD on velocity if not.
+        acc_active = _to_active_cspace(
+            getattr(plan_js, "acceleration", None), src_names, kinematics,
+        )
         T = pos_active.shape[0]
 
         # FK over the segment to get tool-frame WORLD poses for both hands + Trunk.
@@ -280,19 +312,19 @@ def process_motion_plan(
         # Apply -0.0625 X compensation to Trunk world pose: saved value
         # represents real-URDF's Trunk world pose (not sim's), so the MPC
         # consumer needs no compensation.
-        trunk_xyz_w_real = trunk_xyz_w.copy()
-        trunk_xyz_w_real[:, 0] -= SIM_TO_REAL_TRUNK_X_OFFSET_M
 
         pos_np = pos_active.cpu().numpy()
         position = {
             # Trunk world pose (real-URDF-native)
-            "trunk_xyz": trunk_xyz_w_real,
+            "trunk_xyz": trunk_xyz_w,
             "trunk_quat_wxyz": trunk_quat_w,
             "trunk_quat_xyzw": _xyzw_from_wxyz(trunk_quat_w),
-            "trunk_height": trunk_xyz_w_real[:, 2],
+            "trunk_height": trunk_xyz_w[:, 2],
             # Joint values (frame-independent; broadcast both sides on real)
-            "trunk_pitch": pos_np[:, torso_pitch_idx],
+            "trunk_pitch": pos_np[:, torso_pitch_idx],   # sim Torso_Pitch == both Hip_Pitches on real
             "trunk_yaw": pos_np[:, waist_yaw_idx],
+            "ankle_pitch": pos_np[:, ankle_pitch_idx],   # single sim joint; broadcast to both ankles on real
+            "knee_pitch": pos_np[:, knee_pitch_idx],     # single sim joint; broadcast to both knees on real
             # Arms (per-side joint values, names match real URDF)
             "right_arm": pos_np[:, right_arm_idxs],
             "left_arm": pos_np[:, left_arm_idxs],
@@ -308,8 +340,8 @@ def process_motion_plan(
         velocity: Dict[str, Any] = {
             # Trunk linear velocity is unchanged by the X offset (constant
             # subtraction has zero derivative).
-            "trunk_xyz_dot": _forward_finite_diff(trunk_xyz_w_real, dt),
-            "trunk_height": _forward_finite_diff(trunk_xyz_w_real[:, 2], dt),
+            "trunk_xyz_dot": _forward_finite_diff(trunk_xyz_w, dt),
+            "trunk_height": _forward_finite_diff(trunk_xyz_w[:, 2], dt),
             # Hand linear velocities now in WORLD frame
             "right_hand_xyz_dot": _forward_finite_diff(right_xyz_w, dt),
             "left_hand_xyz_dot": _forward_finite_diff(left_xyz_w, dt),
@@ -322,13 +354,47 @@ def process_motion_plan(
             vel_np = vel_active.cpu().numpy()
             velocity["trunk_pitch"] = vel_np[:, torso_pitch_idx]
             velocity["trunk_yaw"] = vel_np[:, waist_yaw_idx]
+            velocity["ankle_pitch"] = vel_np[:, ankle_pitch_idx]
+            velocity["knee_pitch"] = vel_np[:, knee_pitch_idx]
             velocity["right_arm"] = vel_np[:, right_arm_idxs]
             velocity["left_arm"] = vel_np[:, left_arm_idxs]
         else:
             velocity["trunk_pitch"] = _forward_finite_diff(position["trunk_pitch"], dt)
             velocity["trunk_yaw"] = _forward_finite_diff(position["trunk_yaw"], dt)
+            velocity["ankle_pitch"] = _forward_finite_diff(position["ankle_pitch"], dt)
+            velocity["knee_pitch"] = _forward_finite_diff(position["knee_pitch"], dt)
             velocity["right_arm"] = _forward_finite_diff(position["right_arm"], dt)
             velocity["left_arm"] = _forward_finite_diff(position["left_arm"], dt)
+
+        acceleration: Dict[str, Any] = {
+            # Cartesian linear acceleration (FD on the velocity arrays above).
+            "trunk_xyz_ddot": _forward_finite_diff(velocity["trunk_xyz_dot"], dt),
+            "trunk_height": _forward_finite_diff(velocity["trunk_height"], dt),
+            "right_hand_xyz_ddot": _forward_finite_diff(velocity["right_hand_xyz_dot"], dt),
+            "left_hand_xyz_ddot": _forward_finite_diff(velocity["left_hand_xyz_dot"], dt),
+            # Angular acceleration (FD on the sign-canonicalized angular velocity).
+            "trunk_angular_acceleration_world":
+                _forward_finite_diff(velocity["trunk_angular_velocity_world"], dt),
+            "right_hand_angular_acceleration_world":
+                _forward_finite_diff(velocity["right_hand_angular_velocity_world"], dt),
+            "left_hand_angular_acceleration_world":
+                _forward_finite_diff(velocity["left_hand_angular_velocity_world"], dt),
+        }
+        if acc_active is not None:
+            acc_np = acc_active.cpu().numpy()
+            acceleration["trunk_pitch"] = acc_np[:, torso_pitch_idx]
+            acceleration["trunk_yaw"] = acc_np[:, waist_yaw_idx]
+            acceleration["ankle_pitch"] = acc_np[:, ankle_pitch_idx]
+            acceleration["knee_pitch"] = acc_np[:, knee_pitch_idx]
+            acceleration["right_arm"] = acc_np[:, right_arm_idxs]
+            acceleration["left_arm"] = acc_np[:, left_arm_idxs]
+        else:
+            acceleration["trunk_pitch"] = _forward_finite_diff(velocity["trunk_pitch"], dt)
+            acceleration["trunk_yaw"] = _forward_finite_diff(velocity["trunk_yaw"], dt)
+            acceleration["ankle_pitch"] = _forward_finite_diff(velocity["ankle_pitch"], dt)
+            acceleration["knee_pitch"] = _forward_finite_diff(velocity["knee_pitch"], dt)
+            acceleration["right_arm"] = _forward_finite_diff(velocity["right_arm"], dt)
+            acceleration["left_arm"] = _forward_finite_diff(velocity["left_arm"], dt)
 
         held_objs_np = {}
         for arm, (obj_name, poses) in (entry.get("held_objs") or {}).items():
@@ -342,13 +408,14 @@ def process_motion_plan(
             "T": T,
             "position": position,
             "velocity": velocity,
+            "acceleration": acceleration,
             "held_objs": held_objs_np,
         })
 
     # Runtime metadata is kept compact — the authoritative schema reference
     # is the module docstring at the top of this file.
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "segments": processed_segments,
         "joint_name_groups": {
             "left_arm": list(LEFT_ARM_JOINT_NAMES),
