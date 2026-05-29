@@ -88,7 +88,8 @@ def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
     home end-effector position to the block's world pose. Closer = lower
     priority = explored first by biased BFS. For non-pick operators or
     pick operators whose block doesn't resolve (e.g., placeholder name
-    not yet bound to a real scene object), returns 0.0.
+    not yet bound to a real scene object), returns ``float("inf")`` so they
+    sort AFTER all resolved picks in the ascending BFS order.
 
     Same-side picks bubble to the top of the BFS exploration order, so
     the first satisfying plan skeleton tends to be the same-side assignment.
@@ -98,15 +99,15 @@ def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
     def priority(ground_op) -> float:
         meta = ground_op.operator.metadata
         if meta.action_type != "pick" or meta.arm is None:
-            return 0.0
+            return float("inf")
         # LeftPick/RightPick parameter order is (obj, grasp, q). Block is values[0].
         block_name = ground_op.values[0]
         try:
             obj = world.get_object(block_name)
         except (KeyError, ValueError):
-            return 0.0
+            return float("inf")
         if obj is None or obj.pose is None:
-            return 0.0
+            return float("inf")
         block_xyz = np.asarray(obj.pose[:3], dtype=np.float64)
         arm_home_xyz = world.arm_home_ee_world[meta.arm].cpu().numpy().astype(np.float64)
         return float(np.linalg.norm(block_xyz - arm_home_xyz))

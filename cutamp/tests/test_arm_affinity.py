@@ -166,8 +166,9 @@ def test_arm_affinity_priority_orders_closer_arm_first():
 
 
 @needs_cuda
-def test_arm_affinity_priority_zero_for_non_pick():
-    """Non-pick operators return 0 priority (preserves original BFS order)."""
+def test_arm_affinity_priority_inf_for_non_pick():
+    """Non-pick operators return inf priority (sort AFTER resolved picks)."""
+    import math
     from cutamp.algorithm import make_arm_affinity_priority_fn
     from cutamp.t1_domain import LeftMoveFree
     world = _make_world()
@@ -176,15 +177,61 @@ def test_arm_affinity_priority_zero_for_non_pick():
     op = LeftMoveFree.ground(
         {"q_start": "left_q0", "traj": "traj0", "q_end": "left_q1"}
     )
-    assert priority(op) == 0.0
+    assert priority(op) == math.inf
 
 
 @needs_cuda
-def test_arm_affinity_priority_zero_for_missing_block():
-    """Pick with an unknown block name returns 0 (graceful degradation)."""
+def test_arm_affinity_priority_inf_for_missing_block():
+    """Pick with an unknown block name returns inf (sorts last, not first)."""
+    import math
     from cutamp.algorithm import make_arm_affinity_priority_fn
     from cutamp.t1_domain import LeftPick
     world = _make_world()
     priority = make_arm_affinity_priority_fn(world)
     op = LeftPick.ground({"obj": "nonexistent_block", "grasp": "grasp0", "q": "left_q0"})
-    assert priority(op) == 0.0
+    assert priority(op) == math.inf
+
+
+import math
+import types
+
+from cutamp.algorithm import make_arm_affinity_priority_fn
+
+
+def _op(action_type, arm, values):
+    return types.SimpleNamespace(
+        operator=types.SimpleNamespace(
+            metadata=types.SimpleNamespace(action_type=action_type, arm=arm)
+        ),
+        values=values,
+    )
+
+
+def test_priority_non_pick_is_inf():
+    # world is never touched for a non-pick op.
+    fn = make_arm_affinity_priority_fn(world=None)
+    assert fn(_op("place", None, [])) == math.inf
+
+
+def test_priority_unresolved_block_is_inf():
+    class _World:
+        def get_object(self, name):
+            raise KeyError(name)
+    fn = make_arm_affinity_priority_fn(_World())
+    assert fn(_op("pick", "left", ["no_such_block"])) == math.inf
+
+
+def test_priority_sentinel_sorts_after_resolved_pick():
+    import numpy as np
+
+    class _Obj:
+        pose = [0.4, 0.2, 0.5, 0, 0, 0, 1]
+    class _World:
+        arm_home_ee_world = {"left": __import__("torch").tensor([0.0, 0.0, 0.0])}
+        def get_object(self, name):
+            return _Obj()
+    fn = make_arm_affinity_priority_fn(_World())
+    resolved = _op("pick", "left", ["block"])      # finite distance
+    sentinel = _op("place", None, [])               # inf
+    ordered = sorted([sentinel, resolved], key=fn)
+    assert ordered[0] is resolved and ordered[1] is sentinel
