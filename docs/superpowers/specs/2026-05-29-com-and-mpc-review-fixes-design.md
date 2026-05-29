@@ -414,7 +414,12 @@ message. Lowest priority. **Test:** a dict with no `schema_version` raises the
   ```
   Pass: ≥1 satisfying, and near-corner particles that were dropped before are
   now retained (satisfying count ≥ pre-fix; plan regenerates clean).
-- `grep -rn 0.0625 cutamp examples docs` → zero matches (B done).
+- `grep -rn 0.0625 cutamp examples docs` → remaining matches are *only*
+  URDF-origin quotes in `docs/sim_to_real_mapping.md` (explanatory, kept); no
+  match states the offset as a required action or applied compensation (B done).
+- C: a freshly generated plan's Cartesian and joint accel tails are
+  non-degenerate (no alternating-zero / two-zero FD signature); `J·q̇` link
+  velocity matches an analytic FK-difference to tight tol.
 
 ## Sequencing
 
@@ -423,7 +428,11 @@ Independent commits, suggested order:
 1. **A** — constants + max-over-axes + mask unification + tests (core behavior).
 2. **E3** — cheap None-cost safety.
 3. **B + D** — same file region (`examples/`, `plan_processor.py`, docs).
-4. **C** — finite-diff tail.
+4. **C** — split into commits: **C4 investigation** (find where native joint
+   derivatives are dropped before `plan_processor`) → **C3** (`np.gradient`
+   helper + native passthrough) → **C1/C2** (Jacobian `J·q̇` Cartesian velocity
+   + accel from central diff of it). C4 is investigation-first and may land as a
+   source fix in `motion_solver.py` if the drop is upstream of the processor.
 5. **E1, E2, E4** — remaining hardening.
 
 Land as one PR with logical commits, or split A out — decide at finishing.
@@ -440,8 +449,20 @@ Land as one PR with logical commits, or split A out — decide at finishing.
   (inside-or-on), so A2 cannot change which configs the mask accepts vs the
   pre-fix geometric test — it only guarantees the mask and the hard constraint
   use one function.
-- **C convention change:** velocities/accelerations differ from today only in
-  the final 1-2 samples (interior forward-diff unchanged). Acceptable for an
-  offline plan.
+- **C convention change:** Cartesian velocity moves from FD-of-pose to the
+  analytic `J·q̇`, and all remaining finite differences move from forward to
+  central — so values shift vs today across the whole trajectory, not just the
+  tail. Strict accuracy improvement (exact velocity, no fabricated endpoints);
+  fine for an offline reference plan. Only revisit if an MPC were numerically
+  tuned against the *current* (buggy) arrays.
+- **C1 frame/units:** confirm during implementation whether `tool_jacobians` is
+  world- or link-frame and its row order (linear-first vs angular-first) so
+  `J·q̇` lands in the WORLD frame the schema documents. The C1 analytic-FK-diff
+  test catches a frame/order mismatch.
+- **C4 may be upstream:** if native joint derivatives are dropped inside the
+  trajopt-result path rather than `plan_processor`, the fix moves to
+  `motion_solver.py` (still cuTAMP-side). If the drop is inside cuRobo itself,
+  do **not** edit `curobo/` — fall back to C3's central diff and note it
+  (see the no-fork constraint above).
 - **B is data-neutral:** stored pickle bytes are unchanged; only docs/comments
   change. No schema bump.
