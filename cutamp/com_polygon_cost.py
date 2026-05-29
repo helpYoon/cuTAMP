@@ -33,6 +33,17 @@ from curobo._src.cost.cost_base import BaseCost
 from curobo._src.cost.cost_base_cfg import BaseCostCfg
 
 
+# --- Single source of truth for the COM-over-base-polygon geometry ---
+# Two-foot support hull per actual_robot.urdf: 22.3 cm foot length (X, fore/aft)
+# × 31.2 cm stance width (Y, lateral). The cost, the post-IK mask, the per-conf
+# penalties helper, the ComPolygon tolerance, and the planner/IK cost cfgs all
+# reference these so they cannot drift apart.
+COM_HALF_EXTENTS = (0.1115, 0.156)   # (X, Y) half-extents in mobile_base_link frame, meters
+COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
+COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
+COM_TOL = 4e-4                       # == COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2 (on-boundary penalty)
+
+
 @dataclass
 class ComOverBasePolygonCostCfg(BaseCostCfg):
     #: Half-extents of the rectangle in ``mobile_base_link`` frame (X, Y) in
@@ -87,7 +98,11 @@ def com_polygon_penalty(
     offset = torch.abs(com_in_base) - half_extents
     outside = torch.clamp(offset, min=0.0)
     inside = torch.clamp(offset + inside_margin, min=0.0)
-    return (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).sum(dim=-1)
+    # Inside barrier uses MAX over axes (distance to the NEAREST edge), not sum:
+    # near a corner the nearest-edge margin — not the sum of both — is what
+    # bounds tip-over. Summing double-counts corners and wrongly rejects
+    # COM-feasible configs (see test_com_polygon_penalty_corner_*).
+    return (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).max(dim=-1).values
 
 
 class ComOverBasePolygonCost(BaseCost):
@@ -138,8 +153,9 @@ def compute_com_polygon_mask(
             planner-side COM cost.
 
     Returns:
-        ``[B]`` bool tensor; True where the projected COM is inside the
-        rectangle (per-axis ``abs(com_in_base[i]) <= half_extents[i]``).
+        ``[B]`` bool tensor; True where the COM-over-polygon penalty is
+        ``<= COM_TOL`` (COM inside-or-on the support hull) — the same gate
+        the hard ComPolygon constraint uses, so the two cannot diverge.
     """
     from curobo.types import JointState
     if half_extents is None:
@@ -165,11 +181,12 @@ def compute_com_polygon_mask(
         .get_matrix()
         .reshape(-1, 4, 4)
     )
-    R = base_T[:, :3, :3]
-    t = base_T[:, :3, 3]
-    com_in_base = (R.transpose(-1, -2) @ (com - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+    # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
+    # post-IK COM-safe check and ConstraintChecker can never diverge. With the
+    # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
     half = torch.tensor(half_extents, device=device, dtype=q_batch.dtype)
-    return (torch.abs(com_in_base) <= half).all(dim=-1)
+    pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT)
+    return pen <= COM_TOL
 
 
 def compute_com_polygon_penalties(
