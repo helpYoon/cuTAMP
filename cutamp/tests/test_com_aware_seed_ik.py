@@ -56,7 +56,7 @@ def test_flag_on_seed_ik_robot_com_is_real():
         joint_names=list(model.joint_names),
     )
     ks = model.compute_kinematics(js)
-    assert float(ks.robot_com.abs().max()) > 0.01, "robot_com must be populated, not zeros"
+    assert float(ks.robot_com[..., :3].abs().max()) > 0.01, "robot_com xyz must be populated, not zeros"
 
 
 @needs_cuda
