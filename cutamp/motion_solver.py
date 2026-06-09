@@ -65,6 +65,43 @@ def _planner_js_from_full(planner, full_pos, full_joint_names):
     return planner.kinematics.get_active_js(full_js)
 
 
+def _plan_arm_to_conf(
+    planner,
+    conf_full: torch.Tensor,
+    last_js: JointState,
+    full_joint_names,
+    *,
+    disable_obstacle: Optional[str],
+    retries: int,
+    ground_op,
+):
+    """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
+    conf ``conf_full`` (full 21-DOF), via ``plan_cspace`` — so the executed
+    arrival equals the hard-COM-checked conf instead of a free Cartesian
+    redundancy solution. Mirrors the retract branch. ``disable_obstacle`` (if
+    given) is temporarily removed from the world during planning, so terminal
+    gripper-block / held-block-surface contact isn't rejected. Returns the
+    cuRobo result; raises ``RuntimeError`` if no attempt converges.
+    """
+    target_js = _planner_js_from_full(planner, conf_full, full_joint_names)
+    obstacle_ctx = (
+        _disabled_world_obstacle(planner, disable_obstacle)
+        if disable_obstacle is not None
+        else contextlib.nullcontext()
+    )
+    result = None
+    with obstacle_ctx:
+        for _ in range(retries):
+            result = planner.plan_cspace(
+                target_js, last_js,
+                max_attempts=CSPACE_MAX_ATTEMPTS,
+                enable_graph_attempt=CSPACE_ENABLE_GRAPH_ATTEMPT,
+            )
+            if _cspace_plan_succeeded(result, target_js):
+                return result
+    raise RuntimeError(f"cspace-anchored plan failed for {ground_op}")
+
+
 @contextlib.contextmanager
 def _disabled_world_obstacle(planner, name):
     """Temporarily disable a named obstacle in the planner's scene collision.
