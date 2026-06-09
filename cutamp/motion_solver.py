@@ -168,11 +168,9 @@ _ATTACH_LINK_FOR_ARM = {
 # T1 blocks demo robust (commit b45a4bc — graph planner fallback). v0.8
 # defaults are 5 attempts / graph at attempt 1, which is far too tight for
 # constrained dual-arm trajopt.
-CSPACE_MAX_ATTEMPTS = 5           # joint-space (retract / move-base): v0.8 default
+CSPACE_MAX_ATTEMPTS = 5           # joint-space (retract / move-base / cspace-anchored pick+place): v0.8 default
 CSPACE_ENABLE_GRAPH_ATTEMPT = 1   # v0.8 default: attempt 0 unseeded, attempts 1-4 graph-seeded
-POSE_MAX_ATTEMPTS = 120           # Cartesian (place, grasp goalset)
-POSE_ENABLE_GRAPH_ATTEMPT = 5
-GRASP_RETRY = 4                   # outer retry around plan_grasp (since plan_grasp itself doesn't expose attempts)
+GRASP_RETRY = 4                   # outer retry around the cspace-anchored grasp plan
 
 
 def _plan_dt(result, default=0.05):
@@ -358,17 +356,9 @@ def solve_curobo(
     for obj, pose in obj_to_current_pose.items():
         visualizer.log_mat4x4(f"world/{obj}", pose)
 
-    def _active_tool_frame(arm: Optional[str]) -> str:
-        return state.get_tool_frame(arm or "left")
-
-    def _tool_from_ee(arm: Optional[str]) -> torch.Tensor:
-        return world.tool_from_ee[_active_tool_frame(arm)]
-
     for idx, ground_op in enumerate(plan_skeleton):
         metadata = ground_op.operator.metadata
         arm = metadata.arm
-        active_tool = _active_tool_frame(arm)
-        tool_from_ee_mat = _tool_from_ee(arm)
 
         # Pin protocol: navigate locks body, arm ops lock base+inactive arm.
         if metadata.action_type == "navigate":
