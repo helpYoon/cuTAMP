@@ -43,3 +43,23 @@ def test_flag_on_seed_cfg_carries_com_params():
     assert cfg.com_inside_weight == COM_INSIDE_WEIGHT
     assert cfg.com_center_weight == 0.0
     assert cfg.com_base_link_name == "mobile_base_link"
+
+
+@needs_cuda
+def test_flag_on_seed_ik_robot_com_is_real():
+    from curobo.types import JointState
+    world = _world(enable_com_aware_ik=True)
+    model = world.ik_solver.seed_ik_solver._robot_model
+    assert model.compute_com is True
+    js = JointState.from_position(
+        torch.zeros(1, model.get_dof(), device=model.device_cfg.device),
+        joint_names=list(model.joint_names),
+    )
+    ks = model.compute_kinematics(js)
+    assert float(ks.robot_com.abs().max()) > 0.01, "robot_com must be populated, not zeros"
+
+
+@needs_cuda
+def test_flag_off_seed_ik_robot_com_stays_off():
+    world = _world(enable_com_aware_ik=False)
+    assert world.ik_solver.seed_ik_solver._robot_model.compute_com is False
