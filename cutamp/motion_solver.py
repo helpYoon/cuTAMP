@@ -489,30 +489,24 @@ def solve_curobo(
                 last_q_name = ground_op.values[-1]
 
             elif metadata.action_type == "place":
-                obj_name, grasp_name, place_name, surface_name, _ = ground_op.values
+                obj_name, grasp_name, place_name, surface_name, q_name = ground_op.values
                 world_from_obj_target = action_4dof_to_mat4x4(best_particle[place_name].clone())
-                obj_from_grasp = (
-                    action_4dof_to_mat4x4 if config.grasp_dof == 4 else action_6dof_to_mat4x4
-                )(best_particle[grasp_name].clone())
-                world_from_ee = world_from_obj_target @ obj_from_grasp @ tool_from_ee_mat
-                target_pose = Pose.from_matrix(world_from_ee)
 
-                # The held block sits ON the placement surface at the place
-                # pose, which would otherwise be rejected as a held-block ↔
-                # surface collision. Temporarily disable the surface obstacle
-                # for the place planning. The gripper itself stays collision-
-                # checked against everything (table, walls, other blocks).
-                with timer.time("curobo_planning"), _disabled_world_obstacle(planner, surface_name):
-                    place_result = plan_single_arm_pose(
-                        planner,
-                        active_tool_frame=active_tool,
-                        target_pose=target_pose,
-                        current_state=last_js,
-                        max_attempts=POSE_MAX_ATTEMPTS,
-                        enable_graph_attempt=POSE_ENABLE_GRAPH_ATTEMPT,
+                # Anchor the place TERMINAL to the COM-safe particle conf
+                # (best_particle[q_name]) via plan_cspace, instead of a free
+                # Cartesian-pose redundancy solve. The conf is an exact IK
+                # solution for the same place hand pose but sits inside the COM
+                # support hull (hard-checked), so the executed arrival is
+                # COM-feasible. The held block sits ON the placement surface at
+                # the terminal, so the surface obstacle is disabled during
+                # planning (gripper stays collision-checked against everything
+                # else).
+                with timer.time("curobo_planning"):
+                    place_result = _plan_arm_to_conf(
+                        planner, best_particle[q_name].clone(), last_js,
+                        full_joint_names,
+                        disable_obstacle=surface_name, retries=1, ground_op=ground_op,
                     )
-                if place_result is None or not bool(place_result.success.any()):
-                    raise RuntimeError(f"Place plan failed for {ground_op}")
 
                 plan = _interp_plan(place_result)
                 dt = _plan_dt(place_result)
