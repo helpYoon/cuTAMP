@@ -102,6 +102,11 @@ t1_home_head: Tuple[float, ...] = (0.0, 0.0)
 T1_ASSETS_DIR = Path(__file__).parent / "assets" / "t1_description"
 T1_CONFIG_PATH = T1_ASSETS_DIR / "t1_planar_base.yml"
 
+# Starting weight for the seed-IK CoM residual (tuned by the Task-8 sweep;
+# pose/joint-limit weights in that solver are O(1) — the planner's 5e5 rollout
+# weight is NOT transferable here).
+T1_COM_IK_WEIGHT = 1.0
+
 
 # =============================================================================
 # Config loading
@@ -276,6 +281,7 @@ def get_t1_ik_solver(
     self_collision_check: bool = True,
     max_batch_size: int = 64,
     enable_com_polygon: bool = True,
+    enable_com_aware_ik: bool = False,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
     """InverseKinematics solver for T1 with the mobile base locked.
@@ -296,6 +302,8 @@ def get_t1_ik_solver(
     recover from these because pulling the body back would violate the
     KinematicConstraint.
     """
+    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
+
     if device_cfg is None:
         device_cfg = DeviceCfg()
     cfg_dict = _lock_mobile_base(copy.deepcopy(t1_curobo_cfg()))
@@ -314,6 +322,14 @@ def get_t1_ik_solver(
         # accepts arbitrary current_state shapes.
         use_cuda_graph=False,
         transition_model=_ik_transition_dict_with_compute_com(),
+        # CoM-aware seed-IK residual (fork): pulls the CoM toward the support
+        # rectangle while the LM solver reaches the hand pose. Off by default.
+        seed_com_support_weight=(T1_COM_IK_WEIGHT if enable_com_aware_ik else 0.0),
+        seed_com_half_extents=(list(COM_HALF_EXTENTS) if enable_com_aware_ik else None),
+        seed_com_inside_margin=COM_INSIDE_MARGIN,
+        seed_com_inside_weight=COM_INSIDE_WEIGHT,
+        seed_com_center_weight=0.0,
+        seed_com_base_link_name="mobile_base_link",
     )
     ik_solver = InverseKinematics(cfg)
     if enable_com_polygon:
@@ -321,9 +337,6 @@ def get_t1_ik_solver(
         from cutamp.com_polygon_cost import (
             ComOverBasePolygonCost,
             ComOverBasePolygonCostCfg,
-            COM_HALF_EXTENTS,
-            COM_INSIDE_MARGIN,
-            COM_INSIDE_WEIGHT,
         )
         rollout_device_cfg = iter_rollouts(ik_solver)[0].device_cfg
         # Inside-barrier ON for IK rollouts: gives LBFGS a gradient pull from

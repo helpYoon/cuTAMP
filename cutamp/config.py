@@ -82,6 +82,10 @@ class TAMPConfiguration:
     # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
     enable_com_polygon: bool = True
     ik_com_retry_max: int = 15   # Layer 2: max retries when post-IK COM check fails.
+    # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
+    # COM, recruiting legs within limits. Default off until validated (spec
+    # 2026-06-09-com-aware-ik-design.md acceptance gates).
+    enable_com_aware_ik: bool = False
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
     # On RuntimeError from solve_curobo, retry on the next-best satisfying particle

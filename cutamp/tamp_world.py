@@ -63,6 +63,7 @@ class TAMPWorld:
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
         enable_com_polygon: bool = True,
+        enable_com_aware_ik: bool = False,
     ):
         self.env = env
         self.device_cfg = device_cfg
@@ -99,6 +100,7 @@ class TAMPWorld:
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.world_cfg, device_cfg=device_cfg, max_batch_size=512,
             enable_com_polygon=enable_com_polygon,
+            enable_com_aware_ik=enable_com_aware_ik,
         )
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).

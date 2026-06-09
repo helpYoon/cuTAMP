@@ -372,6 +372,7 @@ def setup_cutamp(
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
             enable_com_polygon=config.enable_com_polygon,
+            enable_com_aware_ik=config.enable_com_aware_ik,
         )
         check_tamp_world_not_in_collision(world)
 

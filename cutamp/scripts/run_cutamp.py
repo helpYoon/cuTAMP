@@ -184,6 +184,13 @@ def entrypoint():
              "configurations from tipping over the wheelbase.",
     )
     parser.set_defaults(enable_com_polygon=True)
+    parser.add_argument(
+        "--enable_com_aware_ik",
+        action="store_true",
+        help="Enable the CoM-aware seed-IK residual (cuRobo fork): IK trades "
+             "hand-pose vs COM and recruits the legs to center the COM. "
+             "Default off until validated.",
+    )
 
     # Visualization and logging
     parser.add_argument(
@@ -245,6 +252,7 @@ def entrypoint():
         cache_subgraphs=args.cache_subgraphs,
         curobo_plan=args.motion_plan,
         enable_com_polygon=args.enable_com_polygon,
+        enable_com_aware_ik=args.enable_com_aware_ik,
         enable_visualizer=not args.disable_visualizer,
         opt_viz_interval=args.viz_interval,
         viz_robot_mesh=not args.disable_robot_mesh,
