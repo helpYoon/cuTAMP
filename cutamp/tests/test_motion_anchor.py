@@ -162,3 +162,36 @@ def test_place_arrival_is_com_in_hull():
             f"segment {si} arrival COM penalty {pen:.6f} > tol {COM_TOL}"
         )
     print(f"worst arrival penalty {worst:.6f} <= {COM_TOL}")
+
+
+@needs_cuda
+def test_all_arrivals_in_hull_and_plan_succeeds():
+    # Broader guard: a full plan generates (no RuntimeError from solve_curobo)
+    # and ALL segment arrivals (pick, place, retract) are COM-in-hull. Seed 1
+    # exercises the pick branch anchoring added in Task 3.
+    import torch
+    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES, t1_home
+    from cutamp.com_polygon_cost import compute_com_polygon_penalties, COM_TOL
+
+    world, segments = _generate_plan_segments(seed=1)
+    assert len(segments) > 0, "plan produced no segments"
+    names = list(world.kinematics.joint_names)
+    idx = {n: i for i, n in enumerate(names)}
+    q_home = torch.as_tensor(t1_home, dtype=torch.float32,
+                             device=world.kinematics.device_cfg.device)
+    worst = 0.0
+    for si, seg in enumerate(segments):
+        P = seg["position"]; T = seg["T"]
+        q = q_home.clone()
+        q[idx["Torso_Pitch"]] = float(P["trunk_pitch"][T - 1])
+        q[idx["Waist_Yaw"]] = float(P["trunk_yaw"][T - 1])
+        q[idx["ankle_pitch"]] = float(P["ankle_pitch"][T - 1])
+        q[idx["knee_pitch"]] = float(P["knee_pitch"][T - 1])
+        for j, n in enumerate(LEFT_ARM_JOINT_NAMES):
+            q[idx[n]] = float(P["left_arm"][T - 1][j])
+        for j, n in enumerate(RIGHT_ARM_JOINT_NAMES):
+            q[idx[n]] = float(P["right_arm"][T - 1][j])
+        pen = float(compute_com_polygon_penalties(world, {"q": q.unsqueeze(0)})["q"][0])
+        worst = max(worst, pen)
+        assert pen <= COM_TOL, f"segment {si} arrival COM {pen:.6f} > {COM_TOL}"
+    print(f"all {len(segments)} arrivals in hull; worst penalty {worst:.6f} <= {COM_TOL}")

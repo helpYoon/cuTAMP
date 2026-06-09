@@ -33,7 +33,7 @@ from cutamp._curobo_internals import (
     get_attachment_manager as _get_attachment_manager,
 )
 from cutamp.config import TAMPConfiguration
-from cutamp.grasp_planning import plan_single_arm_grasp, plan_single_arm_pose
+from cutamp.grasp_planning import plan_single_arm_grasp
 from cutamp.optimize_plan import PlanContainer
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.t1_state import T1State
@@ -438,40 +438,28 @@ def solve_curobo(
                 state.current_js = last_js
 
             elif metadata.action_type == "pick":
-                obj_name, grasp_name, _ = ground_op.values
-                world_from_obj = obj_to_current_pose[obj_name]
+                obj_name, grasp_name, q_name = ground_op.values
                 obj_from_grasp = (
                     action_4dof_to_mat4x4 if config.grasp_dof == 4 else action_6dof_to_mat4x4
                 )(best_particle[grasp_name].clone())
-                world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee_mat
-                target_pose = Pose.from_matrix(world_from_ee)
 
-                # Plan directly to the grasp pose. Disable the target block as
-                # a world obstacle so gripper-block contact at the grasp pose
-                # isn't rejected; gripper-table / gripper-other-block collision
-                # stays enforced.
-                with timer.time("curobo_planning"), _disabled_world_obstacle(planner, obj_name):
-                    grasp_result = None
-                    last_status = None
-                    for _ in range(GRASP_RETRY):
-                        grasp_result = plan_single_arm_pose(
-                            planner,
-                            active_tool_frame=active_tool,
-                            target_pose=target_pose,
-                            current_state=last_js,
-                            max_attempts=POSE_MAX_ATTEMPTS,
-                            enable_graph_attempt=POSE_ENABLE_GRAPH_ATTEMPT,
-                        )
-                        if grasp_result is not None and bool(grasp_result.success.any()):
-                            break
-                        last_status = getattr(grasp_result, "status", None)
-                if grasp_result is None or not bool(grasp_result.success.any()):
-                    raise RuntimeError(f"Pick plan failed for {ground_op}: {last_status}")
+                # Anchor the grasp TERMINAL to the COM-safe particle conf
+                # (best_particle[q_name]) via plan_cspace instead of a free
+                # Cartesian-pose redundancy solve. The conf is an exact IK
+                # solution for the grasp pose, so the gripper still arrives at
+                # the grasp, with a COM-safe posture. Disable the target block
+                # obstacle so gripper-block contact at the grasp isn't rejected;
+                # gripper-table / gripper-other-block collision stays enforced.
+                with timer.time("curobo_planning"):
+                    grasp_result = _plan_arm_to_conf(
+                        planner, best_particle[q_name].clone(), last_js,
+                        full_joint_names,
+                        disable_obstacle=obj_name, retries=GRASP_RETRY, ground_op=ground_op,
+                    )
 
-                # Single trajectory: gripper moves from start state to grasp
-                # pose. Attach AT the grasp pose. Block tracking from this
-                # point uses inverse(obj_from_grasp) since the gripper is
-                # actually at the planner's intended grasp pose.
+                # Attach AT the grasp conf. Block tracking from this point uses
+                # inverse(obj_from_grasp) since the gripper is at the intended
+                # grasp pose.
                 grasp_plan = _interp_plan(grasp_result)
                 dt = _plan_dt(grasp_result)
                 accum_plans.append({
