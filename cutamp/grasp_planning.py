@@ -107,30 +107,3 @@ def plan_single_arm_grasp(
         plan_grasp_to_lift=plan_grasp_to_lift,
         disable_collision_links=disable_collision_links,
     )
-
-
-def plan_single_arm_pose(
-    planner: MotionPlanner,
-    active_tool_frame: str,
-    target_pose: Pose,
-    current_state: JointState,
-    *,
-    max_attempts: int = 5,
-    enable_graph_attempt: int = 1,
-):
-    """Plan a single-frame pose target. Helper around ``plan_pose``.
-
-    Builds a multi-frame goal so cuRobo IK's ``reorder_links`` check passes
-    when the planner is configured with more than one tool frame. The
-    inactive frames get their current FK pose; their pose criteria should
-    be disabled by the caller (``T1State.pin_for_arm_action``).
-    """
-    goal = _build_multi_frame_goal(
-        planner, active_tool_frame, target_pose, current_state,
-    )
-    return planner.plan_pose(
-        goal_tool_poses=goal,
-        current_state=current_state,
-        max_attempts=max_attempts,
-        enable_graph_attempt=enable_graph_attempt,
-    )
