@@ -49,12 +49,30 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
     assert fp.n == 3  # retried `retries` times before raising
 
 
+import gc
 import os
 
 needs_cuda = pytest.mark.skipif(
     not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
     reason="Requires a CUDA device.",
 )
+
+
+@pytest.fixture(autouse=True)
+def _free_cuda_between_tests():
+    """Release GPU memory after each test. Each integration test builds a full
+    TAMP pipeline + TAMPWorld (several GiB); without reclaiming between tests,
+    running two heavy needs_cuda tests in one process OOMs a 24 GiB card. The
+    per-test objects are function locals, so a gc + empty_cache on teardown
+    frees them before the next test allocates."""
+    yield
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _generate_plan_segments(seed: int):
