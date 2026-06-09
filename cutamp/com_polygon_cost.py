@@ -77,6 +77,7 @@ def com_polygon_penalty(
     half_extents: torch.Tensor,
     inside_margin: float,
     inside_weight: float,
+    center_weight: float = 0.0,
 ) -> torch.Tensor:
     """Per-sample COM-over-rectangle penalty in ``mobile_base_link`` frame.
 
@@ -87,6 +88,10 @@ def com_polygon_penalty(
         inside_margin: width of the inside soft-barrier band (meters).
         inside_weight: relative scale of the inside barrier vs the outside
             quadratic.
+        center_weight: optional pull-to-center term
+            ``center_weight * Σ(com_in_base/half_extents)²`` active
+            everywhere inside; 0 (default) preserves the pure barrier the
+            hard gate's COM_TOL is calibrated to.
 
     Returns:
         ``[N]`` non-negative penalty.
@@ -102,7 +107,10 @@ def com_polygon_penalty(
     # near a corner the nearest-edge margin — not the sum of both — is what
     # bounds tip-over. Summing double-counts corners and wrongly rejects
     # COM-feasible configs (see test_com_polygon_penalty_corner_*).
-    return (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).max(dim=-1).values
+    penalty = (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).max(dim=-1).values
+    if center_weight:
+        penalty = penalty + center_weight * ((com_in_base / half_extents) ** 2).sum(dim=-1)
+    return penalty
 
 
 class ComOverBasePolygonCost(BaseCost):

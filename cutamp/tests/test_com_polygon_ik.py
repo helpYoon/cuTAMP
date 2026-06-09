@@ -341,6 +341,34 @@ def test_com_polygon_penalty_single_edge_equals_tol():
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
+def test_com_polygon_penalty_center_weight_defaults_off():
+    # Default center_weight=0 -> barrier-only: deep-inside COM scores exactly 0
+    # (the hard-gate path relies on this).
+    import torch
+    from cutamp.com_polygon_cost import com_polygon_penalty
+    half = torch.tensor([0.10, 0.15])
+    base_T = torch.eye(4).unsqueeze(0)
+    com_world = torch.tensor([[0.03, 0.04, 0.0]])  # well inside inset rect
+    pen = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0)
+    assert pen.item() == 0.0
+
+
+def test_com_polygon_penalty_center_pull_active_deep_inside():
+    # With center_weight>0 a deep-inside COM gets a nonzero penalty that grows
+    # with distance from center: center_weight * sum((com/half)^2).
+    import torch
+    from cutamp.com_polygon_cost import com_polygon_penalty
+    half = torch.tensor([0.10, 0.15])
+    base_T = torch.eye(4).unsqueeze(0)
+    cw = 0.01
+    far = torch.tensor([[0.06, 0.0, 0.0]])      # inside inset, barrier=0
+    center = torch.tensor([[0.0, 0.0, 0.0]])
+    pen_far = com_polygon_penalty(far, base_T, half, 0.02, 1.0, center_weight=cw)
+    pen_center = com_polygon_penalty(center, base_T, half, 0.02, 1.0, center_weight=cw)
+    assert pen_center.item() == pytest.approx(0.0)
+    assert pen_far.item() == pytest.approx(cw * (0.06 / 0.10) ** 2, rel=1e-4)
+
+
 def test_com_polygon_penalty_just_outside_exceeds_tol():
     # COM 1mm past one edge -> penalty > tol (outside quadratic + saturated barrier).
     import torch
