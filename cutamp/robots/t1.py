@@ -329,10 +329,9 @@ def get_t1_ik_solver(
         # Inside-barrier ON for IK rollouts: gives LBFGS a gradient pull from
         # inside the band toward the center, broadening the COM-feasible
         # convergence basin so unlucky-seed IK runs still land inside the
-        # polygon. The planner-side cost (above) keeps barrier OFF because
-        # cspace pulls toward home — adding a center-pull there fights
-        # posture and trunk pitches backward. IK has no such cspace pull on
-        # body DOFs (only inactive-arm pin), so the trade is favorable.
+        # polygon. The planner-side cost (get_t1_motion_planner above) uses
+        # the same inside-barrier-ON config to flatten mid-trajectory COM
+        # excursions, so IK and planner share identical COM cost settings.
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
