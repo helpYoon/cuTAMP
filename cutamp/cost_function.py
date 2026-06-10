@@ -476,12 +476,20 @@ class CostFunction:
         num_particles = rollout["num_particles"]
         
         # Object position-based costs
-        if cost_name in ("dist_from_origin", "max_obj_dist", "min_obj_dist", "min_y", "max_y"):
+        if cost_name in ("dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist", "min_y", "max_y"):
             last_obj_position = [v[:, -1, :3, 3] for v in rollout["obj_to_pose"].values()]
             last_obj_position = torch.stack(last_obj_position, dim=1)
-            
+
             if cost_name == "dist_from_origin":
                 return -last_obj_position.norm(dim=-1).sum(dim=-1)
+            elif cost_name == "place_close_to_base":
+                # Pull placed objects toward the base (locked at the origin):
+                # penalize each movable's final XY distance. Far placements
+                # (hand reach >~0.57 m) are where the COM cannot be fully
+                # centered even with leg recruitment; this biases the chosen
+                # placement away from that tail while the hard constraints
+                # keep it stable and in-region.
+                return last_obj_position[..., :2].norm(dim=-1).sum(dim=-1)
             elif cost_name in ("max_obj_dist", "min_obj_dist"):
                 all_obj_dists = torch.cdist(last_obj_position, last_obj_position, p=2)
                 mask = torch.triu(torch.ones_like(all_obj_dists), diagonal=1) == 1

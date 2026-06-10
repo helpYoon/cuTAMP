@@ -39,7 +39,7 @@ class TAMPConfiguration:
 
     ## Soft Costs
     optimize_soft_costs: bool = False
-    # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home, minimize_body_movement, com_polygon
+    # Supported: dist_from_origin, place_close_to_base, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home, minimize_body_movement, com_polygon
     soft_cost: Optional[List[str]] = None
     # Diagnostic: mimic NVlabs/cuTAMP main — Adam always runs with soft costs
     # in the loss; no Phase 2 LBFGS. Useful for pose-class soft costs that
