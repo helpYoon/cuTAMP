@@ -89,18 +89,21 @@ def test_fork_penalty_parity_with_cutamp_reference():
         assert torch.allclose(got, ref, atol=1e-5), f"max diff {(got - ref).abs().max()}"
 
 
-def test_fork_penalty_jterror_matches_autograd_reference():
-    # The gradient of the penalty (the LM rhs contribution) must be finite and
-    # nonzero for an outside-rectangle CoM.
+def test_fork_penalty_gradient_matches_analytic_value():
+    # At com=[0.15, 0, 0.3], half=[0.1115, 0.156], margin=0.02, inside_weight=1:
+    # offset_x = 0.0385 (outside), inside_x = 0.0585, y-terms inactive.
+    # d(pen)/d(com_x) = 2*0.0385 + 2*0.0585 = 0.194 exactly; y and z grads = 0.
     from curobo._src.solver.seed_ik.seed_ik_error_calculator import com_support_penalty
-    com = torch.tensor([[0.15, 0.0, 0.3]], requires_grad=True)  # outside +x edge
+    com = torch.tensor([[0.15, 0.0, 0.3]], requires_grad=True)
     half = torch.tensor([0.1115, 0.156])
     pos = torch.zeros(1, 3)
     quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     pen = com_support_penalty(com, pos, quat, half, 0.02, 1.0, 0.0)
     pen.sum().backward()
-    assert com.grad is not None and torch.isfinite(com.grad).all()
-    assert float(com.grad.abs().max()) > 0.0
+    grad = com.grad[0]
+    assert grad[0].item() == pytest.approx(0.194, rel=1e-5)
+    assert grad[1].item() == pytest.approx(0.0, abs=1e-9)
+    assert grad[2].item() == pytest.approx(0.0, abs=1e-9)
 
 
 @needs_cuda
@@ -137,3 +140,48 @@ def test_residual_fires_iff_enabled():
             gc.collect(); torch.cuda.empty_cache()
     finally:
         SeedIKErrorCalculator._compute_com_penalty = orig
+
+
+@needs_cuda
+def test_robot_com_gradient_flows_to_joints_with_fd_check():
+    # The residual's core chain: joint_position -> fused-FK robot_com -> penalty
+    # -> backward -> joint_position.grad. Verify against finite differences on
+    # the leg/torso joints the residual is meant to recruit.
+    from curobo._src.solver.seed_ik.seed_ik_error_calculator import com_support_penalty
+    from curobo.types import JointState
+
+    world = _world(enable_com_aware_ik=True)
+    model = world.ik_solver.seed_ik_solver._robot_model
+    device = model.device_cfg.device
+    names = list(model.joint_names)
+    half = torch.tensor([0.1115, 0.156], device=device)
+    base_idx = list(model.tool_frames).index("mobile_base_link")
+
+    def penalty_at(q):
+        ks = model.compute_kinematics(
+            JointState.from_position(q, joint_names=names))
+        com = ks.robot_com.view(1, -1)[:, :3]
+        pos = ks.tool_poses.position.view(1, len(model.tool_frames), 3)[:, base_idx, :]
+        quat = ks.tool_poses.quaternion.view(1, len(model.tool_frames), 4)[:, base_idx, :]
+        return com_support_penalty(com, pos, quat, half, 0.02, 1.0, 0.0).sum()
+
+    # A leaning config so the penalty is active: Torso_Pitch forward.
+    q0 = torch.zeros(1, model.get_dof(), device=device)
+    q0[0, names.index("Torso_Pitch")] = -1.5
+
+    q = q0.clone().requires_grad_(True)
+    penalty_at(q).backward()
+    grad = q.grad[0]
+    assert torch.isfinite(grad).all()
+
+    eps = 1e-3
+    for jn in ("Torso_Pitch", "knee_pitch", "ankle_pitch"):
+        j = names.index(jn)
+        qp = q0.clone(); qp[0, j] += eps
+        qm = q0.clone(); qm[0, j] -= eps
+        with torch.no_grad():
+            fd = (penalty_at(qp) - penalty_at(qm)) / (2 * eps)
+        assert grad[j].item() == pytest.approx(fd.item(), rel=0.05, abs=1e-4), \
+            f"{jn}: autograd {grad[j].item():.6f} vs FD {fd.item():.6f}"
+    # The chain must actually recruit the legs: torso gradient clearly nonzero.
+    assert abs(grad[names.index("Torso_Pitch")].item()) > 1e-3
