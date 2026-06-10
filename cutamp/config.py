@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
@@ -38,9 +38,13 @@ class TAMPConfiguration:
     break_on_satisfying: bool = True
 
     ## Soft Costs
-    optimize_soft_costs: bool = False
+    # Default ON since 2026-06-09: the (optimize_soft_costs + coupled_reik +
+    # place_close_to_base) trio dominated every metric in validation — placements
+    # pulled to 0.35-0.37 m reach (no far-place COM tail), all arrivals centered,
+    # num_satisfying 30-40 vs ~15.7 without.
+    optimize_soft_costs: bool = True
     # Supported: dist_from_origin, place_close_to_base, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home, minimize_body_movement, com_polygon
-    soft_cost: Optional[List[str]] = None
+    soft_cost: Optional[List[str]] = field(default_factory=lambda: ["place_close_to_base"])
     # Diagnostic: mimic NVlabs/cuTAMP main — Adam always runs with soft costs
     # in the loss; no Phase 2 LBFGS. Useful for pose-class soft costs that
     # LBFGS can't refine along the IK constraint manifold.
@@ -50,7 +54,7 @@ class TAMPConfiguration:
     # refreshed by an exact IK call every reik_interval steps. Makes pose-class
     # soft costs trainable on T1 by removing the kinematic-constraint coupling
     # that destroys 21-DOF Adam runs.
-    coupled_reik: bool = False
+    coupled_reik: bool = True
     reik_interval: int = 5
 
     ## Task Planning and subgraph caching

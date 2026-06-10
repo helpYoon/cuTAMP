@@ -105,17 +105,20 @@ def entrypoint():
 
     # Soft costs
     parser.add_argument(
-        "--optimize_soft_costs", action="store_true", help="Whether to optimize soft costs (default: False)"
+        "--no_optimize_soft_costs", dest="optimize_soft_costs", action="store_false",
+        help="Disable soft-cost optimization (default: on, with place_close_to_base).",
     )
+    parser.set_defaults(optimize_soft_costs=True)
     parser.add_argument(
         "--upstream_style_optimize", action="store_true",
         help="Diagnostic: mimic NVlabs/cuTAMP main — Adam runs always with soft costs in loss, no Phase 2 LBFGS.",
     )
     parser.add_argument(
-        "--coupled_reik", action="store_true",
-        help="Re-IK-coupled Adam: outer Adam on poses/grasps, covered Confs refreshed by IK every --reik_interval steps. "
-             "Required for pose-class soft costs (dist_from_origin, align_yaw, ...) on T1's 21-DOF cspace.",
+        "--no_coupled_reik", dest="coupled_reik", action="store_false",
+        help="Disable re-IK-coupled Adam (default: on). Coupled mode is required for "
+             "pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
     )
+    parser.set_defaults(coupled_reik=True)
     parser.add_argument(
         "--reik_interval", type=int, default=5,
         help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
@@ -123,8 +126,9 @@ def entrypoint():
     parser.add_argument(
         "--soft_cost",
         nargs="*",
+        default=["place_close_to_base"],
         choices=["dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home", "minimize_body_movement", "com_polygon"],
-        help="Soft cost(s) to optimize. Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
+        help="Soft cost(s) to optimize (default: place_close_to_base). Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
     # Grasp
