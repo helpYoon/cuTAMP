@@ -8,10 +8,11 @@ on the cuRobo v0.8 port that defines the current architecture are in
 [docs/curobo_v08_port.md](docs/curobo_v08_port.md).
 
 > **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
-> `curobo/` tree (the `compute_com` plumbing, a batched-COM kernel fix, and
-> the CoM-aware seed-IK residual). These live as working-tree edits in the
-> nested `curobo/` repo and belong in the cuRobo fork — a fresh `curobo/`
-> checkout without them breaks cuTAMP. Grep `cuTAMP fork` under
+> `curobo/` tree (the `compute_com` plumbing and the CoM-aware seed-IK
+> residual — 7 Python files; the earlier batched-COM kernel fix was dropped
+> when the base moved to NVlabs PR #678, which fixes it upstream). The edits
+> live on the `main` branch of the cuRobo fork (helpYoon/curobo) — a plain
+> NVlabs checkout without them breaks cuTAMP. Grep `cuTAMP fork` under
 > `curobo/curobo/_src/` for the full inventory.
 
 ## T1 Single-Planner Architecture (cuRobo v0.8)

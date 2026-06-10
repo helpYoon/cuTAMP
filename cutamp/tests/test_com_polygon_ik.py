@@ -92,18 +92,17 @@ def test_constraint_checker_filters_com_violators():
 
 @needs_cuda
 def test_curobo_batched_com_kernel_returns_per_batch_distinct():
-    """Regression test for bundled cuRobo's batched COM kernel bug.
+    """Regression test for cuRobo's batched COM kernel.
 
-    Pre-fix (kinematics_forward_kernel.cuh: passing local_batch_offset
-    instead of 0 as matAddrBase): only batch index 0 of robot_com was
-    populated correctly; subsequent slots returned zeros or aliased
-    garbage. Affected any robot with num_spheres ≥ 100 (T1=164, G1=674).
-
-    The fix is at
-    curobo/_src/curobolib/kernels/kinematics/kinematics_forward_kernel.cuh
-    lines 316 and 396 (passing 0 instead of local_batch_offset to
-    process_center_of_mass). This test asserts that a B=4 batched COM
-    call returns the SAME per-batch COMs as four separate B=1 calls."""
+    History: at the NVlabs PR #626 base, the kernel double-offset the
+    cumulative-transform address for batch slots > 0 (pre-offset pointer
+    AND nonzero matAddrBase passed to process_center_of_mass) — only batch
+    index 0 of robot_com was correct for robots with num_spheres >= 100
+    (T1=164). Our fork patched it; PR #678 then rewrote the kernel
+    (write_center_of_mass_tile) with the single-offset convention applied
+    everywhere, fixing it upstream, and the fork patch was dropped. This
+    test remains as the guard: a B=4 batched COM call must return the SAME
+    per-batch COMs as four separate B=1 calls."""
     import torch
     from curobo.types import JointState
     world = _make_world()
@@ -143,9 +142,9 @@ def test_curobo_batched_com_kernel_returns_per_batch_distinct():
         f"Batched COM kernel returned non-matching COMs (max diff {max_diff:.6f}).\n"
         f"  ref (B=1 stacked):\n{ref_coms.cpu().numpy()}\n"
         f"  batched (B=4):\n{batched_coms.cpu().numpy()}\n"
-        f"Bundled cuRobo's batched COM kernel may have regressed — see "
-        f"curobo/_src/curobolib/kernels/kinematics/kinematics_forward_kernel.cuh "
-        f"lines 316 and 396 (process_center_of_mass matAddrBase arg)."
+        f"Bundled cuRobo's batched COM kernel may have regressed — check the "
+        f"per-batch matAddrBase handling in write_center_of_mass_tile "
+        f"(curobo/_src/curobolib/kernels/kinematics/kinematics_forward_helper.cuh)."
     )
 
 
