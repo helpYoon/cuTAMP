@@ -185,3 +185,81 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
             f"{jn}: autograd {grad[j].item():.6f} vs FD {fd.item():.6f}"
     # The chain must actually recruit the legs: torso gradient clearly nonzero.
     assert abs(grad[names.index("Torso_Pitch")].item()) > 1e-3
+
+
+def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
+    """IK a forward-reach grid for the left arm; return (q_full[B,21], success[B], result)."""
+    from curobo.types import JointState
+    from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q
+    names = list(world.kinematics.joint_names)
+    qh = world.q_init
+    af = world.tool_frame_for_arm("left")
+    hm = world.kinematics.compute_kinematics(
+        world.kinematics.get_active_js(
+            JointState.from_position(qh.unsqueeze(0), joint_names=names))
+    ).tool_poses.get_link_pose(af, make_contiguous=True).get_matrix().reshape(4, 4)
+    Ts = []
+    for f in torch.linspace(0.15, 0.33, n_fwd, device=qh.device):
+        for l in torch.linspace(-0.05, 0.15, n_lat, device=qh.device):
+            m = hm.clone(); m[0, 3] += float(f); m[1, 3] = float(l); Ts.append(m)
+    res = _ik_for_pose(world, torch.stack(Ts, 0), "left")
+    s = res.success
+    succ = (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
+    return _ik_solution_to_full_q(res, world), succ, res
+
+
+def _com_abs_x(world, q_full):
+    from curobo.types import JointState
+    kin = world.kinematics_with_com
+    names = list(world.kinematics.joint_names)
+    ks = kin.compute_kinematics(kin.get_active_js(
+        JointState.from_position(q_full.to(kin.device_cfg.device), joint_names=names)))
+    cw = ks.robot_com[..., :3].reshape(-1, 3)
+    bT = ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True) \
+        .get_matrix().reshape(-1, 4, 4)
+    cib = (bT[:, :3, :3].transpose(-1, -2) @ (cw - bT[:, :3, 3]).unsqueeze(-1)).squeeze(-1)
+    return cib[:, 0].abs()
+
+
+@needs_cuda
+def test_centering_ab_legs_within_limits_pose_preserved():
+    import gc
+    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN
+    # OFF baseline
+    world_off = _world(enable_com_aware_ik=False)
+    q_off, s_off, _ = _forward_reach_solutions(world_off)
+    absx_off = _com_abs_x(world_off, q_off)[s_off]
+    del world_off; gc.collect(); torch.cuda.empty_cache()
+    # ON
+    world_on = _world(enable_com_aware_ik=True)
+    q_on, s_on, res_on = _forward_reach_solutions(world_on)
+    assert int(s_on.sum()) > 0, "CoM-aware IK produced no successful solutions"
+    absx_on = _com_abs_x(world_on, q_on)[s_on]
+
+    # (1) centering: mean |com_x| reduced >=10% OR already inside the inset rect
+    inset = COM_HALF_EXTENTS[0] - COM_INSIDE_MARGIN  # 0.0915
+    assert (float(absx_on.mean()) < 0.9 * float(absx_off.mean())
+            or float(absx_on.mean()) <= inset), \
+        f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
+
+    # (2) joint limits: EVERY returned solution within URDF bounds (+1e-3 slack;
+    #     limits are soft residual + filter — out-of-limit output is a fork bug)
+    names = list(world_on.kinematics.joint_names)
+    idx = {n: i for i, n in enumerate(names)}
+    bounds = {"ankle_pitch": (-0.87, 0.0), "knee_pitch": (0.0, 2.34),
+              "Torso_Pitch": (-1.8, 0.0)}
+    for jn, (lo, hi) in bounds.items():
+        col = q_on[:, idx[jn]]
+        assert float(col.min()) >= lo - 1e-3 and float(col.max()) <= hi + 1e-3, \
+            f"{jn} out of [{lo},{hi}]: [{float(col.min()):.3f},{float(col.max()):.3f}]"
+
+    # (3) pose accuracy on successes: solver tolerances (5mm / 0.05rad)
+    pe = res_on.position_error
+    pe = (pe.reshape(pe.shape[0], -1)[:, 0] if pe.ndim > 1 else pe)[s_on]
+    assert float(pe.max()) <= 0.005 + 1e-4, f"pose err {float(pe.max()):.4f}"
+
+    # (4) soft recruitment signal (informational; generous threshold)
+    knee_delta = float((q_on[s_on][:, idx["knee_pitch"]]).abs().max())
+    print(f"recruitment: max knee_pitch={knee_delta:.3f} rad; "
+          f"absx on/off mean {float(absx_on.mean()):.4f}/{float(absx_off.mean()):.4f}")
+    del world_on; gc.collect(); torch.cuda.empty_cache()
