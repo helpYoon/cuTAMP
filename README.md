@@ -3,9 +3,7 @@
 ## Quick Links
 
 The full README with installation instructions, examples, and detailed
-documentation can be found in [README_DETAILED.md](README_DETAILED.md). Notes
-on the cuRobo v0.8 port that defines the current architecture are in
-[docs/curobo_v08_port.md](docs/curobo_v08_port.md).
+documentation can be found in [README_DETAILED.md](README_DETAILED.md).
 
 > **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
 > `curobo/` tree (the `compute_com` plumbing and the CoM-aware seed-IK

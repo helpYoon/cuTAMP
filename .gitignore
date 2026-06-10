@@ -1,6 +1,12 @@
 # Ignore curobo directory
 curobo/
 
+# Ignore docs (internal notes, specs, plans)
+docs/
+
+# Ignore generated data (motion plans, etc.)
+data/
+
 # Python cache
 __pycache__/
 *.pyc

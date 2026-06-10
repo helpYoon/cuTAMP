@@ -169,54 +169,16 @@ To view the available options, run:
 cutamp-demo -h
 ```
 
-### Tetris Packing
-
-The Tetris domain has 1, 2, 3, and 5 block variants named `tetris_{1,2,3,5}`. The `tetris_5` variant is the most
-challenging and benefits from cost tuning and increasing the number of particles.
-
-```bash
-# Tetris packing with 3 blocks and motion planning after cuTAMP solve
-# All plan skeletons are downward refinable, so 1 initial plan is sufficient
-cutamp-demo --env tetris_3 --num_initial_plans 1 --motion_plan
-
-# Tetris packing with 5 blocks and more particles and optimization steps
-cutamp-demo --env tetris_5 --num_particles 2048 --num_opt_steps 2000 \
-  --num_initial_plans 1 --motion_plan
-
-# Tetris packing with 5 blocks and tuned cost weights
-# You can try the --tuned_tetris_weights flag on other problems too (it works)!
-cutamp-demo --env tetris_5 --num_particles 2048 --num_opt_steps 2000 \
-  --num_initial_plans 1 --motion_plan --tuned_tetris_weights
-```
-
-<img src="docs/tetris_5_opt.gif" width="500" alt="Tetris 5 Block Optimization">
-
 ### Optimizing Soft Costs
 
 ```bash
 # Minimize the distance between the objects for 10 seconds
-cutamp-demo --env blocks --optimize_soft_cost --soft_cost min_obj_dist --max_duration 10
+# (soft-cost optimization is on by default; use --no_optimize_soft_costs to disable)
+cutamp-demo --env blocks_t1 --soft_cost min_obj_dist --max_duration 10
 
 # Maximize the distance between the objects for 10 seconds
-cutamp-demo --env blocks --optimize_soft_cost --soft_cost max_obj_dist --max_duration 10
+cutamp-demo --env blocks_t1 --soft_cost max_obj_dist --max_duration 10
 ```
-
-<img src="docs/min_obj_dist.gif" width="500" alt="Minimize Object Distance Optimization">
-
-### Searching over Plan Skeletons
-
-In the Stick Button domain, enabling subgraph caching speeds up particle initialization across plan skeletons.
-
-```bash
-# Stick button domain with Franka Panda
-cutamp-demo --env stick_button --robot panda --num_initial_plans 100 --cache_subgraphs
-
-# Stick button domain with UR5. The UR5 doesn't need to use the stick.
-# Cross-embodiment generalization!
-cutamp-demo --env stick_button --robot ur5 --num_initial_plans 100 --cache_subgraphs
-```
-
-<img src="docs/stick_button.png" width="500" alt="Stick Button Domain">
 
 ### Helpful Flags
 
