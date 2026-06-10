@@ -112,9 +112,13 @@ T1_CONFIG_PATH = T1_ASSETS_DIR / "t1_planar_base.yml"
 T1_COM_IK_WEIGHT = 1.0
 
 # Pull-to-center term of the seed-IK CoM residual: cw * sum((com/half)^2),
-# active everywhere (not just the edge band). 0.0 = barrier-only. Tuned by
-# sweep; see the center-weight sweep notes next to the chosen value.
-T1_COM_IK_CENTER_WEIGHT = 0.0
+# active everywhere (not just the edge band). Sweep 2026-06-09 over
+# {0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1}: 1e-3 is the knee — mean |com_x|
+# 0.0266->0.0009 (near grid) / 0.0556->0.0058 (far), 12/12 success, zero
+# CoM-blind fallback engagements, pose cost <= 2mm. >= 3e-3 regresses:
+# the pull degrades seed convergence, triggering the CoM-blind MPPI->LBFGS
+# fallback (one out-of-hull solution at 1e-2).
+T1_COM_IK_CENTER_WEIGHT = 1e-3
 
 
 # =============================================================================

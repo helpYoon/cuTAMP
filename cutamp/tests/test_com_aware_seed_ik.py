@@ -247,10 +247,11 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     assert int(s_on.sum()) > 0, "CoM-aware IK produced no successful solutions"
     absx_on = _com_abs_x(world_on, q_on)[s_on]
 
-    # (1) centering: mean |com_x| reduced >=10% OR already inside the inset rect
-    inset = COM_HALF_EXTENTS[0] - COM_INSIDE_MARGIN  # 0.0915
-    assert (float(absx_on.mean()) < 0.9 * float(absx_off.mean())
-            or float(absx_on.mean()) <= inset), \
+    # (1) centering: with the center pull on (T1_COM_IK_CENTER_WEIGHT=1e-3)
+    # the COM must be actively pulled toward center, not just kept in-band.
+    # Sweep showed ~30x reduction; assert a conservative 2x to absorb solver
+    # nondeterminism.
+    assert float(absx_on.mean()) < 0.5 * float(absx_off.mean()), \
         f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
 
     # (2) joint limits: every SUCCESSFUL solution within URDF bounds (+1e-3
