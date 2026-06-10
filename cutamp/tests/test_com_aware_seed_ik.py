@@ -41,7 +41,8 @@ def test_flag_on_seed_cfg_carries_com_params():
     assert list(cfg.com_half_extents) == list(COM_HALF_EXTENTS)
     assert cfg.com_inside_margin == COM_INSIDE_MARGIN
     assert cfg.com_inside_weight == COM_INSIDE_WEIGHT
-    assert cfg.com_center_weight == 0.0
+    from cutamp.robots.t1 import T1_COM_IK_CENTER_WEIGHT
+    assert cfg.com_center_weight == T1_COM_IK_CENTER_WEIGHT
     assert cfg.com_base_link_name == "mobile_base_link"
 
 
@@ -104,6 +105,13 @@ def test_fork_penalty_gradient_matches_analytic_value():
     assert grad[0].item() == pytest.approx(0.194, rel=1e-5)
     assert grad[1].item() == pytest.approx(0.0, abs=1e-9)
     assert grad[2].item() == pytest.approx(0.0, abs=1e-9)
+    # Center term gradient: pen = cw*((x/hx)^2 + (y/hy)^2) inside the inset
+    # -> d/dx = 2*cw*x/hx^2. At x=0.05: 2*0.01*0.05/0.1115^2 = 0.0804366...
+    com2 = torch.tensor([[0.05, 0.0, 0.3]], requires_grad=True)
+    pen2 = com_support_penalty(com2, pos, quat, half, 0.02, 1.0, 0.01)
+    pen2.sum().backward()
+    expected = 2 * 0.01 * 0.05 / (0.1115 ** 2)
+    assert com2.grad[0][0].item() == pytest.approx(expected, rel=1e-4)
 
 
 @needs_cuda

@@ -111,6 +111,11 @@ T1_CONFIG_PATH = T1_ASSETS_DIR / "t1_planar_base.yml"
 # transferable here.
 T1_COM_IK_WEIGHT = 1.0
 
+# Pull-to-center term of the seed-IK CoM residual: cw * sum((com/half)^2),
+# active everywhere (not just the edge band). 0.0 = barrier-only. Tuned by
+# sweep; see the center-weight sweep notes next to the chosen value.
+T1_COM_IK_CENTER_WEIGHT = 0.0
+
 
 # =============================================================================
 # Config loading
@@ -328,7 +333,7 @@ def get_t1_ik_solver(
         seed_com_half_extents=(list(COM_HALF_EXTENTS) if enable_com_aware_ik else None),
         seed_com_inside_margin=COM_INSIDE_MARGIN,
         seed_com_inside_weight=COM_INSIDE_WEIGHT,
-        seed_com_center_weight=0.0,
+        seed_com_center_weight=(T1_COM_IK_CENTER_WEIGHT if enable_com_aware_ik else 0.0),
         seed_com_base_link_name="mobile_base_link",
     )
     ik_solver = InverseKinematics(cfg)
