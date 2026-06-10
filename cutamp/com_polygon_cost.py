@@ -137,6 +137,39 @@ class ComOverBasePolygonCost(BaseCost):
 ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
 
 
+def _fk_com_and_base(world, q_batch: torch.Tensor):
+    """FK ``q_batch`` through ``world.kinematics_with_com``; return
+    ``(com_world [B,3], base_T [B,4,4])`` — the inputs every COM-polygon
+    helper needs. Differentiable through cuRobo's FK chain."""
+    from curobo.types import JointState
+    kin = world.kinematics_with_com
+    q_batch = q_batch.to(kin.device_cfg.device)
+    if q_batch.ndim == 1:
+        q_batch = q_batch.unsqueeze(0)
+    js = JointState.from_position(q_batch, joint_names=list(world.kinematics.joint_names))
+    ks = kin.compute_kinematics(kin.get_active_js(js))
+    com_world = ks.robot_com[..., :3].reshape(-1, 3)
+    base_T = (
+        ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
+        .get_matrix()
+        .reshape(-1, 4, 4)
+    )
+    return com_world, base_T
+
+
+def compute_com_in_base(world, q_batch: torch.Tensor) -> torch.Tensor:
+    """Project the robot COM of each conf into the ``mobile_base_link`` frame.
+
+    Returns ``[B, 2]`` (x, y) — the quantity the support rectangle is defined
+    over. Single home of the projection used by audits and tests so they
+    cannot drift from the penalty math.
+    """
+    com_world, base_T = _fk_com_and_base(world, q_batch)
+    R = base_T[:, :3, :3]
+    t = base_T[:, :3, 3]
+    return (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+
+
 def compute_com_polygon_mask(
     world,
     q_batch: torch.Tensor,
@@ -165,29 +198,13 @@ def compute_com_polygon_mask(
         ``<= COM_TOL`` (COM inside-or-on the support hull) — the same gate
         the hard ComPolygon constraint uses, so the two cannot diverge.
     """
-    from curobo.types import JointState
     if half_extents is None:
         half_extents = COM_HALF_EXTENTS
-    kin = world.kinematics_with_com
-    device = kin.device_cfg.device
-    q_batch = q_batch.to(device)
-    if q_batch.ndim == 1:
-        q_batch = q_batch.unsqueeze(0)
-
-    joint_names = list(world.kinematics.joint_names)
-    js = JointState.from_position(q_batch, joint_names=joint_names)
-    active_js = kin.get_active_js(js)
-    ks = kin.compute_kinematics(active_js)
-    com = ks.robot_com[..., :3].reshape(-1, 3)
-    base_T = (
-        ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
-        .get_matrix()
-        .reshape(-1, 4, 4)
-    )
+    com, base_T = _fk_com_and_base(world, q_batch)
     # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
     # post-IK COM-safe check and ConstraintChecker can never diverge. With the
     # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
-    half = torch.tensor(half_extents, device=device, dtype=q_batch.dtype)
+    half = torch.tensor(half_extents, device=com.device, dtype=com.dtype)
     pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT)
     return pen <= COM_TOL
 
@@ -233,13 +250,8 @@ def compute_com_polygon_penalties(
         ``{conf_name: [B] float tensor}`` of penalty values in m².
         Empty dict if no Conf particles are in ``particles``.
     """
-    from curobo.types import JointState
     if half_extents is None:
         half_extents = COM_HALF_EXTENTS
-
-    kin = world.kinematics_with_com
-    device = kin.device_cfg.device
-    joint_names = list(world.kinematics.joint_names)
 
     conf_names = [
         p for p in particles
@@ -247,17 +259,8 @@ def compute_com_polygon_penalties(
     ]
     out: "dict[str, torch.Tensor]" = {}
     for name in conf_names:
-        q = particles[name].to(device)
-        half = torch.tensor(half_extents, device=device, dtype=q.dtype)
-        js = JointState.from_position(q, joint_names=joint_names)
-        active_js = kin.get_active_js(js)
-        ks = kin.compute_kinematics(active_js)
-        com_world = ks.robot_com[..., :3].reshape(-1, 3)
-        base_T = (
-            ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
-            .get_matrix()
-            .reshape(-1, 4, 4)
-        )
+        com_world, base_T = _fk_com_and_base(world, particles[name])
+        half = torch.tensor(half_extents, device=com_world.device, dtype=com_world.dtype)
         out[name] = com_polygon_penalty(
             com_world, base_T, half, inside_margin, inside_weight,
         )

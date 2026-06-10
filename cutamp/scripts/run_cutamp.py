@@ -88,6 +88,9 @@ def cutamp_demo(
 def entrypoint():
     import argparse
 
+    from cutamp.config import SUPPORTED_SOFT_COSTS
+    _defaults = TAMPConfiguration()
+
     parser = argparse.ArgumentParser(
         description="Run cuTAMP demo. We do not expose all the configs so check cutamp/config.py for additional configs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -108,7 +111,7 @@ def entrypoint():
         "--no_optimize_soft_costs", dest="optimize_soft_costs", action="store_false",
         help="Disable soft-cost optimization (default: on, with place_close_to_base).",
     )
-    parser.set_defaults(optimize_soft_costs=True)
+    parser.set_defaults(optimize_soft_costs=_defaults.optimize_soft_costs)
     parser.add_argument(
         "--upstream_style_optimize", action="store_true",
         help="Diagnostic: mimic NVlabs/cuTAMP main — Adam runs always with soft costs in loss, no Phase 2 LBFGS.",
@@ -118,7 +121,7 @@ def entrypoint():
         help="Disable re-IK-coupled Adam (default: on). Coupled mode is required for "
              "pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
     )
-    parser.set_defaults(coupled_reik=True)
+    parser.set_defaults(coupled_reik=_defaults.coupled_reik)
     parser.add_argument(
         "--reik_interval", type=int, default=5,
         help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
@@ -126,9 +129,9 @@ def entrypoint():
     parser.add_argument(
         "--soft_cost",
         nargs="*",
-        default=["place_close_to_base"],
-        choices=["dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist", "min_y", "max_y", "align_yaw", "retract_close_to_home", "minimize_body_movement", "com_polygon"],
-        help="Soft cost(s) to optimize (default: place_close_to_base). Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
+        default=list(_defaults.soft_cost or []),
+        choices=list(SUPPORTED_SOFT_COSTS),
+        help="Soft cost(s) to optimize (default: from TAMPConfiguration). Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
     # Grasp
@@ -187,7 +190,7 @@ def entrypoint():
              "By default the cost is enabled (5e5 weight) and keeps the planner's "
              "configurations from tipping over the wheelbase.",
     )
-    parser.set_defaults(enable_com_polygon=True)
+    parser.set_defaults(enable_com_polygon=_defaults.enable_com_polygon)
     parser.add_argument(
         "--no_enable_com_aware_ik",
         dest="enable_com_aware_ik",
@@ -196,7 +199,7 @@ def entrypoint():
              "IK trades hand-pose vs COM and recruits the legs to center the "
              "COM (validated 2026-06-09; see config.enable_com_aware_ik).",
     )
-    parser.set_defaults(enable_com_aware_ik=True)
+    parser.set_defaults(enable_com_aware_ik=_defaults.enable_com_aware_ik)
 
     # Visualization and logging
     parser.add_argument(

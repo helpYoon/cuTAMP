@@ -102,22 +102,18 @@ t1_home_head: Tuple[float, ...] = (0.0, 0.0)
 T1_ASSETS_DIR = Path(__file__).parent / "assets" / "t1_description"
 T1_CONFIG_PATH = T1_ASSETS_DIR / "t1_planar_base.yml"
 
-# Weight for the seed-IK CoM residual. Sweep 2026-06-09 over {0.1, 0.3, 1.0,
-# 3.0} on a far forward-reach grid: indistinguishable on success (12/12 all),
-# fallback engagements (0 all), and pose error (0.0 all) — synthetic IK targets
-# never reach the barrier band, so 1.0 (mid-range, safe) is kept. The
-# discriminating regime is real pipeline grasps (endpoint audit). Pose/limit
-# weights in that solver are O(1) — the planner's 5e5 rollout weight is NOT
-# transferable here.
+# Seed-IK CoM residual weights. Constraints that bound them:
+# - Pose/joint-limit weights in the seed-IK solver are O(1); the planner's
+#   5e5 rollout weight is NOT transferable here.
+# - Too-strong CoM terms degrade seed convergence, which silently triggers
+#   the CoM-blind MPPI->LBFGS fallback (centering regresses; >= 3e-3 on the
+#   center term even produced an out-of-hull solution).
+# Values are sweep-validated; grids and per-value metrics: commits 473ec51
+# (support weight) and 5b9ae65 (center weight).
 T1_COM_IK_WEIGHT = 1.0
 
-# Pull-to-center term of the seed-IK CoM residual: cw * sum((com/half)^2),
-# active everywhere (not just the edge band). Sweep 2026-06-09 over
-# {0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1}: 1e-3 is the knee — mean |com_x|
-# 0.0266->0.0009 (near grid) / 0.0556->0.0058 (far), 12/12 success, zero
-# CoM-blind fallback engagements, pose cost <= 2mm. >= 3e-3 regresses:
-# the pull degrades seed convergence, triggering the CoM-blind MPPI->LBFGS
-# fallback (one out-of-hull solution at 1e-2).
+# Pull-to-center term: cw * sum((com/half)^2), active everywhere (not just
+# the edge band); 1e-3 is the sweep knee (~30x centering, zero fallbacks).
 T1_COM_IK_CENTER_WEIGHT = 1e-3
 
 
@@ -186,22 +182,6 @@ def _trajopt_transition_dict_with_compute_com() -> dict:
     from curobo.content import get_task_configs_path
 
     d = resolve_config(join_path(get_task_configs_path(), "trajopt/transition_bspline_trajopt.yml"))
-    d["transition_model_cfg"]["compute_com"] = True
-    return d
-
-
-def _ik_transition_dict_with_compute_com() -> dict:
-    """Default IK transition YAML with ``compute_com=True`` injected.
-
-    This dict feeds the IK's ROLLOUT/metrics kinematics (cost managers),
-    NOT the seed-IK solver's own Kinematics — the fork's ``compute_com``
-    flag covers that. Keeps ``robot_com`` available to rollout-side
-    metrics/diagnostics.
-    """
-    from curobo._src.util.config_io import resolve_config, join_path
-    from curobo.content import get_task_configs_path
-
-    d = resolve_config(join_path(get_task_configs_path(), "ik/transition_ik.yml"))
     d["transition_model_cfg"]["compute_com"] = True
     return d
 
@@ -293,7 +273,7 @@ def get_t1_ik_solver(
     num_seeds: int = 32,
     self_collision_check: bool = True,
     max_batch_size: int = 64,
-    enable_com_aware_ik: bool = False,
+    enable_com_aware_ik: bool = True,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
     """InverseKinematics solver for T1 with the mobile base locked.
@@ -330,11 +310,12 @@ def get_t1_ik_solver(
         # ("CUDA graph reset is not available."). Disable so each call
         # accepts arbitrary current_state shapes.
         use_cuda_graph=False,
-        transition_model=_ik_transition_dict_with_compute_com(),
         # CoM-aware seed-IK residual (fork): pulls the CoM toward the support
-        # rectangle while the LM solver reaches the hand pose. Off by default.
+        # rectangle while the LM solver reaches the hand pose. The two weights
+        # are the sole on/off gate (the fork derives compute_com from them);
+        # geometry params are passed unconditionally.
         seed_com_support_weight=(T1_COM_IK_WEIGHT if enable_com_aware_ik else 0.0),
-        seed_com_half_extents=(list(COM_HALF_EXTENTS) if enable_com_aware_ik else None),
+        seed_com_half_extents=list(COM_HALF_EXTENTS),
         seed_com_inside_margin=COM_INSIDE_MARGIN,
         seed_com_inside_weight=COM_INSIDE_WEIGHT,
         seed_com_center_weight=(T1_COM_IK_CENTER_WEIGHT if enable_com_aware_ik else 0.0),

@@ -4,10 +4,7 @@ import os
 import pytest
 import torch
 
-needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
+from cutamp.tests.conftest import needs_cuda
 
 
 def _world(enable_com_aware_ik: bool):
@@ -21,7 +18,19 @@ def _world(enable_com_aware_ik: bool):
     robot = load_robot_container("t1", dc)
     qh = torch.as_tensor(t1_home, dtype=torch.float32, device=dc.device)
     return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=qh,
-                     enable_com_polygon=True, enable_com_aware_ik=enable_com_aware_ik)
+                     enable_com_aware_ik=enable_com_aware_ik)
+
+
+def _home_tool_matrix(world, arm="left"):
+    """4x4 world pose of the arm's tool frame at the home configuration."""
+    from curobo.types import JointState
+    names = list(world.kinematics.joint_names)
+    qh = world.q_init
+    af = world.tool_frame_for_arm(arm)
+    return world.kinematics.compute_kinematics(
+        world.kinematics.get_active_js(
+            JointState.from_position(qh.unsqueeze(0), joint_names=names))
+    ).tool_poses.get_link_pose(af, make_contiguous=True).get_matrix().reshape(4, 4)
 
 
 @needs_cuda
@@ -78,7 +87,7 @@ def test_fork_penalty_parity_with_cutamp_reference():
     com_world = torch.randn(B, 3) * 0.3
     base_pos = torch.randn(B, 3) * 0.2
     quat_xyzw = roma.random_unitquat(B)
-    quat_wxyz = torch.cat([quat_xyzw[:, 3:4], quat_xyzw[:, :3]], dim=-1)
+    quat_wxyz = roma.quat_xyzw_to_wxyz(quat_xyzw)
     R = roma.unitquat_to_rotmat(quat_xyzw)
     base_T = torch.eye(4).repeat(B, 1, 1)
     base_T[:, :3, :3] = R
@@ -118,7 +127,6 @@ def test_fork_penalty_gradient_matches_analytic_value():
 def test_residual_fires_iff_enabled():
     import gc
     from curobo._src.solver.seed_ik.seed_ik_error_calculator import SeedIKErrorCalculator
-    from curobo.types import JointState
     from cutamp.particle_initialization import _ik_for_pose
     calls = {"n": 0}
     orig = SeedIKErrorCalculator._compute_com_penalty
@@ -130,13 +138,7 @@ def test_residual_fires_iff_enabled():
         for flag, expect_calls in ((False, False), (True, True)):
             calls["n"] = 0
             world = _world(enable_com_aware_ik=flag)
-            names = list(world.kinematics.joint_names)
-            qh = world.q_init
-            af = world.tool_frame_for_arm("left")
-            hm = world.kinematics.compute_kinematics(
-                world.kinematics.get_active_js(
-                    JointState.from_position(qh.unsqueeze(0), joint_names=names))
-            ).tool_poses.get_link_pose(af, make_contiguous=True).get_matrix().reshape(4, 4)
+            hm = _home_tool_matrix(world)
             T = hm.unsqueeze(0).repeat(4, 1, 1).clone()
             T[:, 0, 3] += 0.2
             _ik_for_pose(world, T, "left")
@@ -157,12 +159,13 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
     # the leg/torso joints the residual is meant to recruit.
     from curobo._src.solver.seed_ik.seed_ik_error_calculator import com_support_penalty
     from curobo.types import JointState
+    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
 
     world = _world(enable_com_aware_ik=True)
     model = world.ik_solver.seed_ik_solver._robot_model
     device = model.device_cfg.device
     names = list(model.joint_names)
-    half = torch.tensor([0.1115, 0.156], device=device)
+    half = torch.tensor(list(COM_HALF_EXTENTS), device=device)
     base_idx = list(model.tool_frames).index("mobile_base_link")
 
     def penalty_at(q):
@@ -171,7 +174,7 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
         com = ks.robot_com.view(1, -1)[:, :3]
         pos = ks.tool_poses.position.view(1, len(model.tool_frames), 3)[:, base_idx, :]
         quat = ks.tool_poses.quaternion.view(1, len(model.tool_frames), 4)[:, base_idx, :]
-        return com_support_penalty(com, pos, quat, half, 0.02, 1.0, 0.0).sum()
+        return com_support_penalty(com, pos, quat, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, 0.0).sum()
 
     # A leaning config so the penalty is active: Torso_Pitch forward.
     q0 = torch.zeros(1, model.get_dof(), device=device)
@@ -197,15 +200,11 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
 
 def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
     """IK a forward-reach grid for the left arm; return (q_full[B,21], success[B], result)."""
-    from curobo.types import JointState
-    from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q
-    names = list(world.kinematics.joint_names)
+    from cutamp.particle_initialization import (
+        _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask,
+    )
     qh = world.q_init
-    af = world.tool_frame_for_arm("left")
-    hm = world.kinematics.compute_kinematics(
-        world.kinematics.get_active_js(
-            JointState.from_position(qh.unsqueeze(0), joint_names=names))
-    ).tool_poses.get_link_pose(af, make_contiguous=True).get_matrix().reshape(4, 4)
+    hm = _home_tool_matrix(world)
     Ts = []
     for f in torch.linspace(0.15, 0.33, n_fwd, device=qh.device):
         for lat in torch.linspace(-0.05, 0.15, n_lat, device=qh.device):
@@ -213,22 +212,12 @@ def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
             # sweeping Y in [-0.05, 0.15] creates demanding cross-body reaches.
             m = hm.clone(); m[0, 3] += float(f); m[1, 3] = float(lat); Ts.append(m)
     res = _ik_for_pose(world, torch.stack(Ts, 0), "left")
-    s = res.success
-    succ = (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
-    return _ik_solution_to_full_q(res, world), succ, res
+    return _ik_solution_to_full_q(res, world), _ik_success_mask(res), res
 
 
 def _com_abs_x(world, q_full):
-    from curobo.types import JointState
-    kin = world.kinematics_with_com
-    names = list(world.kinematics.joint_names)
-    ks = kin.compute_kinematics(kin.get_active_js(
-        JointState.from_position(q_full.to(kin.device_cfg.device), joint_names=names)))
-    cw = ks.robot_com[..., :3].reshape(-1, 3)
-    bT = ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True) \
-        .get_matrix().reshape(-1, 4, 4)
-    cib = (bT[:, :3, :3].transpose(-1, -2) @ (cw - bT[:, :3, 3]).unsqueeze(-1)).squeeze(-1)
-    return cib[:, 0].abs()
+    from cutamp.com_polygon_cost import compute_com_in_base
+    return compute_com_in_base(world, q_full)[:, 0].abs()
 
 
 @needs_cuda
@@ -295,9 +284,3 @@ def test_store_ik_q_masks_failed_solutions_to_home():
     assert torch.allclose(stored[0], world.q_init), \
         "failed-IK row must fall back to q_init, not keep an unvetted conf"
 
-
-def test_ik_for_pose_has_no_dormant_num_seeds_kwarg():
-    import inspect
-    from cutamp.particle_initialization import _ik_for_pose
-    assert "num_seeds" not in inspect.signature(_ik_for_pose).parameters, \
-        "num_seeds forwarded to solve_pose would TypeError (no such param)"

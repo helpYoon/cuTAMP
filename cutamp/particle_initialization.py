@@ -231,6 +231,16 @@ def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
     return ik.kinematics.get_full_js(sol_js).reorder(list(world.kinematics.joint_names)).position
 
 
+def _ik_success_mask(ik_result) -> torch.Tensor:
+    """``[B]`` bool success mask for the stored (seed-0) solution.
+
+    cuRobo result fields are ``[B]`` or ``[B, return_seeds]``; the seed-0
+    column pairs with ``_ik_solution_to_full_q``'s ``solution[:, 0]``.
+    """
+    s = ik_result.success
+    return (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
+
+
 def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: Optional[str]) -> None:
     """Store the IK result's q under ``q_name``, reordered to the full kin's joint order.
 
@@ -239,10 +249,9 @@ def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: 
     unsuccessful solution may be out-of-limit and must not enter particles.
     """
     q_full = _ik_solution_to_full_q(ik_result, world)
-    s = ik_result.success
-    success = (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
+    success = _ik_success_mask(ik_result).to(q_full.device)
     home = world.q_init.to(q_full.device).unsqueeze(0).expand_as(q_full)
-    particles[q_name] = torch.where(success.to(q_full.device).unsqueeze(-1), q_full, home)
+    particles[q_name] = torch.where(success.unsqueeze(-1), q_full, home)
 
 
 class ParticleInitializer:

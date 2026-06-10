@@ -11,6 +11,15 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
+# Single source of truth for soft-cost names: the CostFunction dispatch, the
+# CLI choices, and config validation all key off this tuple.
+SUPPORTED_SOFT_COSTS = (
+    "dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist",
+    "min_y", "max_y", "align_yaw", "retract_close_to_home",
+    "minimize_body_movement", "com_polygon",
+)
+
+
 @dataclass(frozen=True)
 class TAMPConfiguration:
     # Number of particles to initialize and optimize over
@@ -38,12 +47,10 @@ class TAMPConfiguration:
     break_on_satisfying: bool = True
 
     ## Soft Costs
-    # Default ON since 2026-06-09: the (optimize_soft_costs + coupled_reik +
-    # place_close_to_base) trio dominated every metric in validation — placements
-    # pulled to 0.35-0.37 m reach (no far-place COM tail), all arrivals centered,
-    # num_satisfying 30-40 vs ~15.7 without.
+    # Default ON: validated as a trio with coupled_reik + place_close_to_base
+    # (commit 0c94674) — don't toggle one without considering the others.
     optimize_soft_costs: bool = True
-    # Supported: dist_from_origin, place_close_to_base, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw, retract_close_to_home, minimize_body_movement, com_polygon
+    # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
     soft_cost: Optional[List[str]] = field(default_factory=lambda: ["place_close_to_base"])
     # Diagnostic: mimic NVlabs/cuTAMP main — Adam always runs with soft costs
     # in the loss; no Phase 2 LBFGS. Useful for pose-class soft costs that
@@ -87,10 +94,8 @@ class TAMPConfiguration:
     enable_com_polygon: bool = True
     ik_com_retry_max: int = 3   # Backstop: post-IK COM mask retries (CoM-aware IK makes violations rare).
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
-    # COM, recruiting legs within limits. Validated 2026-06-09 (plan Task 9):
-    # suite 68/68; num_satisfying mean 10.67 on vs 12.00 off (within -3 gate);
-    # endpoint audit 2/2 plans with all 528 frames at penalty 0.0 (baseline:
-    # worst arrivals at 73-99% of COM_TOL in 7/10 trials).
+    # COM, recruiting legs within limits. The post-IK mask (ik_com_retry_max)
+    # stays as the backstop. Validation: commits 217d4b6 / 5b9ae65.
     enable_com_aware_ik: bool = True
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
@@ -147,6 +152,9 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"Configuration learning rate (conf_lr) must be positive, not {config.conf_lr}")
     if config.reik_interval <= 0:
         raise ValueError(f"reik_interval must be positive, not {config.reik_interval}")
+    for name in (config.soft_cost or []):
+        if name not in SUPPORTED_SOFT_COSTS:
+            raise ValueError(f"Unknown soft cost {name!r}; supported: {SUPPORTED_SOFT_COSTS}")
 
     # Advanced args
     if config.max_loop_dur is not None and config.max_loop_dur <= 0:

@@ -9,8 +9,8 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-def _make_world(enable_com_polygon: bool = True):
-    """Build a real TAMPWorld for blocks_t1 with optional COM toggle."""
+def _make_world():
+    """Build a real TAMPWorld for blocks_t1."""
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.tamp_world import TAMPWorld
     from cutamp.robots import load_robot_container
@@ -22,10 +22,7 @@ def _make_world(enable_com_polygon: bool = True):
     device_cfg = DeviceCfg()
     robot = load_robot_container("t1", device_cfg)
     q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=device_cfg.device)
-    return TAMPWorld(
-        env=env, device_cfg=device_cfg, robot=robot, q_init=q_init,
-        enable_com_polygon=enable_com_polygon,
-    )
+    return TAMPWorld(env=env, device_cfg=device_cfg, robot=robot, q_init=q_init)
 
 
 @needs_cuda
@@ -34,7 +31,7 @@ def test_compute_com_polygon_mask_basic():
     correctly classifies a home-pose batch as inside the polygon."""
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_mask
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     # At home pose all DOFs are 0; COM is directly above the wheelbase
     # center → inside polygon for sure. Build a [B=4, full_dof] batch all
     # at home and assert all four come back True.
@@ -56,7 +53,7 @@ def test_compute_com_polygon_mask_excludes_extreme_lean():
     we observed pre-fix)."""
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_mask
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     full_names = list(world.kinematics.joint_names)
     home = world.q_init.detach().clone()
     # Build a configuration with deep forward bend.
@@ -81,7 +78,7 @@ def test_ik_for_pose_com_safe_returns_valid_result():
     a usable result."""
     import torch
     from cutamp.particle_initialization import _ik_for_pose_com_safe
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     # Build a [B=4, 4, 4] batch of reachable left-hand targets.
     # Pose: hand at (0.4, +0.2, 0.5) world — well within left arm reach.
     B = 4
@@ -142,7 +139,7 @@ def test_curobo_batched_com_kernel_returns_per_batch_distinct():
     call returns the SAME per-batch COMs as four separate B=1 calls."""
     import torch
     from curobo.types import JointState
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     kin = world.kinematics_with_com
     full_names = list(world.kinematics.joint_names)
     name_to_idx = {n: i for i, n in enumerate(full_names)}
@@ -194,7 +191,7 @@ def test_compute_com_polygon_penalties_is_differentiable():
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_penalties
 
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     full_names = list(world.kinematics.joint_names)
     name_to_idx = {n: i for i, n in enumerate(full_names)}
     home = world.q_init.detach().clone()
@@ -237,7 +234,7 @@ def test_compute_com_polygon_penalties_matches_mask_at_tolerance():
         compute_com_polygon_penalties,
     )
 
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     full_names = list(world.kinematics.joint_names)
     name_to_idx = {n: i for i, n in enumerate(full_names)}
     home = world.q_init.detach().clone()
@@ -355,7 +352,7 @@ def test_mask_matches_penalty_gate():
     from cutamp.com_polygon_cost import (
         COM_TOL, compute_com_polygon_mask, compute_com_polygon_penalties,
     )
-    world = _make_world(enable_com_polygon=True)
+    world = _make_world()
     # Spread a batch of configs around home so some land near the polygon edge.
     torch.manual_seed(0)
     home = world.q_init.detach().clone()

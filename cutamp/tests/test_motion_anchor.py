@@ -99,6 +99,12 @@ def _generate_plan_segments(seed: int):
         num_opt_steps=50,
         curobo_plan=True,
         enable_com_polygon=True,
+        # Pin the soft-cost trio OFF: these tests assert segment schema +
+        # arrival COM-in-hull, which the CoM-aware IK + hard gate guarantee
+        # regardless; running the default coupled-reik optimization here only
+        # doubles runtime (trio coverage lives in test_coupled_reik_smoke).
+        optimize_soft_costs=False,
+        coupled_reik=False,
         enable_visualizer=False,
         enable_experiment_logging=False,
     )
@@ -120,8 +126,7 @@ def _generate_plan_segments(seed: int):
     dc = DeviceCfg()
     robot = load_robot_container("t1", dc)
     q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=dc.device)
-    world = TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init,
-                      enable_com_polygon=True)
+    world = TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init)
     return world, processed["segments"]
 
 
