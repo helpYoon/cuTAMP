@@ -36,3 +36,18 @@ def t1_planar_base_config_path(t1_assets_path):
 def t1_planar_base_config(t1_planar_base_config_path):
     from curobo._src.util.config_io import load_yaml
     return load_yaml(t1_planar_base_config_path)
+
+
+@pytest.fixture(autouse=True)
+def _free_cuda_between_tests():
+    """Release GPU memory after each test. Integration tests build full
+    TAMPWorld stacks (several GiB each); without reclaiming between tests,
+    two heavy tests in one process OOM a 24 GiB card. Harmless for CPU tests."""
+    yield
+    import gc
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
