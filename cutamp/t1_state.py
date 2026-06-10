@@ -37,8 +37,6 @@ from cutamp.robots.t1 import (
     RIGHT_ARM_JOINT_NAMES,
     RIGHT_TOOL_FRAME,
     TOOL_FRAME_FOR_ARM,
-    GRIPPER_OPEN,
-    GRIPPER_CLOSED,
     JOINT_NAMES_FULL,
 )
 
@@ -64,9 +62,6 @@ class T1State:
 
     def get_tool_frame(self, arm: Literal["left", "right"]) -> str:
         return TOOL_FRAME_FOR_ARM[arm]
-
-    def other_arm(self, arm: Literal["left", "right"]) -> Literal["left", "right"]:
-        return "right" if arm == "left" else "left"
 
     @cached_property
     def _planner_joint_names(self) -> List[str]:
@@ -192,7 +187,6 @@ class T1State:
             default_weight=default_weight,
             hosts=hosts if hosts is not None else [self.planner],
         )
-        # `_disabled_tool_pose_frames` is now set inside `_apply_pin`.
 
     def unpin(self) -> None:
         """Restore default cspace weights and re-enable any disabled
@@ -208,9 +202,6 @@ class T1State:
                 {f: ToolPoseCriteria() for f in self._disabled_tool_pose_frames}
             )
             self._disabled_tool_pose_frames = None
-
-    def gripper_state(self, arm: Literal["left", "right"]):
-        return GRIPPER_CLOSED if self.arm_holding.get(arm) is not None else GRIPPER_OPEN
 
     def compute_held_obj_poses(
         self,

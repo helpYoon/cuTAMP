@@ -20,7 +20,7 @@ import roma
 import torch
 
 from curobo.scene import Cuboid
-from curobo.types import GoalToolPose, JointState, Pose
+from curobo.types import JointState, Pose
 
 from cutamp._curobo_internals import (
     inactive_arm_cspace_weights,
@@ -31,6 +31,12 @@ from cutamp._curobo_internals import (
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
 from cutamp.grasp_planning import _build_multi_frame_goal
+from cutamp.robots.t1 import (
+    BASE_INDICES,
+    LEFT_ARM_INDICES,
+    RIGHT_ARM_INDICES,
+    t1_home,
+)
 from cutamp.samplers import (
     grasp_4dof_sampler,
     grasp_6dof_sampler,
@@ -48,11 +54,6 @@ from cutamp.utils.common import (
     transform_spheres,
 )
 from cutamp.utils.shapes import MultiSphere
-
-try:
-    from cutamp.robots.t1 import t1_home
-except ImportError:
-    t1_home = None
 
 _log = logging.getLogger(__name__)
 
@@ -189,11 +190,11 @@ def _ik_for_pose_com_safe(
         noise_std = 0.1 * (_attempt + 1)
         seed = world.q_init.unsqueeze(0).expand(batch_size, -1).clone()
         noise = torch.randn(batch_size, full_dof, device=device) * noise_std
-        noise[:, :3] = 0.0  # base locked
+        noise[:, BASE_INDICES] = 0.0  # base locked
         if arm == "left":
-            noise[:, 14:21] = 0.0  # right arm locked
+            noise[:, RIGHT_ARM_INDICES] = 0.0  # right arm locked
         elif arm == "right":
-            noise[:, 7:14] = 0.0  # left arm locked
+            noise[:, LEFT_ARM_INDICES] = 0.0  # left arm locked
         seed = seed + noise
         # Clamp the perturbed seed to joint limits so large-sigma retries don't
         # hand cuRobo an out-of-limits current_state. Limits come from the same
@@ -216,6 +217,26 @@ def _ik_for_pose_com_safe(
             f"still out of COM polygon after {max_retries} retries"
         )
     return result
+
+
+def _sample_push_poses(
+    world: TAMPWorld, button: str, num_particles: int, device,
+) -> torch.Tensor:
+    """Sample ``[num_particles, 4]`` (x, y, z, yaw) push poses over ``button``.
+
+    XY is sampled uniformly over the button's top AABB face (inset 1 cm from
+    the edges); z hovers above the surface by 2 cm plus the collision
+    activation distance so the pusher isn't initialized in contact.
+    """
+    aabb = world.get_aabb(button).clone()
+    surface_z = aabb[1, 2]
+    lower_xy, upper_xy = aabb[:, :2]
+    lower_xy += 0.01
+    upper_xy -= 0.01
+    sampled_xy = lower_xy + torch.rand(num_particles, 2, device=device) * (upper_xy - lower_xy)
+    sampled_z = surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
+    sampled_yaw = sample_yaw(num_particles, num_faces=None, device=device)
+    return torch.cat([sampled_xy, sampled_z[:, None], sampled_yaw[:, None]], dim=1)
 
 
 def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
@@ -273,7 +294,7 @@ class ParticleInitializer:
         self.push_stick_cache = {}
         self.failed_push = set()
 
-    def _initial_particles(self, num_particles: int) -> Particles:
+    def _initial_particles(self) -> Particles:
         return {
             "left_q0": self.q_init.clone(),
             "right_q0": self.q_init.clone(),
@@ -304,7 +325,7 @@ class ParticleInitializer:
         world = self.world
         device = world.device
 
-        particles = self._initial_particles(num_particles)
+        particles = self._initial_particles()
         deferred_params: set[str] = set()
         move_free_deferred: dict[str, str] = {}
         log_debug = _log.debug if verbose else lambda *args, **kwargs: None
@@ -508,15 +529,7 @@ class ParticleInitializer:
                     )
                     continue
 
-                aabb = world.get_aabb(button).clone()
-                surface_z = aabb[1, 2]
-                lower_xy, upper_xy = aabb[:, :2]
-                lower_xy += 0.01
-                upper_xy -= 0.01
-                sampled_xy = lower_xy + torch.rand(num_particles, 2, device=device) * (upper_xy - lower_xy)
-                sampled_z = surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
-                sampled_yaw = sample_yaw(num_particles, num_faces=None, device=device)
-                sampled_push = torch.cat([sampled_xy, sampled_z[:, None], sampled_yaw[:, None]], dim=1)
+                sampled_push = _sample_push_poses(world, button, num_particles, device)
                 particles[push_pose] = sampled_push
 
                 world_from_push = action_4dof_to_mat4x4(sampled_push)
@@ -567,15 +580,7 @@ class ParticleInitializer:
                     )
                     continue
 
-                aabb = world.get_aabb(button).clone()
-                surface_z = aabb[1, 2]
-                lower_xy, upper_xy = aabb[:, :2]
-                lower_xy += 0.01
-                upper_xy -= 0.01
-                sampled_xy = lower_xy + torch.rand(num_particles, 2, device=device) * (upper_xy - lower_xy)
-                sampled_z = surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
-                sampled_yaw = sample_yaw(num_particles, num_faces=None, device=device)
-                sampled_push = torch.cat([sampled_xy, sampled_z[:, None], sampled_yaw[:, None]], dim=1)
+                sampled_push = _sample_push_poses(world, button, num_particles, device)
 
                 stick: MultiSphere = world.get_object("stick")
                 spheres = stick.spheres

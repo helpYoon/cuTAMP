@@ -103,7 +103,7 @@ def entrypoint():
         choices=["blocks_t1"],
     )
     parser.add_argument(
-        "-n", "--num_particles", type=int, default=1024, help="Number of particles to use (i.e. batch size)"
+        "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
     )
 
     # Soft costs
@@ -123,7 +123,7 @@ def entrypoint():
     )
     parser.set_defaults(coupled_reik=_defaults.coupled_reik)
     parser.add_argument(
-        "--reik_interval", type=int, default=5,
+        "--reik_interval", type=int, default=_defaults.reik_interval,
         help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
     )
     parser.add_argument(
@@ -138,7 +138,7 @@ def entrypoint():
     parser.add_argument(
         "--grasp_dof",
         type=int,
-        default=4,
+        default=_defaults.grasp_dof,
         choices=[4, 6],
         help="Grasp DOF to use.",
     )
@@ -146,7 +146,7 @@ def entrypoint():
     # Approach
     parser.add_argument(
         "--approach",
-        default="optimization",
+        default=_defaults.approach,
         choices=["optimization", "sampling"],
         help="Approach to use. Optimization is cuTAMP (sampling + optimization), while sampling is just resampling."
         "If using sampling, you may need to modify the --num_resampling_attempts.",
@@ -158,23 +158,23 @@ def entrypoint():
         help="Number of resampling attempts per skeleton if using sampling approach.",
     )
     parser.add_argument(
-        "--num_opt_steps", type=int, default=1000, help="Number of optimization steps to run for each skeleton."
+        "--num_opt_steps", type=int, default=_defaults.num_opt_steps, help="Number of optimization steps to run for each skeleton."
     )
     parser.add_argument(
-        "--lr", type=float, default=7e-3, help="Adam LR for non-Conf particle params (poses, grasps).",
+        "--lr", type=float, default=_defaults.lr, help="Adam LR for non-Conf particle params (poses, grasps).",
     )
     parser.add_argument(
-        "--conf_lr", type=float, default=2.226e-2,
+        "--conf_lr", type=float, default=_defaults.conf_lr,
         help="Adam LR for Conf particle params (robot q). Lowering this reduces Adam first-step destruction on T1's 21-DOF cspace.",
     )
     parser.add_argument(
         "--max_duration",
         type=float,
-        default=None,
+        default=_defaults.max_loop_dur,
         help="Maximum duration for optimization or sampling in seconds. Overrides --num_resampling_attempts and --num_opt_steps if set.",
     )
     parser.add_argument(
-        "--num_initial_plans", type=int, default=30, help="Number of initial plans to sample with task planner."
+        "--num_initial_plans", type=int, default=_defaults.num_initial_plans, help="Number of initial plans to sample with task planner."
     )
     parser.add_argument("--cache_subgraphs", action="store_true", help="Whether to cache subgraph samples for reuse.")
     parser.add_argument(
@@ -208,7 +208,7 @@ def entrypoint():
         help="Disable the rerun visualizer. Note if you want accurate timing information, you should disable the visualizer.",
     )
     parser.add_argument(
-        "--viz_interval", type=int, default=10, help="Interval for visualizing optimization state in steps."
+        "--viz_interval", type=int, default=_defaults.opt_viz_interval, help="Interval for visualizing optimization state in steps."
     )
     parser.add_argument(
         "--disable_robot_mesh",
@@ -216,7 +216,7 @@ def entrypoint():
         help="Disable robot mesh visualization to save visualization bandwidth.",
     )
     parser.add_argument(
-        "--experiment_root", type=str, default="/tmp/cutamp-experiments", help="Root directory for experiment logging."
+        "--experiment_root", type=str, default=_defaults.experiment_root, help="Root directory for experiment logging."
     )
     parser.add_argument(
         "--experiment_id",
@@ -231,13 +231,9 @@ def entrypoint():
         const="auto",
         default=None,
         help=(
-            "Save the generated motion plan to a pickle file in a structured format. "
-            "Omit flag to skip saving. Pass with no arg to write to "
-            "<experiment_root>/<experiment_id>/motion_plan.pkl. Pass an explicit path "
-            "to write there instead. Pickle contains per-segment dicts with "
-            "position/velocity arrays for [trunk_height, trunk_pitch, trunk_yaw, "
-            "right_arm(7), left_arm(7), right_hand_xyz+quat, left_hand_xyz+quat] "
-            "plus dt and held_objs. See cutamp/utils/plan_processor.py for schema."
+            "Save the processed motion plan as a pickle (no arg: "
+            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path). "
+            "See cutamp/utils/plan_processor.py for the schema."
         ),
     )
 

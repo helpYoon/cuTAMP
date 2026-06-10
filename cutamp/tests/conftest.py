@@ -13,6 +13,21 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
+def make_blocks_t1_world(**tamp_world_kwargs):
+    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests."""
+    import torch
+    from curobo.types import DeviceCfg
+    from cutamp.envs.utils import get_env_dir, load_env
+    from cutamp.robots import load_robot_container
+    from cutamp.robots.t1 import t1_home
+    from cutamp.tamp_world import TAMPWorld
+    dc = DeviceCfg()
+    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
+    robot = load_robot_container("t1", dc)
+    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=dc.device)
+    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, **tamp_world_kwargs)
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     if not torch.cuda.is_available():

@@ -18,9 +18,11 @@ class OperatorMetadata:
     Attributes:
         is_actionable: Whether this operator creates action parameters (grasps, placements, push poses)
                        that require IK solving. True for Pick, Place, Push, PushStick operators.
-        is_motion: Whether this operator represents a motion between configurations (MoveFree, MoveHolding).
+        is_motion: Whether this operator represents a motion between configurations
+                   (MoveFree, MoveHolding, Retract*, MoveBaseTo).
         arm: Which arm this operator uses ("left", "right", or None for navigate/non-arm ops).
-        action_type: The type of action ("pick", "place", "push", "push_stick", None for motion ops).
+        action_type: The type of action ("pick", "place", "push", "push_stick"); for motion ops it is
+                     "retract" (Retract*), "navigate" (MoveBaseTo), or None (plain MoveFree/MoveHolding).
     """
     is_actionable: bool = False
     is_motion: bool = False
@@ -70,7 +72,6 @@ class Fluent:
         if len(self.parameters) != len(values):
             raise ValueError(f"Expected {len(self.parameters)} values, got {len(values)}")
 
-        values = [val.name if isinstance(val, Parameter) else val for val in values]
         return Atom(self, values)
 
     def __str__(self) -> str:
@@ -88,6 +89,11 @@ class Atom:
     fluent: Fluent
     values: Sequence[str] = field(default_factory=list)
 
+    def __post_init__(self):
+        # Cache the identity key (fluent name + values) so __hash__/__eq__ don't rebuild
+        # the repr string on every call. object.__setattr__ because the dataclass is frozen.
+        object.__setattr__(self, "_key", (self.fluent.name, tuple(self.values)))
+
     @property
     def name(self) -> str:
         return self.fluent.name
@@ -97,12 +103,11 @@ class Atom:
         return f"{self.name}({val_str})"
 
     def __hash__(self) -> int:
-        # Atom identity is defined by its string representation
-        return hash(str(self))
+        # Atom identity is defined by its fluent name + values
+        return hash(self._key)
 
     def __eq__(self, other):
-        # Equality also based on string representation (same fluent + same values)
-        return isinstance(other, Atom) and str(self) == str(other)
+        return isinstance(other, Atom) and self._key == other._key
 
     def __repr__(self) -> str:
         return str(self)

@@ -7,7 +7,7 @@ This tool allows you to:
 3. Export to .pt tensor for gripper spheres (used by particle initialization)
 
 Usage:
-    python -m cutamp.scripts.sphere_editor --urdf path/to/robot.urdf
+    python -m cutamp.scripts.gripper_sphere_editor --urdf path/to/robot.urdf
 
 Key Controls:
     L           - Cycle through links
@@ -1065,22 +1065,13 @@ def main():
     )
     parser.add_argument(
         "--load",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Load existing .pt files if available (default: True)",
+        help="Load existing spheres from YAML/.pt (use --no-load to always auto-fit)",
     )
-    parser.add_argument(
-        "--no-load",
-        action="store_true",
-        help="Don't load existing .pt files, always auto-fit from scratch",
-    )
-    
+
     args = parser.parse_args()
-    
-    # Handle --no-load flag
-    if args.no_load:
-        args.load = False
-    
+
     # Resolve paths
     urdf_path = Path(args.urdf)
     if not urdf_path.is_absolute():

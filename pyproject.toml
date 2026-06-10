@@ -22,7 +22,6 @@ classifiers = [
 dependencies = [
     "einops",
     "jaxtyping",
-    "omegaconf",
     "open3d",
     "rerun-sdk",
     "roma",

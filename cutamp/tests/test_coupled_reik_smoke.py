@@ -1,13 +1,9 @@
 """Smoke test for --coupled_reik path. Catches the A1-class regression where
 the coupled-reIK feature TypeErrors on first refresh."""
-import os
-import pytest
+from cutamp.tests.conftest import needs_cuda
 
 
-@pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
+@needs_cuda
 def test_coupled_reik_runs_without_error(tmp_path):
     """Run cutamp_demo with --coupled_reik for a few Adam steps. Assert no exception."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.

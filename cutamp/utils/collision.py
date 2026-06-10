@@ -88,23 +88,9 @@ def get_world_collision_cost(
     activation_distance: float,
     weight: float = 1.0,
 ) -> WorldCollisionCost:
-    """Build a callable world-collision cost for the given Scene."""
-    return WorldCollisionCost(scene, device_cfg, activation_distance, weight)
+    """Build a callable world-collision cost for the given Scene.
 
-
-def get_collision_checker(
-    scene: Scene,
-    device_cfg: DeviceCfg,
-    max_distance: float = 0.1,
-) -> SceneCollision:
-    """Build a SceneCollision (low-level handle) for the given Scene.
-
-    Use the higher-level ``WorldCollisionCost`` when possible; this is exposed
-    for code paths that want direct access to the scene checker.
+    Thin passthrough kept for the single caller in tamp_world.py; inlining it
+    there is deferred until that file is free to change.
     """
-    cfg = SceneCollisionCfg(
-        device_cfg=device_cfg,
-        scene_model=scene,
-        max_distance=max_distance,
-    )
-    return SceneCollision.from_config(cfg)
+    return WorldCollisionCost(scene, device_cfg, activation_distance, weight)

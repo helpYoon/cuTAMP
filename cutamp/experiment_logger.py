@@ -11,7 +11,6 @@ import json
 import logging
 from pathlib import Path
 
-import omegaconf
 import yaml
 
 from cutamp.config import TAMPConfiguration
@@ -19,15 +18,6 @@ from cutamp.envs import TAMPEnvironment
 from cutamp.envs.utils import get_env_dict
 
 _log = logging.getLogger(__name__)
-
-
-class _OmegaConfEncoder(json.JSONEncoder):
-    """Encode OmegaConf objects for JSON serialization."""
-
-    def default(self, obj):
-        if isinstance(obj, (omegaconf.ListConfig, omegaconf.DictConfig)):
-            return omegaconf.OmegaConf.to_container(obj, resolve=True)
-        return super().default(obj)
 
 
 class ExperimentLogger:
@@ -52,7 +42,7 @@ class ExperimentLogger:
 
         # Save as JSON, YAML is too slow to load
         with open(path, "w") as f:
-            json.dump(data, f, indent=2, cls=_OmegaConfEncoder)
+            json.dump(data, f, indent=2)
         _log.info(f"Logged {name} to {path}")
         return path
 

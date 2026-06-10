@@ -59,6 +59,8 @@ RightJustPicked = Fluent("RightJustPicked")
 LeftJustPlaced = Fluent("LeftJustPlaced")
 RightJustPlaced = Fluent("RightJustPlaced")
 
+# Deliberately redundant with *HoldingWithGrasp: these are the grasp-free goal predicates
+# reachable from env YAML goals (which can name an object but not a grasp literal).
 LeftHolding = Fluent("LeftHolding", [Parameter("obj", Movable)])
 RightHolding = Fluent("RightHolding", [Parameter("obj", Movable)])
 
@@ -420,12 +422,19 @@ RightRetractFree = TAMPOperator(
 
 # MoveBaseTo: planar-base navigation bound to a target object.
 #
-# Both arms must be at the same starting config (LeftAt(q_start) AND
-# RightAt(q_start)) — initially this is satisfied via shared "q0" in
-# get_initial_state. After MoveBaseTo, both LeftAt and RightAt point to the
-# same q_end (which differs from q_start only in base[0:3]). Subsequent arm
-# operators may diverge LeftAt/RightAt as before (this is fine — once the base
-# is positioned, arm ops do not move it).
+# NOTE: currently unfireable. The precondition requires both arms at the same
+# config literal (LeftAt(q_start) AND RightAt(q_start)), but get_initial_state
+# grounds LeftAt("left_q0") and RightAt("right_q0") — distinct literals — so
+# q_start never co-binds, and no arm operator ever makes LeftAt/RightAt share
+# a literal afterwards. To wire it up, either (a) ground a shared initial
+# config (e.g. both arms at "q0") and keep arm ops from diverging it before
+# navigation, or (b) split the precondition into separate left/right start
+# parameters (q_start_l, q_start_r) with a combined q_end pair in the effects.
+#
+# Intended semantics once fireable: after MoveBaseTo, both LeftAt and RightAt
+# point to the same q_end (which differs from q_start only in base[0:3]).
+# Subsequent arm operators may diverge LeftAt/RightAt as before (this is fine
+# — once the base is positioned, arm ops do not move it).
 #
 # The "Bound to target" semantics: q_end's base must place the target object
 # within reach of either tool frame. The cost function enforces reachability

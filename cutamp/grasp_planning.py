@@ -1,26 +1,17 @@
-"""Single-arm grasp planner — fork of ``MotionPlanner.plan_grasp`` for cuTAMP.
+"""Multi-frame goal construction for single-arm actions on T1.
 
-The stock ``MotionPlanner.plan_grasp`` (curobo/_src/motion/motion_planner.py:412)
-applies its approach/lift offsets uniformly to every frame in
-``grasp_poses.tool_frames``. For T1 we want the offsets applied only to the
-*active* arm; the inactive arm should stay put. This wrapper:
-
-- Accepts a single active tool frame name.
-- Builds a ``GoalToolPose`` covering ALL of the planner's tool frames — the
-  active frame gets the requested target pose, inactive frames get their
-  current FK pose so the IK's ``reorder_links`` check accepts the goal.
-- The caller is expected to have called ``T1State.pin_for_arm_action(arm)``
-  beforehand, which both pins the inactive arm's cspace weight and calls
-  ``update_tool_pose_criteria({inactive: ToolPoseCriteria.disabled()})`` so
-  the inactive frame's pose cost is zero — the trajopt won't try to drag
-  the inactive arm to satisfy a pose target.
+cuRobo IK's ``reorder_links`` check requires a ``GoalToolPose`` that covers
+every kinematics tool frame, even when only one arm is acting.
+``_build_multi_frame_goal`` builds that goal: the active frame gets the
+requested target pose, and every inactive frame gets its current FK pose at
+the segment's start state. The inactive frame's ``ToolPoseCriteria`` stays
+ENABLED — cuRobo's native world-frame ``tool_pose`` cost therefore holds the
+inactive wrist at its start pose, complementing the inactive-arm cspace pin
+applied by ``T1State.pin_for_arm_action``.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-import torch
-
-from curobo.motion_planner import GraspPlanResult, MotionPlanner
 from curobo.types import GoalToolPose, JointState, Pose
 
 
@@ -49,61 +40,3 @@ def _build_multi_frame_goal(
         for f in inactive:
             poses[f] = kin_state.tool_poses.get_link_pose(f)
     return GoalToolPose.from_poses(poses, ordered_tool_frames=all_frames)
-
-
-def plan_single_arm_grasp(
-    planner: MotionPlanner,
-    active_tool_frame: str,
-    grasp_poses_dict: dict,
-    current_state: JointState,
-    *,
-    grasp_approach_axis: str = "z",
-    grasp_approach_offset: float = -0.15,
-    grasp_lift_axis: str = "z",
-    grasp_lift_offset: float = -0.15,
-    plan_approach_to_grasp: bool = True,
-    plan_grasp_to_lift: bool = True,
-    disable_collision_links: Optional[List[str]] = None,
-) -> GraspPlanResult:
-    """Plan an approach→grasp→lift trajectory for one arm.
-
-    Args:
-        planner: The unified MotionPlanner (covers all tool frames).
-        active_tool_frame: The tool frame that should execute the grasp.
-        grasp_poses_dict: ``{active_tool_frame: Pose}`` for the candidate grasp(s).
-        current_state: Current joint state (full robot DOF).
-        grasp_approach_axis / grasp_approach_offset: how far to back off along
-            the tool axis before approaching.
-        grasp_lift_axis / grasp_lift_offset: how far to lift after grasping.
-        plan_approach_to_grasp / plan_grasp_to_lift: which sub-trajectories to
-            actually plan (matches stock ``plan_grasp``).
-        disable_collision_links: links to disable collisions for during the
-            grasp. Defaults to the planner's grasp_contact_link_names.
-    """
-    if active_tool_frame not in grasp_poses_dict:
-        raise ValueError(f"grasp_poses_dict must contain {active_tool_frame}")
-
-    # Multi-tool goal: active frame gets the grasp pose; inactive frames get
-    # their current FK pose. cuRobo's plan_grasp will add the approach/lift
-    # offset to ALL frames in the goal, so the inactive frames receive
-    # offset versions of their current poses — but the inactive
-    # ToolPoseCriteria has been zeroed by pin_for_arm_action, so the trajopt
-    # ignores those targets and the inactive arm stays put under its cspace
-    # pin.
-    grasp_goal = _build_multi_frame_goal(
-        planner, active_tool_frame, grasp_poses_dict[active_tool_frame], current_state,
-    )
-
-    return planner.plan_grasp(
-        grasp_poses=grasp_goal,
-        current_state=current_state,
-        grasp_approach_axis=grasp_approach_axis,
-        grasp_approach_offset=grasp_approach_offset,
-        grasp_approach_in_tool_frame=True,
-        grasp_lift_axis=grasp_lift_axis,
-        grasp_lift_offset=grasp_lift_offset,
-        grasp_lift_in_tool_frame=True,
-        plan_approach_to_grasp=plan_approach_to_grasp,
-        plan_grasp_to_lift=plan_grasp_to_lift,
-        disable_collision_links=disable_collision_links,
-    )

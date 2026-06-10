@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
-# Single source of truth for soft-cost names: the CostFunction dispatch, the
-# CLI choices, and config validation all key off this tuple.
+# The CLI choices (run_cutamp.py) and validate_tamp_config key off this tuple.
+# Note: cost_function.py's _compute_soft_cost hard-codes the same names and
+# must be kept in sync by hand.
 SUPPORTED_SOFT_COSTS = (
     "dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist",
     "min_y", "max_y", "align_yaw", "retract_close_to_home",
@@ -108,8 +109,6 @@ class TAMPConfiguration:
     # the outer retry usually masks transient failures; turn on when debugging
     # cuRobo trajopt issues. See cutamp/utils/motion_diagnostics.py.
     debug_motion_failures: bool = False
-    # For slowing down cuRobo motion plans (0.5 is safe on the real robot)
-    time_dilation_factor: Optional[float] = None
     # Whether to warmup IK solver
     warmup_ik: bool = True
     # Whether to warmup motion generator

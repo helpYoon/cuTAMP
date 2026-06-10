@@ -1,24 +1,13 @@
 """Tests for CoM-aware seed-IK (LM residual fork). Spec:
 docs/superpowers/specs/2026-06-09-com-aware-ik-design.md"""
-import os
 import pytest
 import torch
 
-from cutamp.tests.conftest import needs_cuda
+from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
 def _world(enable_com_aware_ik: bool):
-    from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.tamp_world import TAMPWorld
-    from cutamp.robots import load_robot_container
-    from cutamp.robots.t1 import t1_home
-    from curobo.types import DeviceCfg
-    dc = DeviceCfg()
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    robot = load_robot_container("t1", dc)
-    qh = torch.as_tensor(t1_home, dtype=torch.float32, device=dc.device)
-    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=qh,
-                     enable_com_aware_ik=enable_com_aware_ik)
+    return make_blocks_t1_world(enable_com_aware_ik=enable_com_aware_ik)
 
 
 def _home_tool_matrix(world, arm="left"):

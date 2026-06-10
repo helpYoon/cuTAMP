@@ -17,7 +17,6 @@ from .t1 import (
     LEFT_TOOL_FRAME,
     RIGHT_TOOL_FRAME,
     TOOL_FRAMES as T1_TOOL_FRAMES,
-    curobo_to_urdf_joints,
     get_t1_gripper_spheres,
     get_t1_kinematics,
     get_t1_tool_from_ee,

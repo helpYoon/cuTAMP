@@ -11,7 +11,7 @@
 
 import logging
 from datetime import datetime
-from typing import Callable, Dict, List, Union, Optional, Tuple
+from typing import Callable, List, Union, Optional, Tuple
 from unittest.mock import Mock
 
 import numpy as np
@@ -117,23 +117,7 @@ def get_best_particle(
     plan_info: dict, config: TAMPConfiguration, constraint_checker: ConstraintChecker, cost_reducer: CostReducer
 ) -> dict:
     """Get the particle that satisfies the constraints and has the best soft cost."""
-    particles, rollout_fn, cost_fn = plan_info["particles"], plan_info["rollout_fn"], plan_info["cost_fn"]
-    with torch.no_grad():
-        rollout = rollout_fn(particles)
-        cost_dict = cost_fn(rollout, particles)
-
-    # Take the best particle that is satisfying and has the best soft cost
-    satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
-    if not satisfying_mask.any():
-        raise RuntimeError("No satisfying particles found")
-
-    soft_costs = cost_reducer.soft_costs(cost_dict)
-    satisfying_costs = soft_costs[satisfying_mask]
-    best_satisfying_idx = satisfying_costs.argmin()
-    indices = torch.arange(config.num_particles, device=satisfying_costs.device)
-    best_idx = indices[satisfying_mask][best_satisfying_idx]
-    best_particle = {k: v[best_idx].detach().clone() for k, v in particles.items()}
-    return best_particle
+    return get_top_satisfying_particles(plan_info, config, constraint_checker, cost_reducer, n=1)[0]
 
 
 def get_top_satisfying_particles(
@@ -231,7 +215,6 @@ def sample_plan_skeleton(
 
 def resample_plan_info(
     plan_info: dict,
-    world: TAMPWorld,
     config: TAMPConfiguration,
     timer: TorchTimer,
     cost_reducer: CostReducer,
@@ -265,7 +248,7 @@ def resample_plan_info(
             consider_types.add("cost")
         costs = cost_reducer(cost_dict, consider_types=consider_types)
         if satisfying_mask.any():
-            best_cost = costs[satisfying_mask].min().item()  # note: should consider satisfying mask?
+            best_cost = costs[satisfying_mask].min().item()
             soft_costs = cost_reducer.soft_costs(cost_dict)
             best_soft_cost = soft_costs[satisfying_mask].min().item()
             indices = torch.arange(config.num_particles, device=soft_costs.device)
@@ -339,7 +322,7 @@ def _motion_plan_with_retries(
 def setup_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
-    q_init: Optional[Union[List[float], Dict[str, List[float]]]] = None,
+    q_init: Optional[List[float]] = None,
     experiment_id: Optional[str] = None,
 ):
     # Validate args and setup experiment logger
@@ -358,7 +341,6 @@ def setup_cutamp(
     if q_init is None:
         q_init = get_q_home()
     q_init = tensor_args.to_device(q_init)
-    q_init_for_visualizer = q_init
 
     # Load TAMP world and warmup IK solver
     timer = TorchTimer()
@@ -381,7 +363,7 @@ def setup_cutamp(
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
-        RerunVisualizer(config, q_init_for_visualizer, application_id=env.name, recording_id=experiment_id, spawn=config.rr_spawn)
+        RerunVisualizer(config, q_init, application_id=env.name, recording_id=experiment_id, spawn=config.rr_spawn)
         if config.enable_visualizer
         else MockVisualizer()
     )
@@ -394,7 +376,7 @@ def run_cutamp(
     config: TAMPConfiguration,
     cost_reducer: CostReducer,
     constraint_checker: ConstraintChecker,
-    q_init: Optional[Union[List[float], Dict[str, List[float]]]] = None,
+    q_init: Optional[List[float]] = None,
     experiment_id: Optional[str] = None,
 ):
     """Overall cuTAMP algorithm implementation."""
@@ -507,7 +489,6 @@ def run_cutamp(
                     timer.start("resample_plan_info")
                     num_satisfying = resample_plan_info(
                         plan_info,
-                        world,
                         config,
                         timer,
                         cost_reducer,

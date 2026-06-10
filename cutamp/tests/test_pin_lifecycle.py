@@ -1,12 +1,7 @@
 """Pin lifecycle invariants for T1State."""
-import os
-
 import pytest
 
-needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
+from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
 def _make_state():
@@ -17,25 +12,18 @@ def _make_state():
     state: planner from ``world.get_motion_planner()`` and current_js from
     ``_planner_js_from_full(planner, q_init, full_joint_names)``.
     """
-    from curobo.types import DeviceCfg, JointState
+    from curobo.types import JointState
 
-    from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.robots import get_q_home, load_robot_container
     from cutamp.t1_state import T1State
-    from cutamp.tamp_world import TAMPWorld
 
-    device_cfg = DeviceCfg()
-    robot_container = load_robot_container(device_cfg=device_cfg)
-    q_init = device_cfg.to_device(get_q_home())
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    world = TAMPWorld(env, device_cfg, robot=robot_container, q_init=q_init)
+    world = make_blocks_t1_world()
     planner = world.get_motion_planner()
 
     # Mirror motion_solver._planner_js_from_full: build full-cspace JointState
     # with joint_names, then project to the planner's active cspace.
     full_joint_names = list(world.kinematics.joint_names)
     full_js = JointState.from_position(
-        q_init[None].to(planner.kinematics.device_cfg.device),
+        world.q_init[None].to(planner.kinematics.device_cfg.device),
         joint_names=full_joint_names,
     )
     active_js = planner.kinematics.get_active_js(full_js)

@@ -15,15 +15,9 @@ The CUDA-gated tests build a real T1 processing kinematics and run FK +
 Jacobian on the GPU; they synthesize their own trajectories (no planner
 needed). The CPU tests cover the C2 endpoint math and the C3 error path.
 """
-import os
-
 import pytest
 
-
-needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
+from cutamp.tests.conftest import needs_cuda
 
 
 # --------------------------------------------------------------------------- #
@@ -42,8 +36,6 @@ def test_jacobian_velocity_matches_fk_central_difference():
     from cutamp.utils.plan_processor import (
         _build_processing_kinematics,
         LEFT_TOOL_FRAME,
-        RIGHT_TOOL_FRAME,
-        TRUNK_LINK,
         _quat_conjugate_wxyz,
         _quat_mul_wxyz,
     )

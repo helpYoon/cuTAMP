@@ -167,66 +167,6 @@ def restore_cspace_target_dof_weight(
             cfg.cspace_target_dof_weight.copy_(saved.to(cfg.cspace_target_dof_weight))
 
 
-def write_joint_position_limits(hosts: Iterable, new_position: torch.Tensor) -> None:
-    """In-place write of ``new_position`` (shape ``[2, dof]``) to every
-    rollout's ``cspace_cost.config.joint_limits.position``."""
-    for h in hosts:
-        for c in _cspace_costs_from_rollouts(iter_rollouts(h)):
-            jp = c.config.joint_limits.position
-            jp.copy_(new_position.to(jp))
-
-
-def snapshot_joint_position_limits(hosts: Iterable) -> Dict[int, List[torch.Tensor]]:
-    """Per-host snapshot of the current joint-position limits."""
-    return {
-        id(h): [c.config.joint_limits.position.clone()
-                for c in _cspace_costs_from_rollouts(iter_rollouts(h))]
-        for h in hosts
-    }
-
-
-def restore_joint_position_limits(
-    hosts: Iterable, snapshot: Dict[int, List[torch.Tensor]],
-) -> None:
-    """Restore each host's joint-position limits from a prior snapshot."""
-    for h in hosts:
-        saved_list = snapshot.get(id(h))
-        if saved_list is None:
-            continue
-        for c, saved in zip(_cspace_costs_from_rollouts(iter_rollouts(h)), saved_list):
-            jp = c.config.joint_limits.position
-            jp.copy_(saved.to(jp))
-
-
-def snapshot_cspace_cost_weight(hosts: Iterable) -> Dict[int, List[torch.Tensor]]:
-    """Snapshot the live cspace-cost runtime weight tensor on every rollout."""
-    return {
-        id(h): [c._weight.clone() for c in _cspace_costs_from_rollouts(iter_rollouts(h))]
-        for h in hosts
-    }
-
-
-def restore_cspace_cost_weight(
-    hosts: Iterable, snapshot: Dict[int, List[torch.Tensor]],
-) -> None:
-    """Restore each host's cspace-cost weight from a prior snapshot."""
-    for h in hosts:
-        saved_list = snapshot.get(id(h))
-        if saved_list is None:
-            continue
-        for c, saved in zip(_cspace_costs_from_rollouts(iter_rollouts(h)), saved_list):
-            c._weight.copy_(saved.to(c._weight))
-
-
-def scale_cspace_bound_weight(hosts: Iterable, factor: float) -> None:
-    """In-place multiply the position-bound term (weight[0]) of every
-    cspace cost by ``factor``. The cspace cost kernel reads ``self._weight``
-    each iteration so the scaling takes effect immediately."""
-    for h in hosts:
-        for c in _cspace_costs_from_rollouts(iter_rollouts(h)):
-            c._weight[0] *= factor
-
-
 def inactive_arm_cspace_weights(
     host, active_arm: str, *, pin_weight: float = 1000.0, default_weight: float = 1.0,
 ) -> torch.Tensor:

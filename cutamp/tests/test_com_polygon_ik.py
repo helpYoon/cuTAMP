@@ -1,56 +1,21 @@
 """Tests for the COM polygon penalty math, hard gate, and post-IK mask."""
-import os
 import pytest
 
-
-needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
+from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
 def _make_world():
     """Build a real TAMPWorld for blocks_t1."""
-    from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.tamp_world import TAMPWorld
-    from cutamp.robots import load_robot_container
-    from curobo.types import DeviceCfg
-    from cutamp.robots.t1 import t1_home
-    import torch
-
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    device_cfg = DeviceCfg()
-    robot = load_robot_container("t1", device_cfg)
-    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=device_cfg.device)
-    return TAMPWorld(env=env, device_cfg=device_cfg, robot=robot, q_init=q_init)
-
-
-@needs_cuda
-def test_compute_com_polygon_mask_basic():
-    """Verify batched COM-in-polygon check returns the expected shape +
-    correctly classifies a home-pose batch as inside the polygon."""
-    import torch
-    from cutamp.com_polygon_cost import compute_com_polygon_mask
-    world = _make_world()
-    # At home pose all DOFs are 0; COM is directly above the wheelbase
-    # center → inside polygon for sure. Build a [B=4, full_dof] batch all
-    # at home and assert all four come back True.
-    home = world.q_init.detach().clone()
-    B = 4
-    q_batch = home.unsqueeze(0).expand(B, -1).contiguous()
-    mask = compute_com_polygon_mask(world, q_batch)
-    assert mask.shape == (B,), f"expected shape ({B},), got {mask.shape}"
-    assert bool(mask.all()), (
-        f"home pose should be inside polygon; got mask={mask}"
-    )
+    return make_blocks_t1_world()
 
 
 @needs_cuda
 def test_compute_com_polygon_mask_excludes_extreme_lean():
-    """A bent-far-forward configuration should be classified as OUTSIDE
-    the polygon. Constructs a synthetic q_batch with deeply-bent
-    Torso_Pitch + ankle_pitch + knee_pitch (mimicking the teetering pose
-    we observed pre-fix)."""
+    """Batched COM-in-polygon check returns the expected shape, classifies
+    home poses as inside (all DOFs 0 → COM directly above the wheelbase
+    center) and a bent-far-forward configuration as OUTSIDE the polygon.
+    The bent config has deeply-bent Torso_Pitch + ankle_pitch + knee_pitch
+    (mimicking the teetering pose we observed pre-fix)."""
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     world = _make_world()
@@ -62,11 +27,13 @@ def test_compute_com_polygon_mask_excludes_extreme_lean():
     bent[name_to_idx["Torso_Pitch"]]  = -1.7
     bent[name_to_idx["ankle_pitch"]]  = -0.5
     bent[name_to_idx["knee_pitch"]]   = +0.8
-    q_batch = torch.stack([home, bent], dim=0)  # [2, full_dof]
+    q_batch = torch.stack([home, home, home, bent], dim=0)  # [4, full_dof]
     mask = compute_com_polygon_mask(world, q_batch)
-    assert mask.shape == (2,)
-    assert bool(mask[0]),    f"home should be inside polygon; mask[0]={mask[0]}"
-    assert not bool(mask[1]), f"deeply-bent pose should be OUTSIDE polygon; mask[1]={mask[1]}"
+    assert mask.shape == (4,), f"expected shape (4,), got {mask.shape}"
+    assert bool(mask[:3].all()), (
+        f"home poses should be inside polygon; mask={mask}"
+    )
+    assert not bool(mask[3]), f"deeply-bent pose should be OUTSIDE polygon; mask[3]={mask[3]}"
 
 
 @needs_cuda
@@ -222,41 +189,6 @@ def test_compute_com_polygon_penalties_is_differentiable():
     )
 
 
-@needs_cuda
-def test_compute_com_polygon_penalties_matches_mask_at_tolerance():
-    """Parity between the mask helper and the penalty helper: a
-    particle's penalty <= inside_weight * inside_margin^2 iff its COM
-    is inside the polygon. Calibrates the hard constraint's tolerance
-    (4e-4) against the mask's definition of 'inside'."""
-    import torch
-    from cutamp.com_polygon_cost import (
-        compute_com_polygon_mask,
-        compute_com_polygon_penalties,
-    )
-
-    world = _make_world()
-    full_names = list(world.kinematics.joint_names)
-    name_to_idx = {n: i for i, n in enumerate(full_names)}
-    home = world.q_init.detach().clone()
-    bent = home.clone()
-    bent[name_to_idx["Torso_Pitch"]] = -1.5  # COM far forward -> outside polygon
-    bent[name_to_idx["knee_pitch"]] = +0.6
-
-    q = torch.stack([home, bent], dim=0)  # [2, full_dof]
-
-    mask = compute_com_polygon_mask(world, q)  # [B] Bool
-    pens = compute_com_polygon_penalties(world, {"left_q1": q})
-    p = pens["left_q1"]  # [B] float
-    tol = 1.0 * (0.02) ** 2  # inside_weight * inside_margin^2 = 4e-4
-
-    # mask True <-> COM inside polygon <-> penalty <= tol
-    inside_mask = (p <= tol)
-    assert torch.equal(mask, inside_mask), (
-        f"Penalty-vs-mask disagree.\n  mask={mask.tolist()}\n"
-        f"  penalties={p.tolist()}  tol={tol}\n  inside_mask={inside_mask.tolist()}"
-    )
-
-
 def test_com_polygon_penalty_corner_equals_single_edge():
     # A COM ~1mm inside BOTH edges (near a corner) must score the same as
     # being on a single edge — NOT double. With the buggy summed barrier it
@@ -348,17 +280,37 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
 def test_mask_matches_penalty_gate():
     # The post-IK mask must equal (penalty <= COM_TOL) elementwise, so the IK
     # COM-safe retry loop and the ConstraintChecker can never disagree.
+    # COM_TOL is inside_weight * inside_margin^2 = 4e-4, calibrating the hard
+    # constraint's tolerance against the mask's definition of 'inside'.
     import torch
     from cutamp.com_polygon_cost import (
         COM_TOL, compute_com_polygon_mask, compute_com_polygon_penalties,
     )
     world = _make_world()
-    # Spread a batch of configs around home so some land near the polygon edge.
-    torch.manual_seed(0)
+    full_names = list(world.kinematics.joint_names)
+    name_to_idx = {n: i for i, n in enumerate(full_names)}
     home = world.q_init.detach().clone()
+    # Deep forward lean that is genuinely out-of-hull: forward torso AND
+    # forward ankle. (Torso_Pitch=-1.5 with knee=+0.6 is NOT outside — knee
+    # bend re-centers the COM, which is the whole point of the CoM-aware IK.)
+    bent = home.clone()
+    bent[name_to_idx["Torso_Pitch"]] = -1.7
+    bent[name_to_idx["ankle_pitch"]] = -0.5
+    bent[name_to_idx["knee_pitch"]] = +0.8
+    # Spread a batch of configs around home so some land near the polygon
+    # edge, then append the deterministic [home, bent] pair so both
+    # classifications are guaranteed present in the batch.
+    torch.manual_seed(0)
     q = home.unsqueeze(0).repeat(32, 1).clone()
     q[:, 3:7] += 0.3 * torch.randn(32, 4, device=q.device)   # perturb body DOFs
+    q = torch.cat([q, torch.stack([home, bent], dim=0)], dim=0)  # [34, full_dof]
     mask = compute_com_polygon_mask(world, q)
     pens = compute_com_polygon_penalties(world, {"q": q})["q"]
     gate = pens <= COM_TOL
-    assert torch.equal(mask, gate)
+    assert torch.equal(mask, gate), (
+        f"Penalty-vs-mask disagree.\n  mask={mask.tolist()}\n"
+        f"  penalties={pens.tolist()}  tol={COM_TOL}\n  gate={gate.tolist()}"
+    )
+    # Both classifications must actually be present.
+    assert bool(mask[-2]), "home must classify as inside the polygon"
+    assert not bool(mask[-1]), "bent must classify as outside the polygon"

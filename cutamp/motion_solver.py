@@ -14,8 +14,9 @@ Per plan-skeleton operator (T1):
     + inactive arm so the active arm reaches the target without drifting.
   - MoveBaseTo (action_type="navigate"): ``pin_for_movebase()`` locks both
     arms + lift/torso so only the planar base moves.
-  - Pick / Place use ``plan_single_arm_grasp`` (forked plan_grasp scoped to
-    the active tool frame).
+  - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
+    we plan to the gate-approved particle conf with the grasp-object /
+    placement-surface obstacle temporarily disabled.
   - Retract is a cspace target pinning all joints toward the configured retract.
 """
 
@@ -26,14 +27,13 @@ from typing import List, Optional
 import torch
 
 from curobo.sphere_fit import SphereFitType
-from curobo.types import GoalToolPose, JointState, Pose
+from curobo.types import JointState, Pose
 
 from cutamp._curobo_internals import (
     cspace_plan_succeeded as _cspace_plan_succeeded,
     get_attachment_manager as _get_attachment_manager,
 )
 from cutamp.config import TAMPConfiguration
-from cutamp.grasp_planning import plan_single_arm_grasp
 from cutamp.optimize_plan import PlanContainer
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.t1_state import T1State
@@ -122,7 +122,7 @@ def _disabled_world_obstacle(planner, name):
         sc.enable_obstacle(name=name, enable=True)
 
 
-def _interp_plan(result, interp=None, last_tstep=None):
+def _interp_plan(result):
     """Return the trimmed interpolated trajectory from a v0.8 planner result.
 
     cuRobo's ``interpolated_trajectory`` is padded to a fixed horizon by
@@ -130,31 +130,24 @@ def _interp_plan(result, interp=None, last_tstep=None):
     seconds of the robot standing still — which appears as a "wait" between
     consecutive operators in playback. Mirrors v0.7 main's
     ``get_interpolated_plan()`` pattern.
-
-    For results that own their interpolated trajectory directly, pass only
-    ``result`` (uses ``result.get_interpolated_plan()`` when available).
-    For ``plan_grasp`` sub-trajectories, pass ``result``,
-    ``interp=approach_interpolated_trajectory``, and
-    ``last_tstep=approach_interpolated_last_tstep`` (etc.) — those live on
-    the parent ``GraspPlanResult`` rather than as a sub-result with its own
-    ``get_interpolated_plan``.
     """
     from curobo._src.state.state_joint_trajectory_ops import trim_joint_state_trajectory
+    if result is None:
+        return None
+    if hasattr(result, "get_interpolated_plan"):
+        return result.get_interpolated_plan()
+    interp = getattr(result, "interpolated_trajectory", None)
     if interp is None:
-        if result is None:
-            return None
-        if hasattr(result, "get_interpolated_plan"):
-            return result.get_interpolated_plan()
-        interp = getattr(result, "interpolated_trajectory", None)
-        if interp is None:
-            return getattr(result, "js_solution", None)
-        if last_tstep is None:
-            last_tstep = getattr(result, "interpolated_last_tstep", None)
+        return getattr(result, "js_solution", None)
+    last_tstep = getattr(result, "interpolated_last_tstep", None)
     if last_tstep is None or len(last_tstep) == 0:
         return interp
     return trim_joint_state_trajectory(interp, 0, last_tstep[0])
 
 
+# Currently unreferenced, but intentionally kept — see docs/curobo_v08_port.md
+# "Things we kept from v0.7 (intentional)": relevant again if an explicit
+# retract/approach offset returns.
 APPROACH_HEIGHT = 0.05
 
 # attached_object_{left,right} extra_link names from t1_planar_base.yml.
@@ -340,7 +333,6 @@ def solve_curobo(
         tool_from_ee=world.tool_from_ee,
         current_js=last_js,
     )
-    last_q_name = "left_q0"
     q_init = best_particle["left_q0"]
 
     if config.warmup_motion_gen:
@@ -393,13 +385,11 @@ def solve_curobo(
                 })
                 last_js = _last_timestep_js(plan, planner)
                 state.current_js = last_js
-                last_q_name = q_end_name
 
             elif metadata.is_motion and metadata.action_type is None:
-                # MoveFree / MoveHolding — no trajectory; pick/place chains
-                # from this last_q_name as their start state.
-                q_start = ground_op.values[-3] if len(ground_op.values) == 5 else ground_op.values[0]
-                last_q_name = q_start
+                # MoveFree / MoveHolding — no trajectory; pick/place chain
+                # from the previous trajectory's terminal state via last_js.
+                pass
 
             elif metadata.action_type == "retract":
                 q_retract_name = ground_op.values[-1]
@@ -464,7 +454,6 @@ def solve_curobo(
                 state.current_js = last_js
                 state.arm_holding[arm] = obj_name
                 state.arm_grasp_transform[arm] = grasp_from_obj
-                last_q_name = ground_op.values[-1]
 
             elif metadata.action_type == "place":
                 obj_name, grasp_name, place_name, surface_name, q_name = ground_op.values
@@ -506,7 +495,6 @@ def solve_curobo(
                 attach_link = _ATTACH_LINK_FOR_ARM[arm]
                 _detach_object(planner, link_name=attach_link)
                 _update_world_obstacle_pose(planner, obj_name, world_from_obj_target)
-                last_q_name = ground_op.values[-1]
 
             elif metadata.action_type in ("push", "push_stick"):
                 raise NotImplementedError("Push operations not yet supported in v0.8 motion planning")

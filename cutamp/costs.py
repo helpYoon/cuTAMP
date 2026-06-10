@@ -12,8 +12,6 @@ from typing import Optional
 import torch
 from jaxtyping import Float
 
-from curobo.types import Pose
-
 
 def trajectory_length(
     confs: Float[torch.Tensor, "b *h d"], weights: Optional[Float[torch.Tensor, "d"]] = None
@@ -31,20 +29,6 @@ def trajectory_length(
     dists = diffs.norm(dim=-1)
     traj_lengths = dists.sum(-1)  # sum over horizon
     return traj_lengths
-
-
-def dist_from_bounds(
-    vals: Float[torch.Tensor, "b *h d"],
-    lower: Float[torch.Tensor, "d"],
-    upper: Float[torch.Tensor, "d"],
-) -> Float[torch.Tensor, "b *h"]:
-    """Euclidean distance of values from the given lower and upper bounds. If within the bounds, returns 0."""
-    diff_lower = lower - vals
-    diff_upper = vals - upper
-    diff_max = torch.maximum(diff_lower, diff_upper)
-    diff_max = diff_max.clamp(min=0.0)
-    dists = diff_max.norm(p=2, dim=-1)
-    return dists
 
 
 @torch.jit.script
@@ -93,8 +77,6 @@ def sphere_to_sphere_overlap(
     spheres_1: Float[torch.Tensor, "b *h 4"],
     spheres_2: Float[torch.Tensor, "b *h 4"],
     activation_distance: float | None = None,
-    aabb_1: Float[torch.Tensor, "b *h 2 3"] | None = None,
-    aabb_2: Float[torch.Tensor, "b *h 2 3"] | None = None,
     use_aabb_check: bool = False,
 ) -> Float[torch.Tensor, "b *h"]:
     """
@@ -105,10 +87,8 @@ def sphere_to_sphere_overlap(
         return _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance)
 
     # Compute AABB for each batch of spheres
-    if aabb_1 is None:
-        aabb_1 = get_aabb_from_spheres(spheres_1)  # [b, *h, 2, 3]
-    if aabb_2 is None:
-        aabb_2 = get_aabb_from_spheres(spheres_2)  # [b, *h, 2, 3]
+    aabb_1 = get_aabb_from_spheres(spheres_1)  # [b, *h, 2, 3]
+    aabb_2 = get_aabb_from_spheres(spheres_2)  # [b, *h, 2, 3]
 
     # Check intersection
     min_1, max_1 = aabb_1.unbind(-2)

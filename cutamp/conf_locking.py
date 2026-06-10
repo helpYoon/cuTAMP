@@ -30,7 +30,7 @@ Per-operator locking policy for T1 (single 21-DOF planner with planar base):
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 

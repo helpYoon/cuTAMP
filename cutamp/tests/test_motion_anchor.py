@@ -1,8 +1,11 @@
 """Tests for COM-anchored pick/place terminals (plan_cspace to the conf)."""
+import os
+
 import pytest
 import torch
 
 import cutamp.motion_solver as ms
+from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
 def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
@@ -49,39 +52,20 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
     assert fp.n == 3  # retried `retries` times before raising
 
 
-import os
-
-needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
-
-
 def _generate_plan_segments(seed: int):
-    """Run the full cuTAMP pipeline once for blocks_t1 and return the processed
-    motion-plan segments (schema v3) + a TAMPWorld for COM checks.
+    """Run the full cuTAMP pipeline once for blocks_t1 and return
+    ``(world, segments)``: a TAMPWorld for COM checks plus the processed
+    motion-plan segments (schema v3).
 
-    NOTE on the real run_cutamp API (the plan's `result["curobo_plan"]` guess
-    was wrong): the actual signature is
-
-        run_cutamp(env, config, cost_reducer, constraint_checker,
-                   q_init=None, experiment_id=None) -> (curobo_plan, num_satisfying)
-
-    i.e. it takes an `env` (not a prebuilt `world`) plus a CostReducer and a
-    ConstraintChecker, builds the world itself via `setup_cutamp`, and returns
-    a (raw curobo_plan list, num_satisfying) TUPLE — not a dict. We replicate
-    the exact construction done by `cutamp/scripts/run_cutamp.py:cutamp_demo`
-    (default_constraint_to_mult / default_constraint_to_tol), then process the
-    raw plan to schema v3 with `process_motion_plan`. The TAMPWorld used for
-    the COM checks is built separately from the same env/config — its
-    kinematics depend only on the robot/env, so it matches the planner's.
+    ``run_cutamp(env, config, cost_reducer, constraint_checker, q_init=None,
+    experiment_id=None)`` takes an env (not a prebuilt world), builds the
+    world itself via ``setup_cutamp``, and returns a
+    ``(curobo_plan, num_satisfying)`` tuple; the raw plan is then processed
+    to schema v3 with ``process_motion_plan``. The TAMPWorld used for the
+    COM checks is built separately from the same env — its kinematics
+    depend only on the robot/env, so it matches the planner's.
     """
-    import torch
     from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.tamp_world import TAMPWorld
-    from cutamp.robots import load_robot_container
-    from cutamp.robots.t1 import t1_home
-    from curobo.types import DeviceCfg
     from cutamp.config import TAMPConfiguration
     from cutamp.algorithm import run_cutamp
     from cutamp.constraint_checker import ConstraintChecker
@@ -123,62 +107,38 @@ def _generate_plan_segments(seed: int):
     processed = process_motion_plan(curobo_plan)
 
     # Separate TAMPWorld for COM checks (kinematics depend only on env/robot).
-    dc = DeviceCfg()
-    robot = load_robot_container("t1", dc)
-    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=dc.device)
-    world = TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init)
+    world = make_blocks_t1_world()
     return world, processed["segments"]
 
 
-@needs_cuda
-def test_place_arrival_is_com_in_hull():
-    import torch
-    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES, t1_home
-    from cutamp.com_polygon_cost import compute_com_polygon_penalties, COM_TOL
+def _frame_q(q_home, idx, P, t):
+    """Full-dof configuration for frame ``t`` of a segment's position dict."""
+    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
 
-    world, segments = _generate_plan_segments(seed=0)
-    names = list(world.kinematics.joint_names)
-    idx = {n: i for i, n in enumerate(names)}
-    q_home = torch.as_tensor(t1_home, dtype=torch.float32,
-                             device=world.kinematics.device_cfg.device)
-
-    def frame_q(P, t):
-        q = q_home.clone()
-        q[idx["Torso_Pitch"]] = float(P["trunk_pitch"][t])
-        q[idx["Waist_Yaw"]] = float(P["trunk_yaw"][t])
-        q[idx["ankle_pitch"]] = float(P["ankle_pitch"][t])
-        q[idx["knee_pitch"]] = float(P["knee_pitch"][t])
-        for j, n in enumerate(LEFT_ARM_JOINT_NAMES):
-            q[idx[n]] = float(P["left_arm"][t][j])
-        for j, n in enumerate(RIGHT_ARM_JOINT_NAMES):
-            q[idx[n]] = float(P["right_arm"][t][j])
-        return q
-
-    # Every segment's ARRIVAL (last frame) must be COM-in-hull, since each is a
-    # cspace-anchored conf or retract-home. (Pre-fix, place arrivals leaked out.)
-    assert segments, "no trajectory segments were produced"
-    worst = 0.0
-    for si, seg in enumerate(segments):
-        P = seg["position"]; T = seg["T"]
-        q = frame_q(P, T - 1).unsqueeze(0)
-        pen = float(compute_com_polygon_penalties(world, {"q": q})["q"][0])
-        worst = max(worst, pen)
-        assert pen <= COM_TOL, (
-            f"segment {si} arrival COM penalty {pen:.6f} > tol {COM_TOL}"
-        )
-    print(f"worst arrival penalty {worst:.6f} <= {COM_TOL}")
+    q = q_home.clone()
+    q[idx["Torso_Pitch"]] = float(P["trunk_pitch"][t])
+    q[idx["Waist_Yaw"]] = float(P["trunk_yaw"][t])
+    q[idx["ankle_pitch"]] = float(P["ankle_pitch"][t])
+    q[idx["knee_pitch"]] = float(P["knee_pitch"][t])
+    for j, n in enumerate(LEFT_ARM_JOINT_NAMES):
+        q[idx[n]] = float(P["left_arm"][t][j])
+    for j, n in enumerate(RIGHT_ARM_JOINT_NAMES):
+        q[idx[n]] = float(P["right_arm"][t][j])
+    return q
 
 
 @needs_cuda
-def test_all_arrivals_in_hull_and_plan_succeeds():
-    # Broader guard: a full plan generates (no RuntimeError from solve_curobo)
-    # and ALL segment arrivals (pick, place, retract) are COM-in-hull. Seed 1
-    # exercises the pick branch anchoring added in Task 3.
-    import torch
-    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES, t1_home
+@pytest.mark.parametrize("seed", [0, 1])
+def test_all_segment_arrivals_com_in_hull(seed):
+    # A full plan generates (no RuntimeError from solve_curobo), produces
+    # segments, and EVERY segment's ARRIVAL (last frame) — pick, place,
+    # retract — is COM-in-hull, since each is a cspace-anchored conf or
+    # retract-home. (Pre-fix, place arrivals leaked out.) Seed 1 exercises
+    # the pick branch anchoring added in Task 3.
+    from cutamp.robots.t1 import t1_home
     from cutamp.com_polygon_cost import compute_com_polygon_penalties, COM_TOL
 
-    world, segments = _generate_plan_segments(seed=1)
+    world, segments = _generate_plan_segments(seed=seed)
     assert len(segments) > 0, "plan produced no segments"
     names = list(world.kinematics.joint_names)
     idx = {n: i for i, n in enumerate(names)}
@@ -187,16 +147,10 @@ def test_all_arrivals_in_hull_and_plan_succeeds():
     worst = 0.0
     for si, seg in enumerate(segments):
         P = seg["position"]; T = seg["T"]
-        q = q_home.clone()
-        q[idx["Torso_Pitch"]] = float(P["trunk_pitch"][T - 1])
-        q[idx["Waist_Yaw"]] = float(P["trunk_yaw"][T - 1])
-        q[idx["ankle_pitch"]] = float(P["ankle_pitch"][T - 1])
-        q[idx["knee_pitch"]] = float(P["knee_pitch"][T - 1])
-        for j, n in enumerate(LEFT_ARM_JOINT_NAMES):
-            q[idx[n]] = float(P["left_arm"][T - 1][j])
-        for j, n in enumerate(RIGHT_ARM_JOINT_NAMES):
-            q[idx[n]] = float(P["right_arm"][T - 1][j])
-        pen = float(compute_com_polygon_penalties(world, {"q": q.unsqueeze(0)})["q"][0])
+        q = _frame_q(q_home, idx, P, T - 1).unsqueeze(0)
+        pen = float(compute_com_polygon_penalties(world, {"q": q})["q"][0])
         worst = max(worst, pen)
-        assert pen <= COM_TOL, f"segment {si} arrival COM {pen:.6f} > {COM_TOL}"
+        assert pen <= COM_TOL, (
+            f"segment {si} arrival COM penalty {pen:.6f} > tol {COM_TOL}"
+        )
     print(f"all {len(segments)} arrivals in hull; worst penalty {worst:.6f} <= {COM_TOL}")

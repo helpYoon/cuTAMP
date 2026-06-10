@@ -59,10 +59,6 @@ class RerunRobot:
         if q_neutral is not None:
             self.set_joint_positions(q_neutral)
 
-    @property
-    def joint_positions(self) -> np.ndarray:
-        return self.urdf.cfg
-
     def set_joint_positions(self, joint_positions: Sequence[float]) -> None:
         # Append the remaining joint positions, this can happen if we're only set arm joints not gripper
         if len(joint_positions) != self.urdf.num_actuated_joints:

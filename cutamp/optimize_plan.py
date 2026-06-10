@@ -183,12 +183,9 @@ class ParticleOptimizer:
             _log.warning(f"Phase 2 LBFGS refinement failed: {e}; keeping pre-Phase-2 particles.")
             return
         with torch.no_grad():
-            soft_after = self.cost_reducer.soft_costs(
-                cost_fn(rollout_fn(refined), refined)
-            ).mean().item()
-            post_sat = self.get_satisfying_mask(
-                cost_fn(rollout_fn(refined), refined), verbose=False,
-            )
+            cd = cost_fn(rollout_fn(refined), refined)
+            soft_after = self.cost_reducer.soft_costs(cd).mean().item()
+            post_sat = self.get_satisfying_mask(cd, verbose=False)
         kept = int(post_sat.sum().item())
         _log.info(
             f"Phase 2 LBFGS: refined {n_sat} particles; soft {soft_before:.4f} → "
@@ -339,7 +336,7 @@ class ParticleOptimizer:
         # Adam runs always with soft costs in the loss (statistical
         # exploration), no Phase 2. Useful for pose-class soft costs that
         # have no constraint-manifold tangent for LBFGS to refine along.
-        upstream_style = getattr(self.config, "upstream_style_optimize", False)
+        upstream_style = self.config.upstream_style_optimize
         # Coupled re-IK breaks the KinematicConstraint coupling that destroys
         # vanilla Adam on pose-class soft costs, so soft costs can safely
         # join the Adam loss. Phase 2 LBFGS still runs for q-class refinement.
@@ -449,8 +446,7 @@ class ParticleOptimizer:
                 # Show last state after rolling out the best particle
                 visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
                 q_last = rollout["confs"][best_idx, -1].tolist()
-                
-                # For T1, construct 22-DOF config with active arm + inactive arm at home
+
                 # v0.8: configs are full 21-DOF (T1) or single chain DOF (others).
                 # T1RerunRobot maps 21 → 28 URDF actuated joints internally.
                 visualizer.set_joint_positions(q_last)
@@ -540,14 +536,17 @@ class ParticleOptimizer:
                 if p.startswith(("left_q", "right_q", "q")) and particles[p].ndim == 2
             )
             if conf_names:
-                com_summary = []
-                for cn in conf_names:
-                    mask = compute_com_polygon_mask(rollout_fn.world, particles[cn])
-                    com_summary.append(f"{cn} {int(mask.sum().item())}/{mask.shape[0]}")
+                conf_to_mask = {
+                    cn: compute_com_polygon_mask(rollout_fn.world, particles[cn])
+                    for cn in conf_names
+                }
+                com_summary = [
+                    f"{cn} {int(mask.sum().item())}/{mask.shape[0]}"
+                    for cn, mask in conf_to_mask.items()
+                ]
                 _log.info("COM-in-polygon (per conf): " + ", ".join(com_summary))
                 opt_metrics["com_in_polygon_per_conf"] = {
-                    cn: int(compute_com_polygon_mask(rollout_fn.world, particles[cn]).sum().item())
-                    for cn in conf_names
+                    cn: int(mask.sum().item()) for cn, mask in conf_to_mask.items()
                 }
         except Exception as e:
             _log.debug(f"COM-in-polygon summary skipped: {e}")

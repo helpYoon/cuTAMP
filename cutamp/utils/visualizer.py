@@ -144,23 +144,14 @@ class RerunVisualizer(Visualizer):
     def set_joint_positions(self, q: Float[Union[torch.Tensor, np.ndarray, list], "d"], arm: str = None):
         if isinstance(q, torch.Tensor):
             q = q.tolist()
-        # Pass arm parameter if the robot supports it (e.g., T1 dual-arm)
-        if arm is not None and hasattr(self.robot, 'set_joint_positions'):
+        # Pass arm parameter for the T1 dual-arm robot
+        if arm is not None:
             self.robot.set_joint_positions(q, arm=arm)
         else:
             self.robot.set_joint_positions(q)
 
     def log_joint_trajectory(self, traj: Float[torch.Tensor, "n d"], timeline: str, start_time: float, dt: float, arm: str = None):
-        end_time = start_time + len(traj) * dt
-        times = [rr.TimeColumn(timeline, duration=np.linspace(start_time, end_time, len(traj)))]
-        # Pass arm parameter for T1 robot (needed for 26-DOF format with gripper)
-        if arm is not None and hasattr(self.robot, 'get_rr_columns'):
-            key_to_columns = self.robot.get_rr_columns(traj, arm=arm)
-        else:
-            key_to_columns = self.robot.get_rr_columns(traj)
-        for key, columns in key_to_columns.items():
-            rr.send_columns(key, indexes=times * len(columns), columns=columns)
-        return end_time
+        return self.log_joint_trajectory_with_mat4x4s(traj, {}, timeline, start_time, dt, arm=arm)
 
     def log_joint_trajectory_with_mat4x4s(
         self,
@@ -176,7 +167,8 @@ class RerunVisualizer(Visualizer):
                 raise ValueError(f"Trajectory and mat4x4 for {key} must have the same length.")
         end_time = start_time + len(traj) * dt
         times = [rr.TimeColumn(timeline, duration=np.linspace(start_time, end_time, len(traj)))]
-        if arm is not None and hasattr(self.robot, 'get_rr_columns'):
+        # Pass arm parameter for the T1 robot (needed for 26-DOF format with gripper)
+        if arm is not None:
             key_to_columns = self.robot.get_rr_columns(traj, arm=arm)
         else:
             key_to_columns = self.robot.get_rr_columns(traj)

@@ -1,29 +1,15 @@
 """Tests for arm-affinity priority in plan-skeleton search."""
-import os
-import pytest
+import math
+import types
 
-
-needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
-    reason="Requires a CUDA device.",
-)
+from cutamp.algorithm import make_arm_affinity_priority_fn
+from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
 def _make_world():
     """Build a real TAMPWorld for blocks_t1. Used by tests that need real
     kinematics + scene state."""
-    from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.tamp_world import TAMPWorld
-    from cutamp.robots import load_robot_container
-    from curobo.types import DeviceCfg
-    from cutamp.robots.t1 import t1_home
-    import torch
-
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    device_cfg = DeviceCfg()
-    robot = load_robot_container("t1", device_cfg)
-    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=device_cfg.device)
-    return TAMPWorld(env=env, device_cfg=device_cfg, robot=robot, q_init=q_init)
+    return make_blocks_t1_world()
 
 
 @needs_cuda
@@ -56,30 +42,14 @@ def test_get_valid_ground_operators_sorts_by_priority_fn():
     """When ground_op_priority_fn is provided, ground operators are returned
     in ascending priority order. Closer-arm picks come first."""
     from cutamp.task_planning.search import get_valid_ground_operators, _Node
-    from cutamp.t1_domain import LeftPick, RightPick, all_t1_operators
-    from cutamp.task_planning import Atom
+    from cutamp.t1_domain import all_t1_operators
 
-    # Stub a _Node with a state where both LeftPick and RightPick can ground
-    # on two blocks. We bypass the full pipeline by directly building atoms
-    # for preconditions.
+    # Ground operators come from the REAL blocks_t1 initial state (both
+    # LeftPick and RightPick ground on the scene's blocks).
     # NOTE: this test is structural — it verifies the sort happens, not the
-    # real-scene priority math. Real-scene math is exercised by the smoke
-    # test at the end.
-    # The fastest way to test the sort: provide a priority_fn that returns
-    # a fixed score per ground op based on its serialized name, and assert
-    # the returned list is sorted.
-    from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.tamp_world import TAMPWorld
-    from cutamp.robots import load_robot_container
-    from curobo.types import DeviceCfg
-    from cutamp.robots.t1 import t1_home
-    import os, torch
-
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    device_cfg = DeviceCfg()
-    robot = load_robot_container("t1", device_cfg)
-    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=device_cfg.device)
-    world = TAMPWorld(env=env, device_cfg=device_cfg, robot=robot, q_init=q_init)
+    # real-scene priority math. Real-scene math is exercised by
+    # test_arm_affinity_priority_orders_closer_arm_first below.
+    world = _make_world()
     initial_node = _Node(state=world.initial_state, parent=None, operator=None, depth=0)
 
     # Priority: deterministic lexicographic reverse of repr. Distinct
@@ -113,18 +83,8 @@ def test_task_plan_generator_accepts_priority_fn():
     and still yield plans."""
     from cutamp.task_planning import task_plan_generator
     from cutamp.t1_domain import all_t1_operators
-    from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.tamp_world import TAMPWorld
-    from cutamp.robots import load_robot_container
-    from curobo.types import DeviceCfg
-    from cutamp.robots.t1 import t1_home
-    import os, torch
 
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    device_cfg = DeviceCfg()
-    robot = load_robot_container("t1", device_cfg)
-    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=device_cfg.device)
-    world = TAMPWorld(env=env, device_cfg=device_cfg, robot=robot, q_init=q_init)
+    world = _make_world()
     gen = task_plan_generator(
         world.initial_state, world.goal_state, all_t1_operators,
         ground_op_priority_fn=lambda op: 0.0,
@@ -139,7 +99,6 @@ def test_task_plan_generator_accepts_priority_fn():
 @needs_cuda
 def test_arm_affinity_priority_orders_closer_arm_first():
     """priority(LeftPick(block_on_left)) < priority(LeftPick(block_on_right))."""
-    from cutamp.algorithm import make_arm_affinity_priority_fn
     world = _make_world()
 
     # Find the two blocks and their world Y values.
@@ -165,14 +124,13 @@ def test_arm_affinity_priority_orders_closer_arm_first():
     )
 
 
-@needs_cuda
 def test_arm_affinity_priority_inf_for_non_pick():
-    """Non-pick operators return inf priority (sort AFTER resolved picks)."""
-    import math
-    from cutamp.algorithm import make_arm_affinity_priority_fn
+    """Non-pick operators return inf priority (sort AFTER resolved picks).
+
+    CPU-only: the non-pick path returns inf before world is ever
+    dereferenced, so no real TAMPWorld is needed."""
     from cutamp.t1_domain import LeftMoveFree
-    world = _make_world()
-    priority = make_arm_affinity_priority_fn(world)
+    priority = make_arm_affinity_priority_fn(world=None)
     # LeftMoveFree params are [q_start, traj, q_end] — none are picks.
     op = LeftMoveFree.ground(
         {"q_start": "left_q0", "traj": "traj0", "q_end": "left_q1"}
@@ -183,19 +141,11 @@ def test_arm_affinity_priority_inf_for_non_pick():
 @needs_cuda
 def test_arm_affinity_priority_inf_for_missing_block():
     """Pick with an unknown block name returns inf (sorts last, not first)."""
-    import math
-    from cutamp.algorithm import make_arm_affinity_priority_fn
     from cutamp.t1_domain import LeftPick
     world = _make_world()
     priority = make_arm_affinity_priority_fn(world)
     op = LeftPick.ground({"obj": "nonexistent_block", "grasp": "grasp0", "q": "left_q0"})
     assert priority(op) == math.inf
-
-
-import math
-import types
-
-from cutamp.algorithm import make_arm_affinity_priority_fn
 
 
 def _op(action_type, arm, values):
@@ -222,12 +172,12 @@ def test_priority_unresolved_block_is_inf():
 
 
 def test_priority_sentinel_sorts_after_resolved_pick():
-    import numpy as np
+    import torch
 
     class _Obj:
         pose = [0.4, 0.2, 0.5, 0, 0, 0, 1]
     class _World:
-        arm_home_ee_world = {"left": __import__("torch").tensor([0.0, 0.0, 0.0])}
+        arm_home_ee_world = {"left": torch.tensor([0.0, 0.0, 0.0])}
         def get_object(self, name):
             return _Obj()
     fn = make_arm_affinity_priority_fn(_World())

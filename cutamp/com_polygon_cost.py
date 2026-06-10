@@ -52,9 +52,9 @@ class ComOverBasePolygonCostCfg(BaseCostCfg):
     half_extents: Optional[Union[torch.Tensor, List[float]]] = None
     #: Distance inside the edge at which the soft barrier starts (meters).
     #: ``0`` disables the barrier (outside-only penalization).
-    inside_margin: float = 0.02
+    inside_margin: float = COM_INSIDE_MARGIN
     #: Relative scale of the inside barrier vs the outside quadratic.
-    inside_weight: float = 1.0
+    inside_weight: float = COM_INSIDE_WEIGHT
     #: Tool frame to use as the rectangle's local origin.
     base_link_name: str = "mobile_base_link"
 
@@ -69,6 +69,25 @@ class ComOverBasePolygonCostCfg(BaseCostCfg):
         self.half_extents = self.half_extents.to(
             self.device_cfg.device, dtype=self.device_cfg.dtype
         )
+
+
+def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor) -> torch.Tensor:
+    """Project world-frame COM points into the base frame's XY plane.
+
+    Closed-form SE(3) inverse-transform: ``T_inv @ [p; 1] = R^T (p - t)``.
+    Single home of the projection, shared by :func:`com_polygon_penalty` and
+    :func:`compute_com_in_base`.
+
+    Args:
+        com_world: ``[N, 3]`` COM in world frame.
+        base_T: ``[N, 4, 4]`` SE(3) world pose of the base link.
+
+    Returns:
+        ``[N, 2]`` (x, y) COM in base frame.
+    """
+    R = base_T[:, :3, :3]
+    t = base_T[:, :3, 3]
+    return (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
 
 
 def com_polygon_penalty(
@@ -96,10 +115,7 @@ def com_polygon_penalty(
     Returns:
         ``[N]`` non-negative penalty.
     """
-    # Closed-form SE(3) inverse-transform: T_inv @ [p; 1] = R^T (p - t).
-    R = base_T[:, :3, :3]
-    t = base_T[:, :3, 3]
-    com_in_base = (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+    com_in_base = _project_com_to_base(com_world, base_T)
     offset = torch.abs(com_in_base) - half_extents
     outside = torch.clamp(offset, min=0.0)
     inside = torch.clamp(offset + inside_margin, min=0.0)
@@ -161,13 +177,11 @@ def compute_com_in_base(world, q_batch: torch.Tensor) -> torch.Tensor:
     """Project the robot COM of each conf into the ``mobile_base_link`` frame.
 
     Returns ``[B, 2]`` (x, y) — the quantity the support rectangle is defined
-    over. Single home of the projection used by audits and tests so they
-    cannot drift from the penalty math.
+    over. Shares :func:`_project_com_to_base` with :func:`com_polygon_penalty`,
+    so audits and tests use the same projection as the penalty math.
     """
     com_world, base_T = _fk_com_and_base(world, q_batch)
-    R = base_T[:, :3, :3]
-    t = base_T[:, :3, 3]
-    return (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+    return _project_com_to_base(com_world, base_T)
 
 
 def compute_com_polygon_mask(

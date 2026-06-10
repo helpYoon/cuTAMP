@@ -123,9 +123,11 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   attach/detach via the AttachmentManager. Playback walks `accum_plans` and
   hands each entry to the visualizer.
 
-- [`grasp_planning.py`](cutamp/grasp_planning.py) — `plan_single_arm_grasp` /
-  `plan_single_arm_pose` adapt v0.8's `plan_grasp` / `plan_pose` to a single
-  active tool frame while disabling the inactive frame's pose criterion.
+- [`grasp_planning.py`](cutamp/grasp_planning.py) — `_build_multi_frame_goal`
+  builds the `GoalToolPose` covering every tool frame for single-arm actions:
+  the active frame gets the target pose, while inactive frames keep their
+  ENABLED pose criteria targeting their FK poses at the segment's start
+  state. Pick/place terminal confs are anchored in cspace.
 
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
   particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. Cache

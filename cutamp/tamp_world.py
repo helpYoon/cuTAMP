@@ -9,9 +9,9 @@
 
 """TAMPWorld for cuTAMP (cuRobo v0.8 single-MotionPlanner architecture).
 
-The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics,
-per-tool-frame InverseKinematics solvers, and a MotionPlanner factory. T1
-exposes two tool frames in ``robot_container.tool_frames``.
+The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics, a
+single multi-tool-frame InverseKinematics solver, and a MotionPlanner
+factory. T1 exposes two tool frames in ``robot_container.tool_frames``.
 """
 
 import logging
@@ -26,11 +26,11 @@ from curobo.inverse_kinematics import InverseKinematics
 from curobo.kinematics import Kinematics
 from curobo.motion_planner import MotionPlanner
 from curobo.scene import Obstacle, Scene
-from curobo.types import DeviceCfg
+from curobo.types import DeviceCfg, GoalToolPose, JointState
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.robots import RobotContainer, load_robot_container
-from cutamp.robots.t1 import get_t1_ik_solver, get_t1_motion_planner
+from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, get_t1_ik_solver, get_t1_motion_planner
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
 from cutamp.utils.collision import get_world_collision_cost
@@ -117,7 +117,6 @@ class TAMPWorld:
         # because they're already in tool_frames per t1_planar_base.yml;
         # exact frame doesn't affect ranking, only LEFT-vs-RIGHT direction
         # matters.
-        from curobo.types import JointState
         home_js = JointState.from_position(
             self._q_init.to(self.kinematics.device_cfg.device).unsqueeze(0)
         )
@@ -137,10 +136,6 @@ class TAMPWorld:
     def kinematics(self) -> Kinematics:
         """Single Kinematics for the robot (covers all tool frames)."""
         return self.robot_container.kinematics
-
-    def get_kin_model(self) -> Kinematics:
-        """Backward-name alias of ``kinematics`` (no per-arm dispatch in v0.8)."""
-        return self.kinematics
 
     @cached_property
     def kinematics_with_com(self) -> Kinematics:
@@ -163,7 +158,6 @@ class TAMPWorld:
 
         ``arm=None`` falls back to the left tool frame.
         """
-        from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM
         if arm is None:
             return self.tool_frames[0]
         return TOOL_FRAME_FOR_ARM.get(arm, self.tool_frames[0])
@@ -183,22 +177,9 @@ class TAMPWorld:
     def gripper_spheres(self) -> Dict[str, Float[torch.Tensor, "n 4"]]:
         return self.robot_container.gripper_spheres
 
-    def get_gripper_spheres(self, tool_frame: str = None) -> Float[torch.Tensor, "n 4"]:
-        if tool_frame is None:
-            tool_frame = self.tool_frames[0]
-        return self.robot_container.gripper_spheres[tool_frame]
-
     @property
     def joint_limits(self) -> Float[torch.Tensor, "2 d"]:
         return self.robot_container.joint_limits
-
-    def get_joint_limits(self) -> Float[torch.Tensor, "2 d"]:
-        return self.joint_limits
-
-    def get_ik_solver(self, tool_frame: str = None) -> InverseKinematics:
-        """Return the multi-frame IK solver. ``tool_frame`` is accepted for
-        backward compatibility but the solver covers all tool frames."""
-        return self.ik_solver
 
     @property
     def device(self) -> torch.device:
@@ -279,8 +260,6 @@ class TAMPWorld:
 
     def warmup_ik_solver(self, num_particles: int):
         """Warmup the multi-frame IK solver with a multi-frame FK goal."""
-        from curobo.types import GoalToolPose, JointState
-
         ik = self.ik_solver
         max_bs = getattr(ik.config, "max_batch_size", num_particles)
         n = min(num_particles, max_bs)

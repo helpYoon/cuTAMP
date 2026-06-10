@@ -10,13 +10,16 @@
 import re
 import itertools
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Generator, List, Optional, Sequence
 
-from cutamp.task_planning import Atom, GroundOperator, Operator, State
+from .base_structs import Atom, GroundOperator, Operator, State
 
 _log = logging.getLogger(__name__)
+
+# Maps parameter types to the base string used when sampling literal names (e.g. "q0", "left_q1").
+_BASE_NAMES = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
 
 
 @dataclass(frozen=True)
@@ -61,10 +64,8 @@ def _extract_number(s: str) -> int:
 
 def _extract_prefix(s: str, param_type: str) -> str:
     """Extract the prefix before the base name. E.g., 'left_q0' -> 'left_', 'q0' -> ''"""
-    # Map param_type to base name
-    base_names = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
-    base = base_names.get(param_type, param_type)
-    
+    base = _BASE_NAMES.get(param_type, param_type)
+
     # Find where base name starts
     idx = s.find(base)
     return s[:idx] if idx > 0 else ""
@@ -92,16 +93,17 @@ def get_valid_ground_operators(
     for atom in state:
         fluent_to_atoms[atom.name].add(atom)
 
+    # Walk the node chain once; each operator below gets a fresh copy so the placeholder
+    # names sampled for one operator don't leak into the next.
+    base_param_type_to_literals = node.parameters()
+
     # For each operator, we try to ground it given the current state
     for operator in operators:
-        # FIXME: this sampling is slow once we have lots of plan skeletons, so improve it in the future
-        # Got to do it inside here so we reset for each operator
-        param_type_to_literals = node.parameters()
+        param_type_to_literals: dict[str, set[str]] = defaultdict(set)
+        for param_type, literals in base_param_type_to_literals.items():
+            param_type_to_literals[param_type] = set(literals)
 
         # Sample new parameter names, handling both prefixed (left_q0) and unprefixed (q0) formats.
-        # Base names map parameter types to their string representations.
-        base_names = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
-        
         # Determine arm prefix
         op_name = operator.name
         arm_prefix = ""
@@ -114,11 +116,11 @@ def get_valid_ground_operators(
             if param_type not in param_type_to_literals:
                 # For dual-arm operators, use arm prefix for conf parameters.
                 if arm_prefix and param_type == "conf":
-                    return f"{arm_prefix}{base_names.get(param_type, param_type)}1"
-                return f"{base_names.get(param_type, param_type)}1"
-                
+                    return f"{arm_prefix}{_BASE_NAMES.get(param_type, param_type)}1"
+                return f"{_BASE_NAMES.get(param_type, param_type)}1"
+
             literals = param_type_to_literals[param_type]
-            base = base_names.get(param_type)
+            base = _BASE_NAMES.get(param_type)
             if base is None:
                 raise NotImplementedError(f"Unknown param type: {param_type}")
             
@@ -183,7 +185,6 @@ def get_valid_ground_operators(
         for param in operator.parameters:
             if param.name not in param_to_literals:
                 sampled_value = sample_param_type(param.type)
-                # sampled_value = param.sample_name()
                 param_to_literals[param.name].add(sampled_value)
                 if verbose:
                     _log.debug(f"Parameter '{param}' not bound, sampled placeholder value {sampled_value}")
@@ -220,7 +221,6 @@ def breadth_first_search(
     initial_state: State,
     goal_state: State,
     operators: Sequence[Operator],
-    continue_branch_after_goal: bool = False,
     explored_state_check: bool = True,
     verbose: bool = False,
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
@@ -234,8 +234,6 @@ def breadth_first_search(
     goal_state: State
     operators: List[Operator]
         The possible operators for the given search problem.
-    continue_branch_after_goal: bool
-        Whether to continue searching on a given branch after finding a solution.
     explored_state_check: bool
         Whether to check if a state has been explored before adding it to the frontier.
     verbose: bool
@@ -261,11 +259,11 @@ def breadth_first_search(
             raise ValueError(f"Goal state must contain only atoms, got {elem.__class__.__name__} {elem}")
 
     initial_node = _Node(state=initial_state, parent=None, operator=None, depth=0)
-    frontier: list[_Node] = [initial_node]
+    frontier: deque[_Node] = deque([initial_node])
     explored: set[State] = {initial_node.state}
 
     while frontier:
-        node = frontier.pop(0)
+        node = frontier.popleft()
         if verbose:
             _log.debug(f"Exploring node: {node}")
 
@@ -273,8 +271,7 @@ def breadth_first_search(
         if goal_state.issubset(node.state):
             plan = node.extract_solution()
             yield plan
-            if not continue_branch_after_goal:
-                continue  # stop exploring this branch as we already satisfied the goal
+            continue  # stop exploring this branch as we already satisfied the goal
 
         # Get successor and add to frontier
         ground_ops = get_valid_ground_operators(

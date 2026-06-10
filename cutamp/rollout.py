@@ -139,18 +139,7 @@ class RolloutFunction:
         if config.place_dof != 4:
             raise ValueError(f"Unsupported {config.place_dof=}")
 
-        from cutamp.robots.t1 import LEFT_TOOL_FRAME, RIGHT_TOOL_FRAME
-        self._tool_frame_for_arm = {
-            "left": LEFT_TOOL_FRAME, "right": RIGHT_TOOL_FRAME,
-        }
-
         self._is_first_rollout = True
-
-    def _ee_pose_for_conf(self, ee_pose, conf_name: str):
-        """Look up the active arm's tool-frame pose at the timestep of ``conf_name``."""
-        arm = self.conf_to_arm.get(conf_name)
-        tool_frame = self._tool_frame_for_arm.get(arm, self.world.tool_frames[0])
-        return ee_pose.get_link_pose(tool_frame, make_contiguous=True)
 
     def __call__(self, particles: Particles) -> Rollout:
         num_particles = particles["left_q0"].shape[0]
@@ -168,15 +157,22 @@ class RolloutFunction:
             ee_pose = kin_state.tool_poses  # ToolPose [B*H, 1, num_links, 3/4]
 
             # Per-timestep ee selection: for each conf, pick that arm's tool frame.
-            world_from_ee_per_ts = []
-            for t, conf_name in enumerate(self.conf_params):
-                pose = self._ee_pose_for_conf(ee_pose, conf_name)
-                # pose: Pose [B*H, 3/4]; we want the row for batch=t (per-ts slicing).
-                # ee_pose flattens [num_particles, num_timesteps] into B*H so row index = particle*T + t.
-                # Easier: rebuild as 4x4 matrix and reshape.
-                mat = pose.get_matrix().view(num_particles, confs.shape[1], 4, 4)
-                world_from_ee_per_ts.append(mat[:, t])
-            world_from_ee = torch.stack(world_from_ee_per_ts, dim=1)
+            # Build the 4x4 matrix once per unique tool frame (≤2 for T1), then
+            # index per timestep. ee_pose flattens [num_particles, num_timesteps]
+            # into B*H, so reshaping recovers the per-timestep axis.
+            conf_frames = [
+                self.world.tool_frame_for_arm(self.conf_to_arm.get(conf_name))
+                for conf_name in self.conf_params
+            ]
+            frame_to_mat = {
+                frame: ee_pose.get_link_pose(frame, make_contiguous=True)
+                .get_matrix()
+                .view(num_particles, confs.shape[1], 4, 4)
+                for frame in dict.fromkeys(conf_frames)
+            }
+            world_from_ee = torch.stack(
+                [frame_to_mat[frame][:, t] for t, frame in enumerate(conf_frames)], dim=1
+            )
 
             # Robot spheres: shared across tool frames; reshape directly.
             robot_spheres = kin_state.robot_spheres.view(num_particles, confs.shape[1], -1, 4)
@@ -288,7 +284,7 @@ class RolloutFunction:
             ee_desired_list = []
             for i, action in enumerate(action_params):
                 arm = action_to_arm.get(action)
-                tool_frame = self._tool_frame_for_arm.get(arm, self.world.tool_frames[0])
+                tool_frame = self.world.tool_frame_for_arm(arm)
                 tool_from_ee = self.world.get_tool_from_ee(tool_frame)
                 ee_desired_list.append(world_from_tool_desired[:, i] @ tool_from_ee)
             world_from_ee_desired = torch.stack(ee_desired_list, dim=1)

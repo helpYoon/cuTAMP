@@ -76,7 +76,6 @@ LEFT_TOOL_FRAME = "left_base_link"
 RIGHT_TOOL_FRAME = "right_base_link"
 TOOL_FRAMES: Tuple[str, str] = (LEFT_TOOL_FRAME, RIGHT_TOOL_FRAME)
 TOOL_FRAME_FOR_ARM: Dict[str, str] = {"left": LEFT_TOOL_FRAME, "right": RIGHT_TOOL_FRAME}
-ARM_FOR_TOOL_FRAME: Dict[str, str] = {LEFT_TOOL_FRAME: "left", RIGHT_TOOL_FRAME: "right"}
 
 # Gripper (4-bar parallel linkage): 4 joints, 1 effective DOF.
 GRIPPER_OPEN: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
@@ -92,9 +91,6 @@ t1_home: Tuple[float, ...] = (
     0.5,  1.0, 0.0,  1.4, 0.0, 0.0, 0.0,        # right arm
 )
 assert len(t1_home) == CUROBO_DOF
-
-#: ``{joint_name: home_value}`` for the cspace joints. Built once at import.
-HOME_BY_JOINT_NAME: Dict[str, float] = dict(zip(JOINT_NAMES_FULL, t1_home))
 
 # Locked head joint values (exposed for the visualizer / URDF expansion).
 t1_home_head: Tuple[float, ...] = (0.0, 0.0)
@@ -227,9 +223,8 @@ def get_t1_motion_planner(
         trajopt_transition_model=_trajopt_transition_dict_with_compute_com(),
     )
     planner = MotionPlanner(cfg)
-    from cutamp._curobo_internals import add_extra_cost
-    rollout_device_cfg = planner.trajopt_solver.optimizer_rollouts[0].device_cfg
     if enable_com_polygon:
+        from cutamp._curobo_internals import add_extra_cost
         from cutamp.com_polygon_cost import (
             ComOverBasePolygonCost,
             ComOverBasePolygonCostCfg,
@@ -256,6 +251,7 @@ def get_t1_motion_planner(
         # mid-trajectory bumps. The earlier concern (this fighting
         # body_home_posture) is validated by retesting; if trunk pitches
         # back too much we lower inside_weight from 1.0.
+        rollout_device_cfg = planner.trajopt_solver.optimizer_rollouts[0].device_cfg
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,

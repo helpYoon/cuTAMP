@@ -8,7 +8,7 @@ This tool allows you to:
 4. Export back to YAML for cuRobo motion planning
 
 Usage:
-    python -m cutamp.scripts.yaml_sphere_editor \
+    python -m cutamp.scripts.robot_sphere_editor \
         --urdf path/to/robot.urdf \
         --yaml path/to/robot.yml \
         --links mobile_base_link shank_link thigh_link

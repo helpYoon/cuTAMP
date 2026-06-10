@@ -33,7 +33,7 @@ np.set_printoptions(precision=4, suppress=True)
 AXIS_LENGTH = 0.05
 
 
-def log_frame_to_rerun(path: str, transform_4x4: torch.Tensor, label: str = None):
+def log_frame_to_rerun(path: str, transform_4x4: torch.Tensor):
     """Log a coordinate frame to rerun with axes visualization."""
     transform_4x4_np = transform_4x4.cpu().numpy()
     rr.log(
@@ -111,15 +111,12 @@ def main():
     grasp_4dof = torch.tensor([[0.5, 0.0, 0.3, 0.0]], device=tensor_args.device, dtype=torch.float32)
     world_from_grasp = action_4dof_to_mat4x4(grasp_4dof)[0]
     world_from_ee = world_from_grasp @ tool_from_ee
-    
-    # Verify gripper direction
-    # T1 EE frame (left_base_link / right_base_link) has +X pointing toward fingertips
-    ee_x_world = world_from_ee[:3, 0].cpu().numpy()
-    fingertips_dir = ee_x_world  # +X points toward fingertips
-    gripper_down = fingertips_dir[2] < -0.9
-    
+
+    # Verify gripper direction (EE +X toward fingertips must point DOWN).
+    gripper_down = verify_top_down_grasp(tool_from_ee, world_from_grasp)
+
     print(f"\n    Test grasp: position=[0.5, 0, 0.3], yaw=0")
-    print(f"    EE +X (toward fingertips) in world: {fingertips_dir}")
+    print(f"    EE +X (toward fingertips) in world: {world_from_ee[:3, 0].cpu().numpy()}")
     print(f"    Gripper points DOWN: {'PASS' if gripper_down else 'FAIL'}")
     
     # Visualize frames
@@ -132,7 +129,7 @@ def main():
     print("\n[3] IK feasibility test...")
     
     try:
-        from cutamp.robots.t1 import get_t1_ik_solver, RIGHT_TOOL_FRAME
+        from cutamp.robots.t1 import get_t1_ik_solver
         from curobo.scene import Scene
 
         ik_solver = get_t1_ik_solver(Scene())

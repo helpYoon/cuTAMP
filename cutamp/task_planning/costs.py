@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from cutamp.task_planning import Cost
+from .tamp_structs import Cost
 
 
 class GraspCost(Cost):

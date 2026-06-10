@@ -41,7 +41,6 @@ class MultiSphere(Obstacle):
             raise ValueError("Spheres must not be empty")
         if self.spheres.ndim != 2 or self.spheres.shape[1] != 4:
             raise ValueError(f"Spheres should be (n, 4) not {self.spheres.shape}")
-        self.radius = self.spheres[0, 3].item()
 
     def get_trimesh_mesh(self, process: bool = True, process_color: bool = True) -> trimesh.Trimesh:
         """Create a trimesh instance from the obstacle representation.
@@ -97,7 +96,12 @@ class MultiSphere(Obstacle):
         pre_transform_pose: Optional[Pose] = None,
         tensor_args: TensorDeviceType = TensorDeviceType(),
     ) -> List[Sphere]:
-        """Use the ground truth spheres as the bounding spheres. Ignores most of the arguments."""
+        """Use the ground truth spheres as the bounding spheres. Ignores most of the arguments.
+
+        Intentionally overrides cuRobo's public ``Obstacle.get_bounding_spheres``:
+        the base implementation would sphere-fit the trimesh mesh instead of
+        reusing the exact spheres this obstacle is defined by. Do not delete.
+        """
         pts = self.spheres[:, :3].cpu().numpy()
         n_radius = self.spheres[:, 3].cpu().numpy()
 
@@ -120,32 +124,6 @@ class MultiSphere(Obstacle):
             for i in range(pts.shape[0])
         ]
         return new_spheres
-
-
-def sample_collision_spheres(
-    obj: Obstacle,
-    n_spheres: int = 50,
-    surface_sphere_radius: float = 0.005,
-    fit_type: SphereFitType = SphereFitType.VOXEL,
-    voxelize_method: str = "subdivide",
-) -> Float[torch.Tensor, "n 4"]:
-    """Sample spheres for collision checking using cuRobo. Note the spheres will be in the object's frame."""
-    # Need to temporarily override the pose, so the spheres are at the origin
-    og_pose = obj.pose
-    obj.pose = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]  # unit pose
-    sph_objs = obj.get_bounding_spheres(
-        n_spheres=n_spheres,
-        fit_type=fit_type,
-        voxelize_method=voxelize_method,
-        surface_sphere_radius=surface_sphere_radius,
-    )
-    obj.pose = og_pose
-
-    # Convert to (num_spheres, 4) tensor
-    centers = torch.tensor([sph.pose[:3] for sph in sph_objs], dtype=torch.float32)
-    radii = torch.tensor([sph.radius for sph in sph_objs], dtype=torch.float32)
-    spheres = torch.cat([centers, radii[:, None]], dim=1)
-    return spheres
 
 
 def sample_greedy_surface_spheres(

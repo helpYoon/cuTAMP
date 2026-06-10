@@ -9,9 +9,9 @@
 
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Sequence, Protocol, List
+from typing import Sequence, List
 
-from cutamp.task_planning import Operator, GroundOperator, OperatorMetadata
+from .base_structs import Operator, GroundOperator
 
 
 @dataclass(frozen=True)
@@ -41,18 +41,19 @@ class GroundTAMPOperator(GroundOperator):
 PlanSkeleton = List[GroundTAMPOperator]
 
 
-class Groundable(Protocol):
-    def ground(self, substitutions: dict[str, str]) -> "Groundable": ...
+class _TypeName:
+    """Non-data descriptor so ``SomeClass.type`` and ``instance.type`` both return the class
+    name. Replaces chained ``@classmethod @property``, which was removed in CPython 3.13."""
+
+    def __get__(self, obj, owner):
+        return owner.__name__
 
 
-class Constraint(ABC, Groundable):
+class Constraint(ABC):
     def __init__(self, *params):
         self.params = params
 
-    @classmethod
-    @property
-    def type(cls) -> str:
-        return cls.__name__
+    type = _TypeName()
 
     def ground(self, substitutions: dict[str, str]) -> "Constraint":
         atoms = [substitutions[param.name] for param in self.params]
@@ -63,14 +64,11 @@ class Constraint(ABC, Groundable):
         return f"{name}({', '.join(map(str, self.params))})"
 
 
-class Cost(ABC, Groundable):
+class Cost(ABC):
     def __init__(self, *params):
         self.params = params
 
-    @classmethod
-    @property
-    def type(cls) -> str:
-        return cls.__name__
+    type = _TypeName()
 
     def ground(self, substitutions: dict[str, str]) -> "Cost":
         atoms = [substitutions[param.name] for param in self.params]

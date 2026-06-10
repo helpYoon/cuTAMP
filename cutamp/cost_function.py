@@ -9,7 +9,7 @@
 
 import itertools
 from collections import defaultdict
-from typing import Dict, Literal, Optional, Union
+from typing import Dict, Optional, Union
 
 import roma
 import torch
@@ -109,13 +109,16 @@ class CostFunction:
         self.kinematic_confs = list(self.kinematic_confs)
         self.kinematic_actions = list(self.kinematic_actions)
 
-        # Compute the AABB and surface z-position for the placement surfaces
+        # Compute the AABB and surface z-position for the placement surfaces.
+        # Also precompute the static per-surface placement grouping used by
+        # stable_placement_costs: ordered (obj, placement_param) pairs and the
+        # per-sphere → per-object index map (sphere counts are static).
         self.surface_to_aabb = {}
         self.surface_to_target_z = {}
-        self.surface_to_objs = defaultdict(list)
+        self.surface_to_placements = defaultdict(list)
         for con in self.stable_placement_constraints:
-            obj, _, _, surface = con.params
-            self.surface_to_objs[surface].append(obj)
+            obj, _, placement, surface = con.params
+            self.surface_to_placements[surface].append((obj, placement))
             if surface in self.surface_to_aabb:
                 continue
 
@@ -127,6 +130,16 @@ class CostFunction:
             surface_z = aabb[1, 2]
             target_z = surface_z + world.collision_activation_distance + 2e-3  # add some buffer
             self.surface_to_target_z[surface] = target_z
+
+        self.surface_to_sphere_idx_map = {}
+        for surface, placements in self.surface_to_placements.items():
+            sphere_idx_map = []
+            for o_idx, (obj, _) in enumerate(placements):
+                num_spheres = world.get_collision_spheres(obj).shape[0]
+                sphere_idx_map.extend([o_idx] * num_spheres)
+            self.surface_to_sphere_idx_map[surface] = torch.tensor(
+                sphere_idx_map, dtype=torch.int64, device=world.device
+            )
 
         # Store the button AABBs for ValidPush
         self.button_to_action = {}
@@ -295,42 +308,34 @@ class CostFunction:
         if not self.stable_placement_constraints:
             return None
 
-        # First collate the objects by placement surface.
-        surface_to_obj = defaultdict(list)
-        surface_to_spheres = defaultdict(list)
-        for con in self.stable_placement_constraints:
-            obj, _, placement, surface = con.params
-            pose_ts = rollout["action_to_pose_ts"][placement]
-            obj_spheres = obj_to_spheres[obj][:, pose_ts]
-            surface_to_obj[surface].append(obj)
-            surface_to_spheres[surface].append(obj_spheres)
-
         num_particles = rollout["num_particles"]
         support_vals = {}
-        for surface, objs in surface_to_obj.items():
-            # Create map of sphere index to object index
-            sphere_idx_map = []
-            for o_idx, (obj, spheres) in enumerate(zip(objs, surface_to_spheres[surface])):
-                num_spheres = spheres.shape[1]
-                sph_idxs = [o_idx] * num_spheres
-                sphere_idx_map.extend(sph_idxs)
-            sphere_idx_map = torch.tensor(sphere_idx_map, dtype=torch.int64, device=self.world.device)
+        for surface, placements in self.surface_to_placements.items():
+            # Per-call pose work: each object's spheres at its placement timestep.
+            surface_spheres = [
+                obj_to_spheres[obj][:, rollout["action_to_pose_ts"][placement]]
+                for obj, placement in placements
+            ]
+            # Static sphere-index → object-index map (precomputed in __init__).
+            sphere_idx_map = self.surface_to_sphere_idx_map[surface]
             sphere_idx_map_expand = sphere_idx_map[None].expand(num_particles, -1)  # expand by batch size
 
             # Since objects can have different numbers of spheres, we need to concatenate instead of stack
-            spheres = torch.cat(surface_to_spheres[surface], dim=1)
+            spheres = torch.cat(surface_spheres, dim=1)
             spheres_xy = spheres[..., :2]
 
             # Within goal xy bounds, need to gather by the spheres for each object
             in_goal_xy = dist_from_bounds_jit(spheres_xy, *self.surface_to_aabb[surface])
-            obj_in_goal_xy = torch.zeros((num_particles, len(objs)), dtype=in_goal_xy.dtype, device=in_goal_xy.device)
+            obj_in_goal_xy = torch.zeros(
+                (num_particles, len(placements)), dtype=in_goal_xy.dtype, device=in_goal_xy.device
+            )
             obj_in_goal_xy.scatter_add_(1, sphere_idx_map_expand, in_goal_xy)
             support_vals[f"{surface}_in_xy"] = obj_in_goal_xy
 
             # Distance between bottom of spheres and z-position of the surface
             spheres_bottom = spheres[..., 2] - spheres[..., 3]
             obj_bottom = torch.full(
-                (num_particles, len(objs)), float("inf"), dtype=spheres_bottom.dtype, device=spheres_bottom.device
+                (num_particles, len(placements)), float("inf"), dtype=spheres_bottom.dtype, device=spheres_bottom.device
             )
             obj_bottom.scatter_reduce_(1, sphere_idx_map_expand, spheres_bottom, reduce="amin")
             target_z = self.surface_to_target_z[surface]
@@ -550,12 +555,7 @@ class CostFunction:
         elif cost_name == "com_polygon":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for com_polygon soft cost")
-            if self._com_polygon_penalties_cache is None:
-                from cutamp.com_polygon_cost import compute_com_polygon_penalties
-                self._com_polygon_penalties_cache = compute_com_polygon_penalties(
-                    self.world, self._particles,
-                )
-            pens = self._com_polygon_penalties_cache
+            pens = self._com_polygon_penalties()
             if not pens:
                 return torch.zeros(num_particles, device=device)
             # Sum over confs to match the prior per-particle scalar shape.
