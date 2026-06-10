@@ -83,9 +83,11 @@ class TAMPConfiguration:
     enable_com_polygon: bool = True
     ik_com_retry_max: int = 15   # Layer 2: max retries when post-IK COM check fails.
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
-    # COM, recruiting legs within limits. Default off until validated (spec
-    # 2026-06-09-com-aware-ik-design.md acceptance gates).
-    enable_com_aware_ik: bool = False
+    # COM, recruiting legs within limits. Validated 2026-06-09 (plan Task 9):
+    # suite 68/68; num_satisfying mean 10.67 on vs 12.00 off (within -3 gate);
+    # endpoint audit 2/2 plans with all 528 frames at penalty 0.0 (baseline:
+    # worst arrivals at 73-99% of COM_TOL in 7/10 trials).
+    enable_com_aware_ik: bool = True
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
     # On RuntimeError from solve_curobo, retry on the next-best satisfying particle

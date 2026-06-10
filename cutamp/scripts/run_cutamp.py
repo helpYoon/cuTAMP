@@ -185,12 +185,14 @@ def entrypoint():
     )
     parser.set_defaults(enable_com_polygon=True)
     parser.add_argument(
-        "--enable_com_aware_ik",
-        action="store_true",
-        help="Enable the CoM-aware seed-IK residual (cuRobo fork): IK trades "
-             "hand-pose vs COM and recruits the legs to center the COM. "
-             "Default off until validated.",
+        "--no_enable_com_aware_ik",
+        dest="enable_com_aware_ik",
+        action="store_false",
+        help="Disable the CoM-aware seed-IK residual (cuRobo fork). By default "
+             "IK trades hand-pose vs COM and recruits the legs to center the "
+             "COM (validated 2026-06-09; see config.enable_com_aware_ik).",
     )
+    parser.set_defaults(enable_com_aware_ik=True)
 
     # Visualization and logging
     parser.add_argument(
