@@ -4,12 +4,19 @@
 
 The full README with installation instructions, examples, and detailed
 documentation can be found in [README_DETAILED.md](README_DETAILED.md). Notes
-on the cuRobo v0.8 port that defines this branch's architecture are in
+on the cuRobo v0.8 port that defines the current architecture are in
 [docs/curobo_v08_port.md](docs/curobo_v08_port.md).
+
+> **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
+> `curobo/` tree (the `compute_com` plumbing, a batched-COM kernel fix, and
+> the CoM-aware seed-IK residual). These live as working-tree edits in the
+> nested `curobo/` repo and belong in the cuRobo fork — a fresh `curobo/`
+> checkout without them breaks cuTAMP. Grep `cuTAMP fork` under
+> `curobo/curobo/_src/` for the full inventory.
 
 ## T1 Single-Planner Architecture (cuRobo v0.8)
 
-This branch (`curobo_v2`) plans for the T1 humanoid through a **single 21-DOF
+cuTAMP plans for the T1 humanoid through a **single 21-DOF
 MotionPlanner** built from `t1_planar_base.yml`. The cspace is:
 
 ```
@@ -82,9 +89,13 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   account for T1's +X-toward-fingertips EE convention.
 
 - [`t1.py`](cutamp/robots/t1.py) — T1 module:
-  - cuRobo loaders: `get_t1_kinematics`, `get_t1_ik_solver(scene, arm=…)`
-    (one IK per arm, scoped to its tool frame), `get_t1_motion_planner` (the
-    single planner with the base lock applied).
+  - cuRobo loaders: `get_t1_kinematics`, `get_t1_ik_solver(scene)` (a single
+    multi-tool-frame IK over both arms; with `enable_com_aware_ik=True`, the
+    default, its seed-IK LM stage carries a CoM-over-support-rectangle
+    residual — a cuRobo fork edit — weighted by `T1_COM_IK_WEIGHT` and the
+    pull-to-center `T1_COM_IK_CENTER_WEIGHT`), and `get_t1_motion_planner`
+    (the single planner with the base lock and the COM-over-polygon rollout
+    soft cost applied).
   - Joint-name + index constants: `JOINT_NAMES_FULL`, `BASE_INDICES`,
     `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`,
     `t1_home`.
@@ -95,9 +106,10 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 ### 📁 [`cutamp/`](cutamp/) — core
 
 - [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a TAMPEnvironment
-  with the collision Scene, the single `Kinematics`, two per-arm
-  `InverseKinematics` solvers (keyed by tool-frame name), and a
-  `MotionPlanner` factory. `q_init` is one 21-DOF tensor.
+  with the collision Scene, the single `Kinematics`, a single multi-tool-frame
+  `InverseKinematics` solver, and a `MotionPlanner` factory. `q_init` is one
+  21-DOF tensor. A lazy `kinematics_with_com` (built with `compute_com=True`)
+  serves the COM checks and audits.
 
 - [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner,
   kinematics, current joint state, and per-arm `arm_holding` /
@@ -114,8 +126,20 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`_curobo_internals.py`](cutamp/_curobo_internals.py) — every cuRobo
   private-API workaround in one file (with `# TODO: file upstream issue`
   markers): `get_attachment_manager`, `cspace_plan_succeeded`,
-  `write_cspace_target_dof_weight` / `snapshot…` / `restore…` for the
-  per-rollout target-weight tensors.
+  `iter_rollouts`, the cspace target-weight `write…` / `snapshot…` /
+  `restore…` trio (hosts-iterable), `inactive_arm_cspace_weights`, and
+  `add_extra_cost` (custom-cost dispatch; effective for the planner's
+  rollouts — for IK solve-time costs it is inert, which is why the CoM
+  residual lives inside the seed-IK fork instead).
+
+- [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
+  truth for the COM-over-support-rectangle geometry (`COM_HALF_EXTENTS`,
+  `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT`, `COM_TOL`) and its consumers:
+  `com_polygon_penalty` (outside-quadratic + inside-margin barrier +
+  optional pull-to-center), `ComOverBasePolygonCost` (the planner rollout
+  cost), `compute_com_polygon_mask` / `compute_com_polygon_penalties` (the
+  hard `ComPolygon` gate + post-IK COM-safe retry), and
+  `compute_com_in_base` (audits / tests).
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
   through the single planner. Per-operator: pin the cspace, plan, append a
@@ -139,8 +163,12 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   `RightPlace`, `LeftPush` / `RightPush`, `LeftPushStick` / `RightPushStick`,
   and the `RetractHolding` / `RetractFree` family.
 
-- [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported);
-  `soft_cost: Optional[List[str]]`, `optimize_soft_costs`,
+- [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
+  and `SUPPORTED_SOFT_COSTS`. Notable defaults (all validated together):
+  `optimize_soft_costs=True` + `coupled_reik=True` +
+  `soft_cost=["place_close_to_base"]` (the trio), `enable_com_polygon=True`
+  (planner COM cost + hard gate), `enable_com_aware_ik=True` (seed-IK CoM
+  residual), `ik_com_retry_max` (post-IK COM-mask backstop),
   `debug_motion_failures`.
 
 - [`algorithm.py`](cutamp/algorithm.py) — `setup_cutamp` + `run_cutamp`
@@ -149,9 +177,12 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
   particles; respects `left_q0` / `right_q0` as fixed initial-state.
 
-- [`cost_function.py`](cutamp/cost_function.py) — single-arm soft costs
-  (`retract_close_to_home`, `minimize_body_movement`) + the multi-object
-  costs from `costs.py`. Hard collision constraints over each `q_*`.
+- [`cost_function.py`](cutamp/cost_function.py) — hard constraints
+  (kinematic, collision, stable placement, and the `ComPolygon` COM-in-hull
+  gate over every `q_*` conf) plus the soft costs listed in
+  `SUPPORTED_SOFT_COSTS` (`place_close_to_base`, `retract_close_to_home`,
+  `minimize_body_movement`, `com_polygon`, the multi-object placement
+  costs, …).
 
 - [`rollout.py`](cutamp/rollout.py) — FK rollout helpers used by the cost
   graph (forward kinematics on the full 21-DOF cspace).
@@ -167,15 +198,28 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   `log_joint_trajectory_with_mat4x4s(traj, mat4x4s, …)` accepts any number
   of held-object transforms per trajectory.
 
-### 📁 [`cutamp/tests/`](cutamp/tests/) — 12 tests
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 63 tests
 
-- [`test_t1_config.py`](cutamp/tests/test_t1_config.py) — YAML schema /
-  cspace / lock-joints / DOF-constant checks for `t1_planar_base.yml`.
-- [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) —
-  RobotContainer, both tool frames, joint-limit shape, kinematics
-  smoke-test.
+Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
+(`needs_cuda` marker, `make_blocks_t1_world` factory, GPU-memory cleanup).
+Highlights:
 
-Run with: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -v`.
+- [`test_t1_config.py`](cutamp/tests/test_t1_config.py) /
+  [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) — YAML
+  schema, cspace, lock-joints, tool frames, kinematics smoke.
+- [`test_com_polygon_ik.py`](cutamp/tests/test_com_polygon_ik.py) — COM
+  penalty math, mask/gate parity, batched-COM kernel regression.
+- [`test_com_aware_seed_ik.py`](cutamp/tests/test_com_aware_seed_ik.py) —
+  CoM-aware seed-IK: fork/cuTAMP penalty parity, FD-checked gradients,
+  centering A/B with joint-limit and pose-accuracy guards.
+- [`test_motion_anchor.py`](cutamp/tests/test_motion_anchor.py) — full
+  pipeline: cspace-anchored pick/place terminals, all arrivals COM-in-hull.
+- Plus pin lifecycle, arm-affinity priority, plan-processor derivatives,
+  and a coupled-reIK smoke test.
+
+Run with:
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTORCH_ALLOC_CONF=expandable_segments:True pytest cutamp/tests/ -q`
+(GPU required for the integration tests; ~80 s on an RTX 4090).
 
 ### 📁 [`cutamp/scripts/`](cutamp/scripts/)
 
@@ -187,6 +231,11 @@ Run with: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -v`.
   interactive robot-sphere editor.
 
 ## Usage
+
+By default a run uses the validated trio — soft-cost optimization ON with
+`place_close_to_base` under re-IK-coupled Adam — plus CoM-aware IK, so
+placements stay near the base and every arrival lands with the COM centered
+in the support polygon.
 
 ```bash
 # Smoke test (no motion plan)
@@ -200,18 +249,35 @@ PYTORCH_ALLOC_CONF=expandable_segments:True python -m cutamp.scripts.run_cutamp 
 PYTORCH_ALLOC_CONF=expandable_segments:True python -m cutamp.scripts.run_cutamp \
     --env blocks_t1 --motion_plan -n 64
 
-# Soft-cost optimization
+# Save the processed plan (schema v3) for the MPC consumer
+PYTORCH_ALLOC_CONF=expandable_segments:True python -m cutamp.scripts.run_cutamp \
+    --env blocks_t1 --motion_plan -n 64 --save_plan data/motion_plan.pkl
+
+# Different soft costs (optimization is already on by default)
 python -m cutamp.scripts.run_cutamp --env blocks_t1 --motion_plan \
-    --soft_cost retract_close_to_home minimize_body_movement --optimize_soft_costs
+    --soft_cost retract_close_to_home minimize_body_movement
+
+# Classic single-level optimization, no soft costs
+python -m cutamp.scripts.run_cutamp --env blocks_t1 --motion_plan \
+    --no_optimize_soft_costs --no_coupled_reik
 ```
 
-**Available soft costs** (T1-only ones marked):
+**Available soft costs** (see `SUPPORTED_SOFT_COSTS`; T1-only ones marked):
+- `place_close_to_base` *(default)* — pull placed objects toward the base;
+  keeps placements inside the reach range where the CoM-aware IK can center
+  the COM.
 - `retract_close_to_home` *(T1)* — penalize retract configs far from `t1_home`.
 - `minimize_body_movement` *(T1)* — penalize body (leg/torso/waist) drift.
+- `com_polygon` *(T1)* — differentiable COM-in-polygon penalty on confs.
 - `dist_from_origin`, `max_obj_dist` / `min_obj_dist`, `min_y` / `max_y`,
   `align_yaw` — multi-object placement costs.
 
-VRAM at `-n 64`: ~4.2 GiB above baseline (peaks at the end of motion
+Pose-class soft costs (e.g. `place_close_to_base`) require the re-IK-coupled
+optimizer (`coupled_reik`, on by default): outer Adam moves pose/grasp
+particles while their dependent confs are refreshed by exact IK every
+`reik_interval` steps.
+
+VRAM at `-n 64`: roughly 4–5 GiB above baseline (peaks at the end of motion
 planning). Comfortably fits a 24 GB GPU.
 
 ## Key Design Decisions
@@ -223,7 +289,8 @@ planning). Comfortably fits a 24 GB GPU.
 2. **Planar base via `extra_links`** — `world → base_j_x → base_j_y →
    base_j_yaw → mobile_base_link` adds 3 virtual DOFs that get hard-locked at
    IK / motion-planner construction time for arm operators (so the base
-   doesn't drift while reaching), and unlocked for `MoveBaseTo`.
+   doesn't drift while reaching). `MoveBaseTo` is currently unfireable —
+   wiring it up needs a second, base-unlocked planner.
 
 3. **Cspace pinning replaces per-arm planners** — `pin_for_arm_action` /
    `pin_for_movebase` write into each rollout's
@@ -242,4 +309,23 @@ planning). Comfortably fits a 24 GB GPU.
 
 6. **cuRobo internals isolated** — every reach into cuRobo's private API
    lives in [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py) so a
-   future cuRobo upgrade has one place to audit.
+   future cuRobo upgrade has one place to audit. The exceptions are the
+   fork edits inside the vendored `curobo/` tree itself (grep `cuTAMP fork`);
+   those must travel with any cuRobo upgrade.
+
+7. **Layered COM safety** — the COM is kept inside the two-foot support
+   polygon by independent layers, each guarding a different frontier:
+   - **CoM-aware seed-IK** (cuRobo fork residual, on by default): the IK
+     itself trades hand pose vs COM, recruiting the knees/ankles within
+     joint limits, with a pull-to-center term — endpoint confs come out
+     centered, not edge-parked.
+   - **Hard `ComPolygon` gate**: every optimizer conf must have COM penalty
+     ≤ `COM_TOL`; a post-IK mask + retry backstops the IK.
+   - **COM-anchored terminals**: pick/place trajectories end exactly at the
+     gate-approved conf (`plan_cspace`), so cuRobo can't re-resolve the
+     redundancy at the endpoint.
+   - **Planner rollout COM cost**: a soft barrier keeps mid-trajectory
+     frames in-hull between anchored endpoints.
+   - **`place_close_to_base`** (default soft cost): biases chosen placements
+     away from the far-reach regime where no in-limit posture can center
+     the COM.
