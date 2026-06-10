@@ -81,7 +81,7 @@ class TAMPConfiguration:
     enable_traj: bool = False
     # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
     enable_com_polygon: bool = True
-    ik_com_retry_max: int = 15   # Layer 2: max retries when post-IK COM check fails.
+    ik_com_retry_max: int = 3   # Backstop: post-IK COM mask retries (CoM-aware IK makes violations rare).
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
     # COM, recruiting legs within limits. Validated 2026-06-09 (plan Task 9):
     # suite 68/68; num_satisfying mean 10.67 on vs 12.00 off (within -3 gate);

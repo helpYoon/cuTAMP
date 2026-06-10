@@ -180,7 +180,7 @@ def entrypoint():
         dest="enable_com_polygon",
         action="store_false",
         help="Disable the COM-over-base-polygon soft cost on the motion planner. "
-             "By default the cost is enabled (1e5 weight) and keeps the planner's "
+             "By default the cost is enabled (5e5 weight) and keeps the planner's "
              "configurations from tipping over the wheelbase.",
     )
     parser.set_defaults(enable_com_polygon=True)

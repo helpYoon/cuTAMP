@@ -1,4 +1,4 @@
-"""Tests for the two-layer COM cost on the IK solver."""
+"""Tests for the COM polygon penalty math, hard gate, and post-IK mask."""
 import os
 import pytest
 
@@ -25,43 +25,6 @@ def _make_world(enable_com_polygon: bool = True):
     return TAMPWorld(
         env=env, device_cfg=device_cfg, robot=robot, q_init=q_init,
         enable_com_polygon=enable_com_polygon,
-    )
-
-
-def _ik_extra_costs(world):
-    """Return the union of _extra_costs dicts across all IK rollout cost managers."""
-    from cutamp._curobo_internals import iter_rollouts
-    names = set()
-    for rollout in iter_rollouts(world.ik_solver):
-        for mgr in (
-            getattr(rollout, "cost_manager", None),
-            getattr(rollout, "metrics_cost_manager", None),
-        ):
-            if mgr is None:
-                continue
-            extras = getattr(mgr, "_extra_costs", {}) or {}
-            names.update(extras.keys())
-    return names
-
-
-@needs_cuda
-def test_ik_solver_has_com_polygon_extra_cost_when_enabled():
-    """Default world (enable_com_polygon=True) registers com_polygon on
-    the IK solver's rollouts via add_extra_cost."""
-    world = _make_world(enable_com_polygon=True)
-    assert "com_polygon" in _ik_extra_costs(world), (
-        "IK solver should have com_polygon in its _extra_costs when "
-        "enable_com_polygon=True"
-    )
-
-
-@needs_cuda
-def test_ik_solver_no_com_polygon_when_disabled():
-    """enable_com_polygon=False skips IK cost registration entirely."""
-    world = _make_world(enable_com_polygon=False)
-    assert "com_polygon" not in _ik_extra_costs(world), (
-        "IK solver should NOT have com_polygon registered when "
-        "enable_com_polygon=False"
     )
 
 

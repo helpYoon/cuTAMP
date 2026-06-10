@@ -184,10 +184,10 @@ def _trajopt_transition_dict_with_compute_com() -> dict:
 def _ik_transition_dict_with_compute_com() -> dict:
     """Default IK transition YAML with ``compute_com=True`` injected.
 
-    cuRobo's IK kernel template is fixed at IK-build time (analogous to
-    the motion planner). We inject ``compute_com=True`` so
-    ``state.cuda_robot_model_state.robot_com`` is populated during the
-    LBFGS refinement stage, where the COM-over-base soft cost reads it.
+    This dict feeds the IK's ROLLOUT/metrics kinematics (cost managers),
+    NOT the seed-IK solver's own Kinematics — the fork's ``compute_com``
+    flag covers that. Keeps ``robot_com`` available to rollout-side
+    metrics/diagnostics.
     """
     from curobo._src.util.config_io import resolve_config, join_path
     from curobo.content import get_task_configs_path
@@ -284,7 +284,6 @@ def get_t1_ik_solver(
     num_seeds: int = 32,
     self_collision_check: bool = True,
     max_batch_size: int = 64,
-    enable_com_polygon: bool = True,
     enable_com_aware_ik: bool = False,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
@@ -299,12 +298,9 @@ def get_t1_ik_solver(
     at 0 — IK cannot drift the base during particle init. Legs / torso /
     waist / arms remain free.
 
-    When ``enable_com_polygon`` is True (default), the IK solver gets the
-    same COM-over-base-polygon soft cost as the motion planner. Without
-    this, IK produces extreme leaning configurations whose COM projects
-    outside the wheelbase rectangle — the Adam-side soft cost can't
-    recover from these because pulling the body back would violate the
-    KinematicConstraint.
+    When ``enable_com_aware_ik`` is True (default), the seed-IK LM solver
+    carries a CoM-over-support-rectangle residual (cuRobo fork) that
+    recruits the legs to keep the COM centered while reaching.
     """
     from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
 
@@ -336,27 +332,6 @@ def get_t1_ik_solver(
         seed_com_base_link_name="mobile_base_link",
     )
     ik_solver = InverseKinematics(cfg)
-    if enable_com_polygon:
-        from cutamp._curobo_internals import add_extra_cost, iter_rollouts
-        from cutamp.com_polygon_cost import (
-            ComOverBasePolygonCost,
-            ComOverBasePolygonCostCfg,
-        )
-        rollout_device_cfg = iter_rollouts(ik_solver)[0].device_cfg
-        # Inside-barrier ON for IK rollouts: gives LBFGS a gradient pull from
-        # inside the band toward the center, broadening the COM-feasible
-        # convergence basin so unlucky-seed IK runs still land inside the
-        # polygon. The planner-side cost (get_t1_motion_planner above) uses
-        # the same inside-barrier-ON config to flatten mid-trajectory COM
-        # excursions, so IK and planner share identical COM cost settings.
-        cost_cfg = ComOverBasePolygonCostCfg(
-            weight=[5.0e5],
-            device_cfg=rollout_device_cfg,
-            half_extents=list(COM_HALF_EXTENTS),
-            inside_margin=COM_INSIDE_MARGIN,
-            inside_weight=COM_INSIDE_WEIGHT,
-        )
-        add_extra_cost(ik_solver, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     return ik_solver
 
 

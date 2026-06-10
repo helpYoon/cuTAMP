@@ -62,7 +62,7 @@ class TAMPWorld:
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
-        enable_com_polygon: bool = True,
+        enable_com_polygon: bool = True,  # Retained for API stability; the planner cost + hard gate key off config.enable_com_polygon.
         enable_com_aware_ik: bool = False,
     ):
         self.env = env
@@ -99,7 +99,6 @@ class TAMPWorld:
         # so a "single-arm Pick" doesn't drift the other arm.
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.world_cfg, device_cfg=device_cfg, max_batch_size=512,
-            enable_com_polygon=enable_com_polygon,
             enable_com_aware_ik=enable_com_aware_ik,
         )
 

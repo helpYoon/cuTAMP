@@ -155,10 +155,10 @@ def _ik_for_pose_com_safe(
 ):
     """Call ``_ik_for_pose``; verify COM-in-polygon; retry failed particles.
 
-    Layer 2 of the two-layer COM defense. Layer 1 (cost registered on
-    IK rollouts) makes IK natively COM-aware; this wrapper catches the
-    LBFGS-didn't-converge-to-COM-feasible edge case by re-calling IK
-    on the failed-particle subset. cuRobo's seed sampler has internal
+    Backstop behind the CoM-aware seed-IK residual (Layer 1, cuRobo
+    fork): verifies COM-in-polygon and retries the failed subset. The
+    residual makes violations rare; this wrapper guarantees
+    gate-consistency of stored confs. cuRobo's seed sampler has internal
     randomization so retries may converge to different (feasible)
     solutions.
 

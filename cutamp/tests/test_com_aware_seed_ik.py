@@ -268,7 +268,6 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     knee_delta = float((q_on[s_on][:, idx["knee_pitch"]]).abs().max())
     print(f"recruitment: max knee_pitch={knee_delta:.3f} rad; "
           f"absx on/off mean {float(absx_on.mean()):.4f}/{float(absx_off.mean()):.4f}")
-    del world_on; gc.collect(); torch.cuda.empty_cache()
 
 
 @needs_cuda

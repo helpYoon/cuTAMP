@@ -285,7 +285,12 @@ def add_extra_cost(host, name: str, cost) -> None:
     ``host`` may be a ``MotionPlanner`` (rollouts live at
     ``host.trajopt_solver.optimizer_rollouts``) or an ``IKSolver``
     (rollouts at ``host.core.optimizer_rollouts``). ``iter_rollouts``
-    handles both paths."""
+    handles both paths.
+
+    NOTE: for IK solve-time costs this path is INERT — the seed-IK LM
+    error calculator never consults the rollout cost managers (use the
+    seed-IK CoM residual fork instead). The planner is the supported
+    target."""
     for rollout in iter_rollouts(host):
         for mgr in (
             getattr(rollout, "cost_manager", None),
