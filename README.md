@@ -10,8 +10,48 @@ documentation can be found in [README_DETAILED.md](README_DETAILED.md).
 > residual — 7 Python files; the earlier batched-COM kernel fix was dropped
 > when the base moved to NVlabs PR #678, which fixes it upstream). The edits
 > live on the `main` branch of the cuRobo fork (helpYoon/curobo) — a plain
-> NVlabs checkout without them breaks cuTAMP. Grep `cuTAMP fork` under
-> `curobo/curobo/_src/` for the full inventory.
+> NVlabs checkout without them breaks cuTAMP. Grep `cuTAMP` under
+> `curobo/curobo/_src/` for the full inventory (5 files tagged `cuTAMP fork`,
+> plus `robot_state_transition[_cfg].py` tagged `cuTAMP local addition`).
+
+## How it works (end-to-end)
+
+cuTAMP solves a task-and-motion problem for the T1 by searching over **plan
+skeletons** (symbolic action sequences) and, for each, optimizing a batch of
+**particles** (candidate continuous parameters — grasps, placements, configs)
+until one satisfies every hard constraint, then motion-planning the result.
+
+```mermaid
+graph LR
+    A["Task planning<br/>(t1_domain → skeletons)"] --> B["Particle init<br/>(IK-seeded candidates)"]
+    B --> C["Optimize<br/>(coupled-Adam:<br/>hard constraints + soft costs)"]
+    C --> D["Motion plan<br/>(single planner,<br/>per-operator cspace pinning)"]
+    D --> E["Playback / save<br/>(Rerun · pickle for MPC)"]
+```
+
+1. **Task planning** — `task_plan_generator` (`cutamp/task_planning/`) enumerates
+   PDDL-style plan skeletons over the T1 operators in `t1_domain.py`
+   (`LeftPick`, `RightPlace`, `LeftRetractHolding`, …).
+2. **Particle initialization** — `ParticleInitializer`
+   (`particle_initialization.py`) seeds a batch of candidate grasps / placements
+   / configs (`samplers.py`) and runs cuRobo IK — with CoM-aware seed-IK — for
+   each `q_*` conf.
+3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
+   particles against `CostFunction` (`cost_function.py`): hard constraints
+   (kinematic, collision, stable-placement, the `ComPolygon` COM-in-hull gate)
+   plus soft costs. Pose-class soft costs use **re-IK-coupled Adam** — outer Adam
+   moves poses while dependent confs are refreshed by exact IK every
+   `reik_interval` steps. `ConstraintChecker` decides which particles satisfy.
+4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives the
+   best satisfying particle through `motion_solver.py`: one 21-DOF
+   `MotionPlanner`, re-pinned per operator (`pin_for_arm_action` /
+   `pin_for_movebase`).
+5. **Playback / save** — the Rerun visualizer renders every trajectory (both
+   arms' held objects tracked); `--save_plan` pickles the processed plan for the
+   downstream MPC consumer.
+
+`run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
+the shared `TAMPWorld`.
 
 ## T1 Single-Planner Architecture (cuRobo v0.8)
 
@@ -156,11 +196,21 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. Cache
   hits route through `_apply_cached`.
 
+- [`samplers.py`](cutamp/samplers.py) — grasp / placement / yaw samplers
+  (`grasp_4dof_sampler`, `grasp_6dof_sampler`, `place_4dof_sampler`,
+  `sample_yaw`, `sample_stick_grasps`) that seed the continuous particles.
+
+- [`task_planning/`](cutamp/task_planning/) — the symbolic layer:
+  `task_plan_generator` runs PDDL-style search (`search.py`) over the domain
+  structs (`tamp_structs.py`, `base_structs.py`, `constraints.py`, `costs.py`)
+  to emit plan skeletons.
+
 - [`t1_domain.py`](cutamp/t1_domain.py) — TAMP domain (fluents + operators)
   for T1: `LeftAt` / `RightAt`, `LeftHolding` / `RightHolding`,
   `LeftMoveFree` / `RightMoveFree`, `LeftPick` / `RightPick`, `LeftPlace` /
   `RightPlace`, `LeftPush` / `RightPush`, `LeftPushStick` / `RightPushStick`,
-  and the `RetractHolding` / `RetractFree` family.
+  and `LeftRetractHolding` / `RightRetractHolding`, `LeftRetractFree` /
+  `RightRetractFree`.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
   and `SUPPORTED_SOFT_COSTS`. Notable defaults (all validated together):
@@ -183,6 +233,19 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   `minimize_body_movement`, `com_polygon`, the multi-object placement
   costs, …).
 
+- [`costs.py`](cutamp/costs.py) — low-level differentiable cost primitives
+  (`trajectory_length`, sphere-overlap, AABB, `curobo_pose_error`) that
+  `cost_function.py` composes.
+
+- [`constraint_checker.py`](cutamp/constraint_checker.py) — `ConstraintChecker`
+  evaluates which particles satisfy every hard constraint (the satisfying set).
+
+- [`cost_reduction.py`](cutamp/cost_reduction.py) — `CostReducer` ranks and
+  reduces per-particle costs to pick the best candidate(s).
+
+- [`experiment_logger.py`](cutamp/experiment_logger.py) — `ExperimentLogger`
+  records per-run metrics and timings.
+
 - [`rollout.py`](cutamp/rollout.py) — FK rollout helpers used by the cost
   graph (forward kinematics on the full 21-DOF cspace).
 
@@ -197,7 +260,7 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   `log_joint_trajectory_with_mat4x4s(traj, mat4x4s, …)` accepts any number
   of held-object transforms per trajectory.
 
-### 📁 [`cutamp/tests/`](cutamp/tests/) — 63 tests
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 62 tests
 
 Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 (`needs_cuda` marker, `make_blocks_t1_world` factory, GPU-memory cleanup).
@@ -301,9 +364,9 @@ planning). Comfortably fits a 24 GB GPU.
    translate that block through world. `compute_all_held_obj_poses` returns
    poses for every holding arm so the visualizer renders both correctly.
 
-5. **Retract after pick/place** — `RetractHolding` (collision checks exclude
-   held object) and `RetractFree` (empty gripper) move toward `t1_home` after
-   each manipulation. Hard collision constraints + the
+5. **Retract after pick/place** — the per-arm `RetractHolding` (collision checks
+   exclude held object) and `RetractFree` (empty gripper) operators move toward
+   `t1_home` after each manipulation. Hard collision constraints + the
    `retract_close_to_home` soft cost shape the result.
 
 6. **cuRobo internals isolated** — every reach into cuRobo's private API

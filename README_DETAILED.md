@@ -75,12 +75,19 @@ pip install torch torchvision torchaudio
 ### 3. Install cutamp
 
 ```bash
-git clone https://github.com/NVlabs/cuTAMP.git
+git clone https://github.com/helpYoon/cuTAMP.git
 cd cuTAMP
 pip install -e .
 ```
 
-### 4. Install cuRobo
+### 4. Install cuRobo (the cuTAMP fork)
+
+> ⚠️ cuTAMP requires the **forked cuRobo** at
+> [helpYoon/curobo](https://github.com/helpYoon/curobo), not `NVlabs/curobo`.
+> The fork adds the `compute_com` plumbing and the CoM-aware seed-IK residual
+> the T1 humanoid depends on — a plain NVlabs checkout will **not** run cuTAMP.
+> All additions default off, so the fork stays byte-identical to upstream when
+> unused; see the fork's README for details.
 
 Before cloning cuRobo, make sure `git-lfs` is installed (used for pulling large assets).
 
@@ -89,10 +96,12 @@ sudo apt install git-lfs
 git lfs install
 ```
 
-Then clone and install cuRobo:
+Then clone and install the fork. Run this from the cuTAMP repo root so cuRobo
+lands at `cuTAMP/curobo`, where cuTAMP expects it (this path is git-ignored):
 
 ```bash
-git clone https://github.com/NVlabs/curobo.git
+# from the cuTAMP/ directory
+git clone https://github.com/helpYoon/curobo.git curobo
 cd curobo
 
 # This can take up to 20 minutes to install
