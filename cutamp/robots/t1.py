@@ -102,9 +102,13 @@ t1_home_head: Tuple[float, ...] = (0.0, 0.0)
 T1_ASSETS_DIR = Path(__file__).parent / "assets" / "t1_description"
 T1_CONFIG_PATH = T1_ASSETS_DIR / "t1_planar_base.yml"
 
-# Starting weight for the seed-IK CoM residual (tuned by the Task-8 sweep;
-# pose/joint-limit weights in that solver are O(1) — the planner's 5e5 rollout
-# weight is NOT transferable here).
+# Weight for the seed-IK CoM residual. Sweep 2026-06-09 over {0.1, 0.3, 1.0,
+# 3.0} on a far forward-reach grid: indistinguishable on success (12/12 all),
+# fallback engagements (0 all), and pose error (0.0 all) — synthetic IK targets
+# never reach the barrier band, so 1.0 (mid-range, safe) is kept. The
+# discriminating regime is real pipeline grasps (endpoint audit). Pose/limit
+# weights in that solver are O(1) — the planner's 5e5 rollout weight is NOT
+# transferable here.
 T1_COM_IK_WEIGHT = 1.0
 
 
