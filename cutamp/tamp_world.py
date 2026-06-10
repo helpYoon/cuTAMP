@@ -63,7 +63,7 @@ class TAMPWorld:
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
         enable_com_polygon: bool = True,  # Retained for API stability; the planner cost + hard gate key off config.enable_com_polygon.
-        enable_com_aware_ik: bool = False,
+        enable_com_aware_ik: bool = True,  # Matches config.enable_com_aware_ik's default (validated ON).
     ):
         self.env = env
         self.device_cfg = device_cfg
