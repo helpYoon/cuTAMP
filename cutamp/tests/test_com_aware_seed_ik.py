@@ -200,8 +200,10 @@ def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
     ).tool_poses.get_link_pose(af, make_contiguous=True).get_matrix().reshape(4, 4)
     Ts = []
     for f in torch.linspace(0.15, 0.33, n_fwd, device=qh.device):
-        for l in torch.linspace(-0.05, 0.15, n_lat, device=qh.device):
-            m = hm.clone(); m[0, 3] += float(f); m[1, 3] = float(l); Ts.append(m)
+        for lat in torch.linspace(-0.05, 0.15, n_lat, device=qh.device):
+            # Absolute world-Y on purpose: left tool home Y is ~+0.3, so
+            # sweeping Y in [-0.05, 0.15] creates demanding cross-body reaches.
+            m = hm.clone(); m[0, 3] += float(f); m[1, 3] = float(lat); Ts.append(m)
     res = _ik_for_pose(world, torch.stack(Ts, 0), "left")
     s = res.success
     succ = (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
@@ -229,6 +231,7 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     world_off = _world(enable_com_aware_ik=False)
     q_off, s_off, _ = _forward_reach_solutions(world_off)
     absx_off = _com_abs_x(world_off, q_off)[s_off]
+    assert int(s_off.sum()) > 0, "OFF baseline produced no successes — A/B comparison is blind"
     del world_off; gc.collect(); torch.cuda.empty_cache()
     # ON
     world_on = _world(enable_com_aware_ik=True)
@@ -242,14 +245,17 @@ def test_centering_ab_legs_within_limits_pose_preserved():
             or float(absx_on.mean()) <= inset), \
         f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
 
-    # (2) joint limits: EVERY returned solution within URDF bounds (+1e-3 slack;
-    #     limits are soft residual + filter — out-of-limit output is a fork bug)
+    # (2) joint limits: every SUCCESSFUL solution within URDF bounds (+1e-3
+    #     slack). Limits are a soft residual + success filter in the seed-IK
+    #     solver — failed rows may legitimately sit slightly out of bounds and
+    #     are masked out downstream, but a successful out-of-limit solution
+    #     would be a fork bug.
     names = list(world_on.kinematics.joint_names)
     idx = {n: i for i, n in enumerate(names)}
     bounds = {"ankle_pitch": (-0.87, 0.0), "knee_pitch": (0.0, 2.34),
               "Torso_Pitch": (-1.8, 0.0)}
     for jn, (lo, hi) in bounds.items():
-        col = q_on[:, idx[jn]]
+        col = q_on[s_on][:, idx[jn]]
         assert float(col.min()) >= lo - 1e-3 and float(col.max()) <= hi + 1e-3, \
             f"{jn} out of [{lo},{hi}]: [{float(col.min()):.3f},{float(col.max()):.3f}]"
 
