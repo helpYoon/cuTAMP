@@ -269,3 +269,27 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     print(f"recruitment: max knee_pitch={knee_delta:.3f} rad; "
           f"absx on/off mean {float(absx_on.mean()):.4f}/{float(absx_off.mean()):.4f}")
     del world_on; gc.collect(); torch.cuda.empty_cache()
+
+
+@needs_cuda
+def test_store_ik_q_masks_failed_solutions_to_home():
+    from cutamp.particle_initialization import _store_ik_q
+    world = _world(enable_com_aware_ik=False)
+    q_full, succ, res = _forward_reach_solutions(world, n_fwd=2, n_lat=2)
+    # Forge a failure on problem 0 and store.
+    if res.success.ndim > 1:
+        res.success[0, :] = False
+    else:
+        res.success[0] = False
+    particles = {}
+    _store_ik_q(particles, "left_q1", res, world, "left")
+    stored = particles["left_q1"]
+    assert torch.allclose(stored[0], world.q_init), \
+        "failed-IK row must fall back to q_init, not keep an unvetted conf"
+
+
+def test_ik_for_pose_has_no_dormant_num_seeds_kwarg():
+    import inspect
+    from cutamp.particle_initialization import _ik_for_pose
+    assert "num_seeds" not in inspect.signature(_ik_for_pose).parameters, \
+        "num_seeds forwarded to solve_pose would TypeError (no such param)"

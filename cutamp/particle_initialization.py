@@ -63,7 +63,6 @@ def _ik_for_pose(
     arm: Optional[str],
     *,
     current_state_q: Optional[torch.Tensor] = None,
-    num_seeds: Optional[int] = None,
 ):
     """Solve IK for a batch of EE poses, targeting the active arm's tool frame.
 
@@ -77,10 +76,6 @@ def _ik_for_pose(
     seeds IK from a non-home pose — used by the coupled-reIK refresh during
     Adam to warm-start from the current best particle's q. When ``None``,
     seeds from ``world.q_init`` as before.
-
-    ``num_seeds`` overrides the IK solver's seed count. Set to 1 for warm-start
-    refresh (~10-20x faster than the default multi-seed); leave ``None`` for
-    initial IK from home (which needs the default for reliability).
     """
     ik = world.ik_solver
     active_frame = world.tool_frame_for_arm(arm)
@@ -107,10 +102,7 @@ def _ik_for_pose(
             write_cspace_target_dof_weight(
                 [ik], inactive_arm_cspace_weights(ik, arm),
             )
-        solve_kwargs = {"goal_tool_poses": goal, "current_state": current_state}
-        if num_seeds is not None:
-            solve_kwargs["num_seeds"] = num_seeds
-        return ik.solve_pose(**solve_kwargs)
+        return ik.solve_pose(goal_tool_poses=goal, current_state=current_state)
     finally:
         restore_cspace_target_dof_weight([ik], snapshot)
 
@@ -240,8 +232,17 @@ def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
 
 
 def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: Optional[str]) -> None:
-    """Store the IK result's q under ``q_name``, reordered to the full kin's joint order."""
-    particles[q_name] = _ik_solution_to_full_q(ik_result, world)
+    """Store the IK result's q under ``q_name``, reordered to the full kin's joint order.
+
+    Rows whose IK reported failure fall back to ``world.q_init``: cuRobo's joint
+    limits are a soft residual + success filter (nothing clamps), so an
+    unsuccessful solution may be out-of-limit and must not enter particles.
+    """
+    q_full = _ik_solution_to_full_q(ik_result, world)
+    s = ik_result.success
+    success = (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
+    home = world.q_init.to(q_full.device).unsqueeze(0).expand_as(q_full)
+    particles[q_name] = torch.where(success.to(q_full.device).unsqueeze(-1), q_full, home)
 
 
 class ParticleInitializer:
