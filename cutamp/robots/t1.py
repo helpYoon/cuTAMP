@@ -112,6 +112,41 @@ T1_COM_IK_WEIGHT = 1.0
 # the edge band); 1e-3 is the sweep knee (~30x centering, zero fallbacks).
 T1_COM_IK_CENTER_WEIGHT = 1e-3
 
+# =============================================================================
+# Joint-limit margins
+# =============================================================================
+# Per-side soft-margin bands (rad) from each joint's position limit, in full
+# cspace order (JOINT_NAMES_FULL). Single source of truth for BOTH margin
+# costs (spec: docs/superpowers/specs/2026-06-11-joint-limit-margin-design.md):
+#   - cutamp soft cost "joint_limit_margin" over Conf particles
+#     (segment endpoints — the load-bearing fix: empirically 100% of
+#     near-limit danger in saved plans comes from endpoint configs)
+#   - JointLimitMarginCost on the motion planner (trajectory insurance)
+# 0.0 on the home-side bounds: the standing home posture sits exactly ON the
+# ankle_pitch-upper / knee_pitch-lower / Torso_Pitch-upper limits by design
+# (straight leg, t1_simplified.urdf:79,116,159), so margining those sides
+# would penalize standing still. 0.0 on the virtual base DOFs (locked).
+T1_JOINT_LIMIT_MARGIN = 0.1
+
+_M = T1_JOINT_LIMIT_MARGIN
+T1_LIMIT_MARGIN_LOWER: Tuple[float, ...] = (
+    0.0, 0.0, 0.0,                    # base_j_x, base_j_y, base_j_yaw
+    _M, 0.0,                          # ankle_pitch, knee_pitch (home == lower limit)
+    _M, _M,                           # Torso_Pitch, Waist_Yaw
+    _M, _M, _M, _M, _M, _M, _M,       # left arm
+    _M, _M, _M, _M, _M, _M, _M,       # right arm
+)
+T1_LIMIT_MARGIN_UPPER: Tuple[float, ...] = (
+    0.0, 0.0, 0.0,                    # base_j_x, base_j_y, base_j_yaw
+    0.0, _M,                          # ankle_pitch (home == upper limit), knee_pitch
+    0.0, _M,                          # Torso_Pitch (home == upper limit), Waist_Yaw
+    _M, _M, _M, _M, _M, _M, _M,       # left arm
+    _M, _M, _M, _M, _M, _M, _M,       # right arm
+)
+assert len(T1_LIMIT_MARGIN_LOWER) == CUROBO_DOF
+assert len(T1_LIMIT_MARGIN_UPPER) == CUROBO_DOF
+del _M
+
 
 # =============================================================================
 # Config loading
@@ -192,6 +227,7 @@ def get_t1_motion_planner(
     max_batch_size: int = 1,
     max_goalset: int = 1,
     enable_com_polygon: bool = True,
+    enable_joint_limit_margin: bool = True,
     device_cfg: DeviceCfg = None,
 ) -> MotionPlanner:
     """Single MotionPlanner for the T1 with the mobile base locked.
@@ -206,6 +242,10 @@ def get_t1_motion_planner(
     kernel always builds with ``compute_com=True`` (cheap, useful for any
     future COM-based cost or diagnostic) — the flag only gates registration
     of the cost itself.
+
+    ``enable_joint_limit_margin`` (default True) additionally registers a
+    hinge² cost that keeps the trajectory interior a soft 0.1 rad band away
+    from joint position limits (zero band on the home-side bounds).
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
@@ -260,6 +300,47 @@ def get_t1_motion_planner(
             inside_weight=COM_INSIDE_WEIGHT,
         )
         add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
+    if enable_joint_limit_margin:
+        from cutamp._curobo_internals import add_extra_cost
+        from cutamp.joint_limit_cost import JointLimitMarginCost, JointLimitMarginCostCfg
+
+        # Joint-limit margin: hinge² on entering a per-joint/per-side band
+        # inside the position limits (margins: T1_LIMIT_MARGIN_LOWER/UPPER
+        # above). Endpoint configs are handled by the cutamp-side soft cost;
+        # this keeps the trajectory INTERIOR away from limits between
+        # endpoints. Home-side bounds carry zero margin, so the home dwell
+        # waypoints that legitimately sit ON the ankle/knee/torso bounds
+        # cost nothing. Optimizer-objective only: extra costs never reach
+        # the feasibility/success gate (see _curobo_internals.add_extra_cost).
+        rollout = planner.trajopt_solver.optimizer_rollouts[0]
+        limits = rollout.transition_model.joint_limits.position  # [2, dof_active]
+        active_names = list(planner.kinematics.joint_names)
+        assert len(active_names) == limits.shape[1], (active_names, limits.shape)
+        name_to_full = {n: i for i, n in enumerate(JOINT_NAMES_FULL)}
+        missing = [n for n in active_names if n not in name_to_full]
+        assert not missing, f"planner joints missing from JOINT_NAMES_FULL: {missing}"
+        full_idx = [name_to_full[n] for n in active_names]
+        m_lo = torch.tensor(
+            [T1_LIMIT_MARGIN_LOWER[i] for i in full_idx],
+            device=limits.device, dtype=limits.dtype,
+        )
+        m_hi = torch.tensor(
+            [T1_LIMIT_MARGIN_UPPER[i] for i in full_idx],
+            device=limits.device, dtype=limits.dtype,
+        )
+        jl_weight = 1.0e5  # tuned 1e4→1e5 in verification: kills interior excursions (cuRobo's own bound cost runs 1e4)
+        jl_cfg = JointLimitMarginCostCfg(
+            weight=[jl_weight],
+            device_cfg=rollout.device_cfg,
+            shrunk_lower=limits[0] + m_lo,
+            shrunk_upper=limits[1] - m_hi,
+        )
+        add_extra_cost(planner, "joint_limit_margin", JointLimitMarginCost(jl_cfg))
+        _log.info(
+            "Registered joint_limit_margin trajopt cost (weight %.0e, band %.2f rad)",
+            jl_weight,
+            T1_JOINT_LIMIT_MARGIN,
+        )
     return planner
 
 

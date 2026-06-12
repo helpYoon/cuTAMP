@@ -280,6 +280,7 @@ class TAMPWorld:
         max_batch_size: int = 1,
         max_goalset: int = 1,
         enable_com_polygon: bool = True,
+        enable_joint_limit_margin: bool = True,
     ) -> MotionPlanner:
         """Build a single MotionPlanner for the robot using the world's Scene
         with movables included (so attached objects are part of the collision
@@ -296,6 +297,7 @@ class TAMPWorld:
             max_goalset=max_goalset,
             device_cfg=self.device_cfg,
             enable_com_polygon=enable_com_polygon,
+            enable_joint_limit_margin=enable_joint_limit_margin,
         )
 
 

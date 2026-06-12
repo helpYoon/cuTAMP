@@ -312,6 +312,7 @@ def solve_curobo(
         collision_activation_distance=config.world_activation_distance,
         use_cuda_graph=False,
         enable_com_polygon=config.enable_com_polygon,
+        enable_joint_limit_margin=config.enable_joint_limit_margin,
     )
 
     # Defensive reset in case a prior solve_curobo aborted mid-plan and left the

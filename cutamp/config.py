@@ -17,7 +17,7 @@ from typing import List, Literal, Optional
 SUPPORTED_SOFT_COSTS = (
     "dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist",
     "min_y", "max_y", "align_yaw", "retract_close_to_home",
-    "minimize_body_movement", "com_polygon",
+    "minimize_body_movement", "com_polygon", "joint_limit_margin",
 )
 
 
@@ -50,9 +50,12 @@ class TAMPConfiguration:
     ## Soft Costs
     # Default ON: validated as a trio with coupled_reik + place_close_to_base
     # (commit 0c94674) — don't toggle one without considering the others.
+    # joint_limit_margin (added 2026-06-11) is independent of that trio.
     optimize_soft_costs: bool = True
     # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
-    soft_cost: Optional[List[str]] = field(default_factory=lambda: ["place_close_to_base"])
+    soft_cost: Optional[List[str]] = field(
+        default_factory=lambda: ["place_close_to_base", "joint_limit_margin"]
+    )
     # Diagnostic: mimic NVlabs/cuTAMP main — Adam always runs with soft costs
     # in the loss; no Phase 2 LBFGS. Useful for pose-class soft costs that
     # LBFGS can't refine along the IK constraint manifold.
@@ -93,6 +96,10 @@ class TAMPConfiguration:
     enable_traj: bool = False
     # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
     enable_com_polygon: bool = True
+    # Pass through to MotionPlanner's joint-limit margin trajopt cost
+    # (trajectory insurance; endpoint configs are handled by the
+    # "joint_limit_margin" soft cost). Margins: robots/t1.py.
+    enable_joint_limit_margin: bool = True
     ik_com_retry_max: int = 3   # Backstop: post-IK COM mask retries (CoM-aware IK makes violations rare).
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
     # COM, recruiting legs within limits. The post-IK mask (ik_com_retry_max)

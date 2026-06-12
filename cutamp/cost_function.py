@@ -561,6 +561,29 @@ class CostFunction:
             # Sum over confs to match the prior per-particle scalar shape.
             return torch.stack(list(pens.values()), dim=0).sum(dim=0)
 
+        # Joint-limit margin — keep endpoint configurations a soft band away
+        # from position limits. Per-joint/per-side margins from robots/t1.py
+        # (zero on the home-side bounds the standing posture sits ON, so home
+        # costs exactly 0). q0s are excluded inside the helper: the initial
+        # robot state must never acquire margin gradients (Phase-2 LBFGS
+        # re-leafs every cloned particle).
+        elif cost_name == "joint_limit_margin":
+            if self._particles is None:
+                raise RuntimeError("Particles must be provided for joint_limit_margin soft cost")
+
+            from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
+            from cutamp.robots.t1 import T1_LIMIT_MARGIN_LOWER, T1_LIMIT_MARGIN_UPPER
+
+            limits = self.world.joint_limits  # [2, 21], row 0 = lower
+            return joint_limit_margin_soft_cost(
+                self._particles,
+                limits,
+                torch.tensor(T1_LIMIT_MARGIN_LOWER, device=device, dtype=limits.dtype),
+                torch.tensor(T1_LIMIT_MARGIN_UPPER, device=device, dtype=limits.dtype),
+                num_particles,
+                device,
+            )
+
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
 

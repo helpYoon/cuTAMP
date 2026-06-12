@@ -155,8 +155,9 @@
     <child  link="Waist"/>
     <axis xyz="0 -1 0"/>
     <!-- velocity=12.5 matches real T1 Left/Right_Hip_Pitch (this joint
-         abstracts both). Previously 50 was a placeholder. -->
-    <limit lower="-1.8" upper="0" effort="100" velocity="12.5"/>
+         abstracts both). Previously 50 was a placeholder.
+         lower tightened -1.8 -> -1.7 (experiment 2026-06-11). -->
+    <limit lower="-1.7" upper="0" effort="100" velocity="12.5"/>
   </joint>
 
   <!-- ==================== WAIST ==================== -->
@@ -186,9 +187,11 @@
   </link>
 
   <!-- ==================== WAIST YAW (revolute) ==================== -->
-  <!-- Torso yaw between Waist and Trunk. Axis + limits match the real
-       T1's Waist joint (actual_robot.urdf, axis="0 0 1"). Z-axis sign
-       convention is the same in both URDFs (no flip needed for yaw). -->
+  <!-- Torso yaw between Waist and Trunk. Axis matches the real T1's Waist
+       joint (actual_robot.urdf, axis="0 0 1"); Z-axis sign convention is the
+       same in both URDFs (no flip needed for yaw). Limits tightened
+       2026-06-11 to [-1.47, 1.47] from the real [-1.57, 1.57] (0.1 rad
+       safety inset each side). -->
   <joint name="Waist_Yaw" type="revolute">
     <!-- Note on frame mismatch with actual_robot.urdf: our simplified URDF
          reverses the parent/child for this joint (parent=Waist, child=Trunk)
@@ -205,7 +208,7 @@
     <parent link="Waist" />
     <child link="Trunk" />
     <axis xyz="0 0 1" />
-    <limit lower="-1.57" upper="1.57" effort="30" velocity="10.88" />
+    <limit lower="-1.47" upper="1.47" effort="30" velocity="10.88" />
   </joint>
 
   <!-- ==================== TRUNK ==================== -->

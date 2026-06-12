@@ -240,7 +240,7 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     names = list(world_on.kinematics.joint_names)
     idx = {n: i for i, n in enumerate(names)}
     bounds = {"ankle_pitch": (-0.87, 0.0), "knee_pitch": (0.0, 2.34),
-              "Torso_Pitch": (-1.8, 0.0)}
+              "Torso_Pitch": (-1.7, 0.0)}
     for jn, (lo, hi) in bounds.items():
         col = q_on[s_on][:, idx[jn]]
         assert float(col.min()) >= lo - 1e-3 and float(col.max()) <= hi + 1e-3, \

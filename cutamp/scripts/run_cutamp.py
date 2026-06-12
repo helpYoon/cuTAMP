@@ -192,6 +192,17 @@ def entrypoint():
     )
     parser.set_defaults(enable_com_polygon=_defaults.enable_com_polygon)
     parser.add_argument(
+        "--no_enable_joint_limit_margin",
+        dest="enable_joint_limit_margin",
+        action="store_false",
+        help="Disable the joint-limit margin trajopt cost on the motion planner. "
+             "By default the cost is enabled (1e5 weight, 0.1 rad band; zero on "
+             "the home-side bounds) and keeps the trajectory interior away from "
+             "joint position limits. The endpoint-side soft cost is controlled "
+             "separately via --soft_cost.",
+    )
+    parser.set_defaults(enable_joint_limit_margin=_defaults.enable_joint_limit_margin)
+    parser.add_argument(
         "--no_enable_com_aware_ik",
         dest="enable_com_aware_ik",
         action="store_false",
@@ -257,6 +268,7 @@ def entrypoint():
         cache_subgraphs=args.cache_subgraphs,
         curobo_plan=args.motion_plan,
         enable_com_polygon=args.enable_com_polygon,
+        enable_joint_limit_margin=args.enable_joint_limit_margin,
         enable_com_aware_ik=args.enable_com_aware_ik,
         enable_visualizer=not args.disable_visualizer,
         opt_viz_interval=args.viz_interval,

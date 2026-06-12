@@ -41,6 +41,12 @@ default_constraint_to_mult = {
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
         "com_polygon": 10,  # Penalize COM projection outside the base rectangle
+        # Hinge² band penalties are O(1e-3) rad² (0.05 rad intrusion into the
+        # 0.1 band ≈ 2.5e-3). Tuned in the Task-6 verification battery
+        # (2026-06-11): 1e2 left endpoint offenders; 1e3 cleared every
+        # non-trunk endpoint; 1e4 bought nothing more; 1e5 distorted particle
+        # selection (minted a new elbow offender). Keep 1e3.
+        "joint_limit_margin": 1e3,
     },
 }
 
