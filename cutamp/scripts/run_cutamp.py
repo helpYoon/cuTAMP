@@ -7,6 +7,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+"""
+PYTORCH_ALLOC_CONF=expandable_segments:True     /home/yoonwoo/miniconda3/envs/tamp/bin/python -m cutamp.scripts.run_cutamp     --env blocks_t1 -n 64 --num_opt_steps 50  --surface_height 0.50 --soft_cost place_close_to_base joint_limit_margin minimize_body_movement  --motion_plan --save_plan data/motion_plan.pkl
+"""
+
 import logging
 import os
 import pickle
@@ -18,7 +22,7 @@ from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
-from cutamp.envs.utils import get_env_dir, load_env
+from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
 
 from cutamp.scripts.utils import (
     default_constraint_to_mult,
@@ -104,6 +108,12 @@ def entrypoint():
     )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
+    )
+    parser.add_argument(
+        "--surface_height", type=float, default=0.0,
+        help="Elevate the manipulation surface (boxes + goal pad) by this many METRES. "
+             "0.0 = ground variant (default). cuTAMP is kinematic, so objects sit at the "
+             "new z with no support geometry added. Used for the height sweep.",
     )
 
     # Soft costs
@@ -279,6 +289,7 @@ def entrypoint():
 
     # Load env and run demo
     env = load_demo_env(args.env)
+    raise_surface_height(env, args.surface_height)  # no-op at 0.0
     cutamp_demo(env, config, experiment_id=args.experiment_id, save_plan=args.save_plan)
 
 

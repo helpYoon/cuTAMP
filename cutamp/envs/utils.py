@@ -151,6 +151,27 @@ def load_env(env_path: str) -> TAMPEnvironment:
     return env
 
 
+def raise_surface_height(env: TAMPEnvironment, height: float) -> TAMPEnvironment:
+    """Elevate the manipulation surface by ``height`` metres (mutates in place).
+
+    Shifts the z of every Movable and every Surface object up by ``height`` so
+    the boxes and goal pad sit at the given height instead of on the ground.
+    ``height == 0`` leaves the env unchanged (the ground variant). cuTAMP is a
+    kinematic planner, so the objects simply sit at the new z — no support
+    geometry is added. Used by the ``--surface_height`` height sweep.
+    """
+    if height == 0.0:
+        return env
+    targets = list(env.movables) + list(env.type_to_objects.get("Surface", []))
+    seen: Set[int] = set()
+    for obj in targets:
+        if id(obj) in seen:  # an object could be both movable and a surface
+            continue
+        seen.add(id(obj))
+        obj.pose[2] += height
+    return env
+
+
 def _get_object_dict(obj: Obstacle) -> Tuple[str, dict]:
     """Get the object as a dictionary, so we can serialize."""
     if obj.scale is not None:

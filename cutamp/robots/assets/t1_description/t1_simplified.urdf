@@ -146,11 +146,23 @@
 
   <!-- ==================== TORSO PITCH (revolute) ==================== -->
   <!-- At the top of the thigh. Coordinated abstraction of the real T1's
-       Left_Hip_Pitch + Right_Hip_Pitch (actual_robot.urdf:1077-1093);
-       limits taken directly from Left_Hip_Pitch ([-1.8, 1.57]). Axis
-       negated (see ankle_pitch above for the inverted-chain rationale). -->
+       Left_Hip_Pitch + Right_Hip_Pitch; limits taken from Left_Hip_Pitch.
+       Axis negated (see ankle_pitch above for the inverted-chain rationale).
+
+       The +0.014 X in the origin restores the real robot's knee setback:
+       t1.urdf's Left_Knee_Pitch sits 0.014 m behind the hip (origin
+       x=-0.014), which propagates down to the ankle. Because this chain is
+       built ground-up, the joint that shifts the whole lower leg (thigh +
+       shank + ankle) backward relative to the Trunk is THIS one (the upper
+       boundary of the abstracted thigh), not knee_pitch — moving knee_pitch
+       would only shift the ankle. With +0.014 here, the sim's hip/knee/ankle
+       pitch-axis positions and segment lengths coincide with t1.urdf's, so
+       broadcasting the leg joints reproduces the real Trunk pose to
+       <0.15 mm / 0.000 deg across the whole leg workspace (verified
+       2026-06-13). Fixes the prior 14 mm (home) -> ~24 mm (deep-lean)
+       sim-to-real Trunk/hand offset. -->
   <joint name="Torso_Pitch" type="revolute">
-    <origin xyz="0 0 0.236" rpy="0 0 0"/>
+    <origin xyz="0.014 0 0.236" rpy="0 0 0"/>
     <parent link="thigh_link"/>
     <child  link="Waist"/>
     <axis xyz="0 -1 0"/>
@@ -193,17 +205,15 @@
        2026-06-11 to [-1.47, 1.47] from the real [-1.57, 1.57] (0.1 rad
        safety inset each side). -->
   <joint name="Waist_Yaw" type="revolute">
-    <!-- Note on frame mismatch with actual_robot.urdf: our simplified URDF
-         reverses the parent/child for this joint (parent=Waist, child=Trunk)
-         because our root is `world` and the chain reads bottom-up. The
-         reverse means the Waist_Yaw rotation axis sits at a different
-         physical point than the real URDF's, so trying to align the Trunk
-         LINK FRAME with real (by adding the -0.0625 X here) introduces an
-         off-axis rotation when Waist_Yaw is non-zero. We accept a 6.25 cm
-         offset in the Trunk frame definition (sim's Trunk is forward of
-         real's) to keep the rotation axis behavior correct. Consumers
-         transforming hand poses to real-URDF's Trunk frame must add
-         +0.0625 m to X to compensate. -->
+    <!-- This joint is reversed vs t1.urdf (here parent=Waist, child=Trunk)
+         because our root is `world` and the chain reads bottom-up. Despite
+         the reversal, the resulting Trunk LINK FRAME COINCIDES with the
+         on-robot model t1.urdf's Trunk frame: FK of every Trunk child
+         (head, shoulders, hands) matches t1.urdf to 0.0 m. So the saved
+         plan's Trunk pose needs NO consumer-side X compensation — it is the
+         t1.urdf Trunk pose directly. (An older reference, actual_robot.urdf,
+         placed its Trunk frame 6.25 cm behind this one; that file is not what
+         the MPC uses and is obsolete.) -->
     <origin xyz="0 0 0.1155" rpy="0 0 0" />
     <parent link="Waist" />
     <child link="Trunk" />
@@ -212,11 +222,19 @@
   </joint>
 
   <!-- ==================== TRUNK ==================== -->
-  <!-- Inertial / visual / collision origins all carry a -0.0625 X offset
-       to compensate for our Trunk LINK FRAME being 6.25 cm forward of the
-       real URDF's (see the Waist_Yaw note above). With these compensations,
-       the rendered geometry and mass distribution land at the correct
-       world positions even though the link frame itself is offset. -->
+  <!-- The visual/collision mesh origin carries a -0.0625 X offset: this is
+       the Trunk.STL origin convention, IDENTICAL to t1.urdf (whose Trunk
+       visual is also -0.0625 X), so the rendered geometry matches the MPC
+       model exactly.
+       The inertial origin (X = -0.06986) is INTENTIONALLY left as-inherited;
+       do NOT "correct" it. When building this simplified model only the
+       kinematic axes were changed (for the inverted leg chain) — the
+       mass/inertia model is preserved deliberately because it ties into the
+       MPC walking/tracking dynamics. It therefore differs from t1.urdf's
+       Trunk inertial (-0.00736 X) by design; that difference feeds cuRobo's
+       planning-side compute_com (CoM-over-base cost / CoM-aware IK) only, and
+       does NOT affect the saved Trunk POSE (the kinematic frame is correct,
+       per the Waist_Yaw note above). -->
   <link name="Trunk">
     <inertial>
       <origin xyz="-0.0698634598906924 -1.42058017623659E-06 0.105062332707657" rpy="0 0 0" />

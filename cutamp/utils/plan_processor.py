@@ -6,9 +6,12 @@ structured form for MPC tracking on the real T1.
 example with a clear regenerate-with-current-code message.
 
 v3 stores ``trunk_xyz`` as the raw sim FK output (sim ``t1_simplified.urdf``
-Trunk world pose). The on-robot ``actual_robot.urdf`` now shares the same
-Trunk origin, so the saved value is the real Trunk world pose directly —
-no compensation needed on the consumer side.
+Trunk world pose). The on-robot model the MPC uses, ``t1.urdf``, has a Trunk
+frame IDENTICAL to the sim's (verified: FK of every Trunk child matches to
+0.0 m), so the saved value IS the real Trunk world pose directly — no
+compensation needed on the consumer side. (Do NOT confuse with the obsolete
+``actual_robot.urdf``, whose Trunk frame sits 6.25 cm behind this one; that
+file is not what the MPC uses.)
 
 Output schema per segment::
 
@@ -85,15 +88,14 @@ quaternion-derivative identity ``ω = 2 · (dq/dt) ⊗ conj(q)`` (imag part) for
 ``q = world_q_link`` — the cross-check the derivatives test uses. All angular
 velocity fields are in WORLD frame. Units: rad/s.
 
-**Why this schema for MPC tracking on ``actual_robot.urdf``**:
+**Why this schema for MPC tracking on ``t1.urdf``**:
 
 * Hand poses are emitted in WORLD frame so the consumer (manipulation MPC)
   can use them directly without any frame transform. ``*_hand_link`` is
-  used as the FK target since it exists in both URDFs (``*_base_link`` is
-  sim-only).
+  used as the FK target (present in both the sim and t1.urdf).
 * ``trunk_xyz`` is the Trunk world pose, directly usable on the real robot:
-  the sim and on-robot URDFs share the Trunk origin (see
-  docs/sim_to_real_mapping.md #1), so no X compensation is needed.
+  the sim and the MPC model t1.urdf share the Trunk frame (verified by FK to
+  0.0 m), so no X compensation is needed.
 * ``trunk_pitch`` and ``trunk_yaw`` are JOINT VALUES (Torso_Pitch and
   Waist_Yaw in our simplified URDF), not Trunk-link Euler angles. Joint
   values are frame-independent.
