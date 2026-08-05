@@ -137,7 +137,11 @@ def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
 def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene:
     """Build a cuRobo v0.8 Scene from the TAMP environment's obstacles."""
     geoms = defaultdict(list)
-    obstacles = env.movables if include_movables else []
+    # Copy: `obstacles = env.movables` would ALIAS the env's list and the
+    # += below would permanently append every static into env.movables
+    # (latent corruption that became a live race once the motion planner
+    # build moved onto a background thread).
+    obstacles = list(env.movables) if include_movables else []
     obstacles += env.statics
     for obj in obstacles:
         if isinstance(obj, Cuboid):

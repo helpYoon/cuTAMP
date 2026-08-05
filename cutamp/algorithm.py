@@ -24,7 +24,7 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
-from cutamp.motion_solver import solve_curobo
+from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
 from cutamp.robots import load_t1_container, t1_home
@@ -202,6 +202,7 @@ def _motion_plan_with_retries(
     config: TAMPConfiguration,
     timer: TorchTimer,
     visualizer,
+    get_planner=None,
 ) -> Tuple[Optional[dict], bool]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
 
@@ -220,6 +221,7 @@ def _motion_plan_with_retries(
         try:
             curobo_plan = solve_curobo(
                 plan_info, particle, world, config, timer, visualizer,
+                get_planner=get_planner,
             )
             if rank > 0:
                 _log.warning(
@@ -308,6 +310,34 @@ def run_cutamp(
     """Overall cuTAMP algorithm implementation."""
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id)
     particle_initializer = ParticleInitializer(world, config)
+
+    # Build + warm the trajopt planner on a background thread, overlapped with
+    # particle init and Phase 1 (~10 s of serial wall-clock hidden). Safe: the
+    # build uses no CUDA graphs (see build_motion_planner), so the thread only
+    # contends with the loop for kernel slots. solve_curobo joins via
+    # get_planner; its warmup timer then measures only the residual wait.
+    get_planner = None
+    if config.curobo_plan:
+        import threading
+
+        planner_box: dict = {}
+
+        def _build_planner_bg():
+            try:
+                planner_box["planner"] = build_motion_planner(world, config)
+            except BaseException as e:  # noqa: BLE001 — surfaced at join time
+                planner_box["error"] = e
+
+        planner_thread = threading.Thread(
+            target=_build_planner_bg, daemon=True, name="motion-planner-warmup",
+        )
+        planner_thread.start()
+
+        def get_planner():
+            planner_thread.join()
+            if "error" in planner_box:
+                raise planner_box["error"]
+            return planner_box["planner"]
 
     # Task plan generator
     _log.info(f"Initial State: {world.initial_state}")
@@ -398,6 +428,7 @@ def run_cutamp(
                 )
                 curobo_plan, skip_plan = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
+                    get_planner=get_planner,
                 )
                 if skip_plan or curobo_plan is None:
                     continue

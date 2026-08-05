@@ -261,17 +261,9 @@ def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
         _log.warning(f"update_obstacle_pose({name}) failed: {e}")
 
 
-def solve_curobo(
-    plan_info: PlanContainer,
-    best_particle: Particles,
-    world: TAMPWorld,
-    config: TAMPConfiguration,
-    timer: TorchTimer,
-    visualizer: Visualizer,
-):
-    """Run trajopt across the plan skeleton, producing a list of trajectories."""
-    plan_skeleton = plan_info["plan_skeleton"]
-
+def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
+    """Build and warm the trajopt planner. ~10 s; safe to run on a background
+    thread concurrently with Phase 1 (no CUDA graphs — see solve_curobo)."""
     # Disable CUDA graphs: solve_curobo invokes plan_pose / plan_grasp /
     # plan_cspace with varying batch+goalset shapes across operators, and
     # SolverCore.reset_cuda_graph raises "CUDA graph reset is not available."
@@ -283,6 +275,30 @@ def solve_curobo(
         enable_com_polygon=config.enable_com_polygon,
         enable_joint_limit_margin=config.enable_joint_limit_margin,
     )
+    planner.warmup()
+    return planner
+
+
+def solve_curobo(
+    plan_info: PlanContainer,
+    best_particle: Particles,
+    world: TAMPWorld,
+    config: TAMPConfiguration,
+    timer: TorchTimer,
+    visualizer: Visualizer,
+    get_planner=None,
+):
+    """Run trajopt across the plan skeleton, producing a list of trajectories.
+
+    ``get_planner`` (optional) returns a pre-built, warmed planner — the
+    overlap path: algorithm.py starts ``build_motion_planner`` on a thread
+    when the optimization loop starts, and the timer below then measures
+    only the residual wait. ``None`` builds+warms inline.
+    """
+    plan_skeleton = plan_info["plan_skeleton"]
+
+    with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
+        planner = get_planner() if get_planner is not None else build_motion_planner(world, config)
 
     # Defensive reset in case a prior solve_curobo aborted mid-plan and left the
     # planner with stale attached objects or disabled world obstacles. Required
@@ -302,9 +318,6 @@ def solve_curobo(
         tool_from_ee=world.tool_from_ee,
     )
     q_init = best_particle["left_q0"]
-
-    with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
-        planner.warmup()
 
     accum_plans: List[dict] = []
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
