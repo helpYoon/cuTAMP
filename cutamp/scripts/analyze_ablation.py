@@ -35,16 +35,16 @@ CELL_LABEL = {
 def _total_opt_steps(opt_data):
     """Total optimization steps behind ``loop_s``, for ms/step.
 
-    Each ``opt_*.json`` carries ``num_steps`` (the configured step budget
-    for that plan-skeleton's optimization loop, see
-    ``optimize_plan.py``'s ``opt_metrics["num_steps"]``); sum it across
-    every opt file for the run. If a file lacks the key (older logs),
-    fall back to counting that file as a single step — equivalent to
-    inferring the count from the file's position in the sorted
-    opt_*.json index — so the metric degrades gracefully instead of
-    silently dropping steps.
+    Counts steps actually EXECUTED: ``elapsed`` gains one entry per real
+    optimization iteration (including the one that trips early stopping),
+    so ``len(elapsed)`` is the true step count. ``num_steps`` is only the
+    configured budget (``optimize_plan.py`` stamps it before the loop) —
+    dividing by it would systematically understate ms/step whenever
+    ``early_stop_patience`` fires, which it does in every real study run.
+    A file lacking ``elapsed`` counts as a single step so the metric
+    degrades gracefully instead of silently dropping the file.
     """
-    return sum(o.get("num_steps", 1) for o in opt_data)
+    return sum(len(o["elapsed"]) if o.get("elapsed") else 1 for o in opt_data)
 
 
 def load_study(manifest_path):

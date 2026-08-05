@@ -169,7 +169,9 @@ def test_loop_s_sums_across_opt_files(tmp_path):
     assert len(records) == 1
     assert records[0]["loop_s"] == 15.0  # 5 + 7 + 3
     assert records[0]["num_satisfying_final"] == 100  # from the LAST file only
-    assert records[0]["ms_per_step"] == 1000.0 * 15.0 / 90  # 3 files * 30 steps each
+    # Steps EXECUTED (len(elapsed)=2 per file), not the num_steps=30 budget:
+    # early stopping makes the budget a systematic overcount in real runs.
+    assert records[0]["ms_per_step"] == 1000.0 * 15.0 / 6
 
 
 def test_compute_deltas_paired_by_height_and_seed():
