@@ -15,12 +15,10 @@ factory. T1 exposes two tool frames in ``robot_container.tool_frames``.
 """
 
 import logging
-import warnings
 from functools import cached_property
 from typing import Dict, List, Union
 
 import torch
-from jaxtyping import Float
 
 from curobo.inverse_kinematics import InverseKinematics
 from curobo.kinematics import Kinematics
@@ -29,11 +27,11 @@ from curobo.scene import Obstacle, Scene
 from curobo.types import DeviceCfg, GoalToolPose, JointState
 
 from cutamp.envs import TAMPEnvironment
-from cutamp.robots import RobotContainer, load_robot_container
+from cutamp.robots import RobotContainer
 from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, get_t1_ik_solver, get_t1_motion_planner
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
-from cutamp.utils.collision import get_world_collision_cost
+from cutamp.utils.collision import WorldCollisionCost
 from cutamp.utils.common import (
     approximate_goal_aabb,
     get_world_cfg,
@@ -57,12 +55,15 @@ class TAMPWorld:
         self,
         env: TAMPEnvironment,
         device_cfg: DeviceCfg,
-        robot: Union[str, RobotContainer],
-        q_init: Float[torch.Tensor, "dof"],
+        robot: RobotContainer,
+        q_init: torch.Tensor,
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
         enable_com_aware_ik: bool = True,  # Matches config.enable_com_aware_ik's default (validated ON).
+        ik_max_batch_size: int = 512,  # Must be >= config.num_particles (particle init solves full-batch).
+        reik_num_seeds: int = 0,  # >0: dedicated low-seed IK solver for coupled-reIK refreshes (see ik_refresh_solver).
+        reik_lbfgs_iters: int = 0,  # >0: LBFGS budget for the refresh solver (0 = cuRobo default 100).
     ):
         self.env = env
         self.device_cfg = device_cfg
@@ -72,24 +73,13 @@ class TAMPWorld:
 
         # Static collision Scene (excludes movables; movables get attached at grasp time).
         self.world_cfg: Scene = get_world_cfg(env, include_movables=False)
-        self.collision_fn = get_world_collision_cost(
+        self.collision_fn = WorldCollisionCost(
             self.world_cfg, device_cfg, collision_activation_distance,
         )
         self.collision_activation_distance = collision_activation_distance
 
         # Robot container (kinematics, joint_limits, tool frames, gripper spheres).
-        if isinstance(robot, str):
-            warnings.warn(f"RobotContainer not provided, loading by name: {robot}")
-            self.robot_container = load_robot_container(robot, device_cfg)
-        else:
-            self.robot_container = robot
-        self.robot_name = self.robot_container.name
-
-        if isinstance(q_init, dict):
-            raise TypeError(
-                "Dict q_init is no longer supported under the single-planner refactor. "
-                "Pass a single 1D tensor sized to the robot's full cspace dof."
-            )
+        self.robot_container = robot
         self._q_init = q_init
 
         # Single multi-frame IK solver. Both tool frames are configured
@@ -97,19 +87,25 @@ class TAMPWorld:
         # cspace pin the planner uses to keep the inactive arm at home,
         # so a "single-arm Pick" doesn't drift the other arm.
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
-            self.world_cfg, device_cfg=device_cfg, max_batch_size=512,
+            self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
             enable_com_aware_ik=enable_com_aware_ik,
         )
+        self._reik_num_seeds = reik_num_seeds
+        self._reik_lbfgs_iters = reik_lbfgs_iters
+        self._ik_max_batch_size = ik_max_batch_size
+        self._enable_com_aware_ik = enable_com_aware_ik
+        self._ik_refresh_solver = None
+        self._kinematics_jac = None
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).
-        self._obj_to_spheres: Dict[str, Float[torch.Tensor, "n 4"]] = {}
+        self._obj_to_spheres: Dict[str, torch.Tensor] = {}
         for obj in self.movables:
             spheres = sample_greedy_surface_spheres(
                 obj, n_spheres=coll_n_spheres, sphere_radius=coll_sphere_radius,
             )
             self._obj_to_spheres[obj.name] = spheres.to(device_cfg.device)
 
-        self._obj_to_aabb: Dict[str, Float[torch.Tensor, "2 3"]] = {}
+        self._obj_to_aabb: Dict[str, torch.Tensor] = {}
 
         # Arm-home end-effector positions in world frame. Used by the
         # arm-affinity priority function in plan-skeleton search to rank
@@ -137,18 +133,6 @@ class TAMPWorld:
         """Single Kinematics for the robot (covers all tool frames)."""
         return self.robot_container.kinematics
 
-    @cached_property
-    def kinematics_with_com(self) -> Kinematics:
-        """Separate Kinematics built with ``compute_com=True`` so the
-        COM-over-base soft cost can read ``state.robot_com`` per particle.
-
-        Built lazily — only allocated when a COM-based soft cost actually
-        runs. ``compute_com`` is a CUDA kernel template parameter so it
-        can't be flipped on the existing ``self.kinematics`` instance.
-        """
-        from cutamp.robots.t1 import get_t1_kinematics
-        return get_t1_kinematics(self.device_cfg, compute_com=True)
-
     @property
     def tool_frames(self) -> List[str]:
         return self.robot_container.tool_frames
@@ -163,22 +147,16 @@ class TAMPWorld:
         return TOOL_FRAME_FOR_ARM.get(arm, self.tool_frames[0])
 
     @property
-    def tool_from_ee(self) -> Dict[str, Float[torch.Tensor, "4 4"]]:
+    def tool_from_ee(self) -> Dict[str, torch.Tensor]:
         """Dict keyed by tool-frame name. T1 has two entries; others have one."""
         return self.robot_container.tool_from_ee
 
-    def get_tool_from_ee(self, tool_frame: str = None) -> Float[torch.Tensor, "4 4"]:
-        """Return the tool_from_ee transform for ``tool_frame`` (default: first frame)."""
-        if tool_frame is None:
-            tool_frame = self.tool_frames[0]
-        return self.robot_container.tool_from_ee[tool_frame]
-
     @property
-    def gripper_spheres(self) -> Dict[str, Float[torch.Tensor, "n 4"]]:
+    def gripper_spheres(self) -> Dict[str, torch.Tensor]:
         return self.robot_container.gripper_spheres
 
     @property
-    def joint_limits(self) -> Float[torch.Tensor, "2 d"]:
+    def joint_limits(self) -> torch.Tensor:
         return self.robot_container.joint_limits
 
     @property
@@ -186,7 +164,7 @@ class TAMPWorld:
         return self.device_cfg.device
 
     @property
-    def q_init(self) -> Float[torch.Tensor, "dof"]:
+    def q_init(self) -> torch.Tensor:
         return self._q_init
 
     # ---- Movables and indexing ---------------------------------------------
@@ -204,14 +182,6 @@ class TAMPWorld:
             obj = obj.name
         return obj in self._movable_names
 
-    def get_objects_by_type(self, obj_type: str, return_name: bool = True) -> List[Union[Obstacle, str]]:
-        if obj_type not in self.env.type_to_objects:
-            return []
-        objs = self.env.type_to_objects[obj_type]
-        if return_name:
-            objs = [obj.name for obj in objs]
-        return objs
-
     def get_object(self, name: str) -> Obstacle:
         if name not in self._name_to_obj:
             raise ValueError(f"Object '{name}' not found in environment")
@@ -220,15 +190,15 @@ class TAMPWorld:
     def has_object(self, name: str) -> bool:
         return name in self._name_to_obj
 
-    def get_object_pose(self, obj: Union[Obstacle, str]) -> Float[torch.Tensor, "4 4"]:
+    def get_object_pose(self, obj: Union[Obstacle, str]) -> torch.Tensor:
         obj = obj if isinstance(obj, Obstacle) else self.get_object(obj)
         return pose_list_to_mat4x4(obj.pose).to(self.device)
 
-    def get_collision_spheres(self, obj: Union[Obstacle, str]) -> Float[torch.Tensor, "n 4"]:
+    def get_collision_spheres(self, obj: Union[Obstacle, str]) -> torch.Tensor:
         obj_name = obj.name if isinstance(obj, Obstacle) else obj
         return self._obj_to_spheres[obj_name]
 
-    def get_aabb(self, obj: Union[Obstacle, str]) -> Float[torch.Tensor, "2 3"]:
+    def get_aabb(self, obj: Union[Obstacle, str]) -> torch.Tensor:
         obj_name = obj.name if isinstance(obj, Obstacle) else obj
         if obj_name not in self._obj_to_aabb:
             obj = self.get_object(obj_name)
@@ -236,7 +206,7 @@ class TAMPWorld:
         return self._obj_to_aabb[obj_name]
 
     @cached_property
-    def world_aabb(self) -> Float[torch.Tensor, "2 3"]:
+    def world_aabb(self) -> torch.Tensor:
         aabbs = [self.get_aabb(o) for o in self.movables] + [self.get_aabb(o) for o in self.statics]
         aabbs = torch.stack(aabbs)
         return torch.stack([aabbs[:, 0].min(dim=0).values, aabbs[:, 1].max(dim=0).values])
@@ -246,10 +216,8 @@ class TAMPWorld:
     @property
     def initial_state(self) -> State:
         return get_initial_state(
-            movables=self.get_objects_by_type("Movable", return_name=True),
-            surfaces=self.get_objects_by_type("Surface", return_name=True),
-            sticks=self.get_objects_by_type("Stick", return_name=True),
-            buttons=self.get_objects_by_type("Button", return_name=True),
+            movables=[obj.name for obj in self.env.type_to_objects.get("Movable", [])],
+            surfaces=[obj.name for obj in self.env.type_to_objects.get("Surface", [])],
         )
 
     @property
@@ -257,6 +225,44 @@ class TAMPWorld:
         return self.env.goal_state
 
     # ---- Solvers ------------------------------------------------------------
+
+    @property
+    def kinematics_jac(self) -> Kinematics:
+        """Jacobian-enabled twin of ``kinematics`` (lazily built).
+
+        Same 21-DOF model, but ``compute_jacobian=True`` so every FK call
+        also fills ``tool_jacobians``. Separate instance because the flag is
+        baked into the kernel buffers at construction. Used by the GN reIK
+        refresh (``cutamp/gn_refresh.py``).
+        """
+        if self._kinematics_jac is None:
+            from cutamp.robots.t1 import get_t1_kinematics
+            self._kinematics_jac = get_t1_kinematics(
+                device_cfg=self.device_cfg, compute_jacobian=True,
+            )
+        return self._kinematics_jac
+
+    @property
+    def ik_refresh_solver(self) -> InverseKinematics:
+        """IK solver for coupled-reIK refreshes. With ``reik_num_seeds > 0``,
+        a dedicated low-seed solver (lazily built): refreshes are warm-started
+        from the current particle q, so they don't need the 32-seed global
+        search — cost scales ~linearly with seeds. Same capacity, collision
+        checking, and CoM-aware residual as the main solver, which stays in
+        use for particle init and the final pre-check refresh. Falls back to
+        the main solver when ``reik_num_seeds == 0``.
+        """
+        if self._reik_num_seeds <= 0:
+            return self.ik_solver
+        if self._ik_refresh_solver is None:
+            self._ik_refresh_solver = get_t1_ik_solver(
+                self.world_cfg, device_cfg=self.device_cfg,
+                max_batch_size=self._ik_max_batch_size,
+                enable_com_aware_ik=self._enable_com_aware_ik,
+                num_seeds=self._reik_num_seeds,
+                lbfgs_iters=self._reik_lbfgs_iters,
+            )
+        return self._ik_refresh_solver
 
     def warmup_ik_solver(self, num_particles: int):
         """Warmup the multi-frame IK solver with a multi-frame FK goal."""
@@ -275,10 +281,6 @@ class TAMPWorld:
         self,
         collision_activation_distance: float = 0.01,
         use_cuda_graph: bool = True,
-        num_trajopt_seeds: int = 4,
-        num_ik_seeds: int = 64,
-        max_batch_size: int = 1,
-        max_goalset: int = 1,
         enable_com_polygon: bool = True,
         enable_joint_limit_margin: bool = True,
     ) -> MotionPlanner:
@@ -290,11 +292,7 @@ class TAMPWorld:
         return get_t1_motion_planner(
             scene_with_movables,
             use_cuda_graph=use_cuda_graph,
-            num_ik_seeds=num_ik_seeds,
-            num_trajopt_seeds=num_trajopt_seeds,
             collision_activation_distance=collision_activation_distance,
-            max_batch_size=max_batch_size,
-            max_goalset=max_goalset,
             device_cfg=self.device_cfg,
             enable_com_polygon=enable_com_polygon,
             enable_joint_limit_margin=enable_joint_limit_margin,

@@ -17,7 +17,7 @@ from typing import List, Literal, Optional
 SUPPORTED_SOFT_COSTS = (
     "dist_from_origin", "place_close_to_base", "max_obj_dist", "min_obj_dist",
     "min_y", "max_y", "align_yaw", "retract_close_to_home",
-    "minimize_body_movement", "com_polygon", "joint_limit_margin",
+    "minimize_body_movement", "joint_limit_margin",
 )
 
 
@@ -28,24 +28,19 @@ class TAMPConfiguration:
 
     # Grasp and Placements
     grasp_dof: Literal[4, 6] = 4
-    place_dof: Literal[4] = 4
-
-    # Approach to use. Note: optimization includes particle initialization (i.e., sampling)
-    approach: Literal["optimization", "sampling"] = "optimization"
-
-    # Number of resampling attempts per plan skeleton if the approach is sampling
-    num_resampling_attempts: int = 0
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
+    # Stop Adam Phase 1 after this many steps without meaningful progress
+    # (new-best satisfying count or best-particle loss drop). 0 disables.
+    # The best-seen particle snapshot is kept regardless of this setting.
+    early_stop_patience: int = 0
     lr: float = 7e-3  # default LR for optimizer
     conf_lr: float = 2.226e-2  # LR for robot configurations
 
     ## Advanced args - for soft cost experiments. Warning! Might cause unexpected behavior if not used correctly.
-    # Maximum time for optimization or sampling in seconds before breaking
+    # Maximum time for optimization in seconds before breaking
     max_loop_dur: Optional[float] = None
-    # Whether to break upon finding a satisfying particle
-    break_on_satisfying: bool = True
 
     ## Soft Costs
     # Default ON: validated as a trio with coupled_reik + place_close_to_base
@@ -56,10 +51,6 @@ class TAMPConfiguration:
     soft_cost: Optional[List[str]] = field(
         default_factory=lambda: ["place_close_to_base", "joint_limit_margin"]
     )
-    # Diagnostic: mimic NVlabs/cuTAMP main — Adam always runs with soft costs
-    # in the loss; no Phase 2 LBFGS. Useful for pose-class soft costs that
-    # LBFGS can't refine along the IK constraint manifold.
-    upstream_style_optimize: bool = False
     # Re-IK-coupled Adam (bilevel): outer Adam optimizes Pose/Grasp/free-Conf;
     # covered Confs (q_pick/q_place/etc.) are dropped from the optimizer and
     # refreshed by an exact IK call every reik_interval steps. Makes pose-class
@@ -67,43 +58,79 @@ class TAMPConfiguration:
     # that destroys 21-DOF Adam runs.
     coupled_reik: bool = True
     reik_interval: int = 5
+    # Drift gate for re-IK refreshes: a particle is "provably fresh" when its
+    # IK target moved less than this (metres) since its last successful solve
+    # AND achieved-IK-error + drift still clears the checker's
+    # KinematicConstraint tolerance (triangle inequality — see _ReikDriftGate).
+    # A dep's refresh solve is skipped only when EVERY particle is fresh
+    # (cuRobo pads sub-capacity batches to max_batch_size, so per-particle
+    # subset solves save nothing). Rotation budget scales at 10 rad/m, the
+    # checker's rot/pos tolerance ratio. 0 disables gating; drift stats are
+    # recorded either way under opt_metrics["reik_refresh"].
+    reik_drift_tol: float = 0.0
+    # >0: coupled-reIK refreshes use a dedicated low-seed IK solver, warm-
+    # started from the current particle q (the previous solution is a
+    # near-answer, so the 32-seed global search is wasted there). Cost scales
+    # ~linearly with seeds. Particle init and the final pre-check refresh
+    # always use the full 32-seed solver. 0 = refreshes use the main solver.
+    # Default 4 (= current q + 3 random): A/B on blocks_t1 @512 particles
+    # showed 407 -> 251 ms/step with best-satisfying / best-soft-cost equal
+    # or better than the 32-seed refresh (2026-08-04).
+    reik_num_seeds: int = 4
+    # Gauss-Newton refresh (cutamp/gn_refresh.py): periodic refreshes project
+    # the warm q onto the moved pose target with batched damped GN (~2-5 ms
+    # per dep) instead of a cuRobo solve; rows that miss checker tolerance or
+    # the CoM polygon fall back to the reik_num_seeds cuRobo solve that
+    # refresh. Init and the final pre-check refresh always use the full
+    # 32-seed solver. Default ON: A/B on blocks_t1 @512 (2026-08-04) vs the
+    # cuRobo-only refresh: loop 98.0 -> 63.1 s, best soft 27.9 -> 21.3,
+    # final satisfying 349 vs 341, CoM-in-polygon parity (worst 499 vs 502).
+    reik_gn: bool = True
+    # Add the CoM residual row to the GN projection (gn_refresh.py): violated
+    # support-rectangle axes get an active-set pull back inside. A/B verdict
+    # (2026-08-04, blocks_t1 @512): mechanically sound (halves com-misses;
+    # 1-iter recovery) but NO runtime win — place-dep refreshes have ~70-90
+    # conflicted rows that trade pose for CoM, so >=1 miss always remains and
+    # the all-or-nothing cuRobo fallback fires regardless (pick-deps: 0%
+    # fallbacks; place-deps: 100%, both with and without the row). Quality
+    # parity. Default OFF; revisit if fallbacks become rare/cheap or for K=1.
+    reik_gn_com: bool = False
+    # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
+    # default 100, sized for cold global solves). The fallback is warm-started
+    # repair work. Default 40: full A/B (2026-08-04, blocks_t1 @512, two runs
+    # + user verification) showed fallback 282 -> 168 ms, per-step 142 -> 95 ms
+    # with satisfying / soft / CoM-in-polygon all at parity. 20 was REJECTED:
+    # the CoM re-centering inside LBFGS doesn't converge (CoM-in-polygon
+    # collapsed to 407/512). Must be a multiple of the LBFGS inner_iters
+    # (20, lbfgs_ik.yml). Init and the final pre-check refresh keep the
+    # full 100-iteration schedule.
+    reik_lbfgs_iters: int = 40
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
     num_initial_plans: int = 30
-    # Whether to check if state has been explored before adding to search tree for task planning
-    explored_state_check: bool = True
     # Cache particles for reuse - this is coupled to our current domains so the implementation is not general
-    # Warning: don't use this with the sampling approach, as the samplers will just return the same samples
     cache_subgraphs: bool = False
-    skip_failed_subgraphs: bool = False
-    # Random particle initialization for placements and robot configurations. Not supported for all domains.
-    random_init: bool = False
 
     ## Collision Checking
     # Movable object collision sphere representation
     coll_n_spheres: int = 50
     coll_sphere_radius: float = 0.005
-    # Distance at which collision checking is activated between the world (in cuRobo)
-    world_activation_distance: float = 0.0
     # Distance at which collision checking is activated between gripper and movables
     gripper_activation_distance: float = 0.0
     # Distance at which collision checking is activated between movables and movables
     movable_activation_distance: float = 0.0
 
     ## Trajectories and cuRobo
-    # Whether to also optimize full trajectories (not supported right now)
-    enable_traj: bool = False
     # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
     enable_com_polygon: bool = True
     # Pass through to MotionPlanner's joint-limit margin trajopt cost
     # (trajectory insurance; endpoint configs are handled by the
     # "joint_limit_margin" soft cost). Margins: robots/t1.py.
     enable_joint_limit_margin: bool = True
-    ik_com_retry_max: int = 3   # Backstop: post-IK COM mask retries (CoM-aware IK makes violations rare).
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
-    # COM, recruiting legs within limits. The post-IK mask (ik_com_retry_max)
-    # stays as the backstop. Validation: commits 217d4b6 / 5b9ae65.
+    # COM, recruiting legs within limits. The post-IK mask stays as the
+    # backstop. Validation: commits 217d4b6 / 5b9ae65.
     enable_com_aware_ik: bool = True
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
@@ -111,15 +138,6 @@ class TAMPConfiguration:
     # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
     motion_plan_max_retries: int = 5
-    # When True, dump per-constraint / per-timestep diagnostics on every motion-
-    # plan failure (slow: walks horizon × N FK in Python). Off by default since
-    # the outer retry usually masks transient failures; turn on when debugging
-    # cuRobo trajopt issues. See cutamp/utils/motion_diagnostics.py.
-    debug_motion_failures: bool = False
-    # Whether to warmup IK solver
-    warmup_ik: bool = True
-    # Whether to warmup motion generator
-    warmup_motion_gen: bool = True
 
     ## Visualizer Args
     # Whether to use visualizer, if set to False a Mock is used
@@ -128,8 +146,6 @@ class TAMPConfiguration:
     opt_viz_interval: int = 10
     # Whether to visualize the robot mesh, set to False if you want to save network bandwidth (~10MB)
     viz_robot_mesh: bool = True
-    # Spawn the rerun visualizer
-    rr_spawn: bool = True
 
     ## Logging Args
     enable_experiment_logging: bool = True
@@ -142,22 +158,38 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
     if config.grasp_dof not in {4, 6}:
         raise ValueError(f"Invalid grasp_dof: {config.grasp_dof}")
-    if config.place_dof not in {4}:
-        raise ValueError(f"Invalid place_dof: {config.place_dof}")
-    if config.approach not in {"optimization", "sampling"}:
-        raise ValueError(f"Invalid approach: {config.approach}")
-    if config.num_resampling_attempts < 0:
-        raise ValueError(f"num_resampling_attempts must be non-negative, not {config.num_resampling_attempts}")
 
     # Optimization hyperparams
     if config.num_opt_steps <= 0:
         raise ValueError(f"num_opt_steps must be positive, not {config.num_opt_steps}")
+    if config.early_stop_patience < 0:
+        raise ValueError(f"early_stop_patience must be >= 0, not {config.early_stop_patience}")
     if config.lr <= 0:
         raise ValueError(f"Learning rate (lr) must be positive, not {config.lr}")
     if config.conf_lr <= 0:
         raise ValueError(f"Configuration learning rate (conf_lr) must be positive, not {config.conf_lr}")
     if config.reik_interval <= 0:
         raise ValueError(f"reik_interval must be positive, not {config.reik_interval}")
+    if config.reik_drift_tol < 0:
+        raise ValueError(f"reik_drift_tol must be >= 0, not {config.reik_drift_tol}")
+    if config.reik_num_seeds < 0:
+        raise ValueError(f"reik_num_seeds must be >= 0, not {config.reik_num_seeds}")
+    if config.reik_lbfgs_iters < 0 or config.reik_lbfgs_iters % 20 != 0:
+        # cuRobo's LBFGS requires num_iters to be a multiple of inner_iters
+        # (20 in lbfgs_ik.yml); validate here so a bad value fails at startup,
+        # not at the first mid-loop refresh-solver build.
+        raise ValueError(
+            f"reik_lbfgs_iters must be a non-negative multiple of 20, not {config.reik_lbfgs_iters}"
+        )
+    if config.reik_gn and not config.coupled_reik:
+        # GN refresh only runs inside the coupled-reIK loop. Now that reik_gn
+        # defaults ON, this combination just means "no refreshes at all" —
+        # warn (don't raise) so --no_coupled_reik keeps working, but a
+        # benchmark comparing GN on/off knows the flag was inert.
+        import logging
+        logging.getLogger(__name__).warning(
+            "reik_gn has no effect without coupled_reik (no re-IK refreshes run)"
+        )
     for name in (config.soft_cost or []):
         if name not in SUPPORTED_SOFT_COSTS:
             raise ValueError(f"Unknown soft cost {name!r}; supported: {SUPPORTED_SOFT_COSTS}")
@@ -169,15 +201,11 @@ def validate_tamp_config(config: TAMPConfiguration):
     # Task Planning and subgraph caching
     if config.num_initial_plans <= 0:
         raise ValueError(f"num_initial_plans must be positive, not {config.num_initial_plans}")
-    if config.cache_subgraphs and config.approach == "sampling":
-        raise ValueError("cache_subgraphs is not compatible with sampling approach")
 
     # Collision checking
     if config.coll_n_spheres <= 0:
         raise ValueError(f"coll_n_spheres must be positive, not {config.coll_n_spheres}")
     if config.coll_sphere_radius <= 0:
         raise ValueError(f"coll_sphere_radius must be positive, not {config.coll_sphere_radius}")
-    if config.world_activation_distance < 0:
-        raise ValueError(f"world_activation_distance must be non-negative, not {config.world_activation_distance}")
     if config.movable_activation_distance < 0:
         raise ValueError(f"movable_activation_distance must be non-negative, not {config.movable_activation_distance}")

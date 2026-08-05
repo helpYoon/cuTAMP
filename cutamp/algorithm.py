@@ -27,13 +27,13 @@ from cutamp.experiment_logger import ExperimentLogger
 from cutamp.motion_solver import solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
-from cutamp.robots import get_q_home, load_robot_container
+from cutamp.robots import load_t1_container, t1_home
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
 from cutamp.task_planning import PlanSkeleton, task_plan_generator
 from cutamp.utils.timer import TorchTimer
-from cutamp.utils.visualizer import RerunVisualizer, MockVisualizer
+from cutamp.utils.visualizer import RerunVisualizer, Visualizer
 
 _log = logging.getLogger(__name__)
 
@@ -53,23 +53,12 @@ def heuristic_fn(
     num_particles = None
     for con_type, con_info in full_mask.items():
         for name, mask in con_info.items():
-            if mask.ndim == 2:
-                satisfying = mask.sum(0)
-            else:
-                satisfying = mask.sum()
-
-            if num_particles is None:
-                num_particles = mask.shape[0]
-            else:
-                assert num_particles == mask.shape[0]
-
+            num_particles = mask.shape[0]
+            satisfying = mask.reshape(num_particles, -1).sum(0)
             satisfying[satisfying == 0] = -num_particles
-            sat_list = satisfying.tolist()
-            if not isinstance(sat_list, list):
-                sat_list = [sat_list]
-            successes.extend(sat_list)
+            successes.extend(satisfying.tolist())
             if verbose:
-                _log.debug(f"{con_type} {name} {sat_list}")
+                _log.debug(f"{con_type} {name} {satisfying.tolist()}")
     success_mean = sum(successes) / len(successes)
     success_rate = success_mean / num_particles
     failure_rate = 1 - success_rate
@@ -111,13 +100,6 @@ def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
         arm_home_xyz = world.arm_home_ee_world[meta.arm].cpu().numpy().astype(np.float64)
         return float(np.linalg.norm(block_xyz - arm_home_xyz))
     return priority
-
-
-def get_best_particle(
-    plan_info: dict, config: TAMPConfiguration, constraint_checker: ConstraintChecker, cost_reducer: CostReducer
-) -> dict:
-    """Get the particle that satisfies the constraints and has the best soft cost."""
-    return get_top_satisfying_particles(plan_info, config, constraint_checker, cost_reducer, n=1)[0]
 
 
 def get_top_satisfying_particles(
@@ -213,64 +195,6 @@ def sample_plan_skeleton(
     return plan_info, num_satisfying > 0
 
 
-def resample_plan_info(
-    plan_info: dict,
-    config: TAMPConfiguration,
-    timer: TorchTimer,
-    cost_reducer: CostReducer,
-    constraint_checker: ConstraintChecker,
-    particle_initializer: ParticleInitializer,
-) -> int:
-    """
-    Sample particles again in-place for a plan info container with a plan skeleton. This can be used for rejection
-    sampling strategy (for the sampling baseline), or for random restarts.
-
-    Returns number of satisfying particles after re-sampling.
-    """
-    with timer.time("initialize_particles"), timer.time("resample_particles"):
-        plan_particles = particle_initializer(plan_info["plan_skeleton"], verbose=False)
-
-    # Rollout new particles and compute costs
-    with timer.time("measure_heuristic"), torch.no_grad():
-        rollout = plan_info["rollout_fn"](plan_particles)
-        cost_dict = plan_info["cost_fn"](rollout, plan_particles)
-        heuristic = heuristic_fn(plan_info["plan_skeleton"], cost_dict, constraint_checker, verbose=False)
-
-    # Number of satisfying particles
-    with timer.time("get_satisfying_mask"):
-        satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
-    num_satisfying = satisfying_mask.sum().item()
-
-    # Best cost
-    with timer.time("compute_best_cost"):
-        consider_types = {"constraint"}
-        if config.optimize_soft_costs:
-            consider_types.add("cost")
-        costs = cost_reducer(cost_dict, consider_types=consider_types)
-        if satisfying_mask.any():
-            best_cost = costs[satisfying_mask].min().item()
-            soft_costs = cost_reducer.soft_costs(cost_dict)
-            best_soft_cost = soft_costs[satisfying_mask].min().item()
-            indices = torch.arange(config.num_particles, device=soft_costs.device)
-            best_idx = indices[satisfying_mask][costs[satisfying_mask].argmin()]
-            best_soft_idx = indices[satisfying_mask][soft_costs[satisfying_mask].argmin()]
-        else:
-            best_cost, best_soft_cost = float("inf"), float("inf")
-            best_idx = None
-            best_soft_idx = None
-
-    # Update plan info
-    plan_info["particles"] = plan_particles
-    plan_info["heuristic"] = heuristic
-    plan_info["num_satisfying"] = num_satisfying
-    plan_info["best_cost"] = best_cost
-    plan_info["best_soft_cost"] = best_soft_cost
-    plan_info["rollout"] = rollout
-    plan_info["best_idx"] = best_idx
-    plan_info["best_soft_idx"] = best_soft_idx
-    return num_satisfying
-
-
 def _motion_plan_with_retries(
     plan_info: dict,
     candidates: list,
@@ -335,11 +259,11 @@ def setup_cutamp(
 
     # Loading robot can be done offline, so doesn't count towards timing
     tensor_args = TensorDeviceType()
-    robot_container = load_robot_container(device_cfg=tensor_args)
+    robot_container = load_t1_container(device_cfg=tensor_args)
 
     # v0.8 single-MotionPlanner: q_init is a single full-DOF vector for every robot.
     if q_init is None:
-        q_init = get_q_home()
+        q_init = t1_home
     q_init = tensor_args.to_device(q_init)
 
     # Load TAMP world and warmup IK solver
@@ -350,22 +274,24 @@ def setup_cutamp(
             device_cfg=tensor_args,
             robot=robot_container,
             q_init=q_init,
-            collision_activation_distance=config.world_activation_distance,
+            collision_activation_distance=0.0,
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
             enable_com_aware_ik=config.enable_com_aware_ik,
+            ik_max_batch_size=config.num_particles,
+            reik_num_seeds=config.reik_num_seeds,
+            reik_lbfgs_iters=config.reik_lbfgs_iters,
         )
         check_tamp_world_not_in_collision(world)
 
-    if config.warmup_ik:
-        with timer.time("warmup_ik_solver", log_callback=_log.info):
-            world.warmup_ik_solver(config.num_particles)
+    with timer.time("warmup_ik_solver", log_callback=_log.info):
+        world.warmup_ik_solver(config.num_particles)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
-        RerunVisualizer(config, q_init, application_id=env.name, recording_id=experiment_id, spawn=config.rr_spawn)
+        RerunVisualizer(config, q_init, application_id=env.name, recording_id=experiment_id, spawn=True)
         if config.enable_visualizer
-        else MockVisualizer()
+        else Visualizer(config, None)
     )
     visualizer.log_tamp_world(world)
     return exp_logger, visualizer, timer, world
@@ -393,7 +319,6 @@ def run_cutamp(
             world.initial_state,
             world.goal_state,
             operators=all_operators,
-            explored_state_check=config.explored_state_check,
             ground_op_priority_fn=arm_affinity_priority,
         )
 
@@ -456,126 +381,18 @@ def run_cutamp(
         )
         best_particle = None
 
-        if config.approach == "optimization":
-            has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
-            if metrics["best_cost"] is not None:
-                overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
-            if metrics["best_soft_cost"] is not None:
-                overall_metrics["best_soft_cost"] = min(overall_metrics["best_soft_cost"], metrics["best_soft_cost"])
-            if time_exceeded:
-                _log.info(f"Max loop duration reached, stopping optimization")
-                should_break = True
-            exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
-            if has_satisfying:
-                best_particle = get_best_particle(plan_info, config, constraint_checker, cost_reducer)
-        else:
-            # This is the parallelized sampling baseline
-            assert config.approach == "sampling"
-            num_resample_attempts = 0
-            resample_dur = 0.0
-            has_satisfying = plan_info["num_satisfying"] > 0
-            total_num_satisfying = plan_info["num_satisfying"]
-            best_particle = None
-            best_soft_costs = []
-            elapsed = []
+        has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
+        if metrics["best_cost"] is not None:
+            overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
+        if metrics["best_soft_cost"] is not None:
+            overall_metrics["best_soft_cost"] = min(overall_metrics["best_soft_cost"], metrics["best_soft_cost"])
+        if time_exceeded:
+            _log.info(f"Max loop duration reached, stopping optimization")
+            should_break = True
+        exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
+        if has_satisfying:
+            best_particle = get_top_satisfying_particles(plan_info, config, constraint_checker, cost_reducer, n=1)[0]
 
-            if not has_satisfying or not config.break_on_satisfying:
-                timer.start("resample_duration")
-                for resample_idx in range(config.num_resampling_attempts):
-                    if config.max_loop_dur is not None and timer.elapsed("start_optimization") >= config.max_loop_dur:
-                        _log.info(f"Max loop duration reached, stopping resampling")
-                        should_break = True
-                        break
-                    timer.start("resample_plan_info")
-                    num_satisfying = resample_plan_info(
-                        plan_info,
-                        config,
-                        timer,
-                        cost_reducer,
-                        constraint_checker,
-                        particle_initializer,
-                    )
-                    total_num_satisfying += num_satisfying
-                    if plan_info["best_soft_cost"] < overall_metrics["best_soft_cost"]:
-                        best_soft_idx = plan_info["best_soft_idx"]
-                        best_particle = {
-                            k: v[best_soft_idx].detach().clone() for k, v in plan_info["particles"].items()
-                        }
-
-                    overall_metrics["best_cost"] = min(overall_metrics["best_cost"], plan_info["best_cost"])
-                    overall_metrics["best_soft_cost"] = min(
-                        overall_metrics["best_soft_cost"], plan_info["best_soft_cost"]
-                    )
-
-                    # Keep track of the best soft cost since start of resampling
-                    best_soft_costs.append(overall_metrics["best_soft_cost"])
-                    elapsed.append(timer.elapsed("start_optimization"))
-
-                    resample_plan_info_dur = timer.stop("resample_plan_info")
-                    _log.debug(
-                        f"[Plan {plan_info['idx'] + 1}] Resample attempt {resample_idx + 1}/{config.num_resampling_attempts}, "
-                        f"{num_satisfying}/{config.num_particles} satisfying particles. Total satisfying {total_num_satisfying}. "
-                        f"Took {resample_plan_info_dur:.2f}s"
-                    )
-                    has_satisfying = num_satisfying > 0
-                    num_resample_attempts += 1
-
-                    # Visualize best particle rollout state
-                    rollout = plan_info["rollout"]
-                    best_soft_idx = plan_info["best_soft_idx"]
-                    if best_soft_idx is None:
-                        best_soft_idx = 0
-                    visualizer.set_time_sequence(f"samp", num_resample_attempts)
-                    q_last = rollout["confs"][best_soft_idx, -1].tolist()
-                    visualizer.set_joint_positions(q_last)
-                    for obj in rollout["obj_to_pose"]:
-                        mat4x4_last = rollout["obj_to_pose"][obj][best_soft_idx, -1]
-                        visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
-
-                    if has_satisfying:
-                        if timer.has_timer("first_solution"):
-                            time_to_first_sol = timer.stop("first_solution")
-                            _log.info(f"Found first solution in {time_to_first_sol:.2f}s after sampling plans")
-                        if config.break_on_satisfying:
-                            should_break = True
-                            break
-                resample_dur = timer.stop("resample_duration")
-                _log.info(f"Total resample duration: {resample_dur:.2f}s")
-            else:
-                _log.info("Already has satisfying particles, skipping resampling")
-                overall_metrics["best_cost"] = min(overall_metrics["best_cost"], plan_info["best_cost"])
-                overall_metrics["best_soft_cost"] = min(overall_metrics["best_soft_cost"], plan_info["best_soft_cost"])
-                if config.break_on_satisfying:
-                    should_break = True
-
-            metrics = {
-                "plan_skeleton": [str(op) for op in plan_skeleton],
-                "num_particles": config.num_particles,
-                "num_resample_attempts": num_resample_attempts,
-                "resample_duration": resample_dur,
-                "num_satisfying_final": total_num_satisfying,
-                "total_num_particles": config.num_particles * (num_resample_attempts + 1),
-                "best_cost": overall_metrics["best_cost"],
-                "best_soft_cost": overall_metrics["best_soft_cost"],
-                "best_soft_costs": best_soft_costs,
-                "elapsed": elapsed,
-            }
-            exp_logger.log_dict(f"sampling/samp_{opt_iter:04d}", metrics)
-            has_satisfying = total_num_satisfying > 0
-            overall_metrics["num_satisfying_final"] = total_num_satisfying
-
-            # Log best particle as last
-            if best_particle is not None:
-                rollout = plan_info["rollout_fn"]({k: v[None] for k, v in best_particle.items()})
-                visualizer.set_time_sequence(f"samp", num_resample_attempts)
-                q_last = rollout["confs"][0, -1].tolist()
-                visualizer.set_joint_positions(q_last)
-
-                for obj in rollout["obj_to_pose"]:
-                    mat4x4_last = rollout["obj_to_pose"][obj][0, -1]
-                    visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
-
-        # Now we've either optimized or resampled
         overall_metrics["num_optimized_plans"] += 1
         if has_satisfying:
             if config.curobo_plan:
@@ -592,8 +409,7 @@ def run_cutamp(
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
             _log.debug(f"Total num satisfying {metrics['num_satisfying_final']}")
-            if config.break_on_satisfying:
-                should_break = True
+            should_break = True
 
         if should_break:
             break

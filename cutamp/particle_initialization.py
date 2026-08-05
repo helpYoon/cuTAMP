@@ -14,13 +14,12 @@ vector in T1's full cspace order.
 """
 
 import logging
-from typing import Optional
+from typing import Dict, List, Optional
 
-import roma
 import torch
 
 from curobo.scene import Cuboid
-from curobo.types import JointState, Pose
+from curobo.types import GoalToolPose, JointState, Pose
 
 from cutamp._curobo_internals import (
     inactive_arm_cspace_weights,
@@ -30,7 +29,6 @@ from cutamp._curobo_internals import (
 )
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
-from cutamp.grasp_planning import _build_multi_frame_goal
 from cutamp.robots.t1 import (
     BASE_INDICES,
     LEFT_ARM_INDICES,
@@ -39,23 +37,45 @@ from cutamp.robots.t1 import (
 )
 from cutamp.samplers import (
     grasp_4dof_sampler,
-    grasp_6dof_sampler,
     place_4dof_sampler,
-    sample_yaw,
 )
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
-    action_6dof_to_mat4x4,
     pose_list_to_mat4x4,
-    sample_between_bounds,
     transform_spheres,
 )
-from cutamp.utils.shapes import MultiSphere
 
 _log = logging.getLogger(__name__)
+
+
+def _build_multi_frame_goal(
+    host,
+    active_tool_frame: str,
+    target_pose: Pose,
+    current_state: JointState,
+) -> GoalToolPose:
+    """Build a GoalToolPose covering all of ``host.kinematics.tool_frames``.
+
+    ``host`` may be a ``MotionPlanner`` or an ``IKSolver`` — both expose
+    ``kinematics.tool_frames`` and ``compute_kinematics(state)``.
+
+    The active frame gets ``target_pose``; every inactive frame gets its
+    current FK pose at ``current_state``. This satisfies cuRobo IK's
+    ``reorder_links`` requirement that the goal cover every kinematics
+    tool frame, while keeping the inactive frames at their "stay put"
+    pose so they don't drag the trajopt away from the cspace pin.
+    """
+    all_frames: List[str] = list(host.kinematics.tool_frames)
+    poses: Dict[str, Pose] = {active_tool_frame: target_pose}
+    inactive = [f for f in all_frames if f != active_tool_frame]
+    if inactive:
+        kin_state = host.compute_kinematics(current_state)
+        for f in inactive:
+            poses[f] = kin_state.tool_poses.get_link_pose(f)
+    return GoalToolPose.from_poses(poses, ordered_tool_frames=all_frames)
 
 
 def _ik_for_pose(
@@ -64,6 +84,8 @@ def _ik_for_pose(
     arm: Optional[str],
     *,
     current_state_q: Optional[torch.Tensor] = None,
+    ik=None,
+    seed_from_current: bool = False,
 ):
     """Solve IK for a batch of EE poses, targeting the active arm's tool frame.
 
@@ -74,11 +96,17 @@ def _ik_for_pose(
     arbitrary joint values, polluting downstream particle optimization.
 
     ``current_state_q`` (full-cspace ``[B, len(world.kinematics.joint_names)]``)
-    seeds IK from a non-home pose — used by the coupled-reIK refresh during
-    Adam to warm-start from the current best particle's q. When ``None``,
-    seeds from ``world.q_init`` as before.
+    anchors the cspace pin and inactive-frame goal at a non-home pose. Note
+    cuRobo's seed manager IGNORES ``current_state`` for seeding — pass
+    ``seed_from_current=True`` to additionally inject it as an explicit
+    optimization seed (true warm start; remaining seeds stay random). Used
+    by the coupled-reIK refresh, where the previous solution is a near-answer.
+
+    ``ik`` overrides the solver (default ``world.ik_solver``) — the refresh
+    path passes ``world.ik_refresh_solver``.
     """
-    ik = world.ik_solver
+    if ik is None:
+        ik = world.ik_solver
     active_frame = world.tool_frame_for_arm(arm)
     if active_frame not in ik.kinematics.tool_frames:
         raise RuntimeError(
@@ -103,47 +131,14 @@ def _ik_for_pose(
             write_cspace_target_dof_weight(
                 [ik], inactive_arm_cspace_weights(ik, arm),
             )
-        return ik.solve_pose(goal_tool_poses=goal, current_state=current_state)
+        seed_config = (
+            current_state.position.unsqueeze(1) if seed_from_current else None
+        )
+        return ik.solve_pose(
+            goal_tool_poses=goal, current_state=current_state, seed_config=seed_config,
+        )
     finally:
         restore_cspace_target_dof_weight([ik], snapshot)
-
-
-def _splice_ik_result(orig, retry, idx: torch.Tensor):
-    """Replace ``orig``'s per-batch fields at ``idx`` with values from ``retry``.
-
-    Mirrors the field coverage of cuRobo's
-    ``BaseSolverResult.copy_at_batch_indices`` (curobo/_src/solver/
-    solver_base_result.py:212-237) so any consumer of the returned IK
-    result sees consistent state across all fields.
-
-    Both ``orig`` and ``retry`` have batch dim B (the full batch).
-    ``idx`` selects which entries to copy from ``retry`` into ``orig``.
-    Mutates ``orig`` in place; returns it.
-    """
-    # Per-batch tensor fields on BaseSolverResult (IKSolverResult inherits).
-    for attr in (
-        "success", "solution", "position_error", "rotation_error",
-        "cspace_error", "goalset_index", "feasible", "optimized_seeds",
-        "total_cost_reshaped", "seed_rank", "seed_cost",
-    ):
-        dst = getattr(orig, attr, None)
-        src = getattr(retry, attr, None)
-        if dst is None or src is None:
-            continue
-        # Both dst and src have batch dim B; index src[idx] to match dst[idx].
-        dst[idx] = src[idx]
-
-    # js_solution is a JointState — splice its sub-attrs individually.
-    js_orig = getattr(orig, "js_solution", None)
-    js_retry = getattr(retry, "js_solution", None)
-    if js_orig is not None and js_retry is not None:
-        for sub_attr in ("position", "velocity", "acceleration", "jerk", "dt"):
-            dst = getattr(js_orig, sub_attr, None)
-            src = getattr(js_retry, sub_attr, None)
-            if dst is None or src is None:
-                continue
-            dst[idx] = src[idx]
-    return orig
 
 
 def _ik_for_pose_com_safe(
@@ -176,7 +171,6 @@ def _ik_for_pose_com_safe(
         in_polygon = compute_com_polygon_mask(world, q_batch)
         if bool(in_polygon.all()):
             return result
-        fail_idx = (~in_polygon).nonzero(as_tuple=True)[0]
         # Diversify the LBFGS starting region across retries: each retry
         # perturbs the home seed with gaussian noise whose stddev grows
         # with attempt count. cuRobo's internal seed sampler adds its own
@@ -205,7 +199,7 @@ def _ik_for_pose_com_safe(
         _upper = _limits[1].to(seed.device, seed.dtype)
         seed = torch.clamp(seed, min=_lower, max=_upper)
         retry_result = _ik_for_pose(world, world_from_ee, arm, current_state_q=seed)
-        result = _splice_ik_result(result, retry_result, fail_idx)
+        result.copy_at_batch_indices(retry_result, ~in_polygon)
     # Final check for logging.
     q_batch_final = _ik_solution_to_full_q(result, world)
     in_polygon_final = compute_com_polygon_mask(world, q_batch_final)
@@ -219,24 +213,32 @@ def _ik_for_pose_com_safe(
     return result
 
 
-def _sample_push_poses(
-    world: TAMPWorld, button: str, num_particles: int, device,
-) -> torch.Tensor:
-    """Sample ``[num_particles, 4]`` (x, y, z, yaw) push poses over ``button``.
+def _achieved_pose_errors(
+    world: TAMPWorld, q_full: torch.Tensor, world_from_ee: torch.Tensor, arm: str,
+):
+    """``([B] pos_err, [B] rot_err)`` of ``q_full`` against ``world_from_ee``
+    on ``arm``'s tool frame, in the constraint checker's own metric
+    (``curobo_pose_error``).
 
-    XY is sampled uniformly over the button's top AABB face (inset 1 cm from
-    the edges); z hovers above the surface by 2 cm plus the collision
-    activation distance so the pusher isn't initialized in contact.
+    Exists because cuRobo v0.8's ``IKSolverResult.position_error`` /
+    ``rotation_error`` are unusable on multi-tool-frame robots: ``_get_result``
+    concatenates the per-frame convergence metrics blockwise
+    ``[P0..PL-1, R0..RL-1]`` but then views them as interleaved
+    ``(num_links, 2)`` pairs, cross-pairing metres with radians (the success
+    flag uses the un-mixed values and is unaffected).
     """
-    aabb = world.get_aabb(button).clone()
-    surface_z = aabb[1, 2]
-    lower_xy, upper_xy = aabb[:, :2]
-    lower_xy += 0.01
-    upper_xy -= 0.01
-    sampled_xy = lower_xy + torch.rand(num_particles, 2, device=device) * (upper_xy - lower_xy)
-    sampled_z = surface_z.expand(num_particles) + 0.02 + world.collision_activation_distance
-    sampled_yaw = sample_yaw(num_particles, num_faces=None, device=device)
-    return torch.cat([sampled_xy, sampled_z[:, None], sampled_yaw[:, None]], dim=1)
+    from cutamp.costs import curobo_pose_error
+    js = JointState.from_position(
+        q_full, joint_names=list(world.kinematics.joint_names),
+    )
+    kin_state = world.kinematics.compute_kinematics(js)
+    ee_pose = kin_state.tool_poses.get_link_pose(world.tool_frame_for_arm(arm))
+    # get_link_pose returns strided views; get_matrix requires contiguous.
+    ee = Pose(
+        position=ee_pose.position.contiguous(),
+        quaternion=ee_pose.quaternion.contiguous(),
+    ).get_matrix()
+    return curobo_pose_error(ee, world_from_ee)
 
 
 def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
@@ -277,12 +279,8 @@ def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: 
 
 class ParticleInitializer:
     def __init__(self, world: TAMPWorld, config: TAMPConfiguration):
-        if config.enable_traj:
-            raise NotImplementedError("Trajectory initialization not yet supported")
-        if config.place_dof != 4:
-            raise NotImplementedError(f"Only 4-DOF placement supported, not {config.place_dof}")
-        if config.grasp_dof not in (4, 6):
-            raise NotImplementedError(f"Only 4-DOF or 6-DOF grasp supported, not {config.grasp_dof}")
+        if config.grasp_dof != 4:
+            raise NotImplementedError(f"Only 4-DOF grasp supported, not {config.grasp_dof}")
 
         self.world = world
         self.config = config
@@ -290,9 +288,6 @@ class ParticleInitializer:
 
         self.pick_cache = {}
         self.place_cache = {}
-        self.push_button_cache = {}
-        self.push_stick_cache = {}
-        self.failed_push = set()
 
     def _initial_particles(self) -> Particles:
         return {
@@ -366,7 +361,6 @@ class ParticleInitializer:
 
                 tool_frame = world.tool_frame_for_arm(arm)
                 gripper_spheres = world.gripper_spheres[tool_frame]
-                joint_limits = world.joint_limits
                 tool_from_ee = world.tool_from_ee[tool_frame]
 
                 cache_key = (obj, arm) if arm else obj
@@ -386,37 +380,29 @@ class ParticleInitializer:
                 obj_spheres = world.get_collision_spheres(obj)
                 num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
 
-                if config.grasp_dof == 4:
-                    sampled_grasps = grasp_4dof_sampler(num_particles * 4, obj_curobo, obj_spheres, num_faces=num_faces)
-                    obj_from_grasp = action_4dof_to_mat4x4(sampled_grasps)
-                else:
-                    sampled_grasps = grasp_6dof_sampler(num_particles * 4, obj_curobo, num_faces=num_faces)
-                    obj_from_grasp = action_6dof_to_mat4x4(sampled_grasps)
+                sampled_grasps = grasp_4dof_sampler(num_particles * 4, obj_curobo, obj_spheres, num_faces=num_faces)
+                obj_from_grasp = action_4dof_to_mat4x4(sampled_grasps)
 
                 grasp_spheres = transform_spheres(gripper_spheres, obj_from_grasp)
                 grasp_coll = sphere_to_sphere_overlap(obj_spheres, grasp_spheres)
                 good_idxs = grasp_coll.topk(num_particles, largest=False).indices
                 particles[grasp] = sampled_grasps[good_idxs]
 
-                if config.random_init:
-                    particles[q] = sample_between_bounds(num_particles, joint_limits)
-                else:
-                    obj_from_grasp = obj_from_grasp[good_idxs]
-                    world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
-                    world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                    ik_result = _ik_for_pose_com_safe(
-                        world, world_from_ee, arm,
-                        max_retries=self.config.ik_com_retry_max,
-                        context=f"pick({arm})",
-                    )
-                    log_debug(
-                        f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
-                    )
-                    _store_ik_q(particles, q, ik_result, world, arm)
+                obj_from_grasp = obj_from_grasp[good_idxs]
+                world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
+                world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
+                ik_result = _ik_for_pose_com_safe(
+                    world, world_from_ee, arm,
+                    context=f"pick({arm})",
+                )
+                log_debug(
+                    f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
+                )
+                _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
-                if config.cache_subgraphs and not config.random_init:
+                if config.cache_subgraphs:
                     self.pick_cache[cache_key] = {
                         "sampled_grasps": particles[grasp], "ik_result": ik_result,
                     }
@@ -435,7 +421,6 @@ class ParticleInitializer:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
                 tool_frame = world.tool_frame_for_arm(arm)
-                joint_limits = world.joint_limits
                 tool_from_ee = world.tool_from_ee[tool_frame]
 
                 cache_key = (obj, surface, arm) if arm else (obj, surface)
@@ -454,18 +439,10 @@ class ParticleInitializer:
 
                 obj_curobo = world.get_object(obj)
                 obj_spheres = world.get_collision_spheres(obj)
-                if config.random_init:
-                    yaw = sample_yaw(num_particles * 4, None, device)
-                    aabb = world.world_aabb.clone()
-                    aabb[0, 2] = 0.0
-                    aabb[1, 2] = max(aabb[1, 2], 0.2)
-                    xyz = sample_between_bounds(num_particles * 4, aabb)
-                    sampled_placements = torch.cat([xyz, yaw.unsqueeze(-1)], dim=1)
-                else:
-                    surface_curobo = world.get_object(surface)
-                    sampled_placements = place_4dof_sampler(
-                        num_particles * 4, obj_curobo, obj_spheres, surface_curobo,
-                    )
+                surface_curobo = world.get_object(surface)
+                sampled_placements = place_4dof_sampler(
+                    num_particles * 4, obj_curobo, obj_spheres, surface_curobo,
+                )
 
                 world_from_obj = action_4dof_to_mat4x4(sampled_placements)
                 obj_place_spheres = transform_spheres(obj_spheres, world_from_obj)
@@ -476,148 +453,22 @@ class ParticleInitializer:
                 world_from_obj = world_from_obj[best_idxs]
 
                 particles[placement] = sampled_placements
-                if config.random_init:
-                    particles[q] = sample_between_bounds(num_particles, joint_limits)
-                else:
-                    if config.grasp_dof == 4:
-                        obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
-                    else:
-                        obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
-                    world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                    ik_result = _ik_for_pose_com_safe(
-                        world, world_from_ee, arm,
-                        max_retries=self.config.ik_com_retry_max,
-                        context=f"place({arm})",
-                    )
-                    log_debug(
-                        f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
-                    )
-                    _store_ik_q(particles, q, ik_result, world, arm)
+                obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
+                world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
+                ik_result = _ik_for_pose_com_safe(
+                    world, world_from_ee, arm,
+                    context=f"place({arm})",
+                )
+                log_debug(
+                    f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
+                )
+                _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
-                if config.cache_subgraphs and not config.random_init:
+                if config.cache_subgraphs:
                     self.place_cache[cache_key] = {
                         "sampled_placements": sampled_placements,
-                        "ik_result": ik_result,
-                        "grasp": particles[grasp],
-                    }
-
-            elif metadata.action_type == "push":
-                button, push_pose, q = params
-                assert not config.random_init, "Random initialization not supported for pushing"
-                if not world.has_object(button):
-                    raise ValueError(f"{button=} not found in world")
-                if push_pose in particles:
-                    raise ValueError(f"{push_pose=} shouldn't already be bound")
-                if q in particles:
-                    raise ValueError(f"{q=} shouldn't already be bound")
-
-                tool_frame = world.tool_frame_for_arm(arm)
-                tool_from_ee = world.tool_from_ee[tool_frame]
-
-                cache_key = (button, arm) if arm else button
-                if cache_key in self.failed_push and config.skip_failed_subgraphs:
-                    return None
-                if cache_key in self.push_button_cache:
-                    self._apply_cached(
-                        self.push_button_cache[cache_key],
-                        sampled={push_pose: "sampled_push"},
-                        q=q, arm=arm, particles=particles,
-                        deferred_params=deferred_params,
-                        move_free_deferred=move_free_deferred,
-                    )
-                    continue
-
-                sampled_push = _sample_push_poses(world, button, num_particles, device)
-                particles[push_pose] = sampled_push
-
-                world_from_push = action_4dof_to_mat4x4(sampled_push)
-                world_from_ee = world_from_push @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(
-                    world, world_from_ee, arm,
-                    max_retries=self.config.ik_com_retry_max,
-                    context=f"push({arm})",
-                )
-                log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
-                _store_ik_q(particles, q, ik_result, world, arm)
-                deferred_params.discard(q)
-                move_free_deferred.pop(q, None)
-
-                if not ik_result.success.any():
-                    self.failed_push.add(cache_key)
-                if config.cache_subgraphs:
-                    self.push_button_cache[cache_key] = {
-                        "sampled_push": sampled_push, "ik_result": ik_result,
-                    }
-
-            elif metadata.action_type == "push_stick":
-                button, stick_name, grasp, push_pose, q = params
-                assert not config.random_init, "Random initialization not supported for pushing"
-                if not world.has_object(button):
-                    raise ValueError(f"{button=} not found in world")
-                if not world.has_object(stick_name):
-                    raise ValueError(f"{stick_name=} not found in world")
-                if grasp not in particles:
-                    raise ValueError(f"{grasp=} should already be bound")
-                if push_pose in particles:
-                    raise ValueError(f"{push_pose=} shouldn't already be bound")
-                if q in particles:
-                    raise ValueError(f"{q=} shouldn't already be bound")
-
-                tool_frame = world.tool_frame_for_arm(arm)
-                tool_from_ee = world.tool_from_ee[tool_frame]
-
-                cache_key = (button, stick_name, arm) if arm else (button, stick_name)
-                if cache_key in self.push_stick_cache:
-                    self._apply_cached(
-                        self.push_stick_cache[cache_key],
-                        sampled={push_pose: "sampled_push"},
-                        q=q, arm=arm, particles=particles,
-                        deferred_params=deferred_params,
-                        move_free_deferred=move_free_deferred,
-                        grasp_check=(grasp, f"Grasps don't match for {button}/{stick_name}"),
-                    )
-                    continue
-
-                sampled_push = _sample_push_poses(world, button, num_particles, device)
-
-                stick: MultiSphere = world.get_object("stick")
-                spheres = stick.spheres
-                if not (spheres[:, 1:3] == 0.0).all():
-                    raise ValueError("Expected stick spheres to have y, z = 0")
-                sphere_x = spheres[:, 0]
-                x_idxs = torch.randint(0, len(sphere_x), (num_particles,), device=spheres.device)
-                sampled_x = sphere_x[x_idxs]
-                stick_from_tip = torch.eye(4, device=device).repeat(num_particles, 1, 1)
-                stick_from_tip[:, 0, 3] = -sampled_x
-
-                world_from_push = action_4dof_to_mat4x4(sampled_push)
-                world_from_stick = world_from_push @ stick_from_tip
-                rpy = roma.rotmat_to_euler("XYZ", world_from_stick[:, :3, :3])
-                assert (rpy[:, :2] == 0.0).all(), "stick roll/pitch should be 0"
-                pos = world_from_stick[:, :3, 3]
-                yaw = rpy[:, 2]
-                particles[push_pose] = torch.cat([pos, yaw[:, None]], dim=1)
-
-                if config.grasp_dof == 4:
-                    obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
-                else:
-                    obj_from_grasp = action_6dof_to_mat4x4(particles[grasp])
-                world_from_ee = world_from_stick @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(
-                    world, world_from_ee, arm,
-                    max_retries=self.config.ik_com_retry_max,
-                    context=f"push_stick({arm})",
-                )
-                log_debug(f"{header}. IK success: {ik_result.success.sum()}/{num_particles}")
-                _store_ik_q(particles, q, ik_result, world, arm)
-                deferred_params.discard(q)
-                move_free_deferred.pop(q, None)
-
-                if config.cache_subgraphs:
-                    self.push_stick_cache[cache_key] = {
-                        "sampled_push": sampled_push,
                         "ik_result": ik_result,
                         "grasp": particles[grasp],
                     }

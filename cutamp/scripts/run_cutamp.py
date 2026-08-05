@@ -123,10 +123,6 @@ def entrypoint():
     )
     parser.set_defaults(optimize_soft_costs=_defaults.optimize_soft_costs)
     parser.add_argument(
-        "--upstream_style_optimize", action="store_true",
-        help="Diagnostic: mimic NVlabs/cuTAMP main — Adam runs always with soft costs in loss, no Phase 2 LBFGS.",
-    )
-    parser.add_argument(
         "--no_coupled_reik", dest="coupled_reik", action="store_false",
         help="Disable re-IK-coupled Adam (default: on). Coupled mode is required for "
              "pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
@@ -136,6 +132,34 @@ def entrypoint():
         "--reik_interval", type=int, default=_defaults.reik_interval,
         help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
     )
+    parser.add_argument(
+        "--reik_drift_tol", type=float, default=_defaults.reik_drift_tol,
+        help="Drift gate for re-IK: skip a dep's refresh solve when every particle's "
+             "target drifted less than this (metres) since its last successful solve and "
+             "is provably still within checker tolerance. 0 disables gating (stats still recorded).",
+    )
+    parser.add_argument(
+        "--reik_num_seeds", type=int, default=_defaults.reik_num_seeds,
+        help="Use a dedicated low-seed, warm-started IK solver for re-IK refreshes "
+             "(cost ~linear in seeds; init and final refresh keep 32 seeds). 0 = main solver.",
+    )
+    parser.add_argument(
+        "--reik_gn", action="store_true",
+        help="Gauss-Newton re-IK refresh: project warm confs onto moved pose targets "
+             "(~2-5 ms/dep); non-converged rows fall back to the cuRobo refresh solve.",
+    )
+    parser.set_defaults(reik_gn=_defaults.reik_gn)
+    parser.add_argument(
+        "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
+        help="LBFGS iteration budget for the warm refresh/fallback solver "
+             "(multiple of 20; 0 = cuRobo default 100).",
+    )
+    parser.add_argument(
+        "--reik_gn_com", action="store_true",
+        help="Add the CoM residual row to the GN projection: re-center out-of-polygon "
+             "rows inside GN instead of routing them to the cuRobo fallback.",
+    )
+    parser.set_defaults(reik_gn_com=_defaults.reik_gn_com)
     parser.add_argument(
         "--soft_cost",
         nargs="*",
@@ -153,22 +177,12 @@ def entrypoint():
         help="Grasp DOF to use.",
     )
 
-    # Approach
-    parser.add_argument(
-        "--approach",
-        default=_defaults.approach,
-        choices=["optimization", "sampling"],
-        help="Approach to use. Optimization is cuTAMP (sampling + optimization), while sampling is just resampling."
-        "If using sampling, you may need to modify the --num_resampling_attempts.",
-    )
-    parser.add_argument(
-        "--num_resampling_attempts",
-        type=int,
-        default=100,
-        help="Number of resampling attempts per skeleton if using sampling approach.",
-    )
     parser.add_argument(
         "--num_opt_steps", type=int, default=_defaults.num_opt_steps, help="Number of optimization steps to run for each skeleton."
+    )
+    parser.add_argument(
+        "--early_stop_patience", type=int, default=_defaults.early_stop_patience,
+        help="Stop Adam early after this many steps without meaningful progress (0 disables).",
     )
     parser.add_argument(
         "--lr", type=float, default=_defaults.lr, help="Adam LR for non-Conf particle params (poses, grasps).",
@@ -181,7 +195,7 @@ def entrypoint():
         "--max_duration",
         type=float,
         default=_defaults.max_loop_dur,
-        help="Maximum duration for optimization or sampling in seconds. Overrides --num_resampling_attempts and --num_opt_steps if set.",
+        help="Maximum duration for optimization in seconds. Overrides --num_opt_steps if set.",
     )
     parser.add_argument(
         "--num_initial_plans", type=int, default=_defaults.num_initial_plans, help="Number of initial plans to sample with task planner."
@@ -263,16 +277,19 @@ def entrypoint():
     config = TAMPConfiguration(
         num_particles=args.num_particles,
         grasp_dof=args.grasp_dof,
-        approach=args.approach,
-        num_resampling_attempts=args.num_resampling_attempts,
         num_opt_steps=args.num_opt_steps,
+        early_stop_patience=args.early_stop_patience,
         lr=args.lr,
         conf_lr=args.conf_lr,
         max_loop_dur=args.max_duration,
         optimize_soft_costs=args.optimize_soft_costs,
-        upstream_style_optimize=args.upstream_style_optimize,
         coupled_reik=args.coupled_reik,
         reik_interval=args.reik_interval,
+        reik_drift_tol=args.reik_drift_tol,
+        reik_num_seeds=args.reik_num_seeds,
+        reik_gn=args.reik_gn,
+        reik_gn_com=args.reik_gn_com,
+        reik_lbfgs_iters=args.reik_lbfgs_iters,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
         cache_subgraphs=args.cache_subgraphs,

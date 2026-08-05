@@ -22,13 +22,13 @@ import copy
 import logging
 from pathlib import Path
 from functools import lru_cache
-from typing import Dict, Literal, Tuple
+from typing import Dict, Literal, Tuple, Union
 
 import numpy as np
 import rerun as rr
 import roma
 import torch
-from jaxtyping import Float
+import trimesh
 from yourdfpy import URDF
 
 from curobo._src.util.config_io import load_yaml
@@ -38,8 +38,8 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Scene
 from curobo.types import DeviceCfg
 
-from cutamp.robots.utils import RerunRobot
 from cutamp.utils.common import action_4dof_to_mat4x4
+from cutamp.utils.rerun_utils import clean_rerun_path, log_scene
 
 _log = logging.getLogger(__name__)
 
@@ -170,10 +170,7 @@ def _lock_mobile_base(cfg_dict: dict) -> dict:
     """Extend ``lock_joints`` to fix the 3 base DOFs at 0. Mutates in place.
 
     Locked joints are removed from cspace, so IK and trajopt cannot drift the
-    base during arm operations. The base only changes via the ``MoveBaseTo``
-    discrete action — which currently uses the SAME planner instance, so
-    MoveBaseTo will fail until a second unlocked planner is wired in.
-    blocks_t1 has no MoveBaseTo and is unaffected.
+    base during arm operations.
     """
     lock_joints = cfg_dict["robot_cfg"]["kinematics"].setdefault("lock_joints", {})
     for name in JOINT_NAMES_FULL[BASE_INDICES]:
@@ -185,20 +182,23 @@ def _lock_mobile_base(cfg_dict: dict) -> dict:
 # Kinematics, IK, and MotionPlanner factories
 # =============================================================================
 
-def get_t1_kinematics(
-    device_cfg: DeviceCfg = None, *, compute_com: bool = False,
-) -> Kinematics:
+def get_t1_kinematics(device_cfg: DeviceCfg = None, compute_jacobian: bool = False) -> Kinematics:
     """Single 21-DOF Kinematics for T1 (both arms + planar base).
 
-    ``compute_com=True`` selects the heavier compiled CUDA kernel template
-    so ``KinematicsState.robot_com`` is populated on each FK call. Required
-    for the COM-over-base soft cost.
+    Always built with ``compute_com=True`` so ``KinematicsState.robot_com``
+    is populated on every FK call (COM constraint/gate consumers). Measured
+    overhead vs the plain kernel: none (0.126 vs 0.127 ms per 1024-batch FK).
+
+    ``compute_jacobian=True`` additionally populates
+    ``KinematicsState.tool_jacobians`` ``[b, h, num_tool_frames, 6, 21]``
+    (rows 0-2 linear / 3-5 angular, world frame; verified against finite
+    differences). Used by the Gauss-Newton reIK refresh.
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
     cfg = t1_curobo_cfg()
     kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg)
-    return Kinematics(kin_cfg, compute_com=compute_com)
+    return Kinematics(kin_cfg, compute_com=True, compute_jacobian=compute_jacobian)
 
 
 def _trajopt_transition_dict_with_compute_com() -> dict:
@@ -221,11 +221,7 @@ def get_t1_motion_planner(
     scene: Scene,
     *,
     use_cuda_graph: bool = True,
-    num_ik_seeds: int = 64,
-    num_trajopt_seeds: int = 4,
     collision_activation_distance: float = 0.01,
-    max_batch_size: int = 1,
-    max_goalset: int = 1,
     enable_com_polygon: bool = True,
     enable_joint_limit_margin: bool = True,
     device_cfg: DeviceCfg = None,
@@ -233,8 +229,6 @@ def get_t1_motion_planner(
     """Single MotionPlanner for the T1 with the mobile base locked.
 
     Legs (ankle/knee), Torso_Pitch, Waist_Yaw, and both arms remain free.
-    For envs that need ``MoveBaseTo``, build a second planner without
-    ``_lock_mobile_base`` and dispatch by operator type.
 
     When ``enable_com_polygon`` is True (default), the planner gets a soft
     cost penalizing trajectories whose mass-weighted COM projects outside a
@@ -254,11 +248,11 @@ def get_t1_motion_planner(
         robot=cfg_dict,
         scene_model=scene,
         use_cuda_graph=use_cuda_graph,
-        num_ik_seeds=num_ik_seeds,
-        num_trajopt_seeds=num_trajopt_seeds,
+        num_ik_seeds=64,
+        num_trajopt_seeds=4,
         optimizer_collision_activation_distance=collision_activation_distance,
-        max_batch_size=max_batch_size,
-        max_goalset=max_goalset,
+        max_batch_size=1,
+        max_goalset=1,
         device_cfg=device_cfg,
         trajopt_transition_model=_trajopt_transition_dict_with_compute_com(),
     )
@@ -295,7 +289,7 @@ def get_t1_motion_planner(
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
-            half_extents=list(COM_HALF_EXTENTS),
+            half_extents=torch.tensor(COM_HALF_EXTENTS),
             inside_margin=COM_INSIDE_MARGIN,
             inside_weight=COM_INSIDE_WEIGHT,
         )
@@ -347,10 +341,10 @@ def get_t1_motion_planner(
 def get_t1_ik_solver(
     scene: Scene,
     *,
-    num_seeds: int = 32,
-    self_collision_check: bool = True,
     max_batch_size: int = 64,
     enable_com_aware_ik: bool = True,
+    num_seeds: int = 32,
+    lbfgs_iters: int = 0,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
     """InverseKinematics solver for T1 with the mobile base locked.
@@ -377,7 +371,14 @@ def get_t1_ik_solver(
         robot=cfg_dict,
         scene_model=scene,
         num_seeds=num_seeds,
-        self_collision_check=self_collision_check,
+        # The LBFGS polish stage defaults to 100 iterations (lbfgs_ik.yml) —
+        # sized for cold global solves. Warm-started refresh solvers pass a
+        # smaller count; 0 keeps the cuRobo default schedule.
+        override_optimizer_num_iters=(
+            {"particle": None, "lbfgs": lbfgs_iters} if lbfgs_iters > 0
+            else {"particle": None, "lbfgs": None}
+        ),
+        self_collision_check=True,
         max_batch_size=max_batch_size,
         device_cfg=device_cfg,
         # CUDA graphs specialize for the input shape captured at first call.
@@ -408,7 +409,7 @@ def get_t1_ik_solver(
 
 def get_t1_tool_from_ee(
     device_cfg: DeviceCfg = None,
-) -> Dict[str, Float[torch.Tensor, "4 4"]]:
+) -> Dict[str, torch.Tensor]:
     """``world_from_ee = world_from_grasp @ tool_from_ee``.
 
     The T1 EE frames are ``left_base_link`` / ``right_base_link``. In each EE
@@ -430,7 +431,7 @@ def get_t1_tool_from_ee(
 def get_t1_gripper_spheres(
     arm: Literal["left", "right"],
     device_cfg: DeviceCfg = None,
-) -> Float[torch.Tensor, "n 4"]:
+) -> torch.Tensor:
     """Collision spheres for the named gripper, in the gripper base frame."""
     if arm not in ("left", "right"):
         raise ValueError(f"Invalid arm: {arm}")
@@ -494,7 +495,7 @@ def curobo_to_urdf_joints(
     return urdf
 
 
-def base_se3_from_q(q_curobo) -> Float[torch.Tensor, "4 4"]:
+def base_se3_from_q(q_curobo) -> torch.Tensor:
     """Extract the world-frame SE(3) transform from a 21-DOF cspace vector.
 
     ``q_curobo[0:3] = (x, y, yaw)`` — z=0, no roll/pitch. Use to anchor the
@@ -506,8 +507,37 @@ def base_se3_from_q(q_curobo) -> Float[torch.Tensor, "4 4"]:
     return action_4dof_to_mat4x4(torch.tensor([x, y, 0.0, yaw], dtype=torch.float32))
 
 
-class T1RerunRobot(RerunRobot):
-    """Rerun adapter for T1 with planar-base awareness.
+def _get_scene_transforms(
+    scene: trimesh.Scene, root_node: str, root_path: Union[str, None] = None
+) -> Dict[str, np.ndarray]:
+    """Get the transformations for each link in the scene in the expected rerun keys that we use."""
+    stack = [(root_node, root_path)]
+    path_to_transform = {}
+
+    while stack:
+        node, path = stack.pop()
+        rerun_path = f"{path}/{node}" if path else node
+        rerun_path = clean_rerun_path(rerun_path)
+
+        # Get parent and children for this node
+        parent = scene.graph.transforms.parents.get(node)
+        children = scene.graph.transforms.children.get(node)
+        node_data = scene.graph.get(frame_to=node, frame_from=parent)
+
+        if node_data and parent:
+            assert rerun_path not in path_to_transform
+            path_to_transform[rerun_path] = node_data[0]
+
+        # Add children to stack
+        if children:
+            for child in children:
+                stack.append((child, rerun_path))
+
+    return path_to_transform
+
+
+class T1RerunRobot:
+    """Rerun URDF robot for T1 with planar-base awareness.
 
     Accepts joint vectors of length:
       - 21: cuRobo cspace (base + body). The first 3 DOFs are the planar
@@ -518,9 +548,14 @@ class T1RerunRobot(RerunRobot):
     """
 
     def __init__(self, name: str, urdf: URDF, q_neutral=None, load_mesh: bool = True):
-        super().__init__(name, urdf, q_neutral, load_mesh)
+        self.name = name
+        self.urdf = urdf
         self._left_gripper: Tuple[float, ...] = GRIPPER_OPEN
         self._right_gripper: Tuple[float, ...] = GRIPPER_OPEN
+        rr.log(self.urdf.base_link, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+        log_scene(scene=self.urdf.scene, node=self.urdf.base_link, path=self.name, static=False, add_mesh=load_mesh)
+        if q_neutral is not None:
+            self.set_joint_positions(q_neutral)
 
     def set_grippers(self, left=GRIPPER_OPEN, right=GRIPPER_OPEN) -> None:
         self._left_gripper = tuple(left)
@@ -531,10 +566,7 @@ class T1RerunRobot(RerunRobot):
         m = base_se3_from_q(q_curobo).numpy()
         rr.log(self.name, rr.Transform3D(translation=m[:3, 3], mat3x3=m[:3, :3]))
 
-    def set_joint_positions(self, joint_positions, arm: str = None) -> None:
-        # `arm` is accepted for API compatibility with the visualizer wrapper;
-        # gripper state is set independently via set_grippers.
-        del arm
+    def set_joint_positions(self, joint_positions) -> None:
         if hasattr(joint_positions, "tolist"):
             joint_positions = joint_positions.tolist()
         elif hasattr(joint_positions, "__iter__"):
@@ -545,13 +577,37 @@ class T1RerunRobot(RerunRobot):
             joint_positions = curobo_to_urdf_joints(
                 joint_positions, left_gripper=self._left_gripper, right_gripper=self._right_gripper,
             )
-        super().set_joint_positions(joint_positions)
 
-    def get_rr_columns(self, joint_positions: Float[torch.Tensor, "n d"], arm: str = None):
-        del arm
-        dof = joint_positions.shape[-1]
+        # Append the remaining joint positions, this can happen if we're only set arm joints not gripper
+        if len(joint_positions) != self.urdf.num_actuated_joints:
+            start_idx = len(joint_positions)
+            joint_positions = [*joint_positions, *self.urdf.cfg[start_idx:]]
+
+        self.urdf.update_cfg(joint_positions)
+        log_scene(scene=self.urdf.scene, node=self.urdf.base_link, path=self.name, static=False, add_mesh=False)
+
+    def get_rr_columns(self, joint_positions: torch.Tensor) -> Dict[str, rr.Transform3D.columns]:
+        """
+        Gets the Rerun columns for a batch of joint positions for use in columnar logging. This is especially helpful
+        for logging joint trajectories, as it's much faster than individual row-oriented logging.
+
+        See rerun documentation for more details: https://rerun.io/docs/howto/logging/send-columns
+
+        Parameters
+        ----------
+        joint_positions: torch.Tensor
+           Batch of joint positions for which to get the rerun components.
+
+        Returns
+        -------
+        Dict[str, rr.Transform3D.columns]
+           Mapping of the rerun path to the columns for each joint position.
+        """
+        if joint_positions.ndim != 2:
+            raise ValueError(f"joint_positions must be a 2D tensor of shape (n, d), got {joint_positions.shape}")
+
         base_columns = None
-        if dof == CUROBO_DOF:
+        if joint_positions.shape[-1] == CUROBO_DOF:
             # Build per-frame SE(2) columns BEFORE collapsing to URDF DOFs.
             base_mats = np.stack([base_se3_from_q(q).numpy() for q in joint_positions])
             base_columns = rr.Transform3D.columns(
@@ -565,10 +621,38 @@ class T1RerunRobot(RerunRobot):
             joint_positions = torch.tensor(
                 mapped, dtype=joint_positions.dtype, device=joint_positions.device,
             )
-        cols = super().get_rr_columns(joint_positions)
+
+        # Detach and move to CPU to be safe
+        joint_positions = joint_positions.detach().cpu()
+        n, d = joint_positions.shape
+
+        # Add remaining joint positions (e.g., for the gripper) if needed
+        if d != self.urdf.num_actuated_joints:
+            q_remaining = self.urdf.cfg[d:]
+            q_remaining = torch.tensor(q_remaining, dtype=joint_positions.dtype)
+            # Expand to batch size and concatenate with existing joint positions
+            q_remaining = q_remaining.expand((n, len(q_remaining)))
+            joint_positions = torch.cat([joint_positions, q_remaining], dim=1)
+
+        path_to_tforms = {}  # map of path to list of transforms
+
+        # Update the URDF with joint position and get the transformations
+        for q in joint_positions:
+            self.urdf.update_cfg(q.numpy())
+            for path, tform in _get_scene_transforms(self.urdf.scene, self.urdf.base_link, self.name).items():
+                if path not in path_to_tforms:
+                    path_to_tforms[path] = []
+                path_to_tforms[path].append(tform)
+        path_to_tforms = {k: np.stack(v) for k, v in path_to_tforms.items()}
+
+        # Convert transformations into rerun components
+        path_to_components = {}
+        for path, tforms in path_to_tforms.items():
+            components = rr.Transform3D.columns(mat3x3=tforms[:, :3, :3], translation=tforms[:, :3, 3])
+            path_to_components[path] = components
         if base_columns is not None:
-            cols[self.name] = base_columns
-        return cols
+            path_to_components[self.name] = base_columns
+        return path_to_components
 
 
 def load_t1_rerun(load_mesh: bool = True) -> T1RerunRobot:

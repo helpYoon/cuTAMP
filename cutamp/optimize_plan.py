@@ -20,17 +20,24 @@ from cutamp.conf_locking import apply_grad_masks, build_grad_masks
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
-    action_6dof_to_mat4x4,
 )
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
-from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q
+from cutamp.costs import curobo_pose_error
+from cutamp.gn_refresh import gn_project
+from cutamp.particle_initialization import (
+    _achieved_pose_errors,
+    _ik_for_pose,
+    _ik_solution_to_full_q,
+    _ik_success_mask,
+)
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
+from cutamp.task_planning.constraints import KinematicConstraint
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -58,12 +65,12 @@ def _build_ik_deps(
     is determined by Pose / Grasp particles via IK.
 
     Mirrors ``ParticleInitializer``'s init-time IK targets (Pick /
-    Place / Push / PushStick) so re-IK reproduces what was done at init,
+    Place) so re-IK reproduces what was done at init,
     just from updated particle values. Operators with no IK target
-    (Retract, MoveFree, MoveHolding, Navigate) are skipped.
+    (Retract, MoveFree, MoveHolding) are skipped.
     """
     deps: List[IKDep] = []
-    grasp_to_mat = action_4dof_to_mat4x4 if config.grasp_dof == 4 else action_6dof_to_mat4x4
+    grasp_to_mat = action_4dof_to_mat4x4
     for ground_op in plan_skeleton:
         meta = ground_op.operator.metadata
         if not getattr(meta, "is_actionable", False):
@@ -91,17 +98,7 @@ def _build_ik_deps(
             def target_fn(p, _pl=placement, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
                 return action_4dof_to_mat4x4(p[_pl]) @ _gm(p[_g]) @ _t
             deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
-        elif action_type == "push":
-            button, push_pose, q_name = params
-            def target_fn(p, _pp=push_pose, _t=tool_from_ee):
-                return action_4dof_to_mat4x4(p[_pp]) @ _t
-            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
-        elif action_type == "push_stick":
-            button, stick_name, grasp_name, push_pose, q_name = params
-            def target_fn(p, _pp=push_pose, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
-                return action_4dof_to_mat4x4(p[_pp]) @ _gm(p[_g]) @ _t
-            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
-        # action_type in {"retract", "navigate", None}: no IK target, skip.
+        # action_type in {"retract", None}: no IK target, skip.
     return deps
 
 
@@ -111,6 +108,188 @@ class PlanContainer(TypedDict):
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
     heuristic: float
+
+
+class _BestSnapshot:
+    """Track and restore the best-seen particle state during Adam Phase 1.
+
+    The satisfying count oscillates after convergence (±~50 particles with
+    period ``reik_interval`` — re-IK repairs kinematic drift each refresh),
+    so the final step's state is a lottery ticket. Snapshot on every new-best
+    count; reset the early-stop patience clock only on *meaningful* progress:
+    a count record beating the previous by ``MIN_DELTA``, or the best
+    particle's total loss dropping by ``MIN_LOSS_DELTA`` (proxy for ongoing
+    pose-class soft-cost descent, which trains only in Phase 1).
+    """
+
+    # ponytail: constants calibrated on one blocks_t1 trace (max record gap 35,
+    # sawtooth noise band ~±50); revisit if varying-heights traces disagree.
+    MIN_DELTA = 5
+    MIN_LOSS_DELTA = 0.05
+
+    def __init__(self):
+        self.best_sat = -1
+        self.best_step = 0
+        self.last_improve_step = 0
+        self.state = None
+        self._patience_sat = -1
+        self._best_min_loss = float("inf")
+
+    def update(self, step: int, num_satisfying: int, min_loss: float, particles: dict):
+        if num_satisfying > self.best_sat:
+            self.best_sat = num_satisfying
+            self.best_step = step
+            with torch.no_grad():
+                self.state = {k: v.detach().clone() for k, v in particles.items()}
+        meaningful = num_satisfying >= self._patience_sat + self.MIN_DELTA
+        loss_improved = min_loss < self._best_min_loss - self.MIN_LOSS_DELTA
+        if meaningful:
+            self._patience_sat = num_satisfying
+        if loss_improved:
+            self._best_min_loss = min_loss
+        if meaningful or loss_improved:
+            self.last_improve_step = step
+
+    def should_stop(self, step: int, patience: int) -> bool:
+        return patience > 0 and (step - self.last_improve_step) > patience
+
+    def restore_if_better(self, particles: dict, current_num_satisfying: int) -> bool:
+        """Copy the best-seen state back into ``particles`` (in place) if it
+        beats the current state's satisfying count. Ties keep the current
+        state (it has had more soft-cost descent)."""
+        if self.state is None or self.best_sat <= current_num_satisfying:
+            return False
+        with torch.no_grad():
+            for k, v in particles.items():
+                v.copy_(self.state[k])
+        return True
+
+
+class _ReikDriftGate:
+    """Drift gate for re-IK refreshes: per-particle proof of freshness,
+    used to skip a dep's WHOLE refresh solve when every particle passes.
+
+    FK(q) is fixed between refreshes (covered Confs are out of Adam), so by
+    the triangle inequality the particle's pose error against the *moved*
+    target is bounded by::
+
+        err_now <= err_at_last_solve + drift(target_then, target_now)
+
+    (holds separately for translation L2 and SO(3) geodesic angle). A
+    particle is provably fine iff its last solve succeeded AND drift is
+    under ``drift_tol`` AND the bound above clears the checker tolerance
+    for both position and rotation. Particles whose last solve FAILED are
+    never counted fine: the periodic refresh doubles as repair.
+
+    Drift AND achieved error are both measured with ``curobo_pose_error`` —
+    the constraint checker's own metric — so the bound compares like with
+    like. (Two rejected alternatives, per review: cuRobo's
+    ``position_error``/``rotation_error`` result fields cross-pair
+    metres/radians on multi-tool-frame robots, and an ``acos``-based drift
+    angle collapses to 0.0 in float32 below ~5e-4 rad, exactly the
+    post-convergence regime where skips fire.)
+
+    Granularity is per-dep, not per-particle: cuRobo v0.8 pads every
+    sub-capacity batch to ``max_batch_size`` inside ``solve_pose``
+    (``_pad_batch_inputs``), so a subset solve costs the same as a full one
+    (and trips an upstream bug — ``jerk`` isn't padded). A dep's solve is
+    therefore skipped only when NO particle needs it; otherwise the full
+    batch is re-solved and all successful rows merged.
+
+    Drift statistics are recorded even when gating is off (``drift_tol=0``),
+    so baseline runs measure the per-interval drift distribution for free.
+    """
+
+    # Rotation drift budget per metre of position budget = the checker's
+    # rot/pos tolerance ratio (0.05 rad / 0.005 m).
+    ROT_PER_POS = 10.0
+    # Drift histogram bucket edges (metres) recorded per refresh.
+    _BUCKETS = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
+    # NOTE a fallback cooldown (suppress re-fallback for rows a fallback just
+    # failed to fix) was tried and A/B-REJECTED 2026-08-04: fallbacks are
+    # dominated by fresh churn misses (repairs that succeed), so suppression
+    # rarely engaged (4-36/~380) and holding rows out of repair starved the
+    # satisfying pool + early-stop signal (soft 27.1 vs 22.8). Don't re-add
+    # without new evidence; cheapen the fallback solve instead.
+
+    def __init__(self, num_deps: int, drift_tol: float, pos_tol: float, rot_tol: float):
+        self.drift_tol = drift_tol
+        self.pos_tol = pos_tol
+        self.rot_tol = rot_tol
+        self.refs = [None] * num_deps      # [B, 4, 4] target at last solve
+        self.ok = [None] * num_deps        # [B] last solve succeeded
+        self.err_pos = [None] * num_deps   # [B] achieved IK position error
+        self.err_rot = [None] * num_deps   # [B] achieved IK rotation error
+        self.stats: List[dict] = []
+
+    def need_mask(self, dep_idx: int, target: torch.Tensor):
+        """``(need [B] bool, pos_drift, rot_drift)``; drifts are ``None``
+        before the first solve has established reference targets."""
+        ref = self.refs[dep_idx]
+        all_need = torch.ones(target.shape[0], dtype=torch.bool, device=target.device)
+        if ref is None:
+            return all_need, None, None
+        pos_drift, rot_drift = curobo_pose_error(ref, target)
+        if self.drift_tol <= 0:
+            return all_need, pos_drift, rot_drift
+        skip = (
+            self.ok[dep_idx]
+            & (pos_drift < self.drift_tol)
+            & (rot_drift < self.drift_tol * self.ROT_PER_POS)
+            & (self.err_pos[dep_idx] + pos_drift < self.pos_tol)
+            & (self.err_rot[dep_idx] + rot_drift < self.rot_tol)
+        )
+        return ~skip, pos_drift, rot_drift
+
+    def update(
+        self,
+        dep_idx: int,
+        target: torch.Tensor,
+        idx: torch.Tensor,
+        success: torch.Tensor,
+        pos_err: torch.Tensor,
+        rot_err: torch.Tensor,
+    ) -> None:
+        """Record solve results for the ``idx`` rows just re-solved."""
+        if self.refs[dep_idx] is None:
+            B = target.shape[0]
+            self.refs[dep_idx] = target.clone()
+            self.ok[dep_idx] = torch.zeros(B, dtype=torch.bool, device=target.device)
+            self.err_pos[dep_idx] = torch.zeros(B, device=target.device)
+            self.err_rot[dep_idx] = torch.zeros(B, device=target.device)
+        else:
+            self.refs[dep_idx][idx] = target[idx]
+        self.ok[dep_idx][idx] = success
+        self.err_pos[dep_idx][idx] = pos_err
+        self.err_rot[dep_idx][idx] = rot_err
+
+    def log_stat(self, step, q_name, batch, n_need, n_solved, n_fail, solve_s,
+                 pos_drift, rot_drift, gn_fail=None, gn_fail_pose=None, gn_fail_com=None):
+        rec = {
+            "step": step, "conf": q_name, "batch": batch, "n_need": n_need,
+            "n_solved": n_solved, "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
+        }
+        if gn_fail is not None:
+            # GN refresh: rows the projection missed (they went to the cuRobo
+            # fallback). gn_fail == 0 means the whole dep cost only GN.
+            # NOTE cross-mode stats caveat: in GN mode "n_ik_fail" counts rows
+            # over checker tolerance OR out of the CoM polygon on the merged q;
+            # in cuRobo mode it counts solver success-flag failures. Presence
+            # of "gn_fail" marks which semantic a record uses — don't compare
+            # the two populations directly.
+            rec["gn_fail"] = gn_fail
+            if gn_fail_pose is not None:
+                # Split of the merge-gate misses (a row can fail both).
+                rec["gn_fail_pose"] = gn_fail_pose
+                rec["gn_fail_com"] = gn_fail_com
+        if pos_drift is not None:
+            rec["pos_drift_mean"] = pos_drift.mean().item()
+            rec["pos_drift_max"] = pos_drift.max().item()
+            rec["rot_drift_max"] = rot_drift.max().item()
+            rec["frac_drift_below"] = {
+                f"{b * 1e3:g}mm": (pos_drift < b).float().mean().item() for b in self._BUCKETS
+            }
+        self.stats.append(rec)
 
 
 class ParticleOptimizer:
@@ -212,10 +391,19 @@ class ParticleOptimizer:
         particles: dict,
         ik_deps: List[IKDep],
         world: TAMPWorld,
+        gate: "_ReikDriftGate" = None,
+        step: int = None,
     ) -> None:
         """Re-solve IK for each ``IKDep`` and write the result into the
         corresponding Conf particle in-place. Failed particles keep their
         previous q (per-particle masked write).
+
+        When ``gate`` is given, refreshes run on ``world.ik_refresh_solver``
+        (a cheap low-seed solver when ``reik_num_seeds > 0``), are explicitly
+        warm-started from the current particle q, skip a dep entirely when
+        every particle is provably fresh (see ``_ReikDriftGate``), and record
+        per-dep drift/timing stats. ``gate=None`` refreshes everything on the
+        full-strength main solver — used for the final pre-check refresh.
 
         cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
         so the IK call cannot run under ``torch.no_grad``; only the in-place
@@ -224,22 +412,116 @@ class ParticleOptimizer:
         """
         if not ik_deps:
             return
-        for dep in ik_deps:
+        for i, dep in enumerate(ik_deps):
             # Detach the target so IK's backward doesn't try to flow into
             # Pose / Grasp particles (which are leaves in our autograd graph).
             world_from_ee = dep.target_fn(particles).detach()
-            current_state_q = particles[dep.q_name].detach()
-            ik_result = _ik_for_pose(
-                world, world_from_ee, dep.arm,
-                current_state_q=current_state_q,
-            )
-            new_q = _ik_solution_to_full_q(ik_result, world).detach()
-            success = ik_result.success.view(-1, 1)
-            with torch.no_grad():
-                merged = torch.where(success, new_q, particles[dep.q_name])
-                particles[dep.q_name].copy_(merged)
-                # Dropped from the optimizer, so .grad has no consumer.
-                particles[dep.q_name].grad = None
+            batch = world_from_ee.shape[0]
+            if gate is not None:
+                need, pos_drift, rot_drift = gate.need_mask(i, world_from_ee)
+                n_need = int(need.sum().item())
+            else:
+                need, pos_drift, rot_drift, n_need = None, None, None, batch
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            n_fail = n_solved = 0
+            n_gn_fail = n_gn_fail_pose = n_gn_fail_com = None
+            if need is None or n_need > 0:
+                n_solved = batch
+                use_gn = gate is not None and self.config.reik_gn
+                if use_gn:
+                    from cutamp.com_polygon_cost import compute_com_polygon_mask
+                    # Gauss-Newton projection from the warm q (see gn_refresh.py);
+                    # merge only rows that converged to checker tolerance
+                    # (checker metric via _achieved_pose_errors) AND stayed
+                    # CoM-in-polygon. The CoM term is load-bearing: GN has no
+                    # CoM residual and the fallback is the only CoM-aware
+                    # channel during Adam (covered Confs are out of the
+                    # optimizer), so a pose-only gate would lock in confs that
+                    # drift out of the support polygon (review-verified decay).
+                    q_gn = gn_project(
+                        world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
+                        com_row=self.config.reik_gn_com,
+                    )
+                    with torch.no_grad():
+                        pos_err, rot_err = _achieved_pose_errors(
+                            world, q_gn, world_from_ee, dep.arm,
+                        )
+                        pose_ok = (pos_err < gate.pos_tol) & (rot_err < gate.rot_tol)
+                        com_ok = compute_com_polygon_mask(world, q_gn)
+                        ok = pose_ok & com_ok
+                        merged = torch.where(ok.view(-1, 1), q_gn, particles[dep.q_name])
+                        particles[dep.q_name].copy_(merged)
+                        particles[dep.q_name].grad = None
+                    n_gn_fail = int((~ok).sum().item())
+                    n_gn_fail_pose = int((~pose_ok).sum().item())
+                    n_gn_fail_com = int((~com_ok).sum().item())
+                    if n_gn_fail > 0:
+                        # cuRobo fallback for the rows GN missed. Full-batch
+                        # call (cuRobo pads sub-capacity batches to
+                        # max_batch_size, so subsets save nothing); only
+                        # GN-missed rows that cuRobo solved take its result.
+                        cheap = world.ik_refresh_solver is not world.ik_solver
+                        ik_result = _ik_for_pose(
+                            world, world_from_ee, dep.arm,
+                            current_state_q=particles[dep.q_name].detach(),
+                            ik=world.ik_refresh_solver if cheap else None,
+                            seed_from_current=cheap,
+                        )
+                        new_q = _ik_solution_to_full_q(ik_result, world).detach()
+                        take = (~ok) & _ik_success_mask(ik_result)
+                        with torch.no_grad():
+                            merged = torch.where(take.view(-1, 1), new_q, particles[dep.q_name])
+                            particles[dep.q_name].copy_(merged)
+                            particles[dep.q_name].grad = None
+                            pos_err, rot_err = _achieved_pose_errors(
+                                world, particles[dep.q_name], world_from_ee, dep.arm,
+                            )
+                            ok = (
+                                (pos_err < gate.pos_tol)
+                                & (rot_err < gate.rot_tol)
+                                & compute_com_polygon_mask(world, particles[dep.q_name])
+                            )
+                    n_fail = int((~ok).sum().item())
+                    gate.update(i, world_from_ee, slice(None), ok, pos_err, rot_err)
+                else:
+                    # cuRobo solve. Low-seed refresh solver + warm seed only
+                    # when configured; with reik_num_seeds=0 this path is
+                    # byte-identical to the ungated one (ik_refresh_solver
+                    # falls back to ik_solver). Full batch always: cuRobo pads
+                    # sub-capacity batches internally, so subsets save nothing.
+                    cheap = gate is not None and world.ik_refresh_solver is not world.ik_solver
+                    ik_result = _ik_for_pose(
+                        world, world_from_ee, dep.arm,
+                        current_state_q=particles[dep.q_name].detach(),
+                        ik=world.ik_refresh_solver if cheap else None,
+                        seed_from_current=cheap,
+                    )
+                    new_q = _ik_solution_to_full_q(ik_result, world).detach()
+                    success = _ik_success_mask(ik_result)
+                    n_fail = int((~success).sum().item())
+                    with torch.no_grad():
+                        merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
+                        particles[dep.q_name].copy_(merged)
+                        # Dropped from the optimizer, so .grad has no consumer.
+                        particles[dep.q_name].grad = None
+                    if gate is not None:
+                        # Achieved errors measured on the MERGED q (checker
+                        # metric, via FK — see _achieved_pose_errors for why the
+                        # result's own error fields can't be trusted). Rows that
+                        # kept their old q get their true error vs the target.
+                        with torch.no_grad():
+                            pos_err, rot_err = _achieved_pose_errors(
+                                world, particles[dep.q_name], world_from_ee, dep.arm,
+                            )
+                        gate.update(i, world_from_ee, slice(None), success, pos_err, rot_err)
+            torch.cuda.synchronize()
+            if gate is not None:
+                gate.log_stat(
+                    step, dep.q_name, batch, n_need, n_solved, n_fail,
+                    time.perf_counter() - t0, pos_drift, rot_drift,
+                    gn_fail=n_gn_fail, gn_fail_pose=n_gn_fail_pose, gn_fail_com=n_gn_fail_com,
+                )
 
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
         """Optimize particles for the plan skeleton.
@@ -275,6 +557,15 @@ class ParticleOptimizer:
             if self.config.coupled_reik else []
         )
         dropped_conf_names = {dep.q_name for dep in ik_deps}
+        # Drift gate (also pure instrumentation when reik_drift_tol == 0).
+        # Tolerances come from the live checker so the skip proof tracks
+        # whatever the run actually enforces.
+        reik_gate = _ReikDriftGate(
+            len(ik_deps),
+            self.config.reik_drift_tol,
+            pos_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err"),
+            rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
+        ) if ik_deps else None
 
         param_groups = []
         param_msg = []
@@ -332,15 +623,10 @@ class ParticleOptimizer:
         # refines satisfying particles for soft costs without breaking
         # constraint satisfaction.
         consider_types = {"constraint"}
-        # Upstream-style fallback: when set, mimic NVlabs/cuTAMP main —
-        # Adam runs always with soft costs in the loss (statistical
-        # exploration), no Phase 2. Useful for pose-class soft costs that
-        # have no constraint-manifold tangent for LBFGS to refine along.
-        upstream_style = self.config.upstream_style_optimize
         # Coupled re-IK breaks the KinematicConstraint coupling that destroys
         # vanilla Adam on pose-class soft costs, so soft costs can safely
         # join the Adam loss. Phase 2 LBFGS still runs for q-class refinement.
-        if self.config.optimize_soft_costs and (upstream_style or self.config.coupled_reik):
+        if self.config.optimize_soft_costs and self.config.coupled_reik:
             consider_types.add("cost")
         found_solution = False
         timer.stop("setup_optimizer")
@@ -369,9 +655,7 @@ class ParticleOptimizer:
             init_cost_dict = cost_fn(init_rollout, particles)
             init_satisfying = self.get_satisfying_mask(init_cost_dict, verbose=False)
             init_num = init_satisfying.sum().item()
-        skip_adam = (
-            (init_num > 0) and not upstream_style and not self.config.coupled_reik
-        )
+        skip_adam = (init_num > 0) and not self.config.coupled_reik
         if skip_adam:
             _log.info(
                 f"IK-init already produced {init_num}/{self.config.num_particles} satisfying "
@@ -397,6 +681,7 @@ class ParticleOptimizer:
         pbar = tqdm(range(num_steps)) if not skip_adam else []
         start_time = time.perf_counter()
         time_exceeded = False
+        best_snapshot = _BestSnapshot()
         for step in pbar:
             if self.config.max_loop_dur is not None and timer.elapsed("start_optimization") >= self.config.max_loop_dur:
                 _log.warning(f"Optimization exceeded max time of {self.config.max_loop_dur:.2f}s")
@@ -433,6 +718,18 @@ class ParticleOptimizer:
             torch.cuda.synchronize()
             opt_metrics["elapsed"].append(time.perf_counter() - start_time)
 
+            # Best-seen snapshot + early-stop bookkeeping. Measured state is
+            # pre-step, so the clone is consistent with num_satisfying.
+            best_snapshot.update(step, num_satisfying, costs.min().item(), particles)
+            if best_snapshot.should_stop(step, self.config.early_stop_patience):
+                _log.info(
+                    f"Early stop at step {step}: no meaningful progress for "
+                    f"{self.config.early_stop_patience} steps (best "
+                    f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step})"
+                )
+                opt_metrics["early_stopped_at"] = step
+                break
+
             # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
             if step % vis_every == 0 or step == num_steps - 1:
                 timer.start("visualize_opt_rollout")
@@ -459,25 +756,43 @@ class ParticleOptimizer:
                 timer.stop("visualize_opt_rollout")
 
             # Compute gradients and step the optimizer.
-            # Skip per-conf gradient masking in upstream-style mode so the
-            # comparison is honest (upstream has no grad masking).
             loss.backward()
-            if not upstream_style:
-                apply_grad_masks(optimizer.param_groups, grad_masks)
+            apply_grad_masks(optimizer.param_groups, grad_masks)
             optimizer.step()
             # Counts from 1 so the first refresh lands at step K-1 (after
             # the first batch of pose updates), not step 0.
             if ik_deps and (step + 1) % self.config.reik_interval == 0:
-                self._refresh_ik_deps(particles, ik_deps, world)
+                self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
             timer.stop("optimization_step")
             pbar.set_description(
                 f"Loss: {loss:.3f}, Min: {costs.min():.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
             )
 
+        # Restore the best-seen state if the loop ended on a dip of the
+        # post-convergence oscillation (final state is otherwise a lottery).
+        if not skip_adam and best_snapshot.restore_if_better(
+            particles, opt_metrics["num_satisfying"][-1] if opt_metrics["num_satisfying"] else 0
+        ):
+            _log.info(
+                f"Restored best-seen particles: {best_snapshot.best_sat} satisfying "
+                f"(step {best_snapshot.best_step}) over final "
+                f"{opt_metrics['num_satisfying'][-1]}"
+            )
+        opt_metrics["best_num_satisfying"] = best_snapshot.best_sat
+
         # Final re-IK before downstream satisfaction checks: Adam may have
-        # moved poses since the last periodic refresh.
+        # moved poses since the last periodic refresh. Always FULL (no gate):
+        # restore_if_better may have rewritten particles, making gate refs stale.
         if ik_deps:
             self._refresh_ik_deps(particles, ik_deps, world)
+        if reik_gate is not None and reik_gate.stats:
+            opt_metrics["reik_refresh"] = reik_gate.stats
+            total_s = sum(r["solve_s"] for r in reik_gate.stats)
+            n_dep_skips = sum(1 for r in reik_gate.stats if r["n_solved"] == 0)
+            _log.info(
+                f"re-IK refresh: {len(reik_gate.stats)} dep-refreshes ({n_dep_skips} "
+                f"skipped whole by drift gate), {total_s:.1f}s IK time"
+            )
 
         # Phase 2 (LBFGS soft-cost refinement): when --optimize_soft_costs is
         # set, refine the satisfying particles' soft costs with LBFGS +
@@ -486,7 +801,7 @@ class ParticleOptimizer:
         # so LBFGS's line search backtracks before taking it. Result:
         # soft cost monotonically decreases on satisfying particles, and
         # hard-constraint satisfaction is preserved by construction.
-        if self.config.optimize_soft_costs and not upstream_style:
+        if self.config.optimize_soft_costs:
             with torch.no_grad():
                 pre_p2_rollout = rollout_fn(particles)
                 pre_p2_cost_dict = cost_fn(pre_p2_rollout, particles)
@@ -571,14 +886,12 @@ class ParticleOptimizer:
         for ts in range(len(rollout["conf_params"])):
             visualizer.set_time_sequence(f"rollout_{self.opt_counter}", ts + 1)
             q = rollout["confs"][best_idx, ts]
-            conf_name = rollout["conf_params"][ts]
 
             gripper_close = rollout["gripper_close"][ts]
             # T1 gripper: 4-bar parallel linkage, 4 joints per hand.
             # GRIPPER_OPEN = (0,0,0,0), GRIPPER_CLOSED = (1,-1,-1,1).
             gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
-            arm = "left" if conf_name.startswith("left_") else "right"
-            visualizer.set_joint_positions(q.tolist() + gripper_joints, arm=arm)
+            visualizer.set_joint_positions(q.tolist() + gripper_joints)
 
             world_from_ee = rollout["world_from_ee"][best_idx, ts].cpu()
             visualizer.log_mat4x4("rollout/ee_pose", world_from_ee)
