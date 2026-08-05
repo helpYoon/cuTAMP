@@ -514,7 +514,8 @@ class CostFunction:
 
         # COM-over-base-polygon hard filter (mirrors Collision)
         com_polygon_cost = self.com_polygon_constraint()
-        add_cost(ComPolygon.type, com_polygon_cost)
+        if self.config.enable_com_hard_constraint:
+            add_cost(ComPolygon.type, com_polygon_cost)
 
         # Soft costs
         if self.config.soft_cost:
