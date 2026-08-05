@@ -217,25 +217,6 @@ def _xyzw_from_wxyz(q: np.ndarray) -> np.ndarray:
     return q[..., [1, 2, 3, 0]]
 
 
-def _quat_conjugate_wxyz(q: np.ndarray) -> np.ndarray:
-    """wxyz conjugate (= inverse for unit quaternions)."""
-    out = q.copy()
-    out[..., 1:] *= -1.0
-    return out
-
-
-def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Hamilton product of two wxyz quaternions (broadcasts)."""
-    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
-    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
-    return np.stack([
-        aw*bw - ax*bx - ay*by - az*bz,
-        aw*bx + ax*bw + ay*bz - az*by,
-        aw*by - ax*bz + ay*bw + az*bx,
-        aw*bz + ax*by - ay*bx + az*bw,
-    ], axis=-1)
-
-
 def process_motion_plan(
     curobo_plan: List[Dict[str, Any]],
     kinematics: Optional[Kinematics] = None,

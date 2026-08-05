@@ -6,12 +6,6 @@ from cutamp.algorithm import make_arm_affinity_priority_fn
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
-def _make_world():
-    """Build a real TAMPWorld for blocks_t1. Used by tests that need real
-    kinematics + scene state."""
-    return make_blocks_t1_world()
-
-
 @needs_cuda
 def test_arm_home_ee_world_populated_after_init():
     """TAMPWorld.__init__ computes arm_home_ee_world for both arms.
@@ -19,7 +13,7 @@ def test_arm_home_ee_world_populated_after_init():
     Each value is a 3-vector; left should be on +Y side, right on -Y side
     (T1 stands facing +X so left arm is to its left, which is +Y in world)."""
     import torch
-    world = _make_world()
+    world = make_blocks_t1_world()
     assert hasattr(world, "arm_home_ee_world"), (
         "TAMPWorld must expose arm_home_ee_world after init"
     )
@@ -49,8 +43,8 @@ def test_get_valid_ground_operators_sorts_by_priority_fn():
     # NOTE: this test is structural — it verifies the sort happens, not the
     # real-scene priority math. Real-scene math is exercised by
     # test_arm_affinity_priority_orders_closer_arm_first below.
-    world = _make_world()
-    initial_node = _Node(state=world.initial_state, parent=None, operator=None, depth=0)
+    world = make_blocks_t1_world()
+    initial_node = _Node(state=world.initial_state, parent=None, operator=None)
 
     # Priority: deterministic lexicographic reverse of repr. Distinct
     # reprs give distinct priorities, so the sort assertion has real
@@ -84,7 +78,7 @@ def test_task_plan_generator_accepts_priority_fn():
     from cutamp.task_planning import task_plan_generator
     from cutamp.t1_domain import all_t1_operators
 
-    world = _make_world()
+    world = make_blocks_t1_world()
     gen = task_plan_generator(
         world.initial_state, world.goal_state, all_t1_operators,
         ground_op_priority_fn=lambda op: 0.0,
@@ -99,7 +93,7 @@ def test_task_plan_generator_accepts_priority_fn():
 @needs_cuda
 def test_arm_affinity_priority_orders_closer_arm_first():
     """priority(LeftPick(block_on_left)) < priority(LeftPick(block_on_right))."""
-    world = _make_world()
+    world = make_blocks_t1_world()
 
     # Find the two blocks and their world Y values.
     block_ys = {obj.name: obj.pose[1] for obj in world.env.movables}
@@ -122,30 +116,6 @@ def test_arm_affinity_priority_orders_closer_arm_first():
         f"Expected priority(LeftPick(close)) < priority(LeftPick(far)); "
         f"got {pri_close} vs {pri_far}"
     )
-
-
-def test_arm_affinity_priority_inf_for_non_pick():
-    """Non-pick operators return inf priority (sort AFTER resolved picks).
-
-    CPU-only: the non-pick path returns inf before world is ever
-    dereferenced, so no real TAMPWorld is needed."""
-    from cutamp.t1_domain import LeftMoveFree
-    priority = make_arm_affinity_priority_fn(world=None)
-    # LeftMoveFree params are [q_start, traj, q_end] — none are picks.
-    op = LeftMoveFree.ground(
-        {"q_start": "left_q0", "traj": "traj0", "q_end": "left_q1"}
-    )
-    assert priority(op) == math.inf
-
-
-@needs_cuda
-def test_arm_affinity_priority_inf_for_missing_block():
-    """Pick with an unknown block name returns inf (sorts last, not first)."""
-    from cutamp.t1_domain import LeftPick
-    world = _make_world()
-    priority = make_arm_affinity_priority_fn(world)
-    op = LeftPick.ground({"obj": "nonexistent_block", "grasp": "grasp0", "q": "left_q0"})
-    assert priority(op) == math.inf
 
 
 def _op(action_type, arm, values):

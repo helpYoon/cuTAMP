@@ -7,28 +7,14 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import Optional
-
 import torch
-from jaxtyping import Float
 
 
-def trajectory_length(
-    confs: Float[torch.Tensor, "b *h d"], weights: Optional[Float[torch.Tensor, "d"]] = None
-) -> Float[torch.Tensor, "b"]:
+def trajectory_length(confs: torch.Tensor) -> torch.Tensor:
     """
     Compute the length of a trajectory by summing the distances between consecutive configurations.
-    Optionally apply per-dimension weights before computing distances.
     """
-    if weights is not None:
-        assert weights.shape == (confs.shape[-1],), f"weights must be shape ({confs.shape[-1]},), got {weights.shape}"
-        weights = weights.to(confs.device)
-        confs = confs * weights
-
-    diffs = confs[..., 1:, :] - confs[..., :-1, :]
-    dists = diffs.norm(dim=-1)
-    traj_lengths = dists.sum(-1)  # sum over horizon
-    return traj_lengths
+    return (confs[..., 1:, :] - confs[..., :-1, :]).norm(dim=-1).sum(-1)
 
 
 @torch.jit.script
@@ -42,7 +28,7 @@ def dist_from_bounds_jit(vals, lower, upper):
     return dists
 
 
-def get_aabb_from_spheres(spheres: Float[torch.Tensor, "*b n 4"]) -> Float[torch.Tensor, "*b 2 3"]:
+def get_aabb_from_spheres(spheres: torch.Tensor) -> torch.Tensor:
     """Compute the axis-aligned bounding box (AABB) for a set of spheres that represent some object."""
     centers, radii = spheres[..., :3], spheres[..., 3]
     min_corners = centers - radii.unsqueeze(-1)
@@ -56,10 +42,10 @@ def get_aabb_from_spheres(spheres: Float[torch.Tensor, "*b n 4"]) -> Float[torch
 
 
 def _sphere_to_sphere_overlap(
-    spheres_1: Float[torch.Tensor, "b *h 4"],
-    spheres_2: Float[torch.Tensor, "b *h 4"],
+    spheres_1: torch.Tensor,
+    spheres_2: torch.Tensor,
     activation_distance: float | None = None,
-) -> Float[torch.Tensor, "b *h"]:
+) -> torch.Tensor:
     """Compute the overlap volume between two sets of spheres. Can be used as a collision distance function."""
     centers_1, radii_1 = spheres_1[..., :3], spheres_1[..., 3]
     centers_2, radii_2 = spheres_2[..., :3], spheres_2[..., 3]
@@ -74,11 +60,11 @@ def _sphere_to_sphere_overlap(
 
 
 def sphere_to_sphere_overlap(
-    spheres_1: Float[torch.Tensor, "b *h 4"],
-    spheres_2: Float[torch.Tensor, "b *h 4"],
+    spheres_1: torch.Tensor,
+    spheres_2: torch.Tensor,
     activation_distance: float | None = None,
     use_aabb_check: bool = False,
-) -> Float[torch.Tensor, "b *h"]:
+) -> torch.Tensor:
     """
     Compute the overlap volume between two sets of spheres. Can be used as a collision distance function. If
     use_aabb_check=True, we compute the overlap only for batches of spheres that have intersecting AABBs.
@@ -103,8 +89,8 @@ def sphere_to_sphere_overlap(
 
 
 def curobo_pose_error(
-    pose_a_mat4x4: Float[torch.Tensor, "b *h 4 4"], pose_b_mat4x4: Float[torch.Tensor, "b *h 4 4"]
-) -> (Float[torch.Tensor, "b *h"], Float[torch.Tensor, "b *h"]):
+    pose_a_mat4x4: torch.Tensor, pose_b_mat4x4: torch.Tensor
+) -> (torch.Tensor, torch.Tensor):
     """Translational and rotational errors between two batched 4x4 pose tensors.
 
     Computes element-wise distances. Avoids ``curobo.types.Pose.distance``

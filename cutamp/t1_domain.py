@@ -27,10 +27,8 @@ from cutamp.task_planning.constraints import (
     KinematicConstraint,
     Motion,
     StablePlacement,
-    ValidPush,
-    ValidPushStick,
 )
-from cutamp.task_planning.costs import GraspCost, RetractCost, TrajectoryLength
+from cutamp.task_planning.costs import TrajectoryLength
 
 # Types
 Conf = "conf"
@@ -40,7 +38,6 @@ Grasp = "grasp"
 
 Movable = "movable"
 Surface = "surface"
-Button = "button"
 
 # Fluents (aka predicates)
 LeftAt = Fluent("LeftAt", [Parameter("q", Conf)])
@@ -67,20 +64,10 @@ RightHolding = Fluent("RightHolding", [Parameter("obj", Movable)])
 LeftHoldingWithGrasp = Fluent("LeftHoldingWithGrasp", [Parameter("obj", Movable), Parameter("grasp", Grasp)])
 RightHoldingWithGrasp = Fluent("RightHoldingWithGrasp", [Parameter("obj", Movable), Parameter("grasp", Grasp)])
 
-ButtonPushed = Fluent("ButtonPushed", [Parameter("button", "button")])
-PushedWithStick = Fluent("PushedWithStick", [Parameter("button", "button"), Parameter("obj", Movable)])
-CanPush = Fluent("CanPush", [Parameter("button", "button")])
 IsMovable = Fluent("IsMovable", [Parameter("obj", Movable)])
-IsButton = Fluent("IsButton", [Parameter("button", Button)])
 IsSurface = Fluent("IsSurface", [Parameter("surface", Surface)])
-IsStick = Fluent("IsStick", [Parameter("obj", Movable)])
 HasNotPickedUp = Fluent("HasNotPickedUp", [Parameter("obj", Movable)])
 On = Fluent("On", [Parameter("obj", Movable), Parameter("surface", Surface)])
-
-# Tracks that the planar base is positioned within reach of the named target.
-# Added by MoveBaseTo(target). Pick/Place can require this in a follow-up pass
-# to force the planner to navigate before reaching.
-BaseNearby = Fluent("BaseNearby", [Parameter("target", Movable)])
 
 all_t1_fluents = [
     LeftAt,
@@ -99,16 +86,10 @@ all_t1_fluents = [
     RightHolding,
     LeftHoldingWithGrasp,
     RightHoldingWithGrasp,
-    ButtonPushed,
-    PushedWithStick,
-    CanPush,
     IsMovable,
-    IsButton,
     IsSurface,
-    IsStick,
     HasNotPickedUp,
     On,
-    BaseNearby,
 ]
 
 
@@ -120,11 +101,9 @@ q_retract = Parameter("q_retract", Conf)
 traj = Parameter("traj", Traj)
 
 obj = Parameter("obj", Movable)
-button = Parameter("button", Button)
 surface = Parameter("surface", Surface)
 
 grasp = Parameter("grasp", Grasp)
-pose = Parameter("pose", Pose)
 placement = Parameter("placement", Pose)
 
 
@@ -207,7 +186,7 @@ LeftPick = TAMPOperator(
     ],
     del_effects=[LeftHandEmpty(), LeftJustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
-    costs=[GraspCost(obj, grasp)],
+    costs=[],
     metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="left"),
 )
 
@@ -228,7 +207,7 @@ RightPick = TAMPOperator(
     ],
     del_effects=[RightHandEmpty(), RightJustMoved(), HasNotPickedUp(obj)],
     constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
-    costs=[GraspCost(obj, grasp)],
+    costs=[],
     metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="right"),
 )
 
@@ -283,78 +262,6 @@ RightPlace = TAMPOperator(
 )
 
 
-LeftPush = TAMPOperator(
-    "LeftPush",
-    [button, pose, q],
-    preconditions=[
-        LeftAt(q),
-        IsButton(button),
-        LeftHandEmpty(),
-        CanPush(button),
-        LeftJustMoved(),
-    ],
-    add_effects=[ButtonPushed(button), LeftCanMove()],
-    del_effects=[LeftJustMoved(), CanPush(button)],
-    constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="push", arm="left"),
-)
-
-RightPush = TAMPOperator(
-    "RightPush",
-    [button, pose, q],
-    preconditions=[
-        RightAt(q),
-        IsButton(button),
-        RightHandEmpty(),
-        CanPush(button),
-        RightJustMoved(),
-    ],
-    add_effects=[ButtonPushed(button), RightCanMove()],
-    del_effects=[RightJustMoved(), CanPush(button)],
-    constraints=[KinematicConstraint(q, pose), ValidPush(button, pose)],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="push", arm="right"),
-)
-
-LeftPushStick = TAMPOperator(
-    "LeftPushStick",
-    [button, obj, grasp, pose, q],
-    preconditions=[
-        LeftAt(q),
-        LeftHolding(obj),
-        LeftHoldingWithGrasp(obj, grasp),
-        IsButton(button),
-        IsStick(obj),
-        CanPush(button),
-        LeftJustMoved(),
-    ],
-    add_effects=[ButtonPushed(button), LeftCanMove(), PushedWithStick(button, obj)],
-    del_effects=[LeftJustMoved(), CanPush(button)],
-    constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="push_stick", arm="left"),
-)
-
-RightPushStick = TAMPOperator(
-    "RightPushStick",
-    [button, obj, grasp, pose, q],
-    preconditions=[
-        RightAt(q),
-        RightHolding(obj),
-        RightHoldingWithGrasp(obj, grasp),
-        IsButton(button),
-        IsStick(obj),
-        CanPush(button),
-        RightJustMoved(),
-    ],
-    add_effects=[ButtonPushed(button), RightCanMove(), PushedWithStick(button, obj)],
-    del_effects=[RightJustMoved(), CanPush(button)],
-    constraints=[KinematicConstraint(q, pose), ValidPushStick(button, obj, pose)],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="push_stick", arm="right"),
-)
-
 # Retract operators - move arm to home configuration after pick/place
 # These use soft costs to find the closest collision-free configuration to home
 
@@ -370,7 +277,7 @@ LeftRetractHolding = TAMPOperator(
     add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
     del_effects=[LeftAt(q_start), LeftJustPicked()],
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
-    costs=[RetractCost(q_retract)],
+    costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
 )
 
@@ -386,7 +293,7 @@ RightRetractHolding = TAMPOperator(
     add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
     del_effects=[RightAt(q_start), RightJustPicked()],
     constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
-    costs=[RetractCost(q_retract)],
+    costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
 )
 
@@ -401,7 +308,7 @@ LeftRetractFree = TAMPOperator(
     add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
     del_effects=[LeftAt(q_start), LeftJustPlaced()],
     constraints=[CollisionFree(q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
-    costs=[RetractCost(q_retract)],
+    costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
 )
 
@@ -416,51 +323,9 @@ RightRetractFree = TAMPOperator(
     add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
     del_effects=[RightAt(q_start), RightJustPlaced()],
     constraints=[CollisionFree(q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
-    costs=[RetractCost(q_retract)],
+    costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
 )
-
-# MoveBaseTo: planar-base navigation bound to a target object.
-#
-# NOTE: currently unfireable. The precondition requires both arms at the same
-# config literal (LeftAt(q_start) AND RightAt(q_start)), but get_initial_state
-# grounds LeftAt("left_q0") and RightAt("right_q0") — distinct literals — so
-# q_start never co-binds, and no arm operator ever makes LeftAt/RightAt share
-# a literal afterwards. To wire it up, either (a) ground a shared initial
-# config (e.g. both arms at "q0") and keep arm ops from diverging it before
-# navigation, or (b) split the precondition into separate left/right start
-# parameters (q_start_l, q_start_r) with a combined q_end pair in the effects.
-#
-# Intended semantics once fireable: after MoveBaseTo, both LeftAt and RightAt
-# point to the same q_end (which differs from q_start only in base[0:3]).
-# Subsequent arm operators may diverge LeftAt/RightAt as before (this is fine
-# — once the base is positioned, arm ops do not move it).
-#
-# The "Bound to target" semantics: q_end's base must place the target object
-# within reach of either tool frame. The cost function enforces reachability
-# via a BaseReachable check (added separately).
-MoveBaseTo = TAMPOperator(
-    "MoveBaseTo",
-    [obj, q_start, traj, q_end],
-    preconditions=[
-        LeftAt(q_start), RightAt(q_start),
-        LeftCanMove(), RightCanMove(),
-        IsMovable(obj),  # binds `obj` to an existing movable literal
-    ],
-    add_effects=[
-        LeftAt(q_end), RightAt(q_end),
-        LeftJustMoved(), RightJustMoved(),
-        BaseNearby(obj),
-    ],
-    del_effects=[LeftAt(q_start), RightAt(q_start)],
-    constraints=[
-        CollisionFree(q_start, traj, q_end),
-        Motion(q_start, traj, q_end),
-    ],
-    costs=[TrajectoryLength(q_start, traj, q_end)],
-    metadata=OperatorMetadata(is_motion=True, action_type="navigate", arm=None),
-)
-
 
 all_t1_operators = [
     LeftMoveFree, RightMoveFree,
@@ -469,15 +334,10 @@ all_t1_operators = [
     LeftPlace, RightPlace,
     LeftRetractHolding, RightRetractHolding,
     LeftRetractFree, RightRetractFree,
-    LeftPush, RightPush,
-    LeftPushStick, RightPushStick,
-    MoveBaseTo,
 ]
 
 
-def get_initial_state(
-    movables: Sequence[str] = (), surfaces: Sequence[str] = (), sticks: Sequence[str] = (), buttons: Sequence[str] = ()
-) -> State:
+def get_initial_state(movables: Sequence[str] = (), surfaces: Sequence[str] = ()) -> State:
     """Ground the initial state of the T1 TAMP domain.
     
     Note: left_q0 is the initial left arm configuration, right_q0 is the initial right arm configuration.
@@ -497,15 +357,6 @@ def get_initial_state(
 
     for surface in surfaces:
         initial_state.add(IsSurface.ground(surface))
-
-    for stick in sticks:
-        initial_state.add(IsStick.ground(stick))
-        initial_state.add(IsMovable.ground(stick))
-        initial_state.add(HasNotPickedUp.ground(stick))
-
-    for button in buttons:
-        initial_state.add(IsButton.ground(button))
-        initial_state.add(CanPush.ground(button))
 
     initial_state = frozenset(initial_state)
     return initial_state

@@ -12,8 +12,6 @@
 Per plan-skeleton operator (T1):
   - Arm ops (Pick/Place/Move/Retract): ``pin_for_arm_action(arm)`` locks base
     + inactive arm so the active arm reaches the target without drifting.
-  - MoveBaseTo (action_type="navigate"): ``pin_for_movebase()`` locks both
-    arms + lift/torso so only the planar base moves.
   - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
     we plan to the gate-approved particle conf with the grasp-object /
     placement-surface obstacle temporarily disabled.
@@ -41,9 +39,7 @@ from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
-    action_6dof_to_mat4x4,
 )
-from cutamp.utils.motion_diagnostics import log_cspace_failure_diagnostic
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -126,29 +122,11 @@ def _interp_plan(result):
     """Return the trimmed interpolated trajectory from a v0.8 planner result.
 
     cuRobo's ``interpolated_trajectory`` is padded to a fixed horizon by
-    repeating the last pose. Without trimming, every trajectory's tail is
-    seconds of the robot standing still — which appears as a "wait" between
-    consecutive operators in playback. Mirrors v0.7 main's
-    ``get_interpolated_plan()`` pattern.
+    repeating the last pose; ``get_interpolated_plan`` trims that tail so
+    playback doesn't show a "wait" between consecutive operators.
     """
-    from curobo._src.state.state_joint_trajectory_ops import trim_joint_state_trajectory
-    if result is None:
-        return None
-    if hasattr(result, "get_interpolated_plan"):
-        return result.get_interpolated_plan()
-    interp = getattr(result, "interpolated_trajectory", None)
-    if interp is None:
-        return getattr(result, "js_solution", None)
-    last_tstep = getattr(result, "interpolated_last_tstep", None)
-    if last_tstep is None or len(last_tstep) == 0:
-        return interp
-    return trim_joint_state_trajectory(interp, 0, last_tstep[0])
+    return None if result is None else result.get_interpolated_plan()
 
-
-# Currently unreferenced, but intentionally kept — see docs/curobo_v08_port.md
-# "Things we kept from v0.7 (intentional)": relevant again if an explicit
-# retract/approach offset returns.
-APPROACH_HEIGHT = 0.05
 
 # attached_object_{left,right} extra_link names from t1_planar_base.yml.
 # Each has 50 reserved sphere slots; we use only ~6 via VOXEL fit.
@@ -298,7 +276,6 @@ def solve_curobo(
     config: TAMPConfiguration,
     timer: TorchTimer,
     visualizer: Visualizer,
-    timeline: str = "curobo",
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories."""
     plan_skeleton = plan_info["plan_skeleton"]
@@ -309,7 +286,7 @@ def solve_curobo(
     # CUDA graph capture would speed up identical-shape repeats, but our
     # per-operator shape changes invalidate that.
     planner = world.get_motion_planner(
-        collision_activation_distance=config.world_activation_distance,
+        collision_activation_distance=0.0,
         use_cuda_graph=False,
         enable_com_polygon=config.enable_com_polygon,
         enable_joint_limit_margin=config.enable_joint_limit_margin,
@@ -336,15 +313,14 @@ def solve_curobo(
     )
     q_init = best_particle["left_q0"]
 
-    if config.warmup_motion_gen:
-        with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
-            planner.warmup()
+    with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
+        planner.warmup()
 
     accum_plans: List[dict] = []
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
 
     ts = 0.0
-    visualizer.set_time_seconds(timeline, ts)
+    visualizer.set_time_seconds("curobo", ts)
     visualizer.set_joint_positions(q_init)
     for obj, pose in obj_to_current_pose.items():
         visualizer.log_mat4x4(f"world/{obj}", pose)
@@ -353,41 +329,12 @@ def solve_curobo(
         metadata = ground_op.operator.metadata
         arm = metadata.arm
 
-        # Pin protocol: navigate locks body, arm ops lock base+inactive arm.
-        if metadata.action_type == "navigate":
-            state.pin_for_movebase()
-        elif arm is not None:
+        # Pin protocol: arm ops lock base+inactive arm.
+        if arm is not None:
             state.pin_for_arm_action(arm)
 
         try:
-            if metadata.action_type == "navigate":
-                # MoveBaseTo(obj, q_start, traj, q_end). Plan a cspace trajectory
-                # to q_end while body cspace weights pin everything except base.
-                # WARNING: this planner instance has the mobile base locked, so
-                # navigate will not actually move the base. Envs that need
-                # MoveBaseTo must build a second planner without the base lock
-                # and dispatch by operator type. blocks_t1 has no navigate.
-                q_end_name = ground_op.values[-1]
-                target_q = best_particle[q_end_name].clone()
-                with timer.time("curobo_planning"):
-                    target_js = _planner_js_from_full(planner, target_q, full_joint_names)
-                    result = planner.plan_cspace(
-                        target_js, last_js,
-                        max_attempts=CSPACE_MAX_ATTEMPTS,
-                        enable_graph_attempt=CSPACE_ENABLE_GRAPH_ATTEMPT,
-                    )
-                if not _cspace_plan_succeeded(result, target_js):
-                    raise RuntimeError(f"MoveBaseTo plan failed for {ground_op}")
-                plan = _interp_plan(result)
-                dt = _plan_dt(result)
-                accum_plans.append({
-                    "type": "trajectory", "plan": plan, "dt": dt, "arm": None,
-                    "held_objs": state.compute_all_held_obj_poses(plan),
-                })
-                last_js = _last_timestep_js(plan, planner)
-                state.current_js = last_js
-
-            elif metadata.is_motion and metadata.action_type is None:
+            if metadata.is_motion and metadata.action_type is None:
                 # MoveFree / MoveHolding — no trajectory; pick/place chain
                 # from the previous trajectory's terminal state via last_js.
                 pass
@@ -403,10 +350,6 @@ def solve_curobo(
                         enable_graph_attempt=CSPACE_ENABLE_GRAPH_ATTEMPT,
                     )
                 if not _cspace_plan_succeeded(result, target_js):
-                    if config.debug_motion_failures:
-                        log_cspace_failure_diagnostic(
-                            planner, last_js, target_js, result, ground_op, _log,
-                        )
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
                 plan = _interp_plan(result)
                 dt = _plan_dt(result)
@@ -420,9 +363,7 @@ def solve_curobo(
 
             elif metadata.action_type == "pick":
                 obj_name, grasp_name, q_name = ground_op.values
-                obj_from_grasp = (
-                    action_4dof_to_mat4x4 if config.grasp_dof == 4 else action_6dof_to_mat4x4
-                )(best_particle[grasp_name].clone())
+                obj_from_grasp = action_4dof_to_mat4x4(best_particle[grasp_name].clone())
 
                 # Anchor the grasp TERMINAL to the COM-safe particle conf
                 # (best_particle[q_name]) via plan_cspace instead of a free
@@ -497,19 +438,16 @@ def solve_curobo(
                 _detach_object(planner, link_name=attach_link)
                 _update_world_obstacle_pose(planner, obj_name, world_from_obj_target)
 
-            elif metadata.action_type in ("push", "push_stick"):
-                raise NotImplementedError("Push operations not yet supported in v0.8 motion planning")
-
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
 
         finally:
-            if metadata.action_type == "navigate" or arm is not None:
+            if arm is not None:
                 state.unpin()
 
         _log.info(f"{idx + 1}. {ground_op.name}")
 
-    # Play back the accumulated trajectories on the visualizer's `timeline`
+    # Play back the accumulated trajectories on the visualizer's "curobo"
     # axis. Each entry's `plan.position` is a JointState in cuRobo full-DOF
     # form ([..., time, full_dof]); we squeeze leading length-1 dims, convert
     # to active DOF (which T1RerunRobot maps to URDF joints internally), and
@@ -559,12 +497,12 @@ def solve_curobo(
         mat4x4s = {f"world/{obj_name}": poses for obj_name, poses in held_objs.values()}
         if mat4x4s:
             visualizer.log_joint_trajectory_with_mat4x4s(
-                traj=pos, mat4x4s=mat4x4s, timeline=timeline,
-                start_time=cur_t, dt=dt, arm=traj_arm,
+                traj=pos, mat4x4s=mat4x4s, timeline="curobo",
+                start_time=cur_t, dt=dt,
             )
         else:
             visualizer.log_joint_trajectory(
-                traj=pos, timeline=timeline, start_time=cur_t, dt=dt, arm=traj_arm,
+                traj=pos, timeline="curobo", start_time=cur_t, dt=dt,
             )
         cur_t += pos.shape[0] * dt
 

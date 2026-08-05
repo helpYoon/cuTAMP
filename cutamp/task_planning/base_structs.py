@@ -16,20 +16,18 @@ class OperatorMetadata:
     """Metadata for operators that determines their behavior in the TAMP pipeline.
     
     Attributes:
-        is_actionable: Whether this operator creates action parameters (grasps, placements, push poses)
-                       that require IK solving. True for Pick, Place, Push, PushStick operators.
+        is_actionable: Whether this operator creates action parameters (grasps, placements)
+                       that require IK solving. True for Pick, Place operators.
         is_motion: Whether this operator represents a motion between configurations
-                   (MoveFree, MoveHolding, Retract*, MoveBaseTo).
-        arm: Which arm this operator uses ("left", "right", or None for navigate/non-arm ops).
-        action_type: The type of action ("pick", "place", "push", "push_stick"); for motion ops it is
-                     "retract" (Retract*), "navigate" (MoveBaseTo), or None (plain MoveFree/MoveHolding).
+                   (MoveFree, MoveHolding, Retract*).
+        arm: Which arm this operator uses ("left", "right", or None).
+        action_type: The type of action ("pick", "place"); for motion ops it is
+                     "retract" (Retract*) or None (plain MoveFree/MoveHolding).
     """
     is_actionable: bool = False
     is_motion: bool = False
     arm: Optional[Literal["left", "right"]] = None
-    action_type: Optional[
-        Literal["pick", "place", "push", "push_stick", "retract", "navigate"]
-    ] = None
+    action_type: Optional[Literal["pick", "place", "retract"]] = None
 
 
 @dataclass(frozen=True)

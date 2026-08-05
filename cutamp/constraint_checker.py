@@ -11,7 +11,6 @@ import logging
 from typing import Dict
 
 import torch
-from jaxtyping import Bool
 
 _log = logging.getLogger(__name__)
 
@@ -43,7 +42,7 @@ class ConstraintChecker:
             self._warned_default_tol.add(key)
         return self.default_tol
 
-    def get_full_mask(self, cost_dict: Dict[str, dict]) -> Dict[str, Dict[str, Bool[torch.Tensor, "num_particles"]]]:
+    def get_full_mask(self, cost_dict: Dict[str, dict]) -> Dict[str, Dict[str, torch.Tensor]]:
         """Get the "full" mask that maps the constraints to the satisfying masks."""
         mask_dict = {}
         for cost_type, cost_info in cost_dict.items():
@@ -56,7 +55,7 @@ class ConstraintChecker:
             }
         return mask_dict
 
-    def get_mask(self, cost_dict: Dict[str, dict], verbose: bool = True) -> Bool[torch.Tensor, "num_particles"]:
+    def get_mask(self, cost_dict: Dict[str, dict], verbose: bool = True) -> torch.Tensor:
         """Get the satisfying mask for the constraints given the costs."""
         overall_mask = None
         for cost_type, cost_info in cost_dict.items():

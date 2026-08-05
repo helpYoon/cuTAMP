@@ -37,27 +37,25 @@ def _make_state():
 
 
 @needs_cuda
-def test_double_pin_for_movebase_raises():
-    """Calling pin_for_movebase while a pin is active must raise, matching
-    pin_for_arm_action's guard."""
+def test_double_pin_for_arm_action_raises():
+    """Calling pin_for_arm_action while a pin is already active must raise."""
     state = _make_state()
-    state.pin_for_movebase()
+    state.pin_for_arm_action("left")
     try:
         with pytest.raises(RuntimeError, match="pin"):
-            state.pin_for_movebase()
+            state.pin_for_arm_action("left")
     finally:
         state.unpin()
 
 
 @needs_cuda
-def test_unpin_re_enables_tool_pose_after_partial_apply():
-    """Even if pin_for_movebase succeeds in disabling tool_pose criteria,
-    unpin must always re-enable them. Specifically: after a successful pin
-    + unpin cycle, calling pin_for_movebase a second time must work
-    (snapshot is None again), proving unpin fully cleared state."""
+def test_pin_unpin_cycle_repeats():
+    """After a successful pin + unpin cycle, calling pin_for_arm_action a
+    second time must work (snapshot is None again), proving unpin fully
+    cleared state."""
     state = _make_state()
-    state.pin_for_movebase()
+    state.pin_for_arm_action("left")
     state.unpin()
     # Second cycle — must not raise.
-    state.pin_for_movebase()
+    state.pin_for_arm_action("left")
     state.unpin()

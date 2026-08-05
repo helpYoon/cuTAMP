@@ -27,7 +27,6 @@ class _Node:
     state: frozenset[Atom]
     parent: Optional["_Node"]
     operator: Optional[GroundOperator]
-    depth: int
 
     def parameters(self) -> dict[str, set[str]]:
         """Returns all the parameters ever encountered"""
@@ -221,7 +220,6 @@ def breadth_first_search(
     initial_state: State,
     goal_state: State,
     operators: Sequence[Operator],
-    explored_state_check: bool = True,
     verbose: bool = False,
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
 ) -> Generator[List[GroundOperator], None, None]:
@@ -234,8 +232,6 @@ def breadth_first_search(
     goal_state: State
     operators: List[Operator]
         The possible operators for the given search problem.
-    explored_state_check: bool
-        Whether to check if a state has been explored before adding it to the frontier.
     verbose: bool
         Whether to log debugging information. We have a flag so the log doesn't become polluted.
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]]
@@ -258,7 +254,7 @@ def breadth_first_search(
         if not isinstance(elem, Atom):
             raise ValueError(f"Goal state must contain only atoms, got {elem.__class__.__name__} {elem}")
 
-    initial_node = _Node(state=initial_state, parent=None, operator=None, depth=0)
+    initial_node = _Node(state=initial_state, parent=None, operator=None)
     frontier: deque[_Node] = deque([initial_node])
     explored: set[State] = {initial_node.state}
 
@@ -282,7 +278,7 @@ def breadth_first_search(
 
             # If the successor state hasn't been explored, add it to the frontier.
             # Also if successor is a goal state (we want different ways of getting to the goal)
-            if not explored_state_check or successor_state not in explored or goal_state.issubset(successor_state):
-                child = _Node(state=successor_state, parent=node, operator=ground_op, depth=node.depth + 1)
+            if successor_state not in explored or goal_state.issubset(successor_state):
+                child = _Node(state=successor_state, parent=node, operator=ground_op)
                 frontier.append(child)
                 explored.add(successor_state)

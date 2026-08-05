@@ -13,7 +13,6 @@ Partially modified from:
 - https://github.com/williamshen-nz/rerun-robotics/blob/main/rerun_robotics/rerun_urdf.py
 """
 
-import warnings
 from typing import Union, cast
 
 import numpy as np
@@ -124,18 +123,8 @@ def curobo_to_rerun(entity: CuroboMesh, compute_vertex_normals: bool = True) -> 
     else:
         # The vertices and triangles are already in the mesh
         if not mesh.vertex_normals and compute_vertex_normals:
-            try:
-                # Use open3d to compute vertex normals, so we can get a prettier looking mesh
-                import open3d as o3d
-
-                o3d_mesh = o3d.geometry.TriangleMesh()
-                o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-                o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
-                o3d_mesh.compute_vertex_normals()
-                vertex_normals = np.asarray(o3d_mesh.vertex_normals)
-            except ImportError:
-                warnings.warn("open3d not installed, setting vertex normals to None")
-                vertex_normals = None
+            # Compute vertex normals, so we can get a prettier looking mesh
+            vertex_normals = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False).vertex_normals
         else:
             vertex_normals = mesh.vertex_normals
 

@@ -2,12 +2,11 @@
 
 Spec: docs/superpowers/specs/2026-06-11-joint-limit-margin-design.md
 """
-import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
-import pytest
 import torch
 
+from cutamp.tests.conftest import needs_cuda
 from cutamp.robots.t1 import (
     BASE_INDICES,
     CUROBO_DOF,
@@ -50,28 +49,19 @@ class TestMarginVectors:
             assert T1_LIMIT_MARGIN_UPPER[i] == T1_JOINT_LIMIT_MARGIN, JOINT_NAMES_FULL[i]
 
 
-needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-
-
 def _t1_position_limits() -> torch.Tensor:
     """[2, 21] limits in JOINT_NAMES_FULL order (row 0 = lower).
 
     URDF-parsed for the 18 body joints; virtual base DOFs use the
     t1_planar_base.yml extra_links values.
     """
+    from cutamp.scripts.check_plan_margins import parse_urdf_limits
     base_limits = {
         "base_j_x": (-2.0, 2.0),
         "base_j_y": (-2.0, 2.0),
         "base_j_yaw": (-3.14159, 3.14159),
     }
-    tree = ET.parse(T1_ASSETS_DIR / "t1_simplified.urdf")
-    urdf_limits = {}
-    for joint in tree.getroot().iter("joint"):
-        limit = joint.find("limit")
-        if joint.get("type") == "revolute" and limit is not None:
-            urdf_limits[joint.get("name")] = (
-                float(limit.get("lower")), float(limit.get("upper")),
-            )
+    urdf_limits = parse_urdf_limits(T1_ASSETS_DIR / "t1_simplified.urdf")
     rows = [base_limits.get(n) or urdf_limits[n] for n in JOINT_NAMES_FULL]
     return torch.tensor(rows, dtype=torch.float32).T.contiguous()  # [2, 21]
 

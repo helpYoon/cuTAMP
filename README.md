@@ -44,8 +44,7 @@ graph LR
    `reik_interval` steps. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives the
    best satisfying particle through `motion_solver.py`: one 21-DOF
-   `MotionPlanner`, re-pinned per operator (`pin_for_arm_action` /
-   `pin_for_movebase`).
+   `MotionPlanner`, re-pinned per operator (`pin_for_arm_action`).
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the processed plan for the
    downstream MPC consumer.
@@ -59,7 +58,7 @@ cuTAMP plans for the T1 humanoid through a **single 21-DOF
 MotionPlanner** built from `t1_planar_base.yml`. The cspace is:
 
 ```
-3 base (planar: base_j_x, base_j_y, base_j_yaw)   ← locked at IK time, free during navigate
+3 base (planar: base_j_x, base_j_y, base_j_yaw)   ← locked at IK time
 2 leg  (ankle_pitch, knee_pitch)
 2 torso (Torso_Pitch, Waist_Yaw)
 7 left arm  (Left_Shoulder_Pitch ... Left_Hand_Roll)
@@ -85,7 +84,6 @@ graph TD
 
     subgraph Pinning [Cspace pinning per operator]
         ArmOp["pin_for_arm_action(active_arm)<br/>→ inactive arm pinned to start;<br/>active arm + body free"]
-        Nav["pin_for_movebase()<br/>→ both arms + body pinned;<br/>only base DOFs free"]
     end
 
     subgraph Tools [Tool frames]
@@ -94,7 +92,6 @@ graph TD
     end
 
     Planner --> ArmOp
-    Planner --> Nav
     Planner --> LT
     Planner --> RT
 ```
@@ -124,7 +121,7 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   - `meshes/` — STL meshes referenced by the URDF.
 
 - [`__init__.py`](cutamp/robots/__init__.py) — `RobotContainer` factory and
-  `load_robot_container("t1")`. T1 exposes two tool frames; tool↔EE transforms
+  `load_t1_container()`. T1 exposes two tool frames; tool↔EE transforms
   account for T1's +X-toward-fingertips EE convention.
 
 - [`t1.py`](cutamp/robots/t1.py) — T1 module:
@@ -154,7 +151,6 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   kinematics, current joint state, and per-arm `arm_holding` /
   `arm_grasp_transform`. Cspace pinning lives here:
   - `pin_for_arm_action(arm)` — pin inactive arm; body + active arm free.
-  - `pin_for_movebase()` — pin both arms + body; only base free.
   - `unpin()` — restore original weights.
   - `compute_held_obj_poses(arm, plan)` — per-timestep `world_from_obj` for a
     held object along a planner trajectory.
@@ -174,11 +170,10 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
   truth for the COM-over-support-rectangle geometry (`COM_HALF_EXTENTS`,
   `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT`, `COM_TOL`) and its consumers:
-  `com_polygon_penalty` (outside-quadratic + inside-margin barrier +
-  optional pull-to-center), `ComOverBasePolygonCost` (the planner rollout
-  cost), `compute_com_polygon_mask` / `compute_com_polygon_penalties` (the
-  hard `ComPolygon` gate + post-IK COM-safe retry), and
-  `compute_com_in_base` (audits / tests).
+  `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
+  `ComOverBasePolygonCost` (the planner rollout cost), and
+  `compute_com_polygon_mask` / `compute_com_polygon_penalties` (the
+  hard `ComPolygon` gate + post-IK COM-safe retry).
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
   through the single planner. Per-operator: pin the cspace, plan, append a
@@ -186,19 +181,17 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   attach/detach via the AttachmentManager. Playback walks `accum_plans` and
   hands each entry to the visualizer.
 
-- [`grasp_planning.py`](cutamp/grasp_planning.py) — `_build_multi_frame_goal`
-  builds the `GoalToolPose` covering every tool frame for single-arm actions:
-  the active frame gets the target pose, while inactive frames keep their
-  ENABLED pose criteria targeting their FK poses at the segment's start
-  state. Pick/place terminal confs are anchored in cspace.
-
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
   particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. Cache
-  hits route through `_apply_cached`.
+  hits route through `_apply_cached`. `_build_multi_frame_goal` builds the
+  `GoalToolPose` covering every tool frame for single-arm actions: the
+  active frame gets the target pose, while inactive frames keep their
+  ENABLED pose criteria targeting their FK poses at the segment's start
+  state.
 
 - [`samplers.py`](cutamp/samplers.py) — grasp / placement / yaw samplers
   (`grasp_4dof_sampler`, `grasp_6dof_sampler`, `place_4dof_sampler`,
-  `sample_yaw`, `sample_stick_grasps`) that seed the continuous particles.
+  `sample_yaw`) that seed the continuous particles.
 
 - [`task_planning/`](cutamp/task_planning/) — the symbolic layer:
   `task_plan_generator` runs PDDL-style search (`search.py`) over the domain
@@ -208,17 +201,15 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`t1_domain.py`](cutamp/t1_domain.py) — TAMP domain (fluents + operators)
   for T1: `LeftAt` / `RightAt`, `LeftHolding` / `RightHolding`,
   `LeftMoveFree` / `RightMoveFree`, `LeftPick` / `RightPick`, `LeftPlace` /
-  `RightPlace`, `LeftPush` / `RightPush`, `LeftPushStick` / `RightPushStick`,
-  and `LeftRetractHolding` / `RightRetractHolding`, `LeftRetractFree` /
-  `RightRetractFree`.
+  `RightPlace`, and `LeftRetractHolding` / `RightRetractHolding`,
+  `LeftRetractFree` / `RightRetractFree`.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
   and `SUPPORTED_SOFT_COSTS`. Notable defaults (all validated together):
   `optimize_soft_costs=True` + `coupled_reik=True` +
   `soft_cost=["place_close_to_base"]` (the trio), `enable_com_polygon=True`
   (planner COM cost + hard gate), `enable_com_aware_ik=True` (seed-IK CoM
-  residual), `ik_com_retry_max` (post-IK COM-mask backstop),
-  `debug_motion_failures`.
+  residual).
 
 - [`algorithm.py`](cutamp/algorithm.py) — `setup_cutamp` + `run_cutamp`
   outer loop. The motion-plan retry sweep lives in `_motion_plan_with_retries`.
@@ -230,8 +221,7 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   (kinematic, collision, stable placement, and the `ComPolygon` COM-in-hull
   gate over every `q_*` conf) plus the soft costs listed in
   `SUPPORTED_SOFT_COSTS` (`place_close_to_base`, `retract_close_to_home`,
-  `minimize_body_movement`, `com_polygon`, the multi-object placement
-  costs, …).
+  `minimize_body_movement`, the multi-object placement costs, …).
 
 - [`costs.py`](cutamp/costs.py) — low-level differentiable cost primitives
   (`trajectory_length`, sphere-overlap, AABB, `curobo_pose_error`) that
@@ -251,10 +241,6 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 
 - [`conf_locking.py`](cutamp/conf_locking.py) — utility for freezing a
   configuration during optimization (e.g., already-satisfied IKs).
-
-- [`utils/motion_diagnostics.py`](cutamp/utils/motion_diagnostics.py) —
-  cspace-failure diagnostic helpers (gated behind
-  `config.debug_motion_failures`; not on the hot path by default).
 
 - [`utils/visualizer.py`](cutamp/utils/visualizer.py) — Rerun visualizer.
   `log_joint_trajectory_with_mat4x4s(traj, mat4x4s, …)` accepts any number
@@ -330,7 +316,6 @@ python -m cutamp.scripts.run_cutamp --env blocks_t1 --motion_plan \
   the COM.
 - `retract_close_to_home` *(T1)* — penalize retract configs far from `t1_home`.
 - `minimize_body_movement` *(T1)* — penalize body (leg/torso/waist) drift.
-- `com_polygon` *(T1)* — differentiable COM-in-polygon penalty on confs.
 - `dist_from_origin`, `max_obj_dist` / `min_obj_dist`, `min_y` / `max_y`,
   `align_yaw` — multi-object placement costs.
 
@@ -351,11 +336,10 @@ planning). Comfortably fits a 24 GB GPU.
 2. **Planar base via `extra_links`** — `world → base_j_x → base_j_y →
    base_j_yaw → mobile_base_link` adds 3 virtual DOFs that get hard-locked at
    IK / motion-planner construction time for arm operators (so the base
-   doesn't drift while reaching). `MoveBaseTo` is currently unfireable —
-   wiring it up needs a second, base-unlocked planner.
+   doesn't drift while reaching).
 
-3. **Cspace pinning replaces per-arm planners** — `pin_for_arm_action` /
-   `pin_for_movebase` write into each rollout's
+3. **Cspace pinning replaces per-arm planners** — `pin_for_arm_action`
+   writes into each rollout's
    `cspace_target_dof_weight` to keep the inactive joints at the start
    state. Restored by `unpin()`.
 

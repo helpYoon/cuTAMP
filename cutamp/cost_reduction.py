@@ -10,7 +10,6 @@
 from typing import Dict, Set, Optional
 
 import torch
-from jaxtyping import Float
 
 
 class CostReducer:
@@ -37,7 +36,7 @@ class CostReducer:
         # "no multiplier, pass value through" (no implicit default-for-all).
         return self.cost_to_multiplier.get((cost_type, "default"))
 
-    def get_cost(self, cost_dict: Dict[str, dict], consider_types: Set[str]) -> Float[torch.Tensor, "num_particles"]:
+    def get_cost(self, cost_dict: Dict[str, dict], consider_types: Set[str]) -> torch.Tensor:
         """Returns total cost per particle by taking weighted sum of considered cost types."""
         cost = None
         for cost_type, entry in cost_dict.items():
@@ -63,16 +62,16 @@ class CostReducer:
                     )
         return cost
 
-    def soft_costs(self, cost_dict: Dict[str, dict]) -> Float[torch.Tensor, "num_particles"]:
+    def soft_costs(self, cost_dict: Dict[str, dict]) -> torch.Tensor:
         """Reduce only the soft costs."""
         return self.get_cost(cost_dict, consider_types={"cost"})
 
-    def hard_costs(self, cost_dict: Dict[str, dict]) -> Float[torch.Tensor, "num_particles"]:
+    def hard_costs(self, cost_dict: Dict[str, dict]) -> torch.Tensor:
         """Reduce only the constraints === hard costs."""
         return self.get_cost(cost_dict, consider_types={"constraint"})
 
     def __call__(
         self, cost_dict: Dict[str, dict], consider_types: Set[str] = frozenset(("constraint", "cost"))
-    ) -> Float[torch.Tensor, "num_particles"]:
+    ) -> torch.Tensor:
         """Sum both soft and hard costs."""
         return self.get_cost(cost_dict, consider_types=consider_types)

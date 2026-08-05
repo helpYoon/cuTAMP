@@ -21,11 +21,9 @@ per-parameter normalization, a zero gradient produces a zero step.
 
 Per-operator locking policy for T1 (single 21-DOF planner with planar base):
 
-* Arm action / arm motion (Pick, Place, Push, MoveFree, MoveHolding,
+* Arm action / arm motion (Pick, Place, MoveFree, MoveHolding,
   Retract): lock base (slice 0:3) + inactive arm (the 7 DOFs of the
   non-active arm). Active arm + lift/torso remain free.
-* Navigate (MoveBaseTo): lock lift/torso + both arms (slice 3:21). Only
-  the 3 base DOFs remain free.
 """
 
 from __future__ import annotations
@@ -47,7 +45,6 @@ def get_conf_locked_dofs(
     """
     from cutamp.robots.t1 import (
         BASE_DOF,
-        CUROBO_DOF,
         LEFT_ARM_INDICES,
         RIGHT_ARM_INDICES,
     )
@@ -60,8 +57,6 @@ def get_conf_locked_dofs(
         if conf_name not in ground_op.values:
             continue
         meta = ground_op.operator.metadata
-        if meta.action_type == "navigate":
-            return list(range(BASE_DOF, CUROBO_DOF))
         if meta.arm == "left":
             return base + right_arm
         if meta.arm == "right":

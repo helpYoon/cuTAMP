@@ -70,7 +70,7 @@ def test_fork_penalty_parity_with_cutamp_reference():
     # Random rotated/translated base frames catch quaternion-projection sign errors.
     import roma
     from curobo._src.solver.seed_ik.seed_ik_error_calculator import com_support_penalty
-    from cutamp.com_polygon_cost import com_polygon_penalty
+    from cutamp.com_polygon_cost import _project_com_to_base, com_polygon_penalty
     torch.manual_seed(0)
     B = 256
     com_world = torch.randn(B, 3) * 0.3
@@ -82,8 +82,10 @@ def test_fork_penalty_parity_with_cutamp_reference():
     base_T[:, :3, :3] = R
     base_T[:, :3, 3] = base_pos
     half = torch.tensor([0.1115, 0.156])
+    com_in_base = _project_com_to_base(com_world, base_T)
     for cw in (0.0, 0.01):
-        ref = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0, center_weight=cw)
+        ref = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0)
+        ref = ref + cw * ((com_in_base / half) ** 2).sum(-1)
         got = com_support_penalty(com_world, base_pos, quat_wxyz, half, 0.02, 1.0, cw)
         assert torch.allclose(got, ref, atol=1e-5), f"max diff {(got - ref).abs().max()}"
 
@@ -205,8 +207,9 @@ def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
 
 
 def _com_abs_x(world, q_full):
-    from cutamp.com_polygon_cost import compute_com_in_base
-    return compute_com_in_base(world, q_full)[:, 0].abs()
+    from cutamp.com_polygon_cost import _fk_com_and_base, _project_com_to_base
+    com_world, base_T = _fk_com_and_base(world, q_full)
+    return _project_com_to_base(com_world, base_T)[:, 0].abs()
 
 
 @needs_cuda

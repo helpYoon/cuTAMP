@@ -7,6 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import itertools
 from typing import Callable, Optional, Sequence
 
 from .base_structs import Atom, Fluent, GroundOperator, Operator, OperatorMetadata, Parameter, State
@@ -18,7 +19,6 @@ def task_plan_generator(
     initial: State,
     goal: State,
     operators: Sequence[Operator],
-    explored_state_check: bool = True,
     max_plan_skeletons: int = 99999,
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
 ) -> Sequence[PlanSkeleton]:
@@ -31,12 +31,6 @@ def task_plan_generator(
     """
     plan_iter = breadth_first_search(
         initial, goal, operators,
-        explored_state_check=explored_state_check,
         ground_op_priority_fn=ground_op_priority_fn,
     )
-    for _ in range(max_plan_skeletons):
-        try:
-            plan = next(plan_iter)
-            yield plan
-        except StopIteration:
-            break
+    yield from itertools.islice(plan_iter, max_plan_skeletons)

@@ -21,17 +21,14 @@ from curobo.scene import (
     Scene,
     Sphere,
 )
-from einops import einsum
-from jaxtyping import Float
 from roma import quat_wxyz_to_xyzw, unitquat_to_rotmat
 
 from cutamp.envs import TAMPEnvironment
-from cutamp.utils.shapes import MultiSphere
 
-Particles = Dict[str, Float[torch.Tensor, "num_particles *h d"]]
+Particles = Dict[str, torch.Tensor]  # each [num_particles, *h, d]
 
 
-def pose_list_to_mat4x4(pose: list[float] | None) -> Float[torch.Tensor, "4 4"]:
+def pose_list_to_mat4x4(pose: list[float] | None) -> torch.Tensor:
     """cuRobo pose list to 4x4 transformation matrix."""
     mat4x4 = torch.eye(4)
     if pose is not None:
@@ -43,7 +40,7 @@ def pose_list_to_mat4x4(pose: list[float] | None) -> Float[torch.Tensor, "4 4"]:
     return mat4x4
 
 
-def action_4dof_to_mat4x4(action_4dof: Float[torch.Tensor, "*b 4"]) -> Float[torch.Tensor, "*b 4 4"]:
+def action_4dof_to_mat4x4(action_4dof: torch.Tensor) -> torch.Tensor:
     """Convert 4-DOF action to 4x4 transformation matrix."""
     if action_4dof.shape[-1] != 4:
         raise ValueError(f"Expected last dimension to be 4, got shape {action_4dof.shape}")
@@ -66,23 +63,10 @@ def action_4dof_to_mat4x4(action_4dof: Float[torch.Tensor, "*b 4"]) -> Float[tor
     return mat4x4
 
 
-def action_6dof_to_mat4x4(action_6dof: Float[torch.Tensor, "*b 6"]) -> Float[torch.Tensor, "*b 4 4"]:
-    """Convert 6-DOF action (xyz + rpy) to 4x4 transformation matrix."""
-    translation = action_6dof[..., :3]
-    rpy = action_6dof[..., 3:]
-
-    # Create 4x4 matrix and set rotation and translation
-    mat4x4 = torch.eye(4, device=action_6dof.device, dtype=action_6dof.dtype)
-    mat4x4 = mat4x4.repeat(*action_6dof.shape[:-1], 1, 1)
-    mat4x4[..., :3, :3] = roma.euler_to_rotmat("XYZ", rpy)
-    mat4x4[..., :3, 3] = translation
-    return mat4x4
-
-
 def transform_spheres(
-    spheres: Float[torch.Tensor, "num_spheres 4"], transform: Float[torch.Tensor, "*b 4 4"]
-) -> Float[torch.Tensor, "*b num_spheres 4"]:
-    """Transform spheres by the given transformation matrices"""
+    spheres: torch.Tensor, transform: torch.Tensor
+) -> torch.Tensor:
+    """Transform [num_spheres, 4] spheres by [*b, 4, 4] transformation matrices into [*b, num_spheres, 4]."""
     centers = spheres[:, :3]
     centers_hom = torch.cat([centers, torch.ones_like(centers[:, :1])], dim=1)
     radii = spheres[:, 3]
@@ -92,15 +76,15 @@ def transform_spheres(
         # (*b, 4, 4) -> (*b, 1, 4, 4)
         transform = transform.unsqueeze(-3)
 
-    out_spheres = einsum(transform, centers_hom, "... i j, ... j -> ... i")
+    out_spheres = torch.einsum("...ij,...j->...i", transform, centers_hom)
     out_spheres[..., 3] = radii
     return out_spheres
 
 
 def transform_points(
-    points: Float[torch.Tensor, "num_points 3"], transform: Float[torch.Tensor, "*b 4 4"]
-) -> Float[torch.Tensor, "*b num_points 3"]:
-    """Transform points by the given transformation matrices"""
+    points: torch.Tensor, transform: torch.Tensor
+) -> torch.Tensor:
+    """Transform [num_points, 3] points by [*b, 4, 4] transformation matrices into [*b, num_points, 3]."""
     points_hom = torch.cat([points, torch.ones_like(points[:, :1])], dim=1)
 
     # Add a dimension to broadcast over num_points
@@ -108,12 +92,12 @@ def transform_points(
         # (*b, 4, 4) -> (*b, 1, 4, 4)
         transform = transform.unsqueeze(-3)
 
-    out_points_hom = einsum(transform, points_hom, "... i j, ... j -> ... i")
+    out_points_hom = torch.einsum("...ij,...j->...i", transform, points_hom)
     out_points = out_points_hom[..., :3]
     return out_points
 
 
-def sample_between_bounds(num_samples: int, bounds: Float[torch.Tensor, "2 d"]) -> Float[torch.Tensor, "num_samples d"]:
+def sample_between_bounds(num_samples: int, bounds: torch.Tensor) -> torch.Tensor:
     """
     Sample uniformly between bounds.
     The bounds should be a (2, d) tensor where the first row is the lower bound and the second row is the upper bound.
@@ -124,7 +108,7 @@ def sample_between_bounds(num_samples: int, bounds: Float[torch.Tensor, "2 d"]) 
     return samples
 
 
-def approximate_goal_aabb(goal: Obstacle) -> Float[torch.Tensor, "2 3"]:
+def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
     """Approximate the goal AABB from the goal object."""
     # Compute transformation matrix for object pose
     pose = torch.tensor(goal.pose)
@@ -133,9 +117,6 @@ def approximate_goal_aabb(goal: Obstacle) -> Float[torch.Tensor, "2 3"]:
     mat4x4 = torch.eye(4)
     mat4x4[:3, :3] = roma.unitquat_to_rotmat(xyzw)
     mat4x4[:3, 3] = pos
-    if isinstance(goal, MultiSphere):
-        goal = goal.get_mesh()
-
     if isinstance(goal, Mesh):
         vertices = torch.tensor(goal.vertices, dtype=mat4x4.dtype)
         vertices = transform_points(vertices, mat4x4)
@@ -167,7 +148,7 @@ def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene
             geoms["cylinder"].append(obj)
         elif isinstance(obj, Capsule):
             geoms["capsule"].append(obj)
-        elif isinstance(obj, (MultiSphere, Mesh)):
+        elif isinstance(obj, Mesh):
             geoms["mesh"].append(obj)
         else:
             raise ValueError(f"Unknown object type: {type(obj)}")

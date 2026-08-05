@@ -4,11 +4,6 @@ import pytest
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
-def _make_world():
-    """Build a real TAMPWorld for blocks_t1."""
-    return make_blocks_t1_world()
-
-
 @needs_cuda
 def test_compute_com_polygon_mask_excludes_extreme_lean():
     """Batched COM-in-polygon check returns the expected shape, classifies
@@ -18,7 +13,7 @@ def test_compute_com_polygon_mask_excludes_extreme_lean():
     (mimicking the teetering pose we observed pre-fix)."""
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_mask
-    world = _make_world()
+    world = make_blocks_t1_world()
     full_names = list(world.kinematics.joint_names)
     home = world.q_init.detach().clone()
     # Build a configuration with deep forward bend.
@@ -45,7 +40,7 @@ def test_ik_for_pose_com_safe_returns_valid_result():
     a usable result."""
     import torch
     from cutamp.particle_initialization import _ik_for_pose_com_safe
-    world = _make_world()
+    world = make_blocks_t1_world()
     # Build a [B=4, 4, 4] batch of reachable left-hand targets.
     # Pose: hand at (0.4, +0.2, 0.5) world — well within left arm reach.
     B = 4
@@ -105,8 +100,8 @@ def test_curobo_batched_com_kernel_returns_per_batch_distinct():
     per-batch COMs as four separate B=1 calls."""
     import torch
     from curobo.types import JointState
-    world = _make_world()
-    kin = world.kinematics_with_com
+    world = make_blocks_t1_world()
+    kin = world.kinematics
     full_names = list(world.kinematics.joint_names)
     name_to_idx = {n: i for i, n in enumerate(full_names)}
 
@@ -157,7 +152,7 @@ def test_compute_com_polygon_penalties_is_differentiable():
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_penalties
 
-    world = _make_world()
+    world = make_blocks_t1_world()
     full_names = list(world.kinematics.joint_names)
     name_to_idx = {n: i for i, n in enumerate(full_names)}
     home = world.q_init.detach().clone()
@@ -232,9 +227,9 @@ def test_com_polygon_penalty_single_edge_equals_tol():
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
-def test_com_polygon_penalty_center_weight_defaults_off():
-    # Default center_weight=0 -> barrier-only: deep-inside COM scores exactly 0
-    # (the hard-gate path relies on this).
+def test_com_polygon_penalty_deep_inside_is_zero():
+    # Barrier-only: deep-inside COM scores exactly 0 (the hard-gate path
+    # relies on this).
     import torch
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
@@ -242,22 +237,6 @@ def test_com_polygon_penalty_center_weight_defaults_off():
     com_world = torch.tensor([[0.03, 0.04, 0.0]])  # well inside inset rect
     pen = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0)
     assert pen.item() == 0.0
-
-
-def test_com_polygon_penalty_center_pull_active_deep_inside():
-    # With center_weight>0 a deep-inside COM gets a nonzero penalty that grows
-    # with distance from center: center_weight * sum((com/half)^2).
-    import torch
-    from cutamp.com_polygon_cost import com_polygon_penalty
-    half = torch.tensor([0.10, 0.15])
-    base_T = torch.eye(4).unsqueeze(0)
-    cw = 0.01
-    far = torch.tensor([[0.06, 0.0, 0.0]])      # inside inset, barrier=0
-    center = torch.tensor([[0.0, 0.0, 0.0]])
-    pen_far = com_polygon_penalty(far, base_T, half, 0.02, 1.0, center_weight=cw)
-    pen_center = com_polygon_penalty(center, base_T, half, 0.02, 1.0, center_weight=cw)
-    assert pen_center.item() == pytest.approx(0.0)
-    assert pen_far.item() == pytest.approx(cw * (0.06 / 0.10) ** 2, rel=1e-4)
 
 
 def test_com_polygon_penalty_just_outside_exceeds_tol():
@@ -285,7 +264,7 @@ def test_mask_matches_penalty_gate():
     from cutamp.com_polygon_cost import (
         COM_TOL, compute_com_polygon_mask, compute_com_polygon_penalties,
     )
-    world = _make_world()
+    world = make_blocks_t1_world()
     full_names = list(world.kinematics.joint_names)
     name_to_idx = {n: i for i, n in enumerate(full_names)}
     home = world.q_init.detach().clone()

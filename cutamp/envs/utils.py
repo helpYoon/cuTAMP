@@ -11,17 +11,15 @@ import os
 import warnings
 from typing import Dict, List, ClassVar, Set, Tuple
 
-import torch
 import yaml
 from curobo.scene import Cuboid, Obstacle, Cylinder, Mesh
 
 from cutamp.t1_domain import all_t1_fluents
-from cutamp.utils.shapes import MultiSphere
 from cutamp.task_planning.base_structs import State
 
 
 class TAMPEnvironment:
-    _known_types: ClassVar[Set[str]] = {"Movable", "Surface", "Button", "Stick"}
+    _known_types: ClassVar[Set[str]] = {"Movable", "Surface"}
 
     def __init__(
         self,
@@ -49,37 +47,11 @@ class TAMPEnvironment:
             if obj_type not in self._known_types:
                 raise ValueError(f"Unknown object type: {obj_type}")
 
-    def __str__(self):
-        accum = [f"Environment: {self.name}", "\tMovables:"]
-        # Movables
-        for obj in self.movables:
-            accum.append(f"\t\t{obj.name}")
-        # Statics
-        accum.append("\tStatics:")
-        for obj in self.statics:
-            accum.append(f"\t\t{obj.name}")
-        # Types
-        accum.append("\tTypes:")
-        for obj_type, objects in self.type_to_objects.items():
-            accum.append(f"\t\t{obj_type}: {[obj.name for obj in objects]}")
-
-        result = "\n".join(accum)
-        return result
-
-
-def _multi_sphere_factory(name: str, spheres: List[List[float]], **kwargs) -> MultiSphere:
-    """Create a MultiSphere object from a list of spheres."""
-    spheres_tensor = torch.tensor(spheres)
-    if spheres_tensor.ndim != 2 or spheres_tensor.shape[1] != 4:
-        raise ValueError(f"Spheres should be (n, 4) not {spheres_tensor.shape}")
-    return MultiSphere(name=name, spheres=spheres_tensor, **kwargs)
-
 
 _key_to_factory = {
     "cuboid": Cuboid,
     "cylinder": Cylinder,
     "mesh": Mesh,
-    "multi_sphere": _multi_sphere_factory,
 }
 
 
@@ -188,13 +160,6 @@ def _get_object_dict(obj: Obstacle) -> Tuple[str, dict]:
         return "cylinder", {
             "radius": obj.radius,
             "height": obj.height,
-            "pose": obj.pose,
-            "color": obj.color,
-        }
-    elif isinstance(obj, MultiSphere):
-        spheres = obj.spheres.tolist()
-        return "multi_sphere", {
-            "spheres": spheres,
             "pose": obj.pose,
             "color": obj.color,
         }

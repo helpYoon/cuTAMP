@@ -52,16 +52,6 @@ class StablePlacement(Constraint):
         super().__init__(obj, grasp, placement, surface)
 
 
-class ValidPush(Constraint):
-    def __init__(self, button, push_pose):
-        super().__init__(button, push_pose)
-
-
-class ValidPushStick(Constraint):
-    def __init__(self, button, stick, push_pose):
-        super().__init__(button, stick, push_pose)
-
-
 class ComPolygon(Constraint):
     """Hard filter: particle's final-config COM must project inside the
     mobile-base support polygon. Mirrors how Collision filters particles."""

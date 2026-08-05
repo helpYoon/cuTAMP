@@ -11,9 +11,12 @@ import torch
 
 
 @pytest.fixture
-def t1_container(device_cfg):
+def t1_container():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    from curobo.types import DeviceCfg
     from cutamp.robots import load_t1_container
-    return load_t1_container(device_cfg)
+    return load_t1_container(DeviceCfg())
 
 
 def test_t1_container_is_single_robot(t1_container):

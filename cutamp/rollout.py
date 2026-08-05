@@ -17,7 +17,6 @@ ee/tool poses by looking up which arm each timestep's conf belongs to.
 from typing import Dict, List, Literal, Optional, Tuple, TypedDict
 
 import torch
-from jaxtyping import Float
 
 from curobo.types import JointState
 
@@ -28,7 +27,6 @@ from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
-    action_6dof_to_mat4x4,
 )
 
 
@@ -77,35 +75,17 @@ def get_conf_to_arm(
     return conf_to_arm
 
 
-def get_action_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
-    """Action parameter names (grasp/placement/push pose) per actionable op."""
-    action_params = []
-    for ground_op in plan_skeleton:
-        atype = ground_op.operator.metadata.action_type
-        vals = ground_op.values
-        if atype == "pick":
-            action_params.append(vals[1])
-        elif atype == "place":
-            action_params.append(vals[2])
-        elif atype == "push":
-            action_params.append(vals[1])
-        elif atype == "push_stick":
-            action_params.append(vals[3])
-    return action_params
-
-
 class Rollout(TypedDict):
     num_particles: int
-    confs: Float[torch.Tensor, "num_particles *h d"]
+    confs: torch.Tensor  # [num_particles, *h, d]
     conf_params: List[str]
-    robot_spheres: Float[torch.Tensor, "num_particles *h n 4"]
-    world_from_ee: Float[torch.Tensor, "num_particles *h 4 4"]
-    world_from_tool_desired: Float[torch.Tensor, "num_particles *h 4 4"]
-    world_from_ee_desired: Float[torch.Tensor, "num_particles *h 4 4"]
+    robot_spheres: torch.Tensor  # [num_particles, *h, n, 4]
+    world_from_ee: torch.Tensor  # [num_particles, *h, 4, 4]
+    world_from_tool_desired: torch.Tensor  # [num_particles, *h, 4, 4]
+    world_from_ee_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     gripper_close: List[bool]
     action_params: List[str]
-    obj_to_pose: Dict[str, Float[torch.Tensor, "num_particles *h 4 4"]]
-    action_to_ts: Dict[str, int]
+    obj_to_pose: Dict[str, torch.Tensor]  # each [num_particles, *h, 4, 4]
     action_to_pose_ts: Dict[str, int]
     ts_to_pose_ts: Dict[int, int]
 
@@ -118,8 +98,6 @@ class RolloutFunction:
     """
 
     def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration):
-        if config.enable_traj:
-            raise NotImplementedError("Trajectories are not supported in rollouts yet")
         self.plan_skeleton = plan_skeleton
         self.world = world
         self.config = config
@@ -129,15 +107,8 @@ class RolloutFunction:
             obj.name: self.world.get_object_pose(obj) for obj in self.world.movables
         }
 
-        if config.grasp_dof == 4:
-            self.grasp_to_mat4x4_fn = action_4dof_to_mat4x4
-        elif config.grasp_dof == 6:
-            self.grasp_to_mat4x4_fn = action_6dof_to_mat4x4
-        else:
-            raise ValueError(f"Unsupported {config.grasp_dof=}")
-
-        if config.place_dof != 4:
-            raise ValueError(f"Unsupported {config.place_dof=}")
+        assert config.grasp_dof == 4, f"Unsupported {config.grasp_dof=}"
+        self.grasp_to_mat4x4_fn = action_4dof_to_mat4x4
 
         self._is_first_rollout = True
 
@@ -184,7 +155,6 @@ class RolloutFunction:
         world_from_tool_desired: List[torch.Tensor] = []
         gripper_close: List[bool] = []
         action_params: List[str] = []
-        action_to_ts: Dict[str, int] = {}
         action_to_pose_ts: Dict[str, int] = {}
         ts_to_pose_ts: Dict[int, int] = {}
         action_to_arm: Dict[str, Optional[Literal["left", "right"]]] = {}
@@ -218,7 +188,6 @@ class RolloutFunction:
                 world_from_tool_desired.append(world_from_grasp)
                 gripper_close.append(True)
                 action_params.append(grasp_name)
-                action_to_ts[grasp_name] = ts
                 action_to_pose_ts[grasp_name] = pose_ts
                 action_to_arm[grasp_name] = arm
 
@@ -235,37 +204,9 @@ class RolloutFunction:
                 world_from_tool_desired.append(world_from_tool)
                 gripper_close.append(False)
                 action_params.append(place_name)
-                action_to_ts[place_name] = ts
                 action_to_pose_ts[place_name] = pose_ts
                 ts_to_pose_ts[ts] = pose_ts
                 action_to_arm[place_name] = arm
-
-            elif metadata.action_type == "push":
-                _, pose_name, _ = ground_op.values
-                world_from_push = action_4dof_to_mat4x4(particles[pose_name])
-                world_from_tool_desired.append(world_from_push)
-                gripper_close.append(True)
-                action_params.append(pose_name)
-                action_to_ts[pose_name] = ts
-                action_to_pose_ts[pose_name] = pose_ts
-                action_to_arm[pose_name] = arm
-
-            elif metadata.action_type == "push_stick":
-                _, stick_name, grasp_name, pose_name, _ = ground_op.values
-                world_from_stick = action_4dof_to_mat4x4(particles[pose_name])
-                world_from_tool = world_from_stick @ get_grasp_mat4x4(grasp_name)
-                for obj in self.world.movables:
-                    if obj.name == stick_name:
-                        obj_to_pose[obj.name].append(world_from_stick)
-                    else:
-                        obj_to_pose[obj.name].append(current_pose(obj.name))
-                pose_ts += 1
-                world_from_tool_desired.append(world_from_tool)
-                gripper_close.append(True)
-                action_params.append(pose_name)
-                action_to_ts[pose_name] = ts
-                action_to_pose_ts[pose_name] = pose_ts
-                action_to_arm[pose_name] = arm
 
             else:
                 raise ValueError(f"Unsupported operator {ground_op.operator.name}")
@@ -285,7 +226,7 @@ class RolloutFunction:
             for i, action in enumerate(action_params):
                 arm = action_to_arm.get(action)
                 tool_frame = self.world.tool_frame_for_arm(arm)
-                tool_from_ee = self.world.get_tool_from_ee(tool_frame)
+                tool_from_ee = self.world.tool_from_ee[tool_frame]
                 ee_desired_list.append(world_from_tool_desired[:, i] @ tool_from_ee)
             world_from_ee_desired = torch.stack(ee_desired_list, dim=1)
         else:
@@ -316,7 +257,6 @@ class RolloutFunction:
             gripper_close=gripper_close,
             action_params=action_params,
             obj_to_pose=obj_to_pose,
-            action_to_ts=action_to_ts,
             action_to_pose_ts=action_to_pose_ts,
             ts_to_pose_ts=ts_to_pose_ts,
         )

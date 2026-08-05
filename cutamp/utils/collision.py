@@ -80,17 +80,3 @@ class WorldCollisionCost:
             return_loss=return_loss,
         )
         return per_sphere.clamp(min=0.0).sum(dim=-1)
-
-
-def get_world_collision_cost(
-    scene: Scene,
-    device_cfg: DeviceCfg,
-    activation_distance: float,
-    weight: float = 1.0,
-) -> WorldCollisionCost:
-    """Build a callable world-collision cost for the given Scene.
-
-    Thin passthrough kept for the single caller in tamp_world.py; inlining it
-    there is deferred until that file is free to change.
-    """
-    return WorldCollisionCost(scene, device_cfg, activation_distance, weight)

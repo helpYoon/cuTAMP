@@ -15,9 +15,29 @@ The CUDA-gated tests build a real T1 processing kinematics and run FK +
 Jacobian on the GPU; they synthesize their own trajectories (no planner
 needed). The CPU tests cover the C2 endpoint math and the C3 error path.
 """
+import numpy as np
 import pytest
 
 from cutamp.tests.conftest import needs_cuda
+
+
+def _quat_conjugate_wxyz(q: np.ndarray) -> np.ndarray:
+    """wxyz conjugate (= inverse for unit quaternions)."""
+    out = q.copy()
+    out[..., 1:] *= -1.0
+    return out
+
+
+def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two wxyz quaternions (broadcasts)."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return np.stack([
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+    ], axis=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -36,8 +56,6 @@ def test_jacobian_velocity_matches_fk_central_difference():
     from cutamp.utils.plan_processor import (
         _build_processing_kinematics,
         LEFT_TOOL_FRAME,
-        _quat_conjugate_wxyz,
-        _quat_mul_wxyz,
     )
     from curobo.types import JointState
 

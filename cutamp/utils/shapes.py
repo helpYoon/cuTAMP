@@ -10,120 +10,14 @@
 import logging
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Tuple, List, Optional
 
-import numpy as np
 import torch
 import trimesh
 from _heapq import heappush, heappop
-from jaxtyping import Float
 
-from curobo.sphere_fit import SphereFitType
-from curobo.scene import Obstacle, Sphere
-from curobo.types import DeviceCfg as TensorDeviceType
-from curobo.types import Pose
+from curobo.scene import Obstacle
 
 _log = logging.getLogger(__name__)
-
-
-@dataclass
-class MultiSphere(Obstacle):
-    """Obstacle represented as a collection of spheres."""
-
-    #: Spheres, (n, 4) where each row is (x, y, z, radius)
-    spheres: Float[torch.Tensor, "n 4"] = field(default_factory=lambda: torch.tensor([]))
-
-    def __post_init__(self):
-        # Check spheres is not empty and (n, 4)
-        self.spheres = self.spheres.to(self.device_cfg.device)
-        if len(self.spheres) == 0:
-            raise ValueError("Spheres must not be empty")
-        if self.spheres.ndim != 2 or self.spheres.shape[1] != 4:
-            raise ValueError(f"Spheres should be (n, 4) not {self.spheres.shape}")
-
-    def get_trimesh_mesh(self, process: bool = True, process_color: bool = True) -> trimesh.Trimesh:
-        """Create a trimesh instance from the obstacle representation.
-
-        Args:
-            process: Flag is not used.
-            process_color: Flag is not used.
-
-        Returns:
-            trimesh.Trimesh: Instance of obstacle as a trimesh.
-        """
-        # Create base icosphere
-        base_sphere = trimesh.creation.icosphere(radius=1.0)
-        all_vertices = []
-        all_faces = []
-
-        # Vertex count so we can accumulate them for the faces
-        vertex_count = 0
-        for sphere in self.spheres.cpu().numpy():
-            # Scale and translate the base sphere
-            x, y, z, radius = sphere
-            vertices = base_sphere.vertices * radius + [x, y, z]
-
-            # Add vertices and faces for this sphere
-            all_vertices.append(vertices)
-            all_faces.append(base_sphere.faces + vertex_count)
-            vertex_count += len(vertices)
-
-        # Combine all vertices and faces to create the final mesh
-        vertices = np.vstack(all_vertices)
-        faces = np.vstack(all_faces)
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-
-        if self.color is not None:
-            color_visual = trimesh.visual.color.ColorVisuals(
-                mesh=mesh, face_colors=self.color, vertex_colors=self.color
-            )
-            mesh.visual = color_visual
-        return mesh
-
-    def get_mesh_data(self, process: bool = True) -> Tuple[List[List[float]], List[int]]:
-        m = self.get_trimesh_mesh(process=process)
-        verts = m.vertices.view(np.ndarray)
-        faces = m.faces
-        return verts, faces
-
-    def get_bounding_spheres(
-        self,
-        n_spheres: int = 1,
-        surface_sphere_radius: float = 0.002,
-        fit_type: SphereFitType = SphereFitType.VOXEL,
-        voxelize_method: str = "ray",
-        pre_transform_pose: Optional[Pose] = None,
-        tensor_args: TensorDeviceType = TensorDeviceType(),
-    ) -> List[Sphere]:
-        """Use the ground truth spheres as the bounding spheres. Ignores most of the arguments.
-
-        Intentionally overrides cuRobo's public ``Obstacle.get_bounding_spheres``:
-        the base implementation would sphere-fit the trimesh mesh instead of
-        reusing the exact spheres this obstacle is defined by. Do not delete.
-        """
-        pts = self.spheres[:, :3].cpu().numpy()
-        n_radius = self.spheres[:, 3].cpu().numpy()
-
-        obj_pose = Pose.from_list(self.pose, tensor_args)
-        if pre_transform_pose is not None:
-            obj_pose = pre_transform_pose.multiply(obj_pose)  # convert object pose to another frame
-
-        if pts is None or len(pts) == 0:
-            raise ValueError("No points found from the spheres")
-
-        points_cuda = tensor_args.to_device(pts)
-        pts = obj_pose.transform_points(points_cuda).cpu().view(-1, 3).numpy()
-
-        new_spheres = [
-            Sphere(
-                name=f"{self.name}_sph_{i}",
-                pose=[pts[i, 0], pts[i, 1], pts[i, 2], 1, 0, 0, 0],
-                radius=n_radius[i],
-            )
-            for i in range(pts.shape[0])
-        ]
-        return new_spheres
 
 
 def sample_greedy_surface_spheres(
@@ -131,17 +25,13 @@ def sample_greedy_surface_spheres(
     n_spheres: int,
     sphere_radius: float,
     n_samples: int = 1000,
-) -> Float[torch.Tensor, "n 4"]:
+) -> torch.Tensor:
     """
     Samples approximately non-overlapping surface spheres on a 3D object using a greedy algorithm. Thanks Caelan!
 
     Samples points on the object's surface mesh, constructs a neighborhood graph using a KD-tree,
     and greedily selects points that are far apart (non-overlapping) based on radius.
     """
-    if isinstance(obj, MultiSphere):
-        _log.debug(f"{obj.name} is MultiSphere, using existing spheres of shape {obj.spheres.shape}")
-        return obj.spheres
-
     # Need to temporarily override the pose, so the trimesh mesh is at the origin
     start_time = time.perf_counter()
     og_pose = obj.pose

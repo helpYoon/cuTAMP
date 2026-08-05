@@ -20,9 +20,6 @@ classifiers = [
 ]
 
 dependencies = [
-    "einops",
-    "jaxtyping",
-    "open3d",
     "rerun-sdk",
     "roma",
     "tqdm",
@@ -33,6 +30,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "ruff",
+]
+editor = [
+    "open3d",
 ]
 
 [tool.ruff]

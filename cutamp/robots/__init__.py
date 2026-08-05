@@ -5,10 +5,9 @@ T1 humanoid is the only supported robot. The ``RobotContainer`` exposes its
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List
 
 import torch
-from jaxtyping import Float
 
 from curobo.kinematics import Kinematics
 from curobo.types import DeviceCfg
@@ -23,7 +22,6 @@ from .t1 import (
     load_t1_rerun,
     t1_home,
 )
-from .utils import RerunRobot
 
 
 @dataclass(frozen=True)
@@ -36,10 +34,10 @@ class RobotContainer:
 
     name: str
     kinematics: Kinematics
-    joint_limits: Float[torch.Tensor, "2 d"]
+    joint_limits: torch.Tensor  # [2, d]
     tool_frames: List[str]
-    tool_from_ee: Dict[str, Float[torch.Tensor, "4 4"]]
-    gripper_spheres: Dict[str, Float[torch.Tensor, "n 4"]]
+    tool_from_ee: Dict[str, torch.Tensor]  # each [4, 4]
+    gripper_spheres: Dict[str, torch.Tensor]  # each [n, 4]
 
 
 def load_t1_container(device_cfg: DeviceCfg = None) -> RobotContainer:
@@ -64,23 +62,3 @@ def load_t1_container(device_cfg: DeviceCfg = None) -> RobotContainer:
         tool_from_ee=tool_from_ee,
         gripper_spheres=spheres,
     )
-
-
-def load_rerun_robot(robot: str = "t1", load_mesh: bool = True) -> RerunRobot:
-    if robot != "t1":
-        raise ValueError(f"Unknown robot: {robot}. Only 't1' is supported.")
-    return load_t1_rerun(load_mesh)
-
-
-def get_q_home(robot: str = "t1") -> Sequence[float]:
-    if robot != "t1":
-        raise ValueError(f"Unknown robot: {robot}. Only 't1' is supported.")
-    return t1_home
-
-
-def load_robot_container(
-    robot: str = "t1", device_cfg: DeviceCfg = None,
-) -> RobotContainer:
-    if robot != "t1":
-        raise ValueError(f"Unknown robot: {robot}. Only 't1' is supported.")
-    return load_t1_container(device_cfg)

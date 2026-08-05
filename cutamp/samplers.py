@@ -11,13 +11,11 @@ from typing import Optional
 
 import torch
 from curobo.scene import Cuboid, Mesh, Obstacle
-from jaxtyping import Float
 
 from cutamp.utils.common import approximate_goal_aabb, pose_list_to_mat4x4, transform_points
-from cutamp.utils.shapes import MultiSphere
 
-Grasp4DOF = Place4DOF = Float[torch.Tensor, "n 4"]
-Grasp6DOF = Place6DOF = Float[torch.Tensor, "n 6"]
+Grasp4DOF = Place4DOF = torch.Tensor  # [n, 4]
+Grasp6DOF = Place6DOF = torch.Tensor  # [n, 6]
 
 
 def sample_yaw(num_samples: int, num_faces: Optional[int], device: torch.device):
@@ -34,44 +32,16 @@ def sample_yaw(num_samples: int, num_faces: Optional[int], device: torch.device)
     return yaw
 
 
-def sample_stick_grasps(num_samples: int, stick: MultiSphere) -> Grasp4DOF:
-    """Sample 4-DOF grasps for a stick."""
-    spheres = stick.spheres
-    if not (spheres[:, 1:3] == 0.0).all():
-        raise ValueError(f"Expected stick spheres to have y and z positions of 0")
-
-    # Randomly sample x-coordinate of the sphere
-    sphere_x = spheres[:, 0]
-    x_idxs = torch.randint(0, len(sphere_x), (num_samples,), device=spheres.device)
-    sampled_x = sphere_x[x_idxs]
-
-    # Sample yaws, use two faces since we just want original orientation and mirrored 180 degrees
-    yaw = sample_yaw(num_samples, num_faces=2, device=spheres.device)
-
-    # Create 4-DOF grasp!
-    grasp_4dof = torch.zeros((num_samples, 4), device=spheres.device)
-    grasp_4dof[:, 0] = sampled_x
-    grasp_4dof[:, 3] = yaw
-    return grasp_4dof
-
-
 def grasp_4dof_sampler(
-    num_samples: int, obj: Obstacle, obj_spheres: Float[torch.Tensor, "n 4"], num_faces: Optional[int] = None
+    num_samples: int, obj: Obstacle, obj_spheres: torch.Tensor, num_faces: Optional[int] = None
 ) -> Grasp4DOF:
     """
     Sample 4-DOF grasps for the given object in the object's coordinate frame.
     This could be made a lot more sophisticated.
     """
-    # Handle the stick as a special case
-    if obj.name == "stick":
-        obj: MultiSphere
-        return sample_stick_grasps(num_samples, obj)
-
     # Determine point to grasp from the top of the object
     if isinstance(obj, Cuboid):
         obj_half_z = max(0.0, obj.dims[2] / 2 - 0.02)  # grasp 2cm from top of object
-    elif isinstance(obj, MultiSphere):
-        obj_half_z = 0.0
     else:
         max_z = obj_spheres[:, 2].max()
         obj_half_z = max_z - 0.02  # 2cm from top of obejct
@@ -88,7 +58,7 @@ def grasp_4dof_sampler(
     return grasp_4dof
 
 
-def grasp_6dof_sampler(num_samples: int, obj: Obstacle, num_faces: Optional[int] = None) -> Grasp6DOF:
+def grasp_6dof_sampler(num_samples: int, obj: Obstacle) -> Grasp6DOF:
     """
     Sample 6-DOF grasps for the given object in the object's coordinate frame.
     Note: this is a very simple sampler which was written for the bookshelf domain and isn't general enough.
@@ -130,7 +100,7 @@ def grasp_6dof_sampler(num_samples: int, obj: Obstacle, num_faces: Optional[int]
 
 
 def place_4dof_sampler(
-    num_samples: int, obj: Obstacle, obj_spheres: Float[torch.Tensor, "n 4"], surface: Obstacle
+    num_samples: int, obj: Obstacle, obj_spheres: torch.Tensor, surface: Obstacle
 ) -> Place4DOF:
     """Sample 4-DOF placement poses in the world frame. This does not yet fully support surfaces with yaw."""
     if not isinstance(surface, (Cuboid, Mesh)):

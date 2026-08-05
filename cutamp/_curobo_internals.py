@@ -167,19 +167,16 @@ def restore_cspace_target_dof_weight(
             cfg.cspace_target_dof_weight.copy_(saved.to(cfg.cspace_target_dof_weight))
 
 
-def inactive_arm_cspace_weights(
-    host, active_arm: str, *, pin_weight: float = 1000.0, default_weight: float = 1.0,
+def build_pin_weights(
+    host, pin_names: Iterable[str], pin_weight: float = 1000.0, default_weight: float = 1.0,
 ) -> torch.Tensor:
-    """Build the per-DOF cspace target weight tensor that pins the inactive arm.
+    """Build a per-DOF cspace target weight tensor: ``default_weight``
+    everywhere, ``pin_weight`` on ``pin_names``.
 
-    Sized to the host's active cspace (post-lock_joints). The returned tensor is
-    on the same device/dtype as the host's cspace cost weight.
+    Sized to the host's active cspace (post-lock_joints); names not in the
+    active cspace are silently skipped. The returned tensor is on the same
+    device/dtype as the host's cspace cost weight.
     """
-    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
-
-    inactive_names = (
-        RIGHT_ARM_JOINT_NAMES if active_arm == "left" else LEFT_ARM_JOINT_NAMES
-    )
     costs = _cspace_costs_from_rollouts(iter_rollouts(host))
     if not costs:
         raise RuntimeError("Host has no rollouts with a cspace cost.")
@@ -187,11 +184,23 @@ def inactive_arm_cspace_weights(
     active_names = list(host.kinematics.joint_names)
     weights = torch.full((len(active_names),), default_weight, device=ref.device, dtype=ref.dtype)
     name_to_idx = {n: i for i, n in enumerate(active_names)}
-    for n in inactive_names:
+    for n in pin_names:
         i = name_to_idx.get(n)
         if i is not None:
             weights[i] = pin_weight
     return weights
+
+
+def inactive_arm_cspace_weights(
+    host, active_arm: str, *, pin_weight: float = 1000.0, default_weight: float = 1.0,
+) -> torch.Tensor:
+    """Build the per-DOF cspace target weight tensor that pins the inactive arm."""
+    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
+
+    inactive_names = (
+        RIGHT_ARM_JOINT_NAMES if active_arm == "left" else LEFT_ARM_JOINT_NAMES
+    )
+    return build_pin_weights(host, inactive_names, pin_weight, default_weight)
 
 
 # TODO: file upstream issue against cuRobo. RobotCostManager.compute_costs
