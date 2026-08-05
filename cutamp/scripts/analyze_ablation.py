@@ -89,8 +89,8 @@ def _write_csv(agg, path):
 
 
 def _write_md(agg, path):
-    lines = ["| cell | height | satisfying | CoM-feasible | best soft (CoM-feas.) | margin [m] | traj viol. | loop [s] |",
-             "|---|---|---|---|---|---|---|---|"]
+    lines = ["| cell | height | satisfying | CoM-feasible | best soft (CoM-feas.) | margin [m] | motion plan | traj viol. | loop [s] |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for (cell, height), m in sorted(agg.items(), key=lambda kv: (kv[0][1], CELL_ORDER.index(kv[0][0]))):
         def fmt(name, digits=1):
             if name not in m:
@@ -100,7 +100,7 @@ def _write_md(agg, path):
         lines.append(
             f"| {CELL_LABEL[cell]} | {height:.2f} | {fmt('num_satisfying_final', 0)} "
             f"| {fmt('num_satisfying_com_feasible', 0)} | {fmt('best_soft_cost_com_feasible')} "
-            f"| {fmt('best_com_margin', 3)} | {fmt('traj_com_violation_frac', 3)} | {fmt('loop_s', 0)} |"
+            f"| {fmt('best_com_margin', 3)} | {fmt('motion_plan_success', 2)} | {fmt('traj_com_violation_frac', 3)} | {fmt('loop_s', 0)} |"
         )
     Path(path).write_text("\n".join(lines) + "\n")
 
