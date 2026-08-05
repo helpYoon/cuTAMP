@@ -1,8 +1,9 @@
 """Analysis pipeline on synthetic experiment dirs (no GPU)."""
 import json
+import statistics
 from pathlib import Path
 
-from cutamp.scripts.analyze_ablation import aggregate, load_study
+from cutamp.scripts.analyze_ablation import aggregate, aggregate_deltas, compute_deltas, load_study
 
 
 def _fake_run(root: Path, cell, height, seed, sat=100, sat_com=90):
@@ -110,6 +111,85 @@ def test_main_writes_outputs(tmp_path, monkeypatch):
     ])
     analyze_ablation.main()
     assert (tmp_path / "out" / "results.csv").exists()
+    assert (tmp_path / "out" / "deltas.csv").exists()
     assert (tmp_path / "out" / "results.md").exists()
+    md = (tmp_path / "out" / "results.md").read_text()
+    assert "Per-seed deltas vs. `full`" in md
     figs = list((tmp_path / "out" / "figures").glob("*.png"))
     assert len(figs) >= 3
+
+
+def test_motion_plan_success_false_counts_in_aggregate(tmp_path):
+    """A curobo_plan run that never reached motion planning now writes
+    motion_plan_success=False (not an absent key, see algorithm.py's
+    overall_metrics init); the analyzer must count it in the per-cell
+    mean instead of silently dropping it from the denominator. Also
+    covers found_solution, which is written to overall_metrics.json in
+    every run but wasn't previously consumed by the analyzer."""
+    exp = tmp_path / "ablation_full_h000_s0"
+    (exp / "optimization").mkdir(parents=True)
+    (exp / "optimization" / "opt_0001.json").write_text(json.dumps({
+        "num_satisfying_final": 0, "elapsed": [0.1], "num_steps": 30,
+    }))
+    (exp / "overall_metrics.json").write_text(json.dumps({
+        "motion_plan_success": False, "found_solution": False,
+    }))
+    manifest = [{"cell": "full", "height": 0.0, "seed": 0,
+                 "experiment_id": exp.name, "status": "done",
+                 "experiment_path": str(exp)}]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    records = load_study(tmp_path / "manifest.json")
+    assert records[0]["motion_plan_success"] == 0.0
+    assert records[0]["found_solution"] == 0.0
+    agg = aggregate(records)
+    assert agg[("full", 0.0)]["motion_plan_success"] == (0.0, 0.0)
+    assert agg[("full", 0.0)]["found_solution"] == (0.0, 0.0)
+
+
+def test_loop_s_sums_across_opt_files(tmp_path):
+    """Multi-skeleton run: two abandoned plan skeletons before the one
+    that finally succeeds, each writing its own opt_*.json. loop_s must
+    be the run's total optimization wall-clock (sum of each file's final
+    `elapsed`), not just the last skeleton's — previously it silently
+    under-reported loop_s (and thus ms/step) on any multi-skeleton run."""
+    exp = tmp_path / "ablation_full_h000_s0"
+    (exp / "optimization").mkdir(parents=True)
+    for i, (elapsed_final, sat) in enumerate([(5.0, 0), (7.0, 0), (3.0, 100)], start=1):
+        opt = {
+            "num_satisfying_final": sat,
+            "elapsed": [0.0, elapsed_final],
+            "num_steps": 30,
+        }
+        (exp / "optimization" / f"opt_{i:04d}.json").write_text(json.dumps(opt))
+    manifest = [{"cell": "full", "height": 0.0, "seed": 0,
+                 "experiment_id": exp.name, "status": "done",
+                 "experiment_path": str(exp)}]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    records = load_study(tmp_path / "manifest.json")
+    assert len(records) == 1
+    assert records[0]["loop_s"] == 15.0  # 5 + 7 + 3
+    assert records[0]["num_satisfying_final"] == 100  # from the LAST file only
+    assert records[0]["ms_per_step"] == 1000.0 * 15.0 / 90  # 3 files * 30 steps each
+
+
+def test_compute_deltas_paired_by_height_and_seed():
+    records = [
+        {"cell": "full", "height": 0.0, "seed": 0, "num_satisfying_final": 100, "loop_s": 10.0},
+        {"cell": "full", "height": 0.0, "seed": 1, "num_satisfying_final": 80, "loop_s": 12.0},
+        {"cell": "standard", "height": 0.0, "seed": 0, "num_satisfying_final": 60, "loop_s": 20.0},
+        {"cell": "standard", "height": 0.0, "seed": 1, "num_satisfying_final": 90, "loop_s": 8.0},
+        # seed 2 has no `full` counterpart at this height: must be dropped, not paired.
+        {"cell": "standard", "height": 0.0, "seed": 2, "num_satisfying_final": 50, "loop_s": 5.0},
+    ]
+    rows = compute_deltas(records)
+    by_metric = {(r["seed"], r["metric"]): r["delta"] for r in rows if r["cell"] == "standard"}
+    assert by_metric[(0, "num_satisfying_final")] == -40
+    assert by_metric[(1, "num_satisfying_final")] == 10
+    assert by_metric[(0, "loop_s")] == 10.0
+    assert by_metric[(1, "loop_s")] == -4.0
+    assert (2, "num_satisfying_final") not in by_metric
+    assert all(r["cell"] != "full" for r in rows)  # full is never a delta target
+
+    agg = aggregate_deltas(rows)
+    mean, std = agg[("standard", 0.0)]["num_satisfying_final"]
+    assert mean == -15.0 and round(std, 3) == round(statistics.stdev([-40, 10]), 3)

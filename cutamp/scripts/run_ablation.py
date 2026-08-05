@@ -46,8 +46,10 @@ def build_run_plan(heights=HEIGHTS, seeds=SEEDS, smoke=False):
     return plan
 
 
-def _subprocess_exec(run):
-    cmd = [sys.executable, "-m", "cutamp.scripts.run_cutamp"] + run["args"]
+def _subprocess_exec(run, experiment_root):
+    cmd = [sys.executable, "-m", "cutamp.scripts.run_cutamp"] + run["args"] + [
+        "--experiment_root", str(experiment_root),
+    ]
     print(f"[{run['experiment_id']}] {' '.join(cmd)}", flush=True)
     return subprocess.call(cmd, env={"PYTHONPATH": "", **_clean_env()})
 
@@ -59,9 +61,24 @@ def _clean_env():
     return env
 
 
-def run_study(plan, out_dir, execute=_subprocess_exec, experiment_root="/tmp/cutamp-experiments"):
+def run_study(plan, out_dir, execute=None, experiment_root=None):
+    """Run (or resume) a study's plan, writing a resumable manifest.
+
+    ``experiment_root`` defaults to ``<out_dir>/experiments`` so each
+    study is self-contained under its own ``--out`` dir — two studies (or
+    a real run followed by a ``--smoke`` pilot) never share an
+    experiment_root and can't silently overwrite each other's experiment
+    dirs, even though experiment IDs alone (``ablation_full_h000_s0``)
+    aren't study-discriminated.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if experiment_root is None:
+        experiment_root = out_dir / "experiments"
+    experiment_root = Path(experiment_root)
+    if execute is None:
+        def execute(run, _experiment_root=experiment_root):
+            return _subprocess_exec(run, _experiment_root)
     manifest_path = out_dir / "manifest.json"
     manifest = json.load(open(manifest_path)) if manifest_path.exists() else []
     done = {r["experiment_id"] for r in manifest if r.get("status") == "done"}
@@ -73,7 +90,7 @@ def run_study(plan, out_dir, execute=_subprocess_exec, experiment_root="/tmp/cut
         manifest.append({
             **{k: run[k] for k in ("cell", "height", "seed", "experiment_id")},
             "status": "done" if code == 0 else f"failed({code})",
-            "experiment_path": str(Path(experiment_root) / run["experiment_id"]),
+            "experiment_path": str(experiment_root / run["experiment_id"]),
         })
         tmp_path = manifest_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(manifest, indent=1))

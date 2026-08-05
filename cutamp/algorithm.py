@@ -203,20 +203,21 @@ def _motion_plan_with_retries(
     timer: TorchTimer,
     visualizer,
     get_planner=None,
-) -> Tuple[Optional[dict], Optional[dict], bool]:
+) -> Tuple[Optional[dict], Optional[dict], bool, int]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
     its internal retries; a different particle gives a different pair and
     usually succeeds.
 
-    Returns ``(curobo_plan, audit, skip_plan)``:
+    Returns ``(curobo_plan, audit, skip_plan, attempts)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
         failed.
       - ``audit``: the measure-only trajectory CoM audit dict from
         ``solve_curobo``, or ``None`` if all candidates failed.
       - ``skip_plan``: ``True`` if a ``NotImplementedError`` was raised — the
         caller should skip this plan_skeleton entirely and move on.
+      - ``attempts``: number of candidates actually tried (retries used).
     """
     last_err = None
     for rank, particle in enumerate(candidates):
@@ -229,12 +230,12 @@ def _motion_plan_with_retries(
                 _log.warning(
                     f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
                 )
-            return curobo_plan, audit, False
+            return curobo_plan, audit, False, rank + 1
         except NotImplementedError as e:
             _log.warning(
                 f"Motion planning not supported for this plan: {e}. Trying next plan..."
             )
-            return None, None, True
+            return None, None, True, rank + 1
         except RuntimeError as e:
             _log.warning(
                 f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
@@ -244,7 +245,7 @@ def _motion_plan_with_retries(
         f"Exhausted {len(candidates)} particle retries; giving up on this plan. "
         f"Last error: {last_err}"
     )
-    return None, None, False
+    return None, None, False, len(candidates)
 
 
 def setup_cutamp(
@@ -393,6 +394,15 @@ def run_cutamp(
         "best_cost": float("inf"),
         "best_soft_cost": float("inf"),
     }
+    if config.curobo_plan:
+        # Default to False so a run that never reaches motion planning
+        # (e.g. no satisfying particles found for any skeleton) still
+        # reports motion_plan_success=False instead of an absent key —
+        # an absent key drops the run from the analyzer's mean entirely,
+        # biasing the per-cell denominator toward runs that got far
+        # enough to attempt planning. Runs without curobo_plan never had
+        # a chance to plan, so the key stays absent for them.
+        overall_metrics["motion_plan_success"] = False
     curobo_plan = None
     found_solution = False
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker)
@@ -428,11 +438,12 @@ def run_cutamp(
                     plan_info, config, constraint_checker, cost_reducer,
                     n=config.motion_plan_max_retries,
                 )
-                curobo_plan, traj_audit, skip_plan = _motion_plan_with_retries(
+                curobo_plan, traj_audit, skip_plan, attempts = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
                     get_planner=get_planner,
                 )
                 overall_metrics["motion_plan_success"] = bool(curobo_plan)
+                overall_metrics["motion_plan_attempts"] = attempts
                 if skip_plan or curobo_plan is None:
                     continue
                 overall_metrics.update(traj_audit)

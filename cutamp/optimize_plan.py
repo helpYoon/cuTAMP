@@ -729,7 +729,7 @@ class ParticleOptimizer:
                 ]
                 opt_metrics["best_com_margin"] = min(margins) if margins else None
         except Exception as e:
-            _log.debug(f"COM-in-polygon summary skipped: {e}")
+            _log.warning(f"COM-in-polygon summary skipped: {e}")
 
         # Log initial state
         timer.start("visualize_rollout")
