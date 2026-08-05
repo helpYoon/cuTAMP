@@ -23,8 +23,12 @@ SUPPORTED_SOFT_COSTS = (
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
-    # Number of particles to initialize and optimize over
-    num_particles: int = 1024
+    # Number of particles to initialize and optimize over. The IK solver's
+    # buffers are sized to this (ik_max_batch_size), so it bounds GPU memory:
+    # 1024 OOMs a 24 GB card at solver build, 512 peaks near ~17 GB, 256
+    # leaves room for two concurrent runs. Default lowered 1024 -> 256
+    # (2026-08-05); pass -n for larger sweeps.
+    num_particles: int = 256
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
