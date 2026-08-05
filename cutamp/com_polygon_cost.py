@@ -189,6 +189,25 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     return pen <= COM_TOL
 
 
+def com_margin_from_base(com_in_base: torch.Tensor) -> torch.Tensor:
+    """Static stability margin (McGhee & Frank): min over the two axes of
+    ``h - |c|`` for base-frame CoM points ``[N, >=2]``. Positive inside the
+    support rectangle, zero on an edge, negative outside. Metres."""
+    half = torch.tensor(
+        COM_HALF_EXTENTS, device=com_in_base.device, dtype=com_in_base.dtype
+    )
+    return (half - com_in_base[..., :2].abs()).min(dim=-1).values
+
+
+def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
+    """``[B]`` stability margins for full-cspace configs via FK.
+
+    Measure-only companion to :func:`compute_com_polygon_mask`; used by the
+    ablation study's shared yardstick (recorded in every arm)."""
+    com, base_T = _fk_com_and_base(world, q_batch)
+    return com_margin_from_base(_project_com_to_base(com, base_T))
+
+
 def compute_com_polygon_penalties(
     world,
     particles: "dict[str, torch.Tensor]",
