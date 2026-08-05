@@ -678,6 +678,15 @@ class ParticleOptimizer:
         opt_metrics["best_soft_cost"] = best_soft_cost
         opt_metrics["best_hard_cost"] = best_hard_cost
 
+        # Visualize rollout of the best particle in terms of soft costs, which is just trajectory length if no
+        # other soft costs are specified. If no satisfying particles, just visualize lowest overall cost particle.
+        if num_satisfying > 0:
+            best_satisfying_idx = soft_costs[satisfying_mask].argmin()
+            best_idx = indices[satisfying_mask][best_satisfying_idx]
+        else:
+            best_idx = costs.argmin()
+        best_idx_int = int(best_idx.item())
+
         # Post-optimization COM-polygon visibility: report per-conf how many
         # final particles' configurations are inside the foot-realistic
         # support polygon. Useful diagnostic — COM is a soft cost (not in
@@ -702,16 +711,25 @@ class ParticleOptimizer:
                 opt_metrics["com_in_polygon_per_conf"] = {
                     cn: int(mask.sum().item()) for cn, mask in conf_to_mask.items()
                 }
+
+                # Ablation yardstick (measure-only, recorded in EVERY arm):
+                # a particle is CoM-feasible iff ALL its confs are in-polygon.
+                all_conf_ok = torch.stack(list(conf_to_mask.values()), dim=0).all(dim=0)
+                sat_and_com = satisfying_mask & all_conf_ok
+                opt_metrics["num_satisfying_com_feasible"] = int(sat_and_com.sum().item())
+                soft_np = soft_costs[sat_and_com]
+                opt_metrics["best_soft_cost_com_feasible"] = (
+                    soft_np.min().item() if sat_and_com.any() else None
+                )
+                # Margin of the selected best particle: min over its confs.
+                from cutamp.com_polygon_cost import compute_com_margin
+                margins = [
+                    compute_com_margin(rollout_fn.world, particles[cn][best_idx_int : best_idx_int + 1]).item()
+                    for cn in conf_names
+                ]
+                opt_metrics["best_com_margin"] = min(margins) if margins else None
         except Exception as e:
             _log.debug(f"COM-in-polygon summary skipped: {e}")
-
-        # Visualize rollout of the best particle in terms of soft costs, which is just trajectory length if no
-        # other soft costs are specified. If no satisfying particles, just visualize lowest overall cost particle.
-        if num_satisfying > 0:
-            best_satisfying_idx = soft_costs[satisfying_mask].argmin()
-            best_idx = indices[satisfying_mask][best_satisfying_idx]
-        else:
-            best_idx = costs.argmin()
 
         # Log initial state
         timer.start("visualize_rollout")

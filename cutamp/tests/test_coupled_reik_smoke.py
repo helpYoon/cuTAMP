@@ -27,3 +27,15 @@ def test_coupled_reik_runs_without_error(tmp_path):
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     # cutamp_demo returns without raising if --coupled_reik path is healthy.
     cutamp_demo(env, config)
+
+    import glob, json
+
+    opt_files = sorted(glob.glob(str(tmp_path / "**" / "optimization" / "opt_*.json"), recursive=True))
+    assert opt_files, "no optimization metrics written"
+    opt_metrics = json.load(open(opt_files[-1]))
+
+    # Ablation yardstick: measure-only metrics recorded in EVERY arm.
+    assert "num_satisfying_com_feasible" in opt_metrics
+    assert "best_com_margin" in opt_metrics
+    assert "best_soft_cost_com_feasible" in opt_metrics
+    assert opt_metrics["num_satisfying_com_feasible"] <= opt_metrics["num_satisfying_final"]
