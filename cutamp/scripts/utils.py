@@ -16,7 +16,6 @@ from cutamp.task_planning.constraints import (
     StablePlacement,
     Collision,
     Motion,
-    ValidPush,
 )
 from cutamp.task_planning.costs import TrajectoryLength
 from cutamp.com_polygon_cost import COM_TOL
@@ -40,7 +39,6 @@ default_constraint_to_mult = {
         "align_yaw": 5e-2,
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
-        "com_polygon": 10,  # Penalize COM projection outside the base rectangle
         # Hinge² band penalties are O(1e-3) rad² (0.05 rad intrusion into the
         # 0.1 band ≈ 2.5e-3). Tuned in the Task-6 verification battery
         # (2026-06-11): 1e2 left endpoint offenders; 1e3 cleared every
@@ -61,18 +59,7 @@ default_constraint_to_tol = {
         # You might need to add additional tolerances if your support surfaces have different names
         "goal_in_xy": 1e-3,
         "goal_support": 1e-2,
-        "platform0_in_xy": 1e-3,
-        "platform0_support": 1e-2,
-        "floor_in_xy": 1e-3,
-        "floor_support": 1e-2,
-        "table_in_xy": 1e-3,
-        "table_support": 1e-2,
-        "shelf_in_xy": 1e-3,
-        "shelf_support": 1e-2,
-        "stove_in_xy": 1e-3,
-        "stove_support": 1e-2,
     },
-    ValidPush.type: {"dist_from_button": 0.0},
     # ComPolygon per-conf values are continuous penalty in m² from
     # compute_com_polygon_penalties. With the max-over-axes barrier, the
     # on-boundary penalty (edge OR corner) == COM_TOL == inside_weight *

@@ -25,7 +25,7 @@ Requires:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Type, Union
+from typing import Type
 
 import torch
 
@@ -47,9 +47,9 @@ COM_TOL = 4e-4                       # == COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN*
 @dataclass
 class ComOverBasePolygonCostCfg(BaseCostCfg):
     #: Half-extents of the rectangle in ``mobile_base_link`` frame (X, Y) in
-    #: meters. Default ``COM_HALF_EXTENTS`` = ``(0.1115, 0.156)`` — the two-foot
-    #: support hull per actual_robot.urdf (22.3 cm fore/aft × 31.2 cm lateral).
-    half_extents: Optional[Union[torch.Tensor, List[float]]] = None
+    #: meters, as a ``[2]`` tensor. ``COM_HALF_EXTENTS`` = ``(0.1115, 0.156)``
+    #: is the two-foot support hull per actual_robot.urdf.
+    half_extents: torch.Tensor = None
     #: Distance inside the edge at which the soft barrier starts (meters).
     #: ``0`` disables the barrier (outside-only penalization).
     inside_margin: float = COM_INSIDE_MARGIN
@@ -62,10 +62,6 @@ class ComOverBasePolygonCostCfg(BaseCostCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.half_extents is None:
-            self.half_extents = list(COM_HALF_EXTENTS)
-        if isinstance(self.half_extents, list):
-            self.half_extents = torch.tensor(self.half_extents)
         self.half_extents = self.half_extents.to(
             self.device_cfg.device, dtype=self.device_cfg.dtype
         )
@@ -75,8 +71,7 @@ def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor) -> torch
     """Project world-frame COM points into the base frame's XY plane.
 
     Closed-form SE(3) inverse-transform: ``T_inv @ [p; 1] = R^T (p - t)``.
-    Single home of the projection, shared by :func:`com_polygon_penalty` and
-    :func:`compute_com_in_base`.
+    Single home of the projection, used by :func:`com_polygon_penalty`.
 
     Args:
         com_world: ``[N, 3]`` COM in world frame.
@@ -96,7 +91,6 @@ def com_polygon_penalty(
     half_extents: torch.Tensor,
     inside_margin: float,
     inside_weight: float,
-    center_weight: float = 0.0,
 ) -> torch.Tensor:
     """Per-sample COM-over-rectangle penalty in ``mobile_base_link`` frame.
 
@@ -107,10 +101,6 @@ def com_polygon_penalty(
         inside_margin: width of the inside soft-barrier band (meters).
         inside_weight: relative scale of the inside barrier vs the outside
             quadratic.
-        center_weight: optional pull-to-center term
-            ``center_weight * Σ(com_in_base/half_extents)²`` active
-            everywhere inside; 0 (default) preserves the pure barrier the
-            hard gate's COM_TOL is calibrated to.
 
     Returns:
         ``[N]`` non-negative penalty.
@@ -123,10 +113,7 @@ def com_polygon_penalty(
     # near a corner the nearest-edge margin — not the sum of both — is what
     # bounds tip-over. Summing double-counts corners and wrongly rejects
     # COM-feasible configs (see test_com_polygon_penalty_corner_*).
-    penalty = (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).max(dim=-1).values
-    if center_weight:
-        penalty = penalty + center_weight * ((com_in_base / half_extents) ** 2).sum(dim=-1)
-    return penalty
+    return (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).max(dim=-1).values
 
 
 class ComOverBasePolygonCost(BaseCost):
@@ -154,11 +141,11 @@ ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
 
 
 def _fk_com_and_base(world, q_batch: torch.Tensor):
-    """FK ``q_batch`` through ``world.kinematics_with_com``; return
+    """FK ``q_batch`` through ``world.kinematics``; return
     ``(com_world [B,3], base_T [B,4,4])`` — the inputs every COM-polygon
     helper needs. Differentiable through cuRobo's FK chain."""
     from curobo.types import JointState
-    kin = world.kinematics_with_com
+    kin = world.kinematics
     q_batch = q_batch.to(kin.device_cfg.device)
     if q_batch.ndim == 1:
         q_batch = q_batch.unsqueeze(0)
@@ -173,52 +160,31 @@ def _fk_com_and_base(world, q_batch: torch.Tensor):
     return com_world, base_T
 
 
-def compute_com_in_base(world, q_batch: torch.Tensor) -> torch.Tensor:
-    """Project the robot COM of each conf into the ``mobile_base_link`` frame.
-
-    Returns ``[B, 2]`` (x, y) — the quantity the support rectangle is defined
-    over. Shares :func:`_project_com_to_base` with :func:`com_polygon_penalty`,
-    so audits and tests use the same projection as the penalty math.
-    """
-    com_world, base_T = _fk_com_and_base(world, q_batch)
-    return _project_com_to_base(com_world, base_T)
-
-
-def compute_com_polygon_mask(
-    world,
-    q_batch: torch.Tensor,
-    *,
-    half_extents: Optional[List[float]] = None,
-) -> torch.Tensor:
+def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     """Batched COM-in-polygon check.
 
-    Computes per-link mass-weighted world COM via ``world.kinematics_with_com``
+    Computes per-link mass-weighted world COM via ``world.kinematics``
     (which is built with ``compute_com=True``), projects it into the
     ``mobile_base_link`` frame, and returns a boolean mask of which batch
-    elements have their COM inside an axis-aligned rectangle around the
-    base origin.
+    elements have their COM inside the ``COM_HALF_EXTENTS`` rectangle around
+    the base origin.
 
     Args:
-        world: TAMPWorld instance. Must have ``kinematics_with_com``
+        world: TAMPWorld instance. Must have ``world.kinematics`` (built with ``compute_com=True``)
             available (cached property — first call builds it lazily).
         q_batch: ``[B, full_dof]`` joint positions in
             ``world.kinematics.joint_names`` order.
-        half_extents: ``[2]``-list of (X, Y) half-sizes in meters. Default
-            ``COM_HALF_EXTENTS`` = ``[0.1115, 0.156]`` — the same two-foot
-            support hull the cost and per-conf penalties use.
 
     Returns:
         ``[B]`` bool tensor; True where the COM-over-polygon penalty is
         ``<= COM_TOL`` (COM inside-or-on the support hull) — the same gate
         the hard ComPolygon constraint uses, so the two cannot diverge.
     """
-    if half_extents is None:
-        half_extents = COM_HALF_EXTENTS
     com, base_T = _fk_com_and_base(world, q_batch)
     # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
     # post-IK COM-safe check and ConstraintChecker can never diverge. With the
     # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
-    half = torch.tensor(half_extents, device=com.device, dtype=com.dtype)
+    half = torch.tensor(COM_HALF_EXTENTS, device=com.device, dtype=com.dtype)
     pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT)
     return pen <= COM_TOL
 
@@ -226,47 +192,32 @@ def compute_com_polygon_mask(
 def compute_com_polygon_penalties(
     world,
     particles: "dict[str, torch.Tensor]",
-    *,
-    half_extents: Optional[List[float]] = None,
-    inside_margin: float = COM_INSIDE_MARGIN,
-    inside_weight: float = COM_INSIDE_WEIGHT,
 ) -> "dict[str, torch.Tensor]":
     """Per-conf differentiable COM-polygon penalty.
 
     For every Conf-shaped particle in ``particles`` (name starts with
     ``left_q``/``right_q``/``q`` and ``ndim == 2``), runs
-    ``world.kinematics_with_com.compute_kinematics`` once and computes
+    ``world.kinematics.compute_kinematics`` once and computes
     the per-particle COM-over-polygon penalty via
     :func:`com_polygon_penalty`. Returns a dict mapping conf name to a
     ``[B]`` tensor of penalties in m². Tensors are differentiable
     through cuRobo's FK chain — calling ``.backward()`` on a function of
     these values populates ``.grad`` on the input Conf particles.
 
-    Used by both the hard ``ComPolygon`` constraint (via
-    :meth:`CostFunction.com_polygon_constraint`) and the soft
-    ``--soft_cost com_polygon`` path (via
-    :meth:`CostFunction._compute_soft_cost`). When both are active in
-    the same ``CostFunction.__call__``, the result is cached on the
-    ``CostFunction`` instance so the FK runs once per conf.
+    Used by the hard ``ComPolygon`` constraint (via
+    :meth:`CostFunction.com_polygon_constraint`); the result is cached on
+    the ``CostFunction`` instance so the FK runs once per evaluation.
 
     Args:
-        world: TAMPWorld instance. ``world.kinematics_with_com`` must
+        world: TAMPWorld instance. ``world.kinematics`` must
             be available (cached property — first call builds it).
         particles: dict mapping particle name to ``[B, full_dof]``
             tensor. Non-Conf particles (poses, grasps) are skipped.
-        half_extents: ``[2]``-list of (X, Y) half-sizes in meters.
-            Default ``[0.1115, 0.156]`` matches the cost-side polygon.
-        inside_margin: width of the inside-edge barrier band (meters).
-        inside_weight: relative scale of the inside barrier vs the
-            outside quadratic.
 
     Returns:
         ``{conf_name: [B] float tensor}`` of penalty values in m².
         Empty dict if no Conf particles are in ``particles``.
     """
-    if half_extents is None:
-        half_extents = COM_HALF_EXTENTS
-
     conf_names = [
         p for p in particles
         if p.startswith(("left_q", "right_q", "q")) and particles[p].ndim == 2
@@ -274,8 +225,8 @@ def compute_com_polygon_penalties(
     out: "dict[str, torch.Tensor]" = {}
     for name in conf_names:
         com_world, base_T = _fk_com_and_base(world, particles[name])
-        half = torch.tensor(half_extents, device=com_world.device, dtype=com_world.dtype)
+        half = torch.tensor(COM_HALF_EXTENTS, device=com_world.device, dtype=com_world.dtype)
         out[name] = com_polygon_penalty(
-            com_world, base_T, half, inside_margin, inside_weight,
+            com_world, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT,
         )
     return out

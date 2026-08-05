@@ -16,11 +16,10 @@ import torch
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo.types import JointState
-from jaxtyping import Float
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
-from cutamp.rollout import Rollout, get_conf_to_arm, get_retract_parameters
+from cutamp.rollout import Rollout, get_retract_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import (
@@ -33,10 +32,8 @@ from cutamp.task_planning.constraints import (
     KinematicConstraint,
     Motion,
     StablePlacement,
-    ValidPush,
-    ValidPushStick,
 )
-from cutamp.task_planning.costs import GraspCost, RetractCost, TrajectoryLength
+from cutamp.task_planning.costs import TrajectoryLength
 from cutamp.utils.common import transform_spheres
 
 
@@ -47,9 +44,6 @@ class CostFunction:
     """
 
     def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration):
-        if config.enable_traj:
-            raise NotImplementedError("Trajectories not supported in cost function yet")
-
         self.plan_skeleton = plan_skeleton
         self.world = world
         self.config = config
@@ -60,8 +54,6 @@ class CostFunction:
         self.kinematic_constraints = []
         self.motion_constraints = []
         self.stable_placement_constraints = []
-        self.valid_push_constraints = []
-        self.valid_push_stick_constraints = []
         self.traj_length_costs = []
 
         type_to_list = {
@@ -72,18 +64,13 @@ class CostFunction:
             CollisionFreeGrasp.type: self.cfree_constraints,
             CollisionFreePlacement.type: self.cfree_constraints,
             StablePlacement.type: self.stable_placement_constraints,
-            ValidPush.type: self.valid_push_constraints,
-            ValidPushStick.type: self.valid_push_stick_constraints,
             TrajectoryLength.type: self.traj_length_costs,
         }
-        # GraspCost / RetractCost are recognized but contribute zero (covered
-        # by IK convergence + retract-init at t1_home). Skip silently.
-        ignored_co = {GraspCost.type, RetractCost.type}
         for ground_op in plan_skeleton:
             for co in [*ground_op.constraints, *ground_op.costs]:
                 if co.type in type_to_list:
                     type_to_list[co.type].append(co)
-                elif co.type not in ignored_co:
+                else:
                     raise NotImplementedError(f"Unhandled constraint or cost: {co}")
 
         # All conf parameters for motion constraints, we check rollout is subset
@@ -91,8 +78,6 @@ class CostFunction:
             iter(itertools.chain.from_iterable(con.params for con in self.motion_constraints))
         )
 
-        # Tag confs by arm so soft costs / book-keeping can dispatch per-arm.
-        self.conf_to_arm = get_conf_to_arm(plan_skeleton)
         self.retract_info = get_retract_parameters(plan_skeleton)
 
         # Single self-collision cost over the whole robot — both arms in one
@@ -140,47 +125,6 @@ class CostFunction:
             self.surface_to_sphere_idx_map[surface] = torch.tensor(
                 sphere_idx_map, dtype=torch.int64, device=world.device
             )
-
-        # Store the button AABBs for ValidPush
-        self.button_to_action = {}
-        self.button_aabbs = []
-        for con in self.valid_push_constraints:
-            button, action = con.params
-            if not self.world.has_object(button):
-                raise ValueError(f"{button=} not found in world")
-            if button in self.button_to_action:
-                raise NotImplementedError(f"We only support pushing a button once right now")
-
-            # Set z to be 2cm buffer above surface of the button
-            aabb = self.world.get_aabb(button).clone()
-            aabb[0, 2] = aabb[1, 2] + world.collision_activation_distance + 2e-3
-            aabb[1, 2] = aabb[1, 2] + world.collision_activation_distance + 0.02
-            self.button_aabbs.append(aabb)
-            self.button_to_action[button] = action
-        self.button_aabbs = torch.stack(self.button_aabbs) if self.button_aabbs else None
-
-        # Store the buttons and sticks for ValidPushStick
-        self.button_stick_actions = {}
-        self.button_stick_aabbs = []
-        self.button_to_stick = {}
-        for con in self.valid_push_stick_constraints:
-            button, stick, action = con.params
-            if not self.world.has_object(button):
-                raise ValueError(f"{button=} not found in world")
-            if not self.world.has_object(stick):
-                raise ValueError(f"{stick=} not found in world")
-            if button in self.button_to_stick:
-                raise NotImplementedError(f"We only support pushing a button once right now")
-
-            # Set z to be 2cm buffer above surface of the button
-            button_aabb = self.world.get_aabb(button).clone()
-            button_aabb[0, 2] = button_aabb[1, 2] + world.collision_activation_distance + 2e-3
-            button_aabb[1, 2] = button_aabb[1, 2] + world.collision_activation_distance + 0.02
-            self.button_stick_aabbs.append(button_aabb)
-
-            self.button_to_stick[button] = stick
-            self.button_stick_actions[button] = action
-        self.button_stick_aabbs = torch.stack(self.button_stick_aabbs) if self.button_stick_aabbs else None
 
         # All conf parameters for trajectory length costs, we check rollout matches
         # No support for trajectories right now
@@ -252,53 +196,8 @@ class CostFunction:
         }
         return motion_cost
 
-    def valid_push_costs(
-        self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]
-    ) -> Union[dict, None]:
-        """Valid Push constraints - i.e., distance from the button for push actions."""
-        if not (self.valid_push_constraints or self.valid_push_stick_constraints):
-            return None
-
-        valid_push_cost = {"type": "constraint", "constraints": [], "values": {}}
-
-        if self.valid_push_constraints:
-            ts_idxs = []  # get timestep for the button push actions
-            for button, action in self.button_to_action.items():
-                ts = rollout["action_to_ts"][action]
-                ts_idxs.append(ts)
-            tool_poses = rollout["world_from_tool_desired"][:, ts_idxs]
-            tool_xyz = tool_poses[:, :, :3, 3]
-            dist_from_button = dist_from_bounds_jit(tool_xyz, self.button_aabbs[:, 0], self.button_aabbs[:, 1])
-            valid_push_cost["constraints"].extend(self.valid_push_constraints)
-            valid_push_cost["values"]["dist_from_button"] = dist_from_button
-
-        if self.valid_push_stick_constraints:
-            # Get the stick spheres for each button push action
-            all_stick_spheres = []
-            for button, action in self.button_stick_actions.items():
-                pose_ts = rollout["action_to_pose_ts"][action]
-                stick_name = self.button_to_stick[button]
-                stick_spheres = obj_to_spheres[stick_name][:, pose_ts]
-                all_stick_spheres.append(stick_spheres)
-            all_stick_spheres = torch.stack(all_stick_spheres, dim=1)
-
-            # We'll consider bottom of spheres, so subtract the radius
-            stick_xyz = all_stick_spheres[..., :3].clone()  # important! clone so we don't modify original tensor
-            stick_xyz[..., 2] -= all_stick_spheres[..., 3]
-
-            # Compute distance between all stick spheres and button AABB, take the minimum
-            push_stick_cost = dist_from_bounds_jit(
-                stick_xyz, self.button_stick_aabbs[:, None, 0], self.button_stick_aabbs[:, None, 1]
-            )
-            push_stick_cost = push_stick_cost.min(-1).values
-
-            valid_push_cost["constraints"].extend(self.valid_push_stick_constraints)
-            valid_push_cost["values"]["stick_dist_from_button"] = push_stick_cost
-
-        return valid_push_cost
-
     def stable_placement_costs(
-        self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]
+        self, rollout: Rollout, obj_to_spheres: Dict[str, torch.Tensor]  # each [b, t, n, 4]
     ) -> Union[dict, None]:
         """
         Stable Placement constraints. Converted to two costs:
@@ -357,7 +256,7 @@ class CostFunction:
         }
         return traj_cost
 
-    def collision_costs(self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]) -> dict:
+    def collision_costs(self, rollout: Rollout, obj_to_spheres: Dict[str, torch.Tensor]) -> dict:  # each [b, t, n, 4]
         """Collision costs. This could be tied better to the constraints and sped up significantly."""
         # Robot to world
         robot_spheres = rollout["robot_spheres"]
@@ -429,9 +328,8 @@ class CostFunction:
     def _com_polygon_penalties(self) -> Dict[str, torch.Tensor]:
         """Lazily compute and cache the COM-polygon penalties dict.
 
-        Shared by ``com_polygon_constraint`` and the ``com_polygon`` soft cost
-        so the (expensive) FK-based computation runs at most once per cost
-        evaluation.
+        Sole consumer is ``com_polygon_constraint``; cached so the FK-based
+        computation runs at most once per cost evaluation.
         """
         if self._com_polygon_penalties_cache is None:
             from cutamp.com_polygon_cost import compute_com_polygon_penalties
@@ -548,19 +446,6 @@ class CostFunction:
                 return (all_configs[:, :, BODY_INDICES] - home_body).pow(2).sum(dim=(1, 2))
             return torch.zeros(num_particles, device=device)
 
-        # COM-over-base-polygon — penalize particle configurations whose
-        # mass-weighted COM projects outside the mobile-base support rectangle.
-        # Same shape as the cuRobo-side cost (cutamp/com_polygon_cost.py); the
-        # penalty math is shared via com_polygon_penalty.
-        elif cost_name == "com_polygon":
-            if self._particles is None:
-                raise RuntimeError("Particles must be provided for com_polygon soft cost")
-            pens = self._com_polygon_penalties()
-            if not pens:
-                return torch.zeros(num_particles, device=device)
-            # Sum over confs to match the prior per-particle scalar shape.
-            return torch.stack(list(pens.values()), dim=0).sum(dim=0)
-
         # Joint-limit margin — keep endpoint configurations a soft band away
         # from position limits. Per-joint/per-side margins from robots/t1.py
         # (zero on the home-side bounds the standing posture sits ON, so home
@@ -616,9 +501,6 @@ class CostFunction:
 
         collision_cost = self.collision_costs(rollout, obj_to_spheres)
         add_cost(Collision.type, collision_cost)
-
-        valid_push_cost = self.valid_push_costs(rollout, obj_to_spheres)
-        add_cost(ValidPush.type, valid_push_cost)
 
         stable_placement_cost = self.stable_placement_costs(rollout, obj_to_spheres)
         add_cost(StablePlacement.type, stable_placement_cost)
