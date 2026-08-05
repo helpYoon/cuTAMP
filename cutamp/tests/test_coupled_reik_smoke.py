@@ -8,7 +8,10 @@ def test_coupled_reik_runs_without_error(tmp_path):
     """Run cutamp_demo with --coupled_reik for a few Adam steps. Assert no exception."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
-    from cutamp.scripts.run_cutamp import cutamp_demo, load_demo_env
+    import os
+
+    from cutamp.envs.utils import get_env_dir, load_env
+    from cutamp.scripts.run_cutamp import cutamp_demo
 
     config = TAMPConfiguration(
         num_particles=8,
@@ -21,6 +24,6 @@ def test_coupled_reik_runs_without_error(tmp_path):
         curobo_plan=False,  # skip motion plan to keep test fast
         experiment_root=str(tmp_path),
     )
-    env = load_demo_env("blocks_t1")
+    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     # cutamp_demo returns without raising if --coupled_reik path is healthy.
     cutamp_demo(env, config)

@@ -379,8 +379,6 @@ def run_cutamp(
             f"[Opt {opt_iter}] Optimizing plan {[op.name for op in plan_skeleton]}, plan idx = {plan_info['idx']}, "
             f"heuristic = {plan_info['heuristic']:.2f}"
         )
-        best_particle = None
-
         has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
         if metrics["best_cost"] is not None:
             overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
@@ -390,8 +388,6 @@ def run_cutamp(
             _log.info(f"Max loop duration reached, stopping optimization")
             should_break = True
         exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
-        if has_satisfying:
-            best_particle = get_top_satisfying_particles(plan_info, config, constraint_checker, cost_reducer, n=1)[0]
 
         overall_metrics["num_optimized_plans"] += 1
         if has_satisfying:

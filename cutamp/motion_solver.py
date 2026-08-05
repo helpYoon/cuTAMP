@@ -80,18 +80,12 @@ def _plan_arm_to_conf(
     cuRobo result; raises ``RuntimeError`` if no attempt converges.
     """
     target_js = _planner_js_from_full(planner, conf_full, full_joint_names)
-    obstacle_ctx = (
-        _disabled_world_obstacle(planner, disable_obstacle)
-        if disable_obstacle is not None
-        else contextlib.nullcontext()
-    )
     result = None
-    with obstacle_ctx:
+    # _disabled_world_obstacle no-ops on name=None.
+    with _disabled_world_obstacle(planner, disable_obstacle):
         for _ in range(retries):
             result = planner.plan_cspace(
                 target_js, last_js,
-                max_attempts=CSPACE_MAX_ATTEMPTS,
-                enable_graph_attempt=CSPACE_ENABLE_GRAPH_ATTEMPT,
             )
             if _cspace_plan_succeeded(result, target_js):
                 return result
@@ -139,8 +133,6 @@ _ATTACH_LINK_FOR_ARM = {
 # T1 blocks demo robust (commit b45a4bc — graph planner fallback). v0.8
 # defaults are 5 attempts / graph at attempt 1, which is far too tight for
 # constrained dual-arm trajopt.
-CSPACE_MAX_ATTEMPTS = 5           # joint-space (retract / move-base / cspace-anchored pick+place): v0.8 default
-CSPACE_ENABLE_GRAPH_ATTEMPT = 1   # v0.8 default: attempt 0 unseeded, attempts 1-4 graph-seeded
 GRASP_RETRY = 4                   # outer retry around the cspace-anchored grasp plan
 
 
@@ -307,9 +299,7 @@ def solve_curobo(
     )
     state = T1State(
         planner=planner,
-        kinematics=world.kinematics,
         tool_from_ee=world.tool_from_ee,
-        current_js=last_js,
     )
     q_init = best_particle["left_q0"]
 
@@ -346,8 +336,6 @@ def solve_curobo(
                     target_js = _planner_js_from_full(planner, target_q, full_joint_names)
                     result = planner.plan_cspace(
                         target_js, last_js,
-                        max_attempts=CSPACE_MAX_ATTEMPTS,
-                        enable_graph_attempt=CSPACE_ENABLE_GRAPH_ATTEMPT,
                     )
                 if not _cspace_plan_succeeded(result, target_js):
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
@@ -355,7 +343,7 @@ def solve_curobo(
                 dt = _plan_dt(result)
 
                 accum_plans.append({
-                    "type": "trajectory", "plan": plan, "dt": dt, "arm": arm,
+                    "plan": plan, "dt": dt, "arm": arm,
                     "held_objs": state.compute_all_held_obj_poses(plan),
                 })
                 last_js = _last_timestep_js(plan, planner)
@@ -385,7 +373,7 @@ def solve_curobo(
                 grasp_plan = _interp_plan(grasp_result)
                 dt = _plan_dt(grasp_result)
                 accum_plans.append({
-                    "type": "trajectory", "plan": grasp_plan, "dt": dt, "arm": arm,
+                    "plan": grasp_plan, "dt": dt, "arm": arm,
                     "held_objs": state.compute_all_held_obj_poses(grasp_plan),
                 })
                 last_js = _last_timestep_js(grasp_plan, planner)
@@ -421,7 +409,7 @@ def solve_curobo(
                 dt = _plan_dt(place_result)
 
                 accum_plans.append({
-                    "type": "trajectory", "plan": plan, "dt": dt, "arm": arm,
+                    "plan": plan, "dt": dt, "arm": arm,
                     "held_objs": state.compute_all_held_obj_poses(plan),
                 })
                 last_js = _last_timestep_js(plan, planner)
@@ -464,8 +452,6 @@ def solve_curobo(
 
     cur_t = ts
     for entry in accum_plans:
-        if entry.get("type") != "trajectory":
-            continue
         plan = entry["plan"]
         dt = entry.get("dt", 0.05)
         traj_arm = entry.get("arm")

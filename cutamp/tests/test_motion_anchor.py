@@ -18,10 +18,9 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
     calls = {}
 
     class FakePlanner:
-        def plan_cspace(self, target_js, last_js, max_attempts, enable_graph_attempt):
+        def plan_cspace(self, target_js, last_js):
             calls["target_js"] = target_js
             calls["last_js"] = last_js
-            calls["max_attempts"] = max_attempts
             return "FAKE_RESULT"
 
     res = ms._plan_arm_to_conf(
@@ -31,7 +30,6 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
     assert res == "FAKE_RESULT"
     assert calls["target_js"] is sentinel_target  # planned to the conf, not a pose
     assert calls["last_js"] == "LAST"
-    assert calls["max_attempts"] == ms.CSPACE_MAX_ATTEMPTS
 
 
 def test_plan_arm_to_conf_raises_on_failure(monkeypatch):

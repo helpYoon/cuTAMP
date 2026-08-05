@@ -15,7 +15,6 @@ factory. T1 exposes two tool frames in ``robot_container.tool_frames``.
 """
 
 import logging
-from functools import cached_property
 from typing import Dict, List, Union
 
 import torch
@@ -204,12 +203,6 @@ class TAMPWorld:
             obj = self.get_object(obj_name)
             self._obj_to_aabb[obj_name] = approximate_goal_aabb(obj).to(self.device)
         return self._obj_to_aabb[obj_name]
-
-    @cached_property
-    def world_aabb(self) -> torch.Tensor:
-        aabbs = [self.get_aabb(o) for o in self.movables] + [self.get_aabb(o) for o in self.statics]
-        aabbs = torch.stack(aabbs)
-        return torch.stack([aabbs[:, 0].min(dim=0).values, aabbs[:, 1].max(dim=0).values])
 
     # ---- Initial / goal state ----------------------------------------------
 

@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 
 # The CLI choices (run_cutamp.py) and validate_tamp_config key off this tuple.
@@ -25,9 +25,6 @@ SUPPORTED_SOFT_COSTS = (
 class TAMPConfiguration:
     # Number of particles to initialize and optimize over
     num_particles: int = 1024
-
-    # Grasp and Placements
-    grasp_dof: Literal[4, 6] = 4
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
@@ -58,16 +55,6 @@ class TAMPConfiguration:
     # that destroys 21-DOF Adam runs.
     coupled_reik: bool = True
     reik_interval: int = 5
-    # Drift gate for re-IK refreshes: a particle is "provably fresh" when its
-    # IK target moved less than this (metres) since its last successful solve
-    # AND achieved-IK-error + drift still clears the checker's
-    # KinematicConstraint tolerance (triangle inequality — see _ReikDriftGate).
-    # A dep's refresh solve is skipped only when EVERY particle is fresh
-    # (cuRobo pads sub-capacity batches to max_batch_size, so per-particle
-    # subset solves save nothing). Rotation budget scales at 10 rad/m, the
-    # checker's rot/pos tolerance ratio. 0 disables gating; drift stats are
-    # recorded either way under opt_metrics["reik_refresh"].
-    reik_drift_tol: float = 0.0
     # >0: coupled-reIK refreshes use a dedicated low-seed IK solver, warm-
     # started from the current particle q (the previous solution is a
     # near-answer, so the 32-seed global search is wasted there). Cost scales
@@ -86,15 +73,6 @@ class TAMPConfiguration:
     # cuRobo-only refresh: loop 98.0 -> 63.1 s, best soft 27.9 -> 21.3,
     # final satisfying 349 vs 341, CoM-in-polygon parity (worst 499 vs 502).
     reik_gn: bool = True
-    # Add the CoM residual row to the GN projection (gn_refresh.py): violated
-    # support-rectangle axes get an active-set pull back inside. A/B verdict
-    # (2026-08-04, blocks_t1 @512): mechanically sound (halves com-misses;
-    # 1-iter recovery) but NO runtime win — place-dep refreshes have ~70-90
-    # conflicted rows that trade pose for CoM, so >=1 miss always remains and
-    # the all-or-nothing cuRobo fallback fires regardless (pick-deps: 0%
-    # fallbacks; place-deps: 100%, both with and without the row). Quality
-    # parity. Default OFF; revisit if fallbacks become rare/cheap or for K=1.
-    reik_gn_com: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started
     # repair work. Default 40: full A/B (2026-08-04, blocks_t1 @512, two runs
@@ -106,11 +84,9 @@ class TAMPConfiguration:
     # full 100-iteration schedule.
     reik_lbfgs_iters: int = 40
 
-    ## Task Planning and subgraph caching
+    ## Task Planning
     # Number of initial plans to sample
     num_initial_plans: int = 30
-    # Cache particles for reuse - this is coupled to our current domains so the implementation is not general
-    cache_subgraphs: bool = False
 
     ## Collision Checking
     # Movable object collision sphere representation
@@ -156,8 +132,6 @@ class TAMPConfiguration:
 def validate_tamp_config(config: TAMPConfiguration):
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
-    if config.grasp_dof not in {4, 6}:
-        raise ValueError(f"Invalid grasp_dof: {config.grasp_dof}")
 
     # Optimization hyperparams
     if config.num_opt_steps <= 0:
@@ -170,8 +144,6 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"Configuration learning rate (conf_lr) must be positive, not {config.conf_lr}")
     if config.reik_interval <= 0:
         raise ValueError(f"reik_interval must be positive, not {config.reik_interval}")
-    if config.reik_drift_tol < 0:
-        raise ValueError(f"reik_drift_tol must be >= 0, not {config.reik_drift_tol}")
     if config.reik_num_seeds < 0:
         raise ValueError(f"reik_num_seeds must be >= 0, not {config.reik_num_seeds}")
     if config.reik_lbfgs_iters < 0 or config.reik_lbfgs_iters % 20 != 0:

@@ -3,9 +3,10 @@
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import yaml
 import open3d as o3d
 import trimesh
 from yourdfpy import URDF
@@ -145,6 +146,7 @@ class SphereEditor:
 
     window_title = "Sphere Editor"
     radius_step = 0.005
+    default_sphere_radius = 0.05
 
     def __init__(
         self,
@@ -323,6 +325,23 @@ class SphereEditor:
         self._change_radius(-self.state.radius_step)
         return False
 
+    def _on_key_a(self, vis):
+        """Add a sphere at the link origin (radius = default_sphere_radius)."""
+        link = self._get_current_link()
+        if link is None:
+            return False
+        new_sphere = np.array([[0, 0, 0, self.default_sphere_radius]], dtype=np.float32)
+        if link in self.state.link_spheres and len(self.state.link_spheres[link]) > 0:
+            self.state.link_spheres[link] = np.vstack([self.state.link_spheres[link], new_sphere])
+        else:
+            self.state.link_spheres[link] = new_sphere
+        self.state.current_sphere_idx = len(self.state.link_spheres[link]) - 1
+        self.state.modified = True
+        self._rebuild_sphere_meshes()
+        self._update_info()
+        print(f"\nAdded sphere to {link}")
+        return False
+
     def _on_key_d(self, vis):
         """Delete the selected sphere."""
         link = self._get_current_link()
@@ -414,3 +433,162 @@ class SphereEditor:
         # Run
         self.vis.run()
         self.vis.destroy_window()
+
+
+# =============================================================================
+# Analytical sphere fitting for URDF links (primitives + meshes)
+# =============================================================================
+
+
+def fit_spheres_to_box(
+    size: Tuple[float, float, float],
+    origin: np.ndarray,
+    n_spheres: int = 8,
+) -> np.ndarray:
+    """Fit spheres to a box primitive."""
+    sx, sy, sz = size
+    half = np.array([sx / 2, sy / 2, sz / 2])
+    radius = min(size) / 4
+
+    corners = []
+    for dx in [-1, 1]:
+        for dy in [-1, 1]:
+            for dz in [-1, 1]:
+                corners.append([dx * half[0], dy * half[1], dz * half[2]])
+    corners = np.array(corners)
+
+    faces = np.array([
+        [half[0], 0, 0], [-half[0], 0, 0],
+        [0, half[1], 0], [0, -half[1], 0],
+        [0, 0, half[2]], [0, 0, -half[2]],
+    ])
+
+    all_pts = np.vstack([corners, faces])
+    n_pts = min(n_spheres, len(all_pts))
+    pts = all_pts[:n_pts]
+
+    pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
+    pts_transformed = (origin @ pts_hom.T).T[:, :3]
+
+    radii = np.full((len(pts_transformed), 1), radius)
+    return np.hstack([pts_transformed, radii]).astype(np.float32)
+
+
+def fit_spheres_to_cylinder(
+    radius: float,
+    length: float,
+    origin: np.ndarray,
+    n_spheres: int = 5,
+) -> np.ndarray:
+    """Fit spheres to a cylinder primitive."""
+    half_len = length / 2
+    if n_spheres == 1:
+        z_positions = [0.0]
+    else:
+        z_positions = np.linspace(-half_len + radius, half_len - radius, n_spheres)
+    pts = np.array([[0, 0, z] for z in z_positions])
+    pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
+    pts_transformed = (origin @ pts_hom.T).T[:, :3]
+    radii = np.full((len(pts_transformed), 1), radius)
+    return np.hstack([pts_transformed, radii]).astype(np.float32)
+
+
+def fit_spheres_to_link(
+    link,
+    urdf_dir: Path,
+    n_spheres: int = 10,
+) -> np.ndarray:
+    """Fit spheres to a URDF link based on its collision geometry type."""
+    if not link.collisions:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    collision = link.collisions[0]
+    geom = collision.geometry
+    origin = get_collision_origin(collision)
+
+    if geom.box is not None:
+        _log.info(f"  {link.name}: box {geom.box.size}")
+        return fit_spheres_to_box(geom.box.size, origin, n_spheres)
+    elif geom.cylinder is not None:
+        _log.info(f"  {link.name}: cylinder r={geom.cylinder.radius}, L={geom.cylinder.length}")
+        return fit_spheres_to_cylinder(geom.cylinder.radius, geom.cylinder.length, origin, n_spheres)
+    elif geom.sphere is not None:
+        _log.info(f"  {link.name}: sphere r={geom.sphere.radius}")
+        center = origin[:3, 3]
+        return np.array([[center[0], center[1], center[2], geom.sphere.radius]], dtype=np.float32)
+    elif geom.mesh is not None:
+        mesh_path = urdf_dir / geom.mesh.filename
+        _log.info(f"  {link.name}: mesh {mesh_path.name}")
+        return fit_spheres_to_mesh_file(mesh_path, origin, n_spheres)
+    else:
+        _log.warning(f"  {link.name}: unknown geometry type")
+        return np.zeros((0, 4), dtype=np.float32)
+
+
+# =============================================================================
+# YAML collision-spheres I/O (shared by both editors)
+# =============================================================================
+
+
+def load_yaml_spheres(yaml_path: Path) -> Dict[str, Any]:
+    """Load the full YAML configuration ({} if missing)."""
+    if not yaml_path.exists():
+        _log.warning(f"YAML file not found: {yaml_path}")
+        return {}
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    return data or {}
+
+
+def yaml_spheres_to_numpy(
+    yaml_data: Dict[str, Any],
+    link_names: Optional[List[str]] = None,
+    include_empty: bool = True,
+) -> Dict[str, np.ndarray]:
+    """Convert YAML collision_spheres to {link: (n, 4) array}.
+
+    ``link_names=None`` loads all links. ``include_empty=False`` drops links
+    with no spheres instead of mapping them to a (0, 4) array.
+    """
+    collision_spheres = yaml_data.get('collision_spheres', {})
+    links_to_load = link_names if link_names else list(collision_spheres.keys())
+    link_spheres = {}
+    for link_name in links_to_load:
+        spheres_list = collision_spheres.get(link_name, [])
+        if spheres_list:
+            spheres = [
+                [*s.get('center', [0, 0, 0]), s.get('radius', 0.01)] for s in spheres_list
+            ]
+            link_spheres[link_name] = np.array(spheres, dtype=np.float32)
+        elif include_empty:
+            link_spheres[link_name] = np.zeros((0, 4), dtype=np.float32)
+    return link_spheres
+
+
+def numpy_to_yaml_spheres(link_spheres: Dict[str, np.ndarray]) -> Dict[str, List[Dict]]:
+    """Convert numpy arrays back to YAML format."""
+    return {
+        link_name: [
+            {'center': [float(s[0]), float(s[1]), float(s[2])], 'radius': float(s[3])}
+            for s in spheres
+        ]
+        for link_name, spheres in link_spheres.items()
+    }
+
+
+def save_yaml_spheres(
+    yaml_path: Path,
+    yaml_data: Dict[str, Any],
+    link_spheres: Dict[str, np.ndarray],
+) -> None:
+    """Update ``link_spheres``'s links in ``yaml_data`` and write the file.
+
+    Links not in ``link_spheres`` are preserved untouched.
+    """
+    if 'collision_spheres' not in yaml_data:
+        yaml_data['collision_spheres'] = {}
+    yaml_data['collision_spheres'].update(numpy_to_yaml_spheres(link_spheres))
+    with open(yaml_path, 'w') as f:
+        f.write("##\n## Collision spheres configuration\n##\n")
+        yaml.dump(yaml_data, f, default_flow_style=None, sort_keys=False, allow_unicode=True)
+    _log.info(f"Saved collision spheres to {yaml_path}")

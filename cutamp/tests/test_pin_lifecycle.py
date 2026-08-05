@@ -12,27 +12,15 @@ def _make_state():
     state: planner from ``world.get_motion_planner()`` and current_js from
     ``_planner_js_from_full(planner, q_init, full_joint_names)``.
     """
-    from curobo.types import JointState
 
     from cutamp.t1_state import T1State
 
     world = make_blocks_t1_world()
     planner = world.get_motion_planner()
 
-    # Mirror motion_solver._planner_js_from_full: build full-cspace JointState
-    # with joint_names, then project to the planner's active cspace.
-    full_joint_names = list(world.kinematics.joint_names)
-    full_js = JointState.from_position(
-        world.q_init[None].to(planner.kinematics.device_cfg.device),
-        joint_names=full_joint_names,
-    )
-    active_js = planner.kinematics.get_active_js(full_js)
-
     return T1State(
         planner=planner,
-        kinematics=world.kinematics,
         tool_from_ee=world.tool_from_ee,
-        current_js=active_js,
     )
 
 

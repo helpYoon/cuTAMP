@@ -239,8 +239,6 @@ def process_motion_plan(
     processed_segments: List[Dict[str, Any]] = []
 
     for entry in curobo_plan:
-        if entry.get("type") != "trajectory":
-            continue
         plan_js = entry["plan"]
         dt = float(entry["dt"])
 

@@ -1,6 +1,6 @@
-"""Unit tests for _ReikDriftGate (drift-gated selective re-IK).
+"""Unit tests for _ReikDriftGate (re-IK refresh instrumentation).
 
-CPU-only: exercises the drift math and skip logic, not the IK solver.
+CPU-only: exercises the drift bookkeeping, not the IK solver.
 """
 import math
 
@@ -21,85 +21,41 @@ def _rot_z(t, angle):
     return out
 
 
-def _gate(drift_tol=0.002):
-    return _ReikDriftGate(1, drift_tol, pos_tol=0.005, rot_tol=0.05)
+def test_first_refresh_has_no_reference():
+    gate = _ReikDriftGate(1, pos_tol=0.005, rot_tol=0.05)
+    pos_drift, rot_drift = gate.measure_drift(0, _targets())
+    assert pos_drift is None and rot_drift is None
 
 
-def _prime(gate, target, ok=True, pos_err=0.001, rot_err=0.001):
-    n = target.shape[0]
-    gate.update(
-        0, target, torch.arange(n),
-        torch.full((n,), ok, dtype=torch.bool),
-        torch.full((n,), pos_err), torch.full((n,), rot_err),
-    )
-
-
-def test_first_refresh_solves_everything():
-    gate = _gate()
-    need, pos_drift, rot_drift = gate.need_mask(0, _targets())
-    assert need.all() and pos_drift is None and rot_drift is None
-
-
-def test_small_drift_skips_large_drift_solves():
-    gate = _gate(drift_tol=0.002)
+def test_drift_measured_per_interval():
+    gate = _ReikDriftGate(1, pos_tol=0.005, rot_tol=0.05)
     t0 = _targets()
-    _prime(gate, t0)
+    gate.measure_drift(0, t0)
     t1 = t0.clone()
-    t1[:2, 0, 3] += 0.001  # 1 mm: under budget
-    t1[2:, 0, 3] += 0.004  # 4 mm: over budget
-    need, pos_drift, _ = gate.need_mask(0, t1)
-    assert torch.allclose(pos_drift[:2], torch.tensor(0.001), atol=1e-6)
-    assert (~need[:2]).all() and need[2:].all()
-
-
-def test_rotation_drift_measured_and_gated():
-    gate = _gate(drift_tol=0.002)
-    t0 = _targets()
-    _prime(gate, t0)
-    t1 = _rot_z(t0, 0.1)  # 0.1 rad >> rot budget (0.002 * 10 = 0.02)
-    need, _, rot_drift = gate.need_mask(0, t1)
-    assert torch.allclose(rot_drift, torch.tensor(0.1), atol=1e-4)
-    assert need.all()
-
-
-def test_low_ik_headroom_forces_resolve():
-    # 4.5 mm achieved error + 1 mm drift exceeds the 5 mm checker tolerance,
-    # so drift-under-budget alone must not skip.
-    gate = _gate(drift_tol=0.002)
-    t0 = _targets()
-    _prime(gate, t0, pos_err=0.0045)
-    t1 = t0.clone()
-    t1[:, 0, 3] += 0.001
-    need, _, _ = gate.need_mask(0, t1)
-    assert need.all()
-
-
-def test_failed_solve_forces_resolve_at_zero_drift():
-    gate = _gate(drift_tol=0.002)
-    t0 = _targets()
-    _prime(gate, t0, ok=False)
-    need, pos_drift, _ = gate.need_mask(0, t0)
-    assert need.all() and torch.all(pos_drift == 0)
+    t1[:, 0, 3] += 0.003
+    pos_drift, _ = gate.measure_drift(0, t1)
+    assert torch.allclose(pos_drift, torch.tensor(0.003), atol=1e-6)
+    # Reference advanced: no further motion -> zero drift, not cumulative.
+    pos_drift, _ = gate.measure_drift(0, t1)
+    assert torch.all(pos_drift == 0)
 
 
 def test_tiny_rotation_drift_resolves_in_float32():
-    # Review-confirmed scenario: a solve at the success/checker rot boundary
-    # (0.0497 rad, tolerance 0.05) followed by a 4e-4 rad target drift. An
-    # acos-based drift metric collapses 4e-4 to exactly 0.0 in float32,
-    # wrongly passing the headroom test; the atan2 metric (curobo_pose_error)
-    # resolves it and must deny the skip.
-    gate = _gate(drift_tol=0.002)
+    # curobo_pose_error's atan2 formulation must resolve sub-mrad drift (an
+    # acos-based metric collapses to exactly 0.0 below ~5e-4 rad in float32).
+    gate = _ReikDriftGate(1, pos_tol=0.005, rot_tol=0.05)
     t0 = _targets()
-    _prime(gate, t0, rot_err=0.0497)
-    t1 = _rot_z(t0, 4e-4)
-    need, _, rot_drift = gate.need_mask(0, t1)
+    gate.measure_drift(0, t0)
+    _, rot_drift = gate.measure_drift(0, _rot_z(t0, 4e-4))
     assert rot_drift.max().item() > 1e-4
-    assert need.all()
 
 
-def test_tol_zero_disables_gating_but_records_drift():
-    gate = _gate(drift_tol=0.0)
-    t0 = _targets()
-    _prime(gate, t0)
-    need, pos_drift, _ = gate.need_mask(0, t0)
-    assert need.all() and pos_drift is not None
+def test_log_stat_records_drift_histogram():
+    gate = _ReikDriftGate(1, pos_tol=0.005, rot_tol=0.05)
+    pos_drift = torch.tensor([0.0004, 0.0015, 0.003, 0.02])
+    rot_drift = torch.zeros(4)
+    gate.log_stat(5, "left_q3", 4, 1, 0.1, pos_drift, rot_drift, gn_fail=2,
+                  gn_fail_pose=1, gn_fail_com=1)
+    rec = gate.stats[-1]
+    assert rec["conf"] == "left_q3" and rec["gn_fail"] == 2
+    assert rec["frac_drift_below"]["2mm"] == 0.5

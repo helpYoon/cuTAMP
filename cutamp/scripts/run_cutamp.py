@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 """
-PYTORCH_ALLOC_CONF=expandable_segments:True     /home/yoonwoo/miniconda3/envs/tamp/bin/python -m cutamp.scripts.run_cutamp     --env blocks_t1 -n 64 --num_opt_steps 50  --surface_height 0.50 --soft_cost place_close_to_base joint_limit_margin minimize_body_movement  --motion_plan --save_plan data/motion_plan.pkl
+PYTORCH_ALLOC_CONF=expandable_segments:True     /home/yoonwoo/miniconda3/envs/tamp/bin/python -m cutamp.scripts.run_cutamp     -n 64 --num_opt_steps 50  --surface_height 0.50 --soft_cost place_close_to_base joint_limit_margin minimize_body_movement  --motion_plan --save_plan data/motion_plan.pkl
 """
 
 import logging
@@ -31,13 +31,6 @@ from cutamp.scripts.utils import (
 )
 
 _log = logging.getLogger(__name__)
-
-
-def load_demo_env(name: str) -> TAMPEnvironment:
-    if name == "blocks_t1":
-        env_path = os.path.join(get_env_dir(), "blocks_t1.yml")
-        return load_env(env_path)
-    raise ValueError(f"Unknown environment name: {name}")
 
 
 def cutamp_demo(
@@ -81,7 +74,7 @@ def cutamp_demo(
         processed = process_motion_plan(curobo_plan)
         with open(out_path, "wb") as f:
             pickle.dump(processed, f)
-        n_traj = sum(1 for e in curobo_plan if e.get("type") == "trajectory")
+        n_traj = len(curobo_plan)
         _log.info(f"Saved processed motion plan ({n_traj} segments) to {out_path}")
     elif save_plan is not None and curobo_plan is None:
         _log.warning(f"--save_plan requested but no motion plan was generated (curobo_plan is None)")
@@ -100,12 +93,6 @@ def entrypoint():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument(
-        "--env",
-        help="Environment name to run",
-        default="blocks_t1",
-        choices=["blocks_t1"],
-    )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
     )
@@ -133,20 +120,14 @@ def entrypoint():
         help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
     )
     parser.add_argument(
-        "--reik_drift_tol", type=float, default=_defaults.reik_drift_tol,
-        help="Drift gate for re-IK: skip a dep's refresh solve when every particle's "
-             "target drifted less than this (metres) since its last successful solve and "
-             "is provably still within checker tolerance. 0 disables gating (stats still recorded).",
-    )
-    parser.add_argument(
         "--reik_num_seeds", type=int, default=_defaults.reik_num_seeds,
         help="Use a dedicated low-seed, warm-started IK solver for re-IK refreshes "
              "(cost ~linear in seeds; init and final refresh keep 32 seeds). 0 = main solver.",
     )
     parser.add_argument(
-        "--reik_gn", action="store_true",
-        help="Gauss-Newton re-IK refresh: project warm confs onto moved pose targets "
-             "(~2-5 ms/dep); non-converged rows fall back to the cuRobo refresh solve.",
+        "--no_reik_gn", dest="reik_gn", action="store_false",
+        help="Disable the Gauss-Newton re-IK refresh (default: on); refreshes then run "
+             "the warm cuRobo solve for every dep.",
     )
     parser.set_defaults(reik_gn=_defaults.reik_gn)
     parser.add_argument(
@@ -155,26 +136,11 @@ def entrypoint():
              "(multiple of 20; 0 = cuRobo default 100).",
     )
     parser.add_argument(
-        "--reik_gn_com", action="store_true",
-        help="Add the CoM residual row to the GN projection: re-center out-of-polygon "
-             "rows inside GN instead of routing them to the cuRobo fallback.",
-    )
-    parser.set_defaults(reik_gn_com=_defaults.reik_gn_com)
-    parser.add_argument(
         "--soft_cost",
         nargs="*",
         default=list(_defaults.soft_cost or []),
         choices=list(SUPPORTED_SOFT_COSTS),
         help="Soft cost(s) to optimize (default: from TAMPConfiguration). Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
-    )
-
-    # Grasp
-    parser.add_argument(
-        "--grasp_dof",
-        type=int,
-        default=_defaults.grasp_dof,
-        choices=[4, 6],
-        help="Grasp DOF to use.",
     )
 
     parser.add_argument(
@@ -200,7 +166,6 @@ def entrypoint():
     parser.add_argument(
         "--num_initial_plans", type=int, default=_defaults.num_initial_plans, help="Number of initial plans to sample with task planner."
     )
-    parser.add_argument("--cache_subgraphs", action="store_true", help="Whether to cache subgraph samples for reuse.")
     parser.add_argument(
         "--motion_plan",
         action="store_true",
@@ -276,7 +241,6 @@ def entrypoint():
     args = parser.parse_args()
     config = TAMPConfiguration(
         num_particles=args.num_particles,
-        grasp_dof=args.grasp_dof,
         num_opt_steps=args.num_opt_steps,
         early_stop_patience=args.early_stop_patience,
         lr=args.lr,
@@ -285,14 +249,11 @@ def entrypoint():
         optimize_soft_costs=args.optimize_soft_costs,
         coupled_reik=args.coupled_reik,
         reik_interval=args.reik_interval,
-        reik_drift_tol=args.reik_drift_tol,
         reik_num_seeds=args.reik_num_seeds,
         reik_gn=args.reik_gn,
-        reik_gn_com=args.reik_gn_com,
         reik_lbfgs_iters=args.reik_lbfgs_iters,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
-        cache_subgraphs=args.cache_subgraphs,
         curobo_plan=args.motion_plan,
         enable_com_polygon=args.enable_com_polygon,
         enable_joint_limit_margin=args.enable_joint_limit_margin,
@@ -305,7 +266,7 @@ def entrypoint():
     validate_tamp_config(config)
 
     # Load env and run demo
-    env = load_demo_env(args.env)
+    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, args.surface_height)  # no-op at 0.0
     cutamp_demo(env, config, experiment_id=args.experiment_id, save_plan=args.save_plan)
 

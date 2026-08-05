@@ -22,7 +22,7 @@ from curobo.scene import Cuboid
 from curobo.types import GoalToolPose, JointState, Pose
 
 from cutamp._curobo_internals import (
-    inactive_arm_cspace_weights,
+    build_pin_weights,
     restore_cspace_target_dof_weight,
     snapshot_cspace_target_dof_weight,
     write_cspace_target_dof_weight,
@@ -32,7 +32,9 @@ from cutamp.costs import sphere_to_sphere_overlap
 from cutamp.robots.t1 import (
     BASE_INDICES,
     LEFT_ARM_INDICES,
+    LEFT_ARM_JOINT_NAMES,
     RIGHT_ARM_INDICES,
+    RIGHT_ARM_JOINT_NAMES,
     t1_home,
 )
 from cutamp.samplers import (
@@ -128,8 +130,11 @@ def _ik_for_pose(
     snapshot = snapshot_cspace_target_dof_weight([ik])
     try:
         if arm is not None:
+            # Pin the inactive arm's DOFs at their current values.
             write_cspace_target_dof_weight(
-                [ik], inactive_arm_cspace_weights(ik, arm),
+                [ik], build_pin_weights(
+                    ik, RIGHT_ARM_JOINT_NAMES if arm == "left" else LEFT_ARM_JOINT_NAMES,
+                ),
             )
         seed_config = (
             current_state.position.unsqueeze(1) if seed_from_current else None
@@ -279,40 +284,15 @@ def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: 
 
 class ParticleInitializer:
     def __init__(self, world: TAMPWorld, config: TAMPConfiguration):
-        if config.grasp_dof != 4:
-            raise NotImplementedError(f"Only 4-DOF grasp supported, not {config.grasp_dof}")
-
         self.world = world
         self.config = config
         self.q_init = world.q_init.repeat(config.num_particles, 1)
-
-        self.pick_cache = {}
-        self.place_cache = {}
 
     def _initial_particles(self) -> Particles:
         return {
             "left_q0": self.q_init.clone(),
             "right_q0": self.q_init.clone(),
         }
-
-    def _apply_cached(
-        self, cache_entry: dict, sampled: dict, q: str, arm: Optional[str],
-        particles: dict, deferred_params: set, move_free_deferred: dict,
-        grasp_check: Optional[tuple] = None,
-        log_msg: Optional[str] = None, log_debug=None,
-    ) -> None:
-        if grasp_check is not None:
-            grasp_name, err_msg = grasp_check
-            if not (particles[grasp_name] == cache_entry["grasp"]).all():
-                raise RuntimeError(err_msg)
-        for particle_name, cache_field in sampled.items():
-            particles[particle_name] = cache_entry[cache_field].clone()
-        ik_result = cache_entry["ik_result"]
-        _store_ik_q(particles, q, ik_result, self.world, arm)
-        deferred_params.discard(q)
-        move_free_deferred.pop(q, None)
-        if log_msg is not None and log_debug is not None:
-            log_debug(f"{log_msg} {ik_result.success.sum()}/{self.config.num_particles} success")
 
     def __call__(self, plan_skeleton: PlanSkeleton, verbose: bool = True) -> Optional[Particles]:
         config = self.config
@@ -363,19 +343,6 @@ class ParticleInitializer:
                 gripper_spheres = world.gripper_spheres[tool_frame]
                 tool_from_ee = world.tool_from_ee[tool_frame]
 
-                cache_key = (obj, arm) if arm else obj
-                if cache_key in self.pick_cache:
-                    self._apply_cached(
-                        self.pick_cache[cache_key],
-                        sampled={grasp: "sampled_grasps"},
-                        q=q, arm=arm, particles=particles,
-                        deferred_params=deferred_params,
-                        move_free_deferred=move_free_deferred,
-                        log_msg=f"{header}. Using cached grasp poses for {obj}.",
-                        log_debug=log_debug,
-                    )
-                    continue
-
                 obj_curobo = world.get_object(obj)
                 obj_spheres = world.get_collision_spheres(obj)
                 num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
@@ -402,11 +369,6 @@ class ParticleInitializer:
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
-                if config.cache_subgraphs:
-                    self.pick_cache[cache_key] = {
-                        "sampled_grasps": particles[grasp], "ik_result": ik_result,
-                    }
-
             elif metadata.action_type == "place":
                 obj, grasp, placement, surface, q = params
                 if not world.has_object(obj):
@@ -422,20 +384,6 @@ class ParticleInitializer:
 
                 tool_frame = world.tool_frame_for_arm(arm)
                 tool_from_ee = world.tool_from_ee[tool_frame]
-
-                cache_key = (obj, surface, arm) if arm else (obj, surface)
-                if cache_key in self.place_cache:
-                    self._apply_cached(
-                        self.place_cache[cache_key],
-                        sampled={placement: "sampled_placements"},
-                        q=q, arm=arm, particles=particles,
-                        deferred_params=deferred_params,
-                        move_free_deferred=move_free_deferred,
-                        grasp_check=(grasp, f"Grasps don't match for {obj} on {surface}"),
-                        log_msg=f"{header}. Using cached placement for {obj}.",
-                        log_debug=log_debug,
-                    )
-                    continue
 
                 obj_curobo = world.get_object(obj)
                 obj_spheres = world.get_collision_spheres(obj)
@@ -465,13 +413,6 @@ class ParticleInitializer:
                 _store_ik_q(particles, q, ik_result, world, arm)
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
-
-                if config.cache_subgraphs:
-                    self.place_cache[cache_key] = {
-                        "sampled_placements": sampled_placements,
-                        "ik_result": ik_result,
-                        "grasp": particles[grasp],
-                    }
 
             elif metadata.action_type == "retract":
                 # RetractHolding: obj, grasp, q_start, traj, q_retract

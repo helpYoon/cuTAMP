@@ -191,18 +191,6 @@ def build_pin_weights(
     return weights
 
 
-def inactive_arm_cspace_weights(
-    host, active_arm: str, *, pin_weight: float = 1000.0, default_weight: float = 1.0,
-) -> torch.Tensor:
-    """Build the per-DOF cspace target weight tensor that pins the inactive arm."""
-    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
-
-    inactive_names = (
-        RIGHT_ARM_JOINT_NAMES if active_arm == "left" else LEFT_ARM_JOINT_NAMES
-    )
-    return build_pin_weights(host, inactive_names, pin_weight, default_weight)
-
-
 # TODO: file upstream issue against cuRobo. RobotCostManager.compute_costs
 # (cost_manager_robot.py:195-286) hardcodes evaluation of exactly four cost
 # names (tool_pose, cspace, self_collision, scene_collision); register_cost

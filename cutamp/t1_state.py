@@ -19,7 +19,6 @@ from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import torch
 
-from curobo.kinematics import Kinematics
 from curobo.motion_planner import MotionPlanner
 from curobo.types import JointState
 
@@ -41,9 +40,7 @@ class T1State:
     """State for T1 single-MotionPlanner planning."""
 
     planner: MotionPlanner
-    kinematics: Kinematics
     tool_from_ee: Dict[str, torch.Tensor]      # {tool_frame_name: 4x4 transform}
-    current_js: JointState                      # planner-active-cspace joint state
     arm_holding: Dict[str, Optional[str]] = field(
         default_factory=lambda: {"left": None, "right": None}
     )
@@ -53,9 +50,6 @@ class T1State:
 
     _saved_target_dof_weight: Optional[Dict[int, List[torch.Tensor]]] = None
     _saved_pin_hosts: Optional[List[Any]] = None
-
-    def get_tool_frame(self, arm: Literal["left", "right"]) -> str:
-        return TOOL_FRAME_FOR_ARM[arm]
 
     def _apply_pin(self, pin_joint_names: list, hosts: Iterable[Any]) -> None:
         """Set per-DOF cspace weights (joints addressed by NAME) on every host.
@@ -134,7 +128,7 @@ class T1State:
             pos = self.planner.trajopt_solver.get_active_js(traj_js).position
         js = JointState.from_position(pos.to(grasp_tf.device))
         kin_state = self.planner.kinematics.compute_kinematics(js)
-        tool_frame = self.get_tool_frame(arm)
+        tool_frame = TOOL_FRAME_FOR_ARM[arm]
         ee_pose = kin_state.tool_poses.get_link_pose(tool_frame, make_contiguous=True)
         world_from_ee = ee_pose.get_matrix()
         tool_from_ee_mat = self.tool_from_ee[tool_frame]

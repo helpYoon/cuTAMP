@@ -59,7 +59,7 @@ class IKDep:
 
 
 def _build_ik_deps(
-    plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration,
+    plan_skeleton: PlanSkeleton, world: TAMPWorld,
 ) -> List[IKDep]:
     """Walk the plan skeleton and emit one IKDep per actionable op whose Conf
     is determined by Pose / Grasp particles via IK.
@@ -166,122 +166,58 @@ class _BestSnapshot:
 
 
 class _ReikDriftGate:
-    """Drift gate for re-IK refreshes: per-particle proof of freshness,
-    used to skip a dep's WHOLE refresh solve when every particle passes.
+    """Per-refresh instrumentation for the re-IK subsystem, plus the checker
+    tolerances the GN merge gate tests against.
 
-    FK(q) is fixed between refreshes (covered Confs are out of Adam), so by
-    the triangle inequality the particle's pose error against the *moved*
-    target is bounded by::
+    Records per dep-refresh: target drift since the previous refresh
+    (``curobo_pose_error`` — the checker's own metric; cuRobo's result
+    error fields cross-pair metres/radians on multi-tool-frame robots and
+    must not be used), solve wall time, failure counts, and in GN mode the
+    pose/CoM split of merge-gate misses. Lands in
+    ``opt_metrics["reik_refresh"]``.
 
-        err_now <= err_at_last_solve + drift(target_then, target_now)
-
-    (holds separately for translation L2 and SO(3) geodesic angle). A
-    particle is provably fine iff its last solve succeeded AND drift is
-    under ``drift_tol`` AND the bound above clears the checker tolerance
-    for both position and rotation. Particles whose last solve FAILED are
-    never counted fine: the periodic refresh doubles as repair.
-
-    Drift AND achieved error are both measured with ``curobo_pose_error`` —
-    the constraint checker's own metric — so the bound compares like with
-    like. (Two rejected alternatives, per review: cuRobo's
-    ``position_error``/``rotation_error`` result fields cross-pair
-    metres/radians on multi-tool-frame robots, and an ``acos``-based drift
-    angle collapses to 0.0 in float32 below ~5e-4 rad, exactly the
-    post-convergence regime where skips fire.)
-
-    Granularity is per-dep, not per-particle: cuRobo v0.8 pads every
-    sub-capacity batch to ``max_batch_size`` inside ``solve_pose``
-    (``_pad_batch_inputs``), so a subset solve costs the same as a full one
-    (and trips an upstream bug — ``jerk`` isn't padded). A dep's solve is
-    therefore skipped only when NO particle needs it; otherwise the full
-    batch is re-solved and all successful rows merged.
-
-    Drift statistics are recorded even when gating is off (``drift_tol=0``),
-    so baseline runs measure the per-interval drift distribution for free.
+    NOTE two removed mechanisms, both measured dead 2026-08-04 (git history
+    has the code): a triangle-inequality drift-SKIP path (cuRobo pads
+    sub-capacity batches so per-particle skips save nothing, and the
+    all-512-fresh dep-skip never fired in any run) and a fallback cooldown
+    (fallbacks are dominated by fresh churn misses; withholding repair
+    starved the satisfying pool and the early-stop signal).
     """
 
-    # Rotation drift budget per metre of position budget = the checker's
-    # rot/pos tolerance ratio (0.05 rad / 0.005 m).
-    ROT_PER_POS = 10.0
     # Drift histogram bucket edges (metres) recorded per refresh.
     _BUCKETS = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
-    # NOTE a fallback cooldown (suppress re-fallback for rows a fallback just
-    # failed to fix) was tried and A/B-REJECTED 2026-08-04: fallbacks are
-    # dominated by fresh churn misses (repairs that succeed), so suppression
-    # rarely engaged (4-36/~380) and holding rows out of repair starved the
-    # satisfying pool + early-stop signal (soft 27.1 vs 22.8). Don't re-add
-    # without new evidence; cheapen the fallback solve instead.
 
-    def __init__(self, num_deps: int, drift_tol: float, pos_tol: float, rot_tol: float):
-        self.drift_tol = drift_tol
+    def __init__(self, num_deps: int, pos_tol: float, rot_tol: float):
         self.pos_tol = pos_tol
         self.rot_tol = rot_tol
-        self.refs = [None] * num_deps      # [B, 4, 4] target at last solve
-        self.ok = [None] * num_deps        # [B] last solve succeeded
-        self.err_pos = [None] * num_deps   # [B] achieved IK position error
-        self.err_rot = [None] * num_deps   # [B] achieved IK rotation error
+        self.refs = [None] * num_deps  # [B, 4, 4] target at previous refresh
         self.stats: List[dict] = []
 
-    def need_mask(self, dep_idx: int, target: torch.Tensor):
-        """``(need [B] bool, pos_drift, rot_drift)``; drifts are ``None``
-        before the first solve has established reference targets."""
+    def measure_drift(self, dep_idx: int, target: torch.Tensor):
+        """``(pos_drift, rot_drift)`` vs the previous refresh's targets
+        (``None`` on the first refresh); advances the reference."""
         ref = self.refs[dep_idx]
-        all_need = torch.ones(target.shape[0], dtype=torch.bool, device=target.device)
+        self.refs[dep_idx] = target.clone()
         if ref is None:
-            return all_need, None, None
-        pos_drift, rot_drift = curobo_pose_error(ref, target)
-        if self.drift_tol <= 0:
-            return all_need, pos_drift, rot_drift
-        skip = (
-            self.ok[dep_idx]
-            & (pos_drift < self.drift_tol)
-            & (rot_drift < self.drift_tol * self.ROT_PER_POS)
-            & (self.err_pos[dep_idx] + pos_drift < self.pos_tol)
-            & (self.err_rot[dep_idx] + rot_drift < self.rot_tol)
-        )
-        return ~skip, pos_drift, rot_drift
+            return None, None
+        return curobo_pose_error(ref, target)
 
-    def update(
-        self,
-        dep_idx: int,
-        target: torch.Tensor,
-        idx: torch.Tensor,
-        success: torch.Tensor,
-        pos_err: torch.Tensor,
-        rot_err: torch.Tensor,
-    ) -> None:
-        """Record solve results for the ``idx`` rows just re-solved."""
-        if self.refs[dep_idx] is None:
-            B = target.shape[0]
-            self.refs[dep_idx] = target.clone()
-            self.ok[dep_idx] = torch.zeros(B, dtype=torch.bool, device=target.device)
-            self.err_pos[dep_idx] = torch.zeros(B, device=target.device)
-            self.err_rot[dep_idx] = torch.zeros(B, device=target.device)
-        else:
-            self.refs[dep_idx][idx] = target[idx]
-        self.ok[dep_idx][idx] = success
-        self.err_pos[dep_idx][idx] = pos_err
-        self.err_rot[dep_idx][idx] = rot_err
-
-    def log_stat(self, step, q_name, batch, n_need, n_solved, n_fail, solve_s,
-                 pos_drift, rot_drift, gn_fail=None, gn_fail_pose=None, gn_fail_com=None):
+    def log_stat(self, step, q_name, batch, n_fail, solve_s, pos_drift, rot_drift,
+                 gn_fail=None, gn_fail_pose=None, gn_fail_com=None):
         rec = {
-            "step": step, "conf": q_name, "batch": batch, "n_need": n_need,
-            "n_solved": n_solved, "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
+            "step": step, "conf": q_name, "batch": batch,
+            "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
         }
         if gn_fail is not None:
             # GN refresh: rows the projection missed (they went to the cuRobo
-            # fallback). gn_fail == 0 means the whole dep cost only GN.
-            # NOTE cross-mode stats caveat: in GN mode "n_ik_fail" counts rows
-            # over checker tolerance OR out of the CoM polygon on the merged q;
-            # in cuRobo mode it counts solver success-flag failures. Presence
-            # of "gn_fail" marks which semantic a record uses — don't compare
-            # the two populations directly.
+            # fallback), split by which merge-gate criterion failed (a row can
+            # fail both). NOTE cross-mode stats caveat: in GN mode "n_ik_fail"
+            # counts rows still failing after GN + fallback; in cuRobo mode it
+            # counts solver success-flag failures. Presence of "gn_fail" marks
+            # which semantic a record uses.
             rec["gn_fail"] = gn_fail
-            if gn_fail_pose is not None:
-                # Split of the merge-gate misses (a row can fail both).
-                rec["gn_fail_pose"] = gn_fail_pose
-                rec["gn_fail_com"] = gn_fail_com
+            rec["gn_fail_pose"] = gn_fail_pose
+            rec["gn_fail_com"] = gn_fail_com
         if pos_drift is not None:
             rec["pos_drift_mean"] = pos_drift.mean().item()
             rec["pos_drift_max"] = pos_drift.max().item()
@@ -398,12 +334,11 @@ class ParticleOptimizer:
         corresponding Conf particle in-place. Failed particles keep their
         previous q (per-particle masked write).
 
-        When ``gate`` is given, refreshes run on ``world.ik_refresh_solver``
-        (a cheap low-seed solver when ``reik_num_seeds > 0``), are explicitly
-        warm-started from the current particle q, skip a dep entirely when
-        every particle is provably fresh (see ``_ReikDriftGate``), and record
-        per-dep drift/timing stats. ``gate=None`` refreshes everything on the
-        full-strength main solver — used for the final pre-check refresh.
+        When ``gate`` is given, refreshes run GN-first on
+        ``world.ik_refresh_solver`` (a cheap warm-seeded low-seed solver when
+        ``reik_num_seeds > 0``) and record per-dep drift/timing stats.
+        ``gate=None`` refreshes everything on the full-strength main solver —
+        used for the final pre-check refresh.
 
         cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
         so the IK call cannot run under ``torch.no_grad``; only the in-place
@@ -418,79 +353,42 @@ class ParticleOptimizer:
             world_from_ee = dep.target_fn(particles).detach()
             batch = world_from_ee.shape[0]
             if gate is not None:
-                need, pos_drift, rot_drift = gate.need_mask(i, world_from_ee)
-                n_need = int(need.sum().item())
-            else:
-                need, pos_drift, rot_drift, n_need = None, None, None, batch
+                pos_drift, rot_drift = gate.measure_drift(i, world_from_ee)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            n_fail = n_solved = 0
             n_gn_fail = n_gn_fail_pose = n_gn_fail_com = None
-            if need is None or n_need > 0:
-                n_solved = batch
-                use_gn = gate is not None and self.config.reik_gn
-                if use_gn:
-                    from cutamp.com_polygon_cost import compute_com_polygon_mask
-                    # Gauss-Newton projection from the warm q (see gn_refresh.py);
-                    # merge only rows that converged to checker tolerance
-                    # (checker metric via _achieved_pose_errors) AND stayed
-                    # CoM-in-polygon. The CoM term is load-bearing: GN has no
-                    # CoM residual and the fallback is the only CoM-aware
-                    # channel during Adam (covered Confs are out of the
-                    # optimizer), so a pose-only gate would lock in confs that
-                    # drift out of the support polygon (review-verified decay).
-                    q_gn = gn_project(
-                        world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
-                        com_row=self.config.reik_gn_com,
+            if gate is not None and self.config.reik_gn:
+                from cutamp.com_polygon_cost import compute_com_polygon_mask
+                # Gauss-Newton projection from the warm q (see gn_refresh.py);
+                # merge only rows that converged to checker tolerance (checker
+                # metric via _achieved_pose_errors) AND stayed CoM-in-polygon.
+                # The CoM term is load-bearing: GN has no CoM residual and the
+                # fallback is the only CoM-aware channel during Adam (covered
+                # Confs are out of the optimizer), so a pose-only gate would
+                # lock in confs that drift out of the support polygon.
+                q_gn = gn_project(
+                    world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
+                )
+                with torch.no_grad():
+                    pos_err, rot_err = _achieved_pose_errors(
+                        world, q_gn, world_from_ee, dep.arm,
                     )
-                    with torch.no_grad():
-                        pos_err, rot_err = _achieved_pose_errors(
-                            world, q_gn, world_from_ee, dep.arm,
-                        )
-                        pose_ok = (pos_err < gate.pos_tol) & (rot_err < gate.rot_tol)
-                        com_ok = compute_com_polygon_mask(world, q_gn)
-                        ok = pose_ok & com_ok
-                        merged = torch.where(ok.view(-1, 1), q_gn, particles[dep.q_name])
-                        particles[dep.q_name].copy_(merged)
-                        particles[dep.q_name].grad = None
-                    n_gn_fail = int((~ok).sum().item())
-                    n_gn_fail_pose = int((~pose_ok).sum().item())
-                    n_gn_fail_com = int((~com_ok).sum().item())
-                    if n_gn_fail > 0:
-                        # cuRobo fallback for the rows GN missed. Full-batch
-                        # call (cuRobo pads sub-capacity batches to
-                        # max_batch_size, so subsets save nothing); only
-                        # GN-missed rows that cuRobo solved take its result.
-                        cheap = world.ik_refresh_solver is not world.ik_solver
-                        ik_result = _ik_for_pose(
-                            world, world_from_ee, dep.arm,
-                            current_state_q=particles[dep.q_name].detach(),
-                            ik=world.ik_refresh_solver if cheap else None,
-                            seed_from_current=cheap,
-                        )
-                        new_q = _ik_solution_to_full_q(ik_result, world).detach()
-                        take = (~ok) & _ik_success_mask(ik_result)
-                        with torch.no_grad():
-                            merged = torch.where(take.view(-1, 1), new_q, particles[dep.q_name])
-                            particles[dep.q_name].copy_(merged)
-                            particles[dep.q_name].grad = None
-                            pos_err, rot_err = _achieved_pose_errors(
-                                world, particles[dep.q_name], world_from_ee, dep.arm,
-                            )
-                            ok = (
-                                (pos_err < gate.pos_tol)
-                                & (rot_err < gate.rot_tol)
-                                & compute_com_polygon_mask(world, particles[dep.q_name])
-                            )
-                    n_fail = int((~ok).sum().item())
-                    gate.update(i, world_from_ee, slice(None), ok, pos_err, rot_err)
-                else:
-                    # cuRobo solve. Low-seed refresh solver + warm seed only
-                    # when configured; with reik_num_seeds=0 this path is
-                    # byte-identical to the ungated one (ik_refresh_solver
-                    # falls back to ik_solver). Full batch always: cuRobo pads
-                    # sub-capacity batches internally, so subsets save nothing.
-                    cheap = gate is not None and world.ik_refresh_solver is not world.ik_solver
+                    pose_ok = (pos_err < gate.pos_tol) & (rot_err < gate.rot_tol)
+                    com_ok = compute_com_polygon_mask(world, q_gn)
+                    ok = pose_ok & com_ok
+                    merged = torch.where(ok.view(-1, 1), q_gn, particles[dep.q_name])
+                    particles[dep.q_name].copy_(merged)
+                    particles[dep.q_name].grad = None
+                n_gn_fail = int((~ok).sum().item())
+                n_gn_fail_pose = int((~pose_ok).sum().item())
+                n_gn_fail_com = int((~com_ok).sum().item())
+                n_fail = n_gn_fail
+                if n_gn_fail > 0:
+                    # cuRobo fallback for the rows GN missed. Full-batch call
+                    # (cuRobo pads sub-capacity batches to max_batch_size, so
+                    # subsets save nothing); only GN-missed rows that cuRobo
+                    # solved take its result.
+                    cheap = world.ik_refresh_solver is not world.ik_solver
                     ik_result = _ik_for_pose(
                         world, world_from_ee, dep.arm,
                         current_state_q=particles[dep.q_name].detach(),
@@ -498,27 +396,37 @@ class ParticleOptimizer:
                         seed_from_current=cheap,
                     )
                     new_q = _ik_solution_to_full_q(ik_result, world).detach()
-                    success = _ik_success_mask(ik_result)
-                    n_fail = int((~success).sum().item())
+                    take = (~ok) & _ik_success_mask(ik_result)
                     with torch.no_grad():
-                        merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
+                        merged = torch.where(take.view(-1, 1), new_q, particles[dep.q_name])
                         particles[dep.q_name].copy_(merged)
-                        # Dropped from the optimizer, so .grad has no consumer.
                         particles[dep.q_name].grad = None
-                    if gate is not None:
-                        # Achieved errors measured on the MERGED q (checker
-                        # metric, via FK — see _achieved_pose_errors for why the
-                        # result's own error fields can't be trusted). Rows that
-                        # kept their old q get their true error vs the target.
-                        with torch.no_grad():
-                            pos_err, rot_err = _achieved_pose_errors(
-                                world, particles[dep.q_name], world_from_ee, dep.arm,
-                            )
-                        gate.update(i, world_from_ee, slice(None), success, pos_err, rot_err)
+                    n_fail = int((~(ok | take)).sum().item())
+            else:
+                # cuRobo solve. Low-seed refresh solver + warm seed only when
+                # gated; with reik_num_seeds=0 this path is byte-identical to
+                # the ungated one (ik_refresh_solver falls back to ik_solver).
+                # Full batch always: cuRobo pads sub-capacity batches
+                # internally, so subsets save nothing.
+                cheap = gate is not None and world.ik_refresh_solver is not world.ik_solver
+                ik_result = _ik_for_pose(
+                    world, world_from_ee, dep.arm,
+                    current_state_q=particles[dep.q_name].detach(),
+                    ik=world.ik_refresh_solver if cheap else None,
+                    seed_from_current=cheap,
+                )
+                new_q = _ik_solution_to_full_q(ik_result, world).detach()
+                success = _ik_success_mask(ik_result)
+                n_fail = int((~success).sum().item())
+                with torch.no_grad():
+                    merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
+                    particles[dep.q_name].copy_(merged)
+                    # Dropped from the optimizer, so .grad has no consumer.
+                    particles[dep.q_name].grad = None
             torch.cuda.synchronize()
             if gate is not None:
                 gate.log_stat(
-                    step, dep.q_name, batch, n_need, n_solved, n_fail,
+                    step, dep.q_name, batch, n_fail,
                     time.perf_counter() - t0, pos_drift, rot_drift,
                     gn_fail=n_gn_fail, gn_fail_pose=n_gn_fail_pose, gn_fail_com=n_gn_fail_com,
                 )
@@ -553,16 +461,14 @@ class ParticleOptimizer:
         # instead of trained by gradient descent).
         world = rollout_fn.world
         ik_deps: List[IKDep] = (
-            _build_ik_deps(plan_skeleton, world, self.config)
+            _build_ik_deps(plan_skeleton, world)
             if self.config.coupled_reik else []
         )
         dropped_conf_names = {dep.q_name for dep in ik_deps}
-        # Drift gate (also pure instrumentation when reik_drift_tol == 0).
-        # Tolerances come from the live checker so the skip proof tracks
-        # whatever the run actually enforces.
+        # Refresh instrumentation + the GN merge-gate tolerances, taken from
+        # the live checker so the gate tracks whatever the run enforces.
         reik_gate = _ReikDriftGate(
             len(ik_deps),
-            self.config.reik_drift_tol,
             pos_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err"),
             rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
         ) if ik_deps else None
@@ -788,10 +694,8 @@ class ParticleOptimizer:
         if reik_gate is not None and reik_gate.stats:
             opt_metrics["reik_refresh"] = reik_gate.stats
             total_s = sum(r["solve_s"] for r in reik_gate.stats)
-            n_dep_skips = sum(1 for r in reik_gate.stats if r["n_solved"] == 0)
             _log.info(
-                f"re-IK refresh: {len(reik_gate.stats)} dep-refreshes ({n_dep_skips} "
-                f"skipped whole by drift gate), {total_s:.1f}s IK time"
+                f"re-IK refresh: {len(reik_gate.stats)} dep-refreshes, {total_s:.1f}s IK time"
             )
 
         # Phase 2 (LBFGS soft-cost refinement): when --optimize_soft_costs is

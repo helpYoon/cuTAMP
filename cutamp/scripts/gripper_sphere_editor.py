@@ -36,8 +36,10 @@ from yourdfpy import URDF
 
 from cutamp.scripts._sphere_editor_common import (
     SphereEditor,
-    fit_spheres_to_mesh_file,
-    get_collision_origin,
+    fit_spheres_to_link,
+    load_yaml_spheres,
+    save_yaml_spheres,
+    yaml_spheres_to_numpy,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -47,89 +49,9 @@ _log = logging.getLogger(__name__)
 # Link Sphere Fitting
 # =============================================================================
 
-def fit_spheres_to_link(
-    link,
-    urdf_dir: Path,
-    n_spheres: int = 10,
-) -> np.ndarray:
-    """
-    Fit spheres to a URDF link based on its collision geometry type.
-
-    Args:
-        link: yourdfpy Link object
-        urdf_dir: Directory containing the URDF (for resolving mesh paths)
-        n_spheres: Target number of spheres
-
-    Returns:
-        (n, 4) array of sphere centers and radii in link frame
-    """
-    if not link.collisions:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    collision = link.collisions[0]
-    geom = collision.geometry
-    origin = get_collision_origin(collision)
-
-    if geom.mesh is not None:
-        mesh_filename = geom.mesh.filename
-        mesh_path = urdf_dir / mesh_filename
-        _log.info(f"  {link.name}: mesh {mesh_path.name}")
-        return fit_spheres_to_mesh_file(mesh_path, origin, n_spheres)
-
-    else:
-        _log.warning(f"  {link.name}: unknown geometry type")
-        return np.zeros((0, 4), dtype=np.float32)
-
-
 # =============================================================================
 # Export Functions
 # =============================================================================
-
-def load_spheres_from_yaml(
-    yaml_path: Path,
-    gripper_links: List[str],
-) -> Dict[str, np.ndarray]:
-    """
-    Load gripper spheres from YAML file with correct per-link assignments.
-
-    Args:
-        yaml_path: Path to the YAML file (e.g., t1_spheres.yml)
-        gripper_links: List of gripper link names to load
-
-    Returns:
-        Dict mapping link names to (n, 4) sphere arrays in link-local frames
-    """
-    if not yaml_path.exists():
-        _log.info(f"No YAML file found at {yaml_path}")
-        return {}
-
-    _log.info(f"Loading spheres from YAML: {yaml_path.name}")
-
-    with open(yaml_path, 'r') as f:
-        data = yaml.safe_load(f) or {}
-
-    if 'collision_spheres' not in data:
-        _log.warning("No collision_spheres key in YAML file")
-        return {}
-
-    result = {}
-    for link_name in gripper_links:
-        spheres_data = data['collision_spheres'].get(link_name, [])
-        if not spheres_data:
-            continue
-
-        spheres = []
-        for s in spheres_data:
-            center = s.get('center', [0, 0, 0])
-            radius = s.get('radius', 0.01)
-            spheres.append([center[0], center[1], center[2], radius])
-
-        if spheres:
-            result[link_name] = np.array(spheres, dtype=np.float32)
-            _log.info(f"  {link_name}: {len(spheres)} spheres")
-
-    return result
-
 
 def load_gripper_pt(
     urdf: URDF,
@@ -296,73 +218,6 @@ def export_gripper_pt(
     _log.info(f"Saved {len(result)} gripper spheres to {output_path}")
 
 
-class _FlowList(list):
-    """A list that will be serialized in flow style (inline) by YAML."""
-    pass
-
-
-def _flow_list_representer(dumper, data):
-    return dumper.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=True)
-
-
-yaml.add_representer(_FlowList, _flow_list_representer)
-
-
-def export_spheres_to_yaml(
-    link_spheres: Dict[str, np.ndarray],
-    yaml_path: Path,
-    gripper_links: List[str],
-) -> None:
-    """
-    Export/update gripper spheres in the YAML collision spheres file.
-
-    This updates only the specified gripper links in the YAML file,
-    preserving all other links (arm, torso, etc.).
-
-    Args:
-        link_spheres: Dict mapping link names to (n, 4) sphere arrays
-        yaml_path: Path to the YAML file (e.g., t1_spheres.yml)
-        gripper_links: List of gripper link names to update
-    """
-    # Load existing YAML if it exists
-    if yaml_path.exists():
-        with open(yaml_path, 'r') as f:
-            data = yaml.safe_load(f) or {}
-    else:
-        data = {}
-
-    # Ensure collision_spheres key exists
-    if 'collision_spheres' not in data:
-        data['collision_spheres'] = {}
-
-    # Update only the gripper links
-    for link_name in gripper_links:
-        spheres = link_spheres.get(link_name)
-        if spheres is None or len(spheres) == 0:
-            # Set to empty list if no spheres
-            data['collision_spheres'][link_name] = []
-        else:
-            # Convert to YAML format with flow-style centers
-            sphere_list = []
-            for sphere in spheres:
-                sphere_list.append({
-                    'center': _FlowList([float(sphere[0]), float(sphere[1]), float(sphere[2])]),
-                    'radius': float(sphere[3])
-                })
-            data['collision_spheres'][link_name] = sphere_list
-
-    # Write back to YAML
-    with open(yaml_path, 'w') as f:
-        # Write header comment
-        f.write("##\n## Collision spheres configuration\n##\n")
-        # Dump the data
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-    # Count total spheres updated
-    total = sum(len(link_spheres.get(link, [])) for link in gripper_links)
-    _log.info(f"Updated {len(gripper_links)} gripper links ({total} spheres) in {yaml_path.name}")
-
-
 # =============================================================================
 # Open3D Visualization
 # =============================================================================
@@ -373,6 +228,7 @@ class GripperSphereEditor(SphereEditor):
 
     window_title = "Gripper Sphere Editor"
     radius_step = 0.002
+    default_sphere_radius = 0.02
 
     def __init__(
         self,
@@ -416,58 +272,19 @@ class GripperSphereEditor(SphereEditor):
 
     def _on_key_l(self, vis):
         """Cycle to next link (or target link in reassign mode)."""
-        if not self.state.link_names:
-            return False
-
-        if self.state.reassign_mode:
-            # In reassign mode, cycle through target links
+        if self.state.reassign_mode and self.state.link_names:
             self.state.reassign_target_idx = (self.state.reassign_target_idx + 1) % len(self.state.link_names)
             self._update_info()
-        else:
-            # Normal mode: cycle through links
-            self.state.current_link_idx = (self.state.current_link_idx + 1) % len(self.state.link_names)
-            self.state.current_sphere_idx = 0
-            self._rebuild_sphere_meshes()
-            self._update_info()
-        return False
+            return False
+        return super()._on_key_l(vis)
 
     def _on_key_shift_l(self, vis):
         """Cycle to previous link (or target link in reassign mode)."""
-        if not self.state.link_names:
-            return False
-
-        if self.state.reassign_mode:
-            # In reassign mode, cycle through target links
+        if self.state.reassign_mode and self.state.link_names:
             self.state.reassign_target_idx = (self.state.reassign_target_idx - 1) % len(self.state.link_names)
             self._update_info()
-        else:
-            # Normal mode: cycle through links
-            self.state.current_link_idx = (self.state.current_link_idx - 1) % len(self.state.link_names)
-            self.state.current_sphere_idx = 0
-            self._rebuild_sphere_meshes()
-            self._update_info()
-        return False
-
-    def _on_key_a(self, vis):
-        """Add a sphere at the link origin."""
-        link = self._get_current_link()
-        if link is None:
             return False
-
-        # Add sphere at origin with default radius
-        new_sphere = np.array([[0, 0, 0, 0.02]], dtype=np.float32)
-
-        if link in self.state.link_spheres:
-            self.state.link_spheres[link] = np.vstack([self.state.link_spheres[link], new_sphere])
-        else:
-            self.state.link_spheres[link] = new_sphere
-
-        self.state.current_sphere_idx = len(self.state.link_spheres[link]) - 1
-        self.state.modified = True
-        self._rebuild_sphere_meshes()
-        self._update_info()
-        print(f"\nAdded sphere to {link}")
-        return False
+        return super()._on_key_shift_l(vis)
 
     def _on_key_f(self, vis):
         """Re-fit spheres for current link."""
@@ -512,10 +329,11 @@ class GripperSphereEditor(SphereEditor):
             all_gripper_links = []
             for cfg in self.gripper_configs:
                 all_gripper_links.extend(cfg["links"])
-            export_spheres_to_yaml(
-                self.state.link_spheres,
+            save_yaml_spheres(
                 self.spheres_yaml_path,
-                all_gripper_links,
+                load_yaml_spheres(self.spheres_yaml_path),
+                {ln: self.state.link_spheres.get(ln, np.zeros((0, 4), dtype=np.float32))
+                 for ln in all_gripper_links},
             )
 
         self.state.modified = False
@@ -743,7 +561,9 @@ def main():
         # First, try loading from YAML (has correct per-link assignments)
         if spheres_yaml_path.exists():
             print(f"\nLoading from YAML: {spheres_yaml_path.name}")
-            yaml_spheres = load_spheres_from_yaml(spheres_yaml_path, all_gripper_links)
+            yaml_spheres = yaml_spheres_to_numpy(
+                load_yaml_spheres(spheres_yaml_path), all_gripper_links, include_empty=False,
+            )
             if yaml_spheres:
                 link_spheres.update(yaml_spheres)
                 loaded_source = "YAML"

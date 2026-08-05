@@ -107,7 +107,6 @@ class RolloutFunction:
             obj.name: self.world.get_object_pose(obj) for obj in self.world.movables
         }
 
-        assert config.grasp_dof == 4, f"Unsupported {config.grasp_dof=}"
         self.grasp_to_mat4x4_fn = action_4dof_to_mat4x4
 
         self._is_first_rollout = True
