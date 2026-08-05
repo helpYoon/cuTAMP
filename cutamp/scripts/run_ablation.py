@@ -10,6 +10,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -74,7 +75,9 @@ def run_study(plan, out_dir, execute=_subprocess_exec, experiment_root="/tmp/cut
             "status": "done" if code == 0 else f"failed({code})",
             "experiment_path": str(Path(experiment_root) / run["experiment_id"]),
         })
-        manifest_path.write_text(json.dumps(manifest, indent=1))
+        tmp_path = manifest_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(manifest, indent=1))
+        os.replace(tmp_path, manifest_path)
     return manifest
 
 

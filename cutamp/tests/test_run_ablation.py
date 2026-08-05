@@ -39,3 +39,41 @@ def test_run_study_is_resumable(tmp_path):
     calls.clear()
     run_study(plan, out_dir=tmp_path, execute=fake_exec)
     assert calls == []
+
+
+def test_run_study_retries_failed_runs(tmp_path):
+    calls = []
+
+    def failing_exec(run):
+        calls.append(run["experiment_id"])
+        # Fail only the second run (no_com cell)
+        return 0 if run["cell"] != "no_com" else 42
+
+    plan = build_run_plan(heights=[0.0], seeds=[0])
+    run_study(plan, out_dir=tmp_path, execute=failing_exec)
+    assert len(calls) == 4
+    manifest = json.load(open(tmp_path / "manifest.json"))
+
+    # Three done, one failed
+    done_runs = [r for r in manifest if r["status"] == "done"]
+    failed_runs = [r for r in manifest if r["status"].startswith("failed")]
+    assert len(done_runs) == 3
+    assert len(failed_runs) == 1
+    assert failed_runs[0]["experiment_id"] == "ablation_no_com_h000_s0"
+    assert failed_runs[0]["status"] == "failed(42)"
+
+    # Now retry with a succeeding executor
+    calls.clear()
+
+    def succeeding_exec(run):
+        calls.append(run["experiment_id"])
+        return 0
+
+    run_study(plan, out_dir=tmp_path, execute=succeeding_exec)
+
+    # Only the failed run should be retried
+    assert calls == ["ablation_no_com_h000_s0"]
+
+    manifest = json.load(open(tmp_path / "manifest.json"))
+    assert all(r["status"] == "done" for r in manifest)
+    assert len(manifest) == 4
