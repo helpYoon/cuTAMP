@@ -241,87 +241,6 @@ class ParticleOptimizer:
         self.types_to_optimize = {Pose, Conf}
         self.opt_counter = 0
 
-    def _run_phase2_lbfgs_refinement(
-        self,
-        particles: dict,
-        sat_mask: torch.Tensor,
-        rollout_fn,
-        cost_fn,
-        *,
-        barrier_weight: float = 1e6,
-        max_iter: int = 20,
-    ) -> None:
-        """Refine soft costs on satisfying particles via LBFGS + line search.
-
-        Operates on a SUBSET of particles (those that already satisfy hard
-        constraints). The barrier term ``barrier_weight * mean(hard_costs)``
-        spikes the loss whenever a step would break satisfaction, so the
-        strong-Wolfe line search backtracks before destruction. Refined
-        values are written back into ``particles[*][sat_mask]``.
-        """
-        n_sat = int(sat_mask.sum().item())
-        if n_sat == 0:
-            return
-        # Detach + clone so LBFGS owns the parameter tape independent of any
-        # outer optimizer state (Adam, grad_masks, etc.).
-        refined = {
-            k: v[sat_mask].detach().clone().requires_grad_(True)
-            for k, v in particles.items()
-        }
-        params = list(refined.values())
-        lbfgs = torch.optim.LBFGS(
-            params,
-            lr=1.0,
-            max_iter=max_iter,
-            line_search_fn="strong_wolfe",
-            tolerance_grad=1e-6,
-            tolerance_change=1e-9,
-        )
-
-        def closure():
-            lbfgs.zero_grad()
-            rollout = rollout_fn(refined)
-            cost_dict = cost_fn(rollout, refined)
-            soft = self.cost_reducer.soft_costs(cost_dict).mean()
-            hard = self.cost_reducer.hard_costs(cost_dict).mean()
-            loss = soft + barrier_weight * hard
-            loss.backward()
-            return loss
-
-        with torch.no_grad():
-            soft_before = self.cost_reducer.soft_costs(
-                cost_fn(rollout_fn(refined), refined)
-            ).mean().item()
-        try:
-            lbfgs.step(closure)
-        except Exception as e:
-            _log.warning(f"Phase 2 LBFGS refinement failed: {e}; keeping pre-Phase-2 particles.")
-            return
-        with torch.no_grad():
-            cd = cost_fn(rollout_fn(refined), refined)
-            soft_after = self.cost_reducer.soft_costs(cd).mean().item()
-            post_sat = self.get_satisfying_mask(cd, verbose=False)
-        kept = int(post_sat.sum().item())
-        _log.info(
-            f"Phase 2 LBFGS: refined {n_sat} particles; soft {soft_before:.4f} → "
-            f"{soft_after:.4f}; {kept}/{n_sat} still satisfying after refinement."
-        )
-        # Write refined values back. Particles that became unsatisfying during
-        # refinement (rare with the barrier, but possible if Wolfe couldn't
-        # find a backtracking step) get their original values restored.
-        with torch.no_grad():
-            for k in particles:
-                # Build the refined-or-original tensor for the sat_mask slice.
-                sub = refined[k].detach()
-                # Restore to pre-refinement values where post_sat is False.
-                if (~post_sat).any():
-                    pre = particles[k][sat_mask]
-                    sub = torch.where(
-                        post_sat.view(-1, *([1] * (sub.dim() - 1))).expand_as(sub),
-                        sub, pre,
-                    )
-                particles[k][sat_mask] = sub
-
     def _refresh_ik_deps(
         self,
         particles: dict,
@@ -408,6 +327,27 @@ class ParticleOptimizer:
                 # the ungated one (ik_refresh_solver falls back to ik_solver).
                 # Full batch always: cuRobo pads sub-capacity batches
                 # internally, so subsets save nothing.
+                ok_now = None
+                if gate is None:
+                    # Final pre-check refresh: REPAIR-ONLY. Measure which rows
+                    # actually fail the checker's kinematic tolerance or the
+                    # CoM gate and only overwrite those — a blanket
+                    # success-masked overwrite perturbs already-good rows'
+                    # soft costs (measured best_soft 18.6 -> 22.8 on one run).
+                    from cutamp.com_polygon_cost import compute_com_polygon_mask
+                    pos_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err")
+                    rot_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err")
+                    with torch.no_grad():
+                        pos_err, rot_err = _achieved_pose_errors(
+                            world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
+                        )
+                        ok_now = (
+                            (pos_err < pos_tol)
+                            & (rot_err < rot_tol)
+                            & compute_com_polygon_mask(world, particles[dep.q_name])
+                        )
+                    if bool(ok_now.all()):
+                        continue  # nothing to repair for this dep
                 cheap = gate is not None and world.ik_refresh_solver is not world.ik_solver
                 ik_result = _ik_for_pose(
                     world, world_from_ee, dep.arm,
@@ -418,6 +358,9 @@ class ParticleOptimizer:
                 new_q = _ik_solution_to_full_q(ik_result, world).detach()
                 success = _ik_success_mask(ik_result)
                 n_fail = int((~success).sum().item())
+                if ok_now is not None:
+                    # Repair-only merge: already-good rows keep their q.
+                    success = success & ~ok_now
                 with torch.no_grad():
                     merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
@@ -523,15 +466,13 @@ class ParticleOptimizer:
         _log.debug(f"Total DOF for each particle: {total_dof}")
 
         indices = torch.arange(self.config.num_particles, device="cuda")
-        # Adam only ever minimizes hard-constraint penalties (Phase 1).
-        # ``--optimize_soft_costs`` engages a separate Phase 2 (LBFGS with
-        # strong-Wolfe line search + barrier on hard constraints) that
-        # refines satisfying particles for soft costs without breaking
-        # constraint satisfaction.
         consider_types = {"constraint"}
         # Coupled re-IK breaks the KinematicConstraint coupling that destroys
         # vanilla Adam on pose-class soft costs, so soft costs can safely
-        # join the Adam loss. Phase 2 LBFGS still runs for q-class refinement.
+        # join the Adam loss when --optimize_soft_costs is on. (A separate
+        # "Phase 2" LBFGS soft polish existed for the upstream Adam-only-hard
+        # regime; measured null-to-negative under coupled re-IK and deleted
+        # 2026-08-04 — soft descent lives entirely in this Adam loss now.)
         if self.config.optimize_soft_costs and self.config.coupled_reik:
             consider_types.add("cost")
         found_solution = False
@@ -697,23 +638,6 @@ class ParticleOptimizer:
             _log.info(
                 f"re-IK refresh: {len(reik_gate.stats)} dep-refreshes, {total_s:.1f}s IK time"
             )
-
-        # Phase 2 (LBFGS soft-cost refinement): when --optimize_soft_costs is
-        # set, refine the satisfying particles' soft costs with LBFGS +
-        # strong-Wolfe line search. A large barrier on the hard-constraint
-        # penalty makes any step that breaks satisfaction increase the loss,
-        # so LBFGS's line search backtracks before taking it. Result:
-        # soft cost monotonically decreases on satisfying particles, and
-        # hard-constraint satisfaction is preserved by construction.
-        if self.config.optimize_soft_costs:
-            with torch.no_grad():
-                pre_p2_rollout = rollout_fn(particles)
-                pre_p2_cost_dict = cost_fn(pre_p2_rollout, particles)
-                pre_p2_sat = self.get_satisfying_mask(pre_p2_cost_dict, verbose=False)
-            if pre_p2_sat.any():
-                self._run_phase2_lbfgs_refinement(
-                    particles, pre_p2_sat, rollout_fn, cost_fn,
-                )
 
         # Now we've finished the optimization loop. Check the satisfying particles and compute soft/hard costs.
         with torch.no_grad():

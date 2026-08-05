@@ -129,8 +129,7 @@ class TestSoftCostHelper:
         # Violating config under every initial-state name + clean home under
         # q_pick: total must be exactly 0 (exclusion works inside the stacked
         # path, not just via the empty-dict fallback). Initial states must
-        # never acquire margin gradients — Phase-2 LBFGS re-leafs every
-        # cloned particle with requires_grad_(True).
+        # never acquire margin gradients through the Adam soft loss.
         from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
         limits = _t1_position_limits()
         m_lo, m_hi = self._margins()
