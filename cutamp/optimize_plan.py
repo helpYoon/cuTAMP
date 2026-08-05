@@ -102,6 +102,25 @@ def _build_ik_deps(
     return deps
 
 
+def _should_skip_adam(init_num: int, config: TAMPConfiguration) -> bool:
+    """Skip Phase 1 only when init already satisfies, re-IK is off, and the
+    ablation fairness flag hasn't forced optimization (upstream never
+    skipped; skipping is our shortcut for the uncoupled configuration)."""
+    return init_num > 0 and not config.coupled_reik and not config.force_adam
+
+
+def _adam_consider_types(config: TAMPConfiguration) -> set:
+    """Cost types in the Adam loss. Soft costs join when coupled re-IK makes
+    them trainable ("auto") or unconditionally ("always" — the ablation's
+    upstream-faithful attempt; historically destroys 21-DOF configs)."""
+    consider = {"constraint"}
+    if config.optimize_soft_costs and (
+        config.coupled_reik or config.soft_in_adam == "always"
+    ):
+        consider.add("cost")
+    return consider
+
+
 class PlanContainer(TypedDict):
     plan_skeleton: PlanSkeleton
     particles: Particles
@@ -466,15 +485,7 @@ class ParticleOptimizer:
         _log.debug(f"Total DOF for each particle: {total_dof}")
 
         indices = torch.arange(self.config.num_particles, device="cuda")
-        consider_types = {"constraint"}
-        # Coupled re-IK breaks the KinematicConstraint coupling that destroys
-        # vanilla Adam on pose-class soft costs, so soft costs can safely
-        # join the Adam loss when --optimize_soft_costs is on. (A separate
-        # "Phase 2" LBFGS soft polish existed for the upstream Adam-only-hard
-        # regime; measured null-to-negative under coupled re-IK and deleted
-        # 2026-08-04 — soft descent lives entirely in this Adam loss now.)
-        if self.config.optimize_soft_costs and self.config.coupled_reik:
-            consider_types.add("cost")
+        consider_types = _adam_consider_types(self.config)
         found_solution = False
         timer.stop("setup_optimizer")
 
@@ -502,7 +513,7 @@ class ParticleOptimizer:
             init_cost_dict = cost_fn(init_rollout, particles)
             init_satisfying = self.get_satisfying_mask(init_cost_dict, verbose=False)
             init_num = init_satisfying.sum().item()
-        skip_adam = (init_num > 0) and not self.config.coupled_reik
+        skip_adam = _should_skip_adam(init_num, self.config)
         if skip_adam:
             _log.info(
                 f"IK-init already produced {init_num}/{self.config.num_particles} satisfying "

@@ -89,3 +89,29 @@ def test_init_ik_selector_respects_gate():
     assert _select_init_ik(
         TAMPConfiguration(enable_com_init_gate=False)
     ) is _ik_for_pose_no_gate
+
+
+def test_should_skip_adam_logic():
+    from cutamp.config import TAMPConfiguration
+    from cutamp.optimize_plan import _should_skip_adam
+    # Today's behavior at defaults (coupled_reik=True): never skip.
+    assert not _should_skip_adam(10, TAMPConfiguration())
+    # Uncoupled + init satisfied: skips today...
+    c = TAMPConfiguration(coupled_reik=False)
+    assert _should_skip_adam(10, c)
+    assert not _should_skip_adam(0, c)
+    # ...unless force_adam (the baseline fairness fix).
+    assert not _should_skip_adam(10, TAMPConfiguration(coupled_reik=False, force_adam=True))
+
+
+def test_adam_consider_types_soft_gate():
+    from cutamp.config import TAMPConfiguration
+    from cutamp.optimize_plan import _adam_consider_types
+    assert _adam_consider_types(TAMPConfiguration()) == {"constraint", "cost"}
+    assert _adam_consider_types(TAMPConfiguration(coupled_reik=False)) == {"constraint"}
+    assert _adam_consider_types(
+        TAMPConfiguration(coupled_reik=False, soft_in_adam="always")
+    ) == {"constraint", "cost"}
+    assert _adam_consider_types(
+        TAMPConfiguration(optimize_soft_costs=False, soft_in_adam="always")
+    ) == {"constraint"}
