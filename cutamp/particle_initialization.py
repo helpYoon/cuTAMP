@@ -218,6 +218,17 @@ def _ik_for_pose_com_safe(
     return result
 
 
+def _ik_for_pose_no_gate(world, world_from_ee, arm, *, context: str = ""):
+    """Ablation (enable_com_init_gate=False): plain IK, no CoM gate or
+    retries — layer L2 off. Same call shape as _ik_for_pose_com_safe."""
+    return _ik_for_pose(world, world_from_ee, arm)
+
+
+def _select_init_ik(config):
+    """The init-IK entry point for this run's config (L2 on/off)."""
+    return _ik_for_pose_com_safe if config.enable_com_init_gate else _ik_for_pose_no_gate
+
+
 def _achieved_pose_errors(
     world: TAMPWorld, q_full: torch.Tensor, world_from_ee: torch.Tensor, arm: str,
 ):
@@ -358,7 +369,7 @@ class ParticleInitializer:
                 obj_from_grasp = obj_from_grasp[good_idxs]
                 world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(
+                ik_result = _select_init_ik(config)(
                     world, world_from_ee, arm,
                     context=f"pick({arm})",
                 )
@@ -403,7 +414,7 @@ class ParticleInitializer:
                 particles[placement] = sampled_placements
                 obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(
+                ik_result = _select_init_ik(config)(
                     world, world_from_ee, arm,
                     context=f"place({arm})",
                 )

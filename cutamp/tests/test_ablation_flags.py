@@ -78,3 +78,14 @@ def test_com_hard_constraint_flag_controls_cost_dict():
     off = _tiny_cost_dict(False)
     assert ComPolygon.type in on
     assert ComPolygon.type not in off
+
+
+def test_init_ik_selector_respects_gate():
+    from cutamp.config import TAMPConfiguration
+    from cutamp.particle_initialization import (
+        _ik_for_pose_com_safe, _ik_for_pose_no_gate, _select_init_ik,
+    )
+    assert _select_init_ik(TAMPConfiguration()) is _ik_for_pose_com_safe
+    assert _select_init_ik(
+        TAMPConfiguration(enable_com_init_gate=False)
+    ) is _ik_for_pose_no_gate
