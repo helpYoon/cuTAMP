@@ -200,6 +200,27 @@ def entrypoint():
              "COM (validated 2026-06-09; see config.enable_com_aware_ik).",
     )
     parser.set_defaults(enable_com_aware_ik=_defaults.enable_com_aware_ik)
+    parser.add_argument(
+        "--no_com_all", action="store_true",
+        help="Ablation umbrella: disable ALL CoM machinery — seed-IK residual "
+             "(L1), init gate+retries (L2), ComPolygon hard constraint (L3), "
+             "trajopt cost (L5). Equivalent to the four individual flags.",
+    )
+    parser.add_argument(
+        "--force_adam", action="store_true",
+        help="Run Phase 1 even when init already satisfies with coupled_reik "
+             "off (fairness fix for the ablation baseline).",
+    )
+    parser.add_argument(
+        "--soft_in_adam", choices=["auto", "always"], default=None,
+        help="'always' puts soft costs in the Adam loss even without "
+             "coupled_reik (upstream-faithful attempt for -reIK arms).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="torch.manual_seed for reproducible sampling (ablation study "
+             "uses seeds 0..4).",
+    )
 
     # Visualization and logging
     parser.add_argument(
@@ -239,6 +260,9 @@ def entrypoint():
 
     # We only expose a subset of the full TAMPConfiguration. Check config.py for the full configuration.
     args = parser.parse_args()
+    if args.seed is not None:
+        import torch
+        torch.manual_seed(args.seed)
     config = TAMPConfiguration(
         num_particles=args.num_particles,
         num_opt_steps=args.num_opt_steps,
@@ -255,9 +279,13 @@ def entrypoint():
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
         curobo_plan=args.motion_plan,
-        enable_com_polygon=args.enable_com_polygon,
+        enable_com_polygon=args.enable_com_polygon and not args.no_com_all,
         enable_joint_limit_margin=args.enable_joint_limit_margin,
-        enable_com_aware_ik=args.enable_com_aware_ik,
+        enable_com_aware_ik=args.enable_com_aware_ik and not args.no_com_all,
+        enable_com_init_gate=not args.no_com_all,
+        enable_com_hard_constraint=not args.no_com_all,
+        force_adam=args.force_adam,
+        soft_in_adam=args.soft_in_adam or TAMPConfiguration.soft_in_adam,
         enable_visualizer=not args.disable_visualizer,
         opt_viz_interval=args.viz_interval,
         viz_robot_mesh=not args.disable_robot_mesh,

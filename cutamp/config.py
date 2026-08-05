@@ -116,6 +116,21 @@ class TAMPConfiguration:
     # COM, recruiting legs within limits. The post-IK mask stays as the
     # backstop. Validation: commits 217d4b6 / 5b9ae65.
     enable_com_aware_ik: bool = True
+    # --- Ablation-study flags (2x2 baseline; docs/superpowers/specs/
+    # 2026-08-05-standard-cutamp-baseline-design.md). All default to the
+    # full system; the baseline cells turn them off/on explicitly. ---
+    # L3: register the ComPolygon hard constraint (satisfying-mask member).
+    enable_com_hard_constraint: bool = True
+    # L2: particle init uses the CoM-safe retry wrapper; False = plain IK.
+    enable_com_init_gate: bool = True
+    # Fairness: run Phase 1 even when init already satisfies and coupled_reik
+    # is off (today's skip_adam shortcut would let the baseline skip
+    # optimization entirely on easy tasks — upstream never skipped).
+    force_adam: bool = False
+    # "auto" = soft costs join the Adam loss only when coupled_reik is on
+    # (today's rule). "always" = join regardless — the upstream-faithful
+    # attempt for the -reIK arms (spec decision (a)).
+    soft_in_adam: str = "auto"
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
     # On RuntimeError from solve_curobo, retry on the next-best satisfying particle
@@ -160,6 +175,10 @@ def validate_tamp_config(config: TAMPConfiguration):
         # not at the first mid-loop refresh-solver build.
         raise ValueError(
             f"reik_lbfgs_iters must be a non-negative multiple of 20, not {config.reik_lbfgs_iters}"
+        )
+    if config.soft_in_adam not in ("auto", "always"):
+        raise ValueError(
+            f"soft_in_adam must be 'auto' or 'always', not {config.soft_in_adam!r}"
         )
     if config.reik_gn and not config.coupled_reik:
         # GN refresh only runs inside the coupled-reIK loop. Now that reik_gn
