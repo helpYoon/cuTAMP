@@ -505,4 +505,36 @@ def solve_curobo(
             )
         cur_t += pos.shape[0] * dt
 
-    return accum_plans
+    # Measure-only trajectory CoM audit (recorded in every ablation arm).
+    #
+    # Deviates from the task brief's illustrative snippet in one respect:
+    # accum_plans entries carry trajectories in different DOF forms depending
+    # on which planner method produced them — either the planner's locked
+    # active-cspace (18-DOF, missing the locked base joints) or the fully
+    # articulated form (31-DOF, a superset of world.kinematics's 21 joints
+    # that already includes the "locked" base joints). Unconditionally
+    # calling get_full_js (as the brief's snippet does) raises
+    # ``ValueError: lock_joints is also listed in js.joint_names`` on the
+    # latter case. Mirror the same conditional the playback loop just above
+    # already uses for this exact DOF-form ambiguity: only augment with
+    # get_full_js when the trajectory is short the locked joints; a plain
+    # reorder (index-select) handles the already-fully-articulated case.
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    total_frames, violation_frames = 0, 0
+    audit_full_dof = len(world.kinematics.joint_names)
+    with torch.no_grad():
+        for entry in accum_plans:
+            plan_js = entry["plan"]
+            pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
+            js = JointState.from_position(pos, joint_names=list(plan_js.joint_names))
+            if pos.shape[-1] < audit_full_dof:
+                js = planner.kinematics.get_full_js(js)
+            full = js.reorder(list(world.kinematics.joint_names)).position
+            ok = compute_com_polygon_mask(world, full)
+            total_frames += int(ok.numel())
+            violation_frames += int((~ok).sum().item())
+    audit = {
+        "traj_com_violation_frac": (violation_frames / total_frames) if total_frames else 0.0,
+        "traj_com_frames": total_frames,
+    }
+    return accum_plans, audit

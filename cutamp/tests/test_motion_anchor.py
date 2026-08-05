@@ -52,16 +52,17 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
 
 def _generate_plan_segments(seed: int):
     """Run the full cuTAMP pipeline once for blocks_t1 and return
-    ``(world, segments)``: a TAMPWorld for COM checks plus the processed
-    motion-plan segments (schema v3).
+    ``(world, segments, overall_metrics)``: a TAMPWorld for COM checks, the
+    processed motion-plan segments (schema v3), and the ``overall_metrics``
+    dict (includes the measure-only trajectory CoM audit).
 
     ``run_cutamp(env, config, cost_reducer, constraint_checker, q_init=None,
     experiment_id=None)`` takes an env (not a prebuilt world), builds the
     world itself via ``setup_cutamp``, and returns a
-    ``(curobo_plan, num_satisfying)`` tuple; the raw plan is then processed
-    to schema v3 with ``process_motion_plan``. The TAMPWorld used for the
-    COM checks is built separately from the same env — its kinematics
-    depend only on the robot/env, so it matches the planner's.
+    ``(curobo_plan, num_satisfying, overall_metrics)`` tuple; the raw plan is
+    then processed to schema v3 with ``process_motion_plan``. The TAMPWorld
+    used for the COM checks is built separately from the same env — its
+    kinematics depend only on the robot/env, so it matches the planner's.
     """
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.config import TAMPConfiguration
@@ -93,7 +94,7 @@ def _generate_plan_segments(seed: int):
     cost_reducer = CostReducer(default_constraint_to_mult.copy())
     constraint_checker = ConstraintChecker(default_constraint_to_tol.copy())
 
-    curobo_plan, _num_satisfying = run_cutamp(
+    curobo_plan, _num_satisfying, overall_metrics = run_cutamp(
         env, config, cost_reducer, constraint_checker,
         experiment_id="test_place_arrival",
     )
@@ -106,7 +107,7 @@ def _generate_plan_segments(seed: int):
 
     # Separate TAMPWorld for COM checks (kinematics depend only on env/robot).
     world = make_blocks_t1_world()
-    return world, processed["segments"]
+    return world, processed["segments"], overall_metrics
 
 
 def _frame_q(q_home, idx, P, t):
@@ -136,7 +137,7 @@ def test_all_segment_arrivals_com_in_hull(seed):
     from cutamp.robots.t1 import t1_home
     from cutamp.com_polygon_cost import compute_com_polygon_penalties, COM_TOL
 
-    world, segments = _generate_plan_segments(seed=seed)
+    world, segments, overall = _generate_plan_segments(seed=seed)
     assert len(segments) > 0, "plan produced no segments"
     names = list(world.kinematics.joint_names)
     idx = {n: i for i, n in enumerate(names)}
@@ -152,3 +153,10 @@ def test_all_segment_arrivals_com_in_hull(seed):
             f"segment {si} arrival COM penalty {pen:.6f} > tol {COM_TOL}"
         )
     print(f"all {len(segments)} arrivals in hull; worst penalty {worst:.6f} <= {COM_TOL}")
+
+    # Trajectory audit is recorded (measure-only) whenever a plan is produced.
+    assert overall["motion_plan_success"] is True
+    assert 0.0 <= overall["traj_com_violation_frac"] <= 1.0
+    assert overall["traj_com_frames"] > 0
+    # Full system: trajectories should be (near-)fully inside the polygon.
+    assert overall["traj_com_violation_frac"] < 0.05

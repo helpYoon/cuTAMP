@@ -58,7 +58,7 @@ def cutamp_demo(
         from datetime import datetime
         experiment_id = datetime.now().isoformat().split(".")[0]
 
-    curobo_plan, _num_satisfying = run_cutamp(
+    curobo_plan, _num_satisfying, _overall_metrics = run_cutamp(
         env, config, cost_reducer, constraint_checker, experiment_id=experiment_id,
     )
 
