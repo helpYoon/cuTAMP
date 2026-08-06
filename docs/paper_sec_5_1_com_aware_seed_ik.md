@@ -56,7 +56,7 @@ P_{\mathrm{com}}(q)=
 \tag{5}
 $$
 
-The first term is zero inside the support rectangle and grows quadratically outside it. The second activates within $m$ of the nearest edge and remains active outside, creating a soft interior buffer. The normalized center term breaks ties among otherwise feasible redundant postures by preferring configurations farther from every edge. The implemented geometry and weights are $h=(0.1115,0.156)\,\mathrm{m}$, $m=0.02\,\mathrm{m}$, $w_{\mathrm{in}}=1$, $w_c=10^{-3}$, and an overall support weight $w=1$.
+The first term is zero inside the support rectangle and grows quadratically outside it. The second activates within $m$ of the nearest edge and remains active outside, creating a soft interior buffer. The normalized center term breaks ties among otherwise feasible redundant postures by biasing the CoM toward the rectangle center. The implemented geometry and weights are $h=(0.1115,0.156)\,\mathrm{m}$, $m=0.02\,\mathrm{m}$, $w_{\mathrm{in}}=1$, $w_c=10^{-3}$, and an overall support weight $w=1$.
 
 Using $E_{\mathrm{pose}}$ and $E_{\mathrm{lim}}$ for cuRobo's native pose and joint-limit terms, respectively, the modified seed objective is
 
