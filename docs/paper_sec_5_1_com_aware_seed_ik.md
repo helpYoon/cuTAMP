@@ -87,7 +87,35 @@ $$
 
 The first two terms penalize motion outside the support rectangle. The margin term becomes positive when the CoM enters the $m$-wide strip near any edge and remains active outside the rectangle. The final term gently biases otherwise feasible postures toward the center. The implemented values are $h_x=0.1115\,\mathrm{m}$, $h_y=0.156\,\mathrm{m}$, $m=0.02\,\mathrm{m}$, $w_{\mathrm{in}}=1$, $w_c=10^{-3}$, and an overall support weight $w=1$.
 
-Using $E_{\mathrm{pose}}$ and $E_{\mathrm{lim}}$ for cuRobo's native pose and joint-limit terms, respectively, the modified seed objective is
+The other two terms in the seed objective come from cuRobo. Let $\mathcal{L}$ be the set of tracked frames: the active hand, inactive hand, and base. For each frame $\ell\in\mathcal{L}$, let $p_\ell(q)$ and $R_\ell(q)$ be its current position and orientation, and let $p_\ell^d$ and $R_\ell^d$ be the corresponding targets. If $\phi(\cdot)$ converts a relative rotation to its axis--angle vector, then the current unit-weight pose score is
+
+$$
+E_{\mathrm{pose}}(q)=\sum_{\ell\in\mathcal{L}}
+\left[
+\frac{1}{2}\left\lVert p_\ell(q)-p_\ell^d\right\rVert_2^2
++\left\lVert\phi\!\left(R_\ell(q)R_\ell^{d\top}\right)\right\rVert_2^2
+\right].
+$$
+
+Thus, $E_{\mathrm{pose}}$ is small only when every tracked frame is close to its target in both position and orientation.
+
+For joint $i$, let $q_i^-$ and $q_i^+$ denote the lower and upper bounds. cuRobo moves each original bound inward by $0.1\%$ of that joint's range before LM begins. Define the amount by which the joint violates these margin-adjusted bounds as
+
+$$
+v_i(q)=\max(q_i^- - q_i,0)+\max(q_i-q_i^+,0).
+$$
+
+With the current unit joint-limit weight, cuRobo forms
+
+$$
+r_{\mathrm{lim}}(q)=\begin{bmatrix}v_1(q)&\cdots&v_n(q)\end{bmatrix}^{\top},
+\qquad
+E_{\mathrm{lim}}(q)=\sum_{i=1}^{n}v_i(q).
+$$
+
+Each $v_i$ is zero inside the permitted interval and equals the distance beyond the violated bound outside it. The scalar $E_{\mathrm{lim}}$ is used when comparing the current and candidate objectives. The local LM system separately treats $r_{\mathrm{lim}}$ as a residual, producing the term $J_{\mathrm{lim}}^\top r_{\mathrm{lim}}$ in the update below.
+
+The complete scalar objective used by the gain-ratio test is
 
 $$
 E(q)=E_{\mathrm{pose}}(q)+E_{\mathrm{lim}}(q)+wP_{\mathrm{com}}(q).
@@ -102,7 +130,7 @@ Let $K$ denote the number of LM candidates retained for later stages. Figure 5.1
 
 ## Mapping the objective to the implemented solver
 
-Let $r_{\mathrm{lim}}$ and $J_{\mathrm{lim}}$ be the analytical joint-limit residual and Jacobian, respectively, and let $J_{\mathrm{pose}}$ be the tool-pose Jacobian. The implementation forms the right-hand side gradient $g$ and residual Jacobian $J$ as
+Let $J_{\mathrm{lim}}=\partial r_{\mathrm{lim}}/\partial q$ be the analytical joint-limit Jacobian, and let $J_{\mathrm{pose}}$ be the tool-pose Jacobian. The implementation forms the right-hand side gradient $g$ and residual Jacobian $J$ as
 
 $$
 g=\nabla_q\!\left(E_{\mathrm{pose}}+wP_{\mathrm{com}}\right)
