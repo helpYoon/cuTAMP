@@ -25,7 +25,7 @@
     <text x="996" y="222" text-anchor="middle" font-weight="600" fill="#1D2732">q* + success</text><text x="996" y="241" text-anchor="middle" font-size="9.5">recomputed pose +</text><text x="996" y="254" text-anchor="middle" font-size="9.5">collision metrics</text>
     <rect x="548" y="208" width="156" height="58" rx="8" fill="#E8F6F3" stroke="#0E7D6B" stroke-dasharray="5 4"/>
     <text x="626" y="232" text-anchor="middle" font-weight="600" fill="#0E7D6B">cuTAMP CoM mask / retry</text><text x="626" y="250" text-anchor="middle" font-size="10.5">then hard ComPolygon constraint</text>
-    <g fill="none" stroke="#5A6673" stroke-width="1.5" marker-end="url(#arrow)"><path d="M198 140H228"/><path d="M388 140H418"/><path d="M586 140H616"/><path d="M786 140H780"/><path d="M884 140H902V108H908" stroke-dasharray="5 4"/><path d="M836 175V202"/><path d="M936 237H952"/><path d="M958 256H704" stroke-dasharray="5 4"/></g>
+    <g fill="none" stroke="#5A6673" stroke-width="1.5" marker-end="url(#arrow)"><path d="M198 140H228"/><path d="M388 140H418"/><path d="M586 140H616"/><path d="M786 140H788"/><path d="M884 140H902V108H908" stroke-dasharray="5 4"/><path d="M966 140V192" stroke-dasharray="5 4"/><path d="M836 175V202"/><path d="M936 237H952"/><path d="M958 256H704" stroke-dasharray="5 4"/></g>
     <text x="891" y="130" font-size="10" fill="#5A6673">yes</text><text x="848" y="195" font-size="10" fill="#5A6673">no</text>
   </g>
   <g id="panel-b" aria-label="One Levenberg-Marquardt iteration">
@@ -39,9 +39,9 @@
     <text x="575" y="415" text-anchor="middle" font-weight="600" fill="#1D2732">damped LM solve</text><text x="575" y="435" text-anchor="middle" font-size="10">(J^T J + lambda I) delta q = -g</text>
     <rect x="700" y="388" width="174" height="74" rx="8" fill="#F0F3F1" stroke="#DCE1E4"/>
     <text x="787" y="415" text-anchor="middle" font-weight="600" fill="#1D2732">evaluate candidate q+</text><text x="787" y="435" text-anchor="middle" font-size="10.5">same FK and objective path</text>
-    <rect x="780" y="500" width="222" height="52" rx="8" fill="#F0F3F1" stroke="#DCE1E4"/>
-    <text x="891" y="518" text-anchor="middle" font-weight="600" fill="#1D2732">gain-ratio test</text><text x="891" y="534" text-anchor="middle" font-size="9.5">accept: q &lt;- q+, lambda / 2;</text><text x="891" y="546" text-anchor="middle" font-size="9.5">reject: keep q, 2 lambda</text>
-    <g fill="none" stroke="#5A6673" stroke-width="1.5" marker-end="url(#arrow)"><path d="M236 425H268"/><path d="M450 425H482"/><path d="M662 425H694"/><path d="M787 462V494H891"/><path d="M780 526H520V468H149V462"/></g>
+    <rect x="780" y="500" width="222" height="62" rx="8" fill="#F0F3F1" stroke="#DCE1E4"/>
+    <text x="891" y="516" text-anchor="middle" font-weight="600" fill="#1D2732">gain-ratio test</text><text x="891" y="530" text-anchor="middle" font-size="9.5">rho = actual / predicted reduction</text><text x="891" y="544" text-anchor="middle" font-size="9.5">accept: q &lt;- q+, lambda / 2;</text><text x="891" y="556" text-anchor="middle" font-size="9.5">reject: keep q, 2 lambda</text>
+    <g fill="none" stroke="#5A6673" stroke-width="1.5" marker-end="url(#arrow)"><path d="M236 425H268"/><path d="M450 425H482"/><path d="M662 425H694"/><path d="M787 462V494H891"/><path d="M780 531H520V468H149V462"/></g>
     <text x="475" y="486" font-size="10.5">accepted q feeds next iteration</text>
   </g>
   <g id="legend" aria-label="Legend"><rect x="48" y="602" width="12" height="12" fill="#E8F6F3" stroke="#0E7D6B"/><text x="68" y="612" font-size="10.5">teal: CoM addition</text><rect x="202" y="602" width="12" height="12" fill="#FFF5E6" stroke="#B57614"/><text x="222" y="612" font-size="10.5">amber: CoM-blind refinement</text><line x1="440" y1="608" x2="472" y2="608" stroke="#5A6673" stroke-dasharray="5 4"/><text x="480" y="612" font-size="10.5">dashed: conditional / external check</text></g>
