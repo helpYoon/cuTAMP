@@ -11,12 +11,22 @@ Let $B$ denote the configured batch capacity, and hence the number of targets pr
 
 ## Levenberg–Marquardt from first principles
 
-Consider first a generic nonlinear least-squares problem. For a residual vector $r(q)$, define the scalar objective
+Forward kinematics defines a smooth map
 
 $$
-E_0(q)=\frac{1}{2}\lVert r(q)\rVert_2^2.
+x=f(q), \qquad q\in\mathbb{R}^n,\quad x\in\mathbb{R}^m,
+$$
+
+where $q$ contains the joint variables and $x$ represents the tracked task-space poses. Inverse kinematics seeks a configuration for which $f(q)=x_d$, where $x_d$ is the desired stacked pose target. Because $f$ is nonlinear and generally has no closed-form inverse, IK is instead formulated as nonlinear least squares. Define the pose residual and its weighted cost as
+
+$$
+e(q)=x_d\ominus f(q),
+\qquad
+E_0(q)=\frac{1}{2}e(q)^\top W_e e(q).
 \tag{1}
 $$
+
+Here $\ominus$ denotes the appropriate pose difference, including both translation and orientation, and $W_e\succeq0$ weights the components of that error. Defining the weighted residual $r(q)=W_e^{1/2}e(q)$ gives $E_0(q)=\tfrac12\lVert r(q)\rVert_2^2$. LM is the standard nonlinear least-squares solver applied to this cost.
 
 For an increment $\delta q$, let $J(q)=\partial r/\partial q$ be the residual Jacobian at the current configuration. Its first-order expansion is
 
@@ -41,7 +51,7 @@ $$
 
 Positive damping makes the linear solve well posed. Small $\lambda$ approaches the Gauss--Newton step, whereas increasing $\lambda$ interpolates toward the shorter gradient step $-J^\top r/\lambda$.
 
-The implementation follows this LM structure but supplies its native pose and joint-limit score, gradient, and Jacobian blocks separately.
+$E_0$ is the pose-only objective underlying this LM step. The implementation follows the same structure but supplies its native pose and joint-limit score, gradient, and Jacobian blocks separately.
 
 ## Adding the support-polygon objective
 
