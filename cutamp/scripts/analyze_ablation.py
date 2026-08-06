@@ -24,11 +24,13 @@ METRICS = [
     "ms_per_step",
 ]
 CELL_ORDER = ["full", "no_com", "no_reik", "standard"]
+# Label arms by what they HAVE, not what was removed — "−CoM" reads as
+# "the CoM thing" in figures when it is precisely the arm WITHOUT it.
 CELL_LABEL = {
-    "full": "Full system",
-    "no_com": "−CoM",
-    "no_reik": "−re-IK",
-    "standard": "Standard cuTAMP",
+    "full": "Full (CoM + re-IK)",
+    "no_com": "re-IK only (no CoM)",
+    "no_reik": "CoM only (no re-IK)",
+    "standard": "Standard cuTAMP (neither)",
 }
 
 
