@@ -55,18 +55,37 @@ $E_0$ is the pose-only objective underlying this LM step. The implementation fol
 
 ## Adding the support-polygon objective
 
-Let $c(q)\in\mathbb{R}^2$ be the mass-weighted robot CoM projected into the `mobile_base_link` frame. Let $h\in\mathbb{R}^2$ contain the rectangular support half-extents, let $[x]_+=\max(x,0)$ and $|x|$ act componentwise, let $m$ be an inside margin, let $w_{\mathrm{in}}$ and $w_c$ be the inside-barrier and center weights, and let $\oslash$ denote componentwise division. The implemented penalty is
+Let $c(q)=(c_x(q),c_y(q))$ be the robot's mass-weighted CoM projected onto the horizontal plane and expressed in the `mobile_base_link` frame. The support rectangle is centered at the frame origin and has half-widths $h_x$ and $h_y$. We first define how far the CoM lies beyond each support boundary,
 
 $$
-P_{\mathrm{com}}(q)=
-\left\lVert[|c(q)|-h]_+\right\rVert_2^2
-+w_{\mathrm{in}}
-\left\lVert[|c(q)|-h+m]_+\right\rVert_\infty^2
-+w_c\left\lVert c(q)\oslash h\right\rVert_2^2.
+d_x(q)=\max\!\left(|c_x(q)|-h_x,0\right),
+\qquad
+d_y(q)=\max\!\left(|c_y(q)|-h_y,0\right).
+$$
+
+Both values are zero while the CoM remains inside the rectangle. To create a soft buffer of width $m$ near its edges, define
+
+$$
+d_{\mathrm{margin}}(q)=\max\!\left(
+|c_x(q)|-h_x+m,
+|c_y(q)|-h_y+m,
+0
+\right).
+$$
+
+The implemented CoM penalty is then
+
+$$
+P_{\mathrm{com}}(q)=d_x(q)^2+d_y(q)^2
++w_{\mathrm{in}}d_{\mathrm{margin}}(q)^2
++w_c\left[
+\left(\frac{c_x(q)}{h_x}\right)^2+
+\left(\frac{c_y(q)}{h_y}\right)^2
+\right].
 \tag{5}
 $$
 
-The first term is zero inside the support rectangle and grows quadratically outside it. The second activates within $m$ of the nearest edge and remains active outside, creating a soft interior buffer. The normalized center term breaks ties among otherwise feasible redundant postures by biasing the CoM toward the rectangle center. The implemented geometry and weights are $h=(0.1115,0.156)\,\mathrm{m}$, $m=0.02\,\mathrm{m}$, $w_{\mathrm{in}}=1$, $w_c=10^{-3}$, and an overall support weight $w=1$.
+The first two terms penalize motion outside the support rectangle. The margin term becomes positive when the CoM enters the $m$-wide strip near any edge and remains active outside the rectangle. The final term gently biases otherwise feasible postures toward the center. The implemented values are $h_x=0.1115\,\mathrm{m}$, $h_y=0.156\,\mathrm{m}$, $m=0.02\,\mathrm{m}$, $w_{\mathrm{in}}=1$, $w_c=10^{-3}$, and an overall support weight $w=1$.
 
 Using $E_{\mathrm{pose}}$ and $E_{\mathrm{lim}}$ for cuRobo's native pose and joint-limit terms, respectively, the modified seed objective is
 
