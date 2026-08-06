@@ -101,7 +101,7 @@ $$
 \tag{9}
 $$
 
-The step is accepted when $\rho\ge 10^{-5}$. Accepted rows use the candidate and halve $\lambda$; rejected rows retain the current iterate and double $\lambda$. Damping starts at $\lambda=1$ and is clamped to $[10^{-5},10^{10}]$ (equivalently, the implementation values are `10^-5` and `10^10`).
+The step is accepted when $\rho\ge 10^{-5}$. Accepted rows use the candidate and halve $\lambda$; rejected rows retain the current iterate and double $\lambda$. Damping starts at $\lambda=1$ and is clamped to $[10^{-5},10^{10}]$.
 
 RHS-only coupling is useful because pose-null directions have weak $J^\top J$ curvature. Damping therefore allows the CoM gradient to choose among redundant postures without adding a new residual or Jacobian template. Candidate re-evaluation nevertheless tests the full modified score, limiting steps whose omitted CoM curvature makes the local model inaccurate.
 
@@ -121,7 +121,7 @@ The soft term changes preference, not admissibility. It guides seed LM toward be
 
 ## Parameter selection
 
-Empirical sweeps selected the support weight $w=1$ within a robust tested range of $0.1$--$3.0$, together with center weight $w_c=10^{-3}$ (`10^-3`). Center weights at or above $3\times10^{-3}$ degraded seed convergence and increased reliance on CoM-blind refinement. These values are empirical tuning results rather than a theorem or stability guarantee.
+Empirical sweeps selected the support weight $w=1$ within a robust tested range of $0.1$--$3.0$, together with center weight $w_c=10^{-3}$. Center weights at or above $3\times10^{-3}$ degraded seed convergence and increased reliance on CoM-blind refinement. These values are empirical tuning results rather than a theorem or stability guarantee.
 
 ---
 
