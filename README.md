@@ -6,13 +6,17 @@ The full README with installation instructions, examples, and detailed
 documentation can be found in [README_DETAILED.md](README_DETAILED.md).
 
 > **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
-> `curobo/` tree (the `compute_com` plumbing and the CoM-aware seed-IK
-> residual — 7 Python files; the earlier batched-COM kernel fix was dropped
+> `curobo/` tree (the `compute_com` plumbing, the CoM-aware seed-IK
+> residual, and a thread-safety fix for warp stream wrappers — 8 Python files;
+> the earlier batched-COM kernel fix was dropped
 > when the base moved to NVlabs PR #678, which fixes it upstream). The edits
 > live on the `main` branch of the cuRobo fork (helpYoon/curobo) — a plain
 > NVlabs checkout without them breaks cuTAMP. Grep `cuTAMP` under
-> `curobo/curobo/_src/` for the full inventory (5 files tagged `cuTAMP fork`,
+> `curobo/curobo/_src/` for the full inventory (6 files tagged `cuTAMP fork`,
 > plus `robot_state_transition[_cfg].py` tagged `cuTAMP local addition`).
+> Without the `util/warp.py` fix, the background motion-planner warmup
+> thread can crash the process with heap corruption
+> (`malloc(): unaligned tcache chunk detected`).
 
 ## How it works (end-to-end)
 

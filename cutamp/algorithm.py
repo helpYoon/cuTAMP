@@ -315,10 +315,12 @@ def run_cutamp(
     particle_initializer = ParticleInitializer(world, config)
 
     # Build + warm the trajopt planner on a background thread, overlapped with
-    # particle init and Phase 1 (~10 s of serial wall-clock hidden). Safe: the
-    # build uses no CUDA graphs (see build_motion_planner), so the thread only
-    # contends with the loop for kernel slots. solve_curobo joins via
-    # get_planner; its warmup timer then measures only the residual wait.
+    # particle init and Phase 1 (~10 s of serial wall-clock hidden). The build
+    # uses no CUDA graphs (see build_motion_planner). Concurrent cuRobo use is
+    # only safe with the fork's per-stream warp wrapper cache
+    # (curobo/_src/util/warp.py): warp's stream registry is unlocked, and a
+    # fresh wrapper per launch from two threads corrupts the heap. solve_curobo
+    # joins via get_planner; its warmup timer then measures only the residual wait.
     get_planner = None
     if config.curobo_plan:
         import threading
