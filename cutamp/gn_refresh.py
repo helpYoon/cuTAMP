@@ -39,8 +39,8 @@ particle init, on per-refresh fallback, and at the final pre-check refresh):
   tolerance are handed to the cuRobo fallback by the caller).
 
 ``gn_project_balanced`` is the balance-first variant behind
-``config.reik_balance_first``: CoM-in-polygon is a hard first level and the
-pose is least squares inside it.
+``config.reik_balance_first``: CoM-in-polygon is a hard first level, the
+pose is least squares inside it, and joint-limit margins use what is left.
 """
 
 import roma
@@ -48,7 +48,9 @@ import torch
 
 from curobo.types import JointState
 
-from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
+from cutamp.robots.t1 import (
+    BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES, T1_LIMIT_MARGIN_LOWER, T1_LIMIT_MARGIN_UPPER,
+)
 
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
 # fallback-rate instrumentation shows a fat non-converged band.
@@ -69,6 +71,17 @@ GN_STEP_CLAMP = 0.15
 # cluster within 1 cm of the edge, and a 1 cm activation band knocked 27/240
 # of them off their pose on the captured rows.
 GN_COM_MARGIN = 0.005
+# Balance-first only, level 3 (joint margins). Damping: a joint with little
+# freedom left after balance and pose would otherwise demand a huge
+# compensating motion from the others; this caps it near 5x its own error.
+GN_MARGIN_DAMPING = 1e-2
+# Per-iteration |dq| cap on level 3. Its null-space steps hold levels 1-2 to
+# first order only: at the full GN_STEP_CLAMP box their second-order drift
+# walked edge-hugging place confs' CoM out of the rectangle, and level 1's
+# correction then clamped joints at hard limits (9-20/512 place confs lost
+# their pose per refresh; 0-2 at this cap). Margins need ~0.1 rad and get a
+# refresh every 5 Adam steps, so small steps cost little.
+GN_MARGIN_STEP = 0.03
 
 
 def _setup(world, q_full: torch.Tensor, arm: str):
@@ -168,6 +181,51 @@ def _prioritized_step(jac_com, com, active, com_target, jac, r, damping):
     return dq1, dq2
 
 
+def _fraction_that_fits(base, extra):
+    """Largest ``f`` in [0, 1] with ``|base + f * extra| <= GN_STEP_CLAMP`` per joint."""
+    room = (GN_STEP_CLAMP - base * extra.sign()) / extra.abs().clamp_min(1e-12)
+    return room.amin(-1, keepdim=True).clamp(0.0, 1.0)
+
+
+def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lower, upper):
+    """Level 3: move joints with nonzero ``margin_err`` (rad to their margin
+    band's edge) by at most ``GN_MARGIN_STEP``, on top of the levels 1-2
+    ``step``, without moving the pose or the ``locked`` CoM axes to first
+    order. Its task Jacobian is a joint selector, so its projected Jacobian is
+    the selected rows of the null-space projector.
+
+    Active sets, re-solved up to three times like levels 1-2: a CoM axis this
+    step would push past ``inner`` is locked, and a joint it would push past
+    a hard limit is frozen (joints frozen by levels 1-2 stay frozen).
+    Float64 because the explicit projector is ill-conditioned (cond(A A^T)
+    ~5e5 on place confs): in float32 it leaked ~5e-3 of each step into the
+    pose, the damped solve amplified that ~15x, and ~80/512 place confs lost
+    their pose per refresh.
+    """
+    f64 = torch.float64
+    eye_dof = torch.eye(q.shape[-1], device=q.device, dtype=f64)
+    eye8 = torch.eye(8, device=q.device, dtype=f64)
+    for _ in range(3):
+        a = (torch.cat([jac_com * locked.to(q.dtype).unsqueeze(-1), jac], dim=1) * free.unsqueeze(1)).to(f64)
+        proj = eye_dof - a.transpose(-1, -2) @ torch.linalg.solve(a @ a.transpose(-1, -2) + 1e-12 * eye8, a)
+        sel = (margin_err * free != 0).to(f64)
+        m = sel.unsqueeze(-1) * proj                                # [B, dof, dof]
+        rhs = sel * (margin_err - step).to(f64)
+        y = torch.linalg.solve(m @ m.transpose(-1, -2) + GN_MARGIN_DAMPING * eye_dof, rhs.unsqueeze(-1))
+        dq3 = (m.transpose(-1, -2) @ y).squeeze(-1).to(q.dtype)
+        s3 = _fraction_that_fits(step, dq3) * dq3
+        s3 = s3 * (GN_MARGIN_STEP / s3.abs().amax(-1, keepdim=True).clamp_min(GN_MARGIN_STEP))
+        q_lin = q + step + s3
+        crossed = (((q_lin > upper) & (s3 > 0)) | ((q_lin < lower) & (s3 < 0))) & free.bool()
+        com_lin = com + (jac_com @ (step + s3).unsqueeze(-1)).squeeze(-1)
+        pushed = ~locked & (com_lin.abs() > inner) & (com_lin.sign() * (jac_com @ s3.unsqueeze(-1)).squeeze(-1) > 0)
+        if not bool(crossed.any() or pushed.any()):
+            break
+        free = free * ~crossed
+        locked = locked | pushed
+    return s3
+
+
 def gn_project_balanced(
     world,
     q_full: torch.Tensor,
@@ -177,16 +235,23 @@ def gn_project_balanced(
 ) -> torch.Tensor:
     """Balance-first variant of :func:`gn_project` (``config.reik_balance_first``).
 
-    Each step is a two-level hierarchy (Kanoun et al. T-RO 2011; Escande et
+    Each step is a three-level hierarchy (Kanoun et al. T-RO 2011; Escande et
     al. IJRR 2014): (1) keep the base-frame CoM inside the support rectangle
     shrunk by ``GN_COM_MARGIN``; (2) least squares on the pose residual in
-    whatever freedom level 1 leaves. An unreachable target therefore returns
-    the closest balanced pose, not an unbalanced exact one, and its leftover
-    pose error is what the kinematic cost hands to the placement.
+    whatever freedom level 1 leaves; (3) move joints out of the
+    ``joint_limit_margin`` bands (robots/t1.py margins) in whatever freedom
+    is left, in small steps (:func:`_margin_step`). An unreachable target
+    therefore returns the closest balanced pose, not an unbalanced exact one,
+    and its leftover pose error is what the kinematic cost hands to the
+    placement. Level 3 exists because covered confs are outside Adam, so the
+    margin soft cost never reaches them: on blocks_t1 some runs initialized
+    every particle's pick-conf Torso_Pitch ~3 mrad from its limit and kept a
+    soft cost near 9.35 all run.
 
     Differences from :func:`gn_project` beyond the hierarchy:
-    - steps are scaled into the ``GN_STEP_CLAMP`` box (level 1 first), not
-      clipped per joint, so they keep their direction;
+    - steps are scaled into the ``GN_STEP_CLAMP`` box (level 1 first, then
+      the largest fractions of levels 2 and 3 that fit), not clipped per
+      joint, so they keep their direction;
     - damping grows with the squared residual (Levenberg-Marquardt), which
       keeps steps sane where the two levels conflict;
     - the CoM Jacobian comes from autograd through cuRobo's FK, so each
@@ -201,6 +266,8 @@ def gn_project_balanced(
     B = q.shape[0]
     half = torch.tensor(COM_HALF_EXTENTS, device=q.device, dtype=q.dtype)
     inner = half - GN_COM_MARGIN
+    band_lo = lower + torch.tensor(T1_LIMIT_MARGIN_LOWER, device=q.device, dtype=q.dtype)
+    band_hi = upper - torch.tensor(T1_LIMIT_MARGIN_UPPER, device=q.device, dtype=q.dtype)
 
     for _ in range(iters):
         q_g = q.detach().requires_grad_(True)
@@ -246,11 +313,13 @@ def gn_project_balanced(
                 active = active | pushed_out
                 free = free * ~blocked
 
-            # Trust region, level 1 first: scale dq1 into the box, then take
-            # the largest fraction of dq2 that still fits.
-            dq1 = dq1 * (GN_STEP_CLAMP / dq1.abs().amax(-1, keepdim=True).clamp_min(GN_STEP_CLAMP))
-            room = (GN_STEP_CLAMP - dq1 * dq2.sign()) / dq2.abs().clamp_min(1e-12)
-            frac = room.amin(-1, keepdim=True).clamp(0.0, 1.0)
-            q = (q + dq1 + frac * dq2).clamp(lower, upper)
+            # Trust region in priority order: scale dq1 into the box, then add
+            # the largest fraction of dq2 that still fits; level 3 takes what
+            # room is left.
+            step = _fraction_that_fits(torch.zeros_like(dq1), dq1) * dq1
+            step = step + _fraction_that_fits(step, dq2) * dq2
+            margin_err = ((band_lo - q).clamp_min(0) - (q - band_hi).clamp_min(0)) * col_mask
+            step = step + _margin_step(q, step, margin_err, jac, jac_com, com, active, inner, free, lower, upper)
+            q = (q + step).clamp(lower, upper)
 
     return q.detach()

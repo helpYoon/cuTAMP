@@ -141,3 +141,42 @@ def test_gn_project_balanced_keeps_com_in_and_closes_pose():
     pos2, _ = _achieved_pose_errors(world, q2, far, "left")
     assert bool(compute_com_polygon_mask(world, q2).all())
     assert bool((pos2 < pos0 - 0.05).all()), f"{pos0.min().item():.3f} -> {pos2.max().item():.3f}"
+
+
+@needs_cuda
+def test_gn_project_balanced_leaves_margin_bands_holding_pose_and_com():
+    # Level 3: Torso_Pitch 3 mrad above its hard lower limit (the pick confs
+    # behind the 9.35 soft-cost mode) climbs out of its joint_limit_margin
+    # band while the pose and CoM levels hold. This posture can't leave the
+    # band entirely (it stalls ~0.04 rad deep with the CoM at the 5 mm lock),
+    # so it checks steady progress: two-level GN would not move it at all.
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    from cutamp.gn_refresh import gn_project_balanced
+    from cutamp.particle_initialization import (
+        _achieved_pose_errors, _ik_for_pose, _ik_solution_to_full_q,
+    )
+    from cutamp.robots.t1 import T1_LIMIT_MARGIN_LOWER
+
+    world = make_blocks_t1_world()
+    B = 8
+    target = torch.eye(4, device="cuda").unsqueeze(0).expand(B, 4, 4).contiguous()
+    target[:, :3, 3] = torch.tensor([0.35, 0.25, 0.25], device="cuda")
+    q0 = _ik_solution_to_full_q(_ik_for_pose(world, target, "left"), world)
+    tp = list(world.kinematics.joint_names).index("Torso_Pitch")
+    lower = world.kinematics.get_joint_limits().position[0]
+    q0[:, tp] = lower[tp] + 0.003
+    assert bool(compute_com_polygon_mask(world, q0).all())
+    pos, quat, _ = _fk_pose(world, q0, world.tool_frame_for_arm("left"))
+    held = target.clone()
+    held[:, :3, 3] = pos
+    held[:, :3, :3] = _quat_to_mat(quat)
+
+    q = q0
+    for _ in range(8):  # one call per refresh
+        q = gn_project_balanced(world, q, held, "left")
+    band_edge = lower[tp] + T1_LIMIT_MARGIN_LOWER[tp]
+    depth = (band_edge - q[:, tp]).clamp_min(0)
+    assert bool((depth < 0.6 * (band_edge - q0[:, tp])).all()), f"depth {depth.max().item():.4f}"
+    pos_err, rot_err = _achieved_pose_errors(world, q, held, "left")
+    assert bool((pos_err < 0.005).all() & (rot_err < 0.05).all()), f"pos {pos_err.max().item():.4f}"
+    assert bool(compute_com_polygon_mask(world, q).all())
