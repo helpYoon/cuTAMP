@@ -636,6 +636,8 @@ class ParticleOptimizer:
                     f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step})"
                 )
                 opt_metrics["early_stopped_at"] = step
+                # Close it: the next skeleton reuses this timer.
+                timer.stop("optimization_step")
                 break
 
             # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
