@@ -81,6 +81,12 @@ class TAMPConfiguration:
     # cuRobo-only refresh: loop 98.0 -> 63.1 s, best soft 27.9 -> 21.3,
     # final satisfying 349 vs 341, CoM-in-polygon parity (worst 499 vs 502).
     reik_gn: bool = True
+    # Balance-first GN refresh (gn_project_balanced, prototype): CoM-in-polygon
+    # is GN's first priority and the pose is least squares inside it; every
+    # row's iterate is written back, and cuRobo runs only for rows stalled
+    # several refreshes, taking only answers that pass pose AND CoM. Needs
+    # reik_gn.
+    reik_balance_first: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started
     # repair work. Default 40: full A/B (2026-08-04, blocks_t1 @512, two runs
@@ -180,6 +186,8 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(
             f"soft_in_adam must be 'auto' or 'always', not {config.soft_in_adam!r}"
         )
+    if config.reik_balance_first and not config.reik_gn:
+        raise ValueError("reik_balance_first needs reik_gn (it replaces the GN refresh step)")
     if config.reik_gn and not config.coupled_reik:
         # GN refresh only runs inside the coupled-reIK loop. Now that reik_gn
         # defaults ON, this combination just means "no refreshes at all" —

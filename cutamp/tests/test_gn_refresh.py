@@ -108,3 +108,36 @@ def test_gn_project_respects_locked_dofs():
     assert torch.equal(q1[:, RIGHT_ARM_INDICES], q0[:, RIGHT_ARM_INDICES])
     # ...and it did actually move the unlocked DOFs toward the target.
     assert not torch.equal(q1, q0)
+
+
+@needs_cuda
+def test_gn_project_balanced_keeps_com_in_and_closes_pose():
+    # Balance-first GN: from a warm start it converges like gn_project; from a
+    # target well out of balanced reach it ends CoM-inside and closer to the
+    # target than it started (closest balanced pose, not an unbalanced exact one).
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    from cutamp.gn_refresh import gn_project_balanced
+    from cutamp.particle_initialization import (
+        _achieved_pose_errors, _ik_for_pose, _ik_solution_to_full_q,
+    )
+
+    world = make_blocks_t1_world()
+    B = 8
+    target = torch.eye(4, device="cuda").unsqueeze(0).expand(B, 4, 4).contiguous()
+    target[:, :3, 3] = torch.tensor([0.35, 0.25, 0.25], device="cuda")
+    q0 = _ik_solution_to_full_q(_ik_for_pose(world, target, "left"), world)
+    moved = target.clone()
+    moved[:, 0, 3] += 0.003
+    moved[:, 2, 3] += 0.0025
+    q1 = gn_project_balanced(world, q0, moved, "left")
+    pos, rot = _achieved_pose_errors(world, q1, moved, "left")
+    assert bool((pos < 0.005).all() & (rot < 0.05).all()), f"pos {pos.max().item():.4f}"
+    assert bool(compute_com_polygon_mask(world, q1).all())
+
+    far = target.clone()
+    far[:, 0, 3] = 0.9
+    pos0, _ = _achieved_pose_errors(world, q0, far, "left")
+    q2 = gn_project_balanced(world, q0, far, "left", iters=30)
+    pos2, _ = _achieved_pose_errors(world, q2, far, "left")
+    assert bool(compute_com_polygon_mask(world, q2).all())
+    assert bool((pos2 < pos0 - 0.05).all()), f"{pos0.min().item():.3f} -> {pos2.max().item():.3f}"

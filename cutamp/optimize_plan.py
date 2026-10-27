@@ -26,7 +26,7 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
-from cutamp.gn_refresh import gn_project
+from cutamp.gn_refresh import gn_project, gn_project_balanced
 from cutamp.particle_initialization import (
     _achieved_pose_errors,
     _ik_for_pose,
@@ -205,12 +205,35 @@ class _ReikDriftGate:
 
     # Drift histogram bucket edges (metres) recorded per refresh.
     _BUCKETS = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
+    # Balance-first refresh only: a row failing this many consecutive
+    # refreshes is stalled, and a dep's cuRobo fallback runs at most once per
+    # this many refreshes. This revisits the cooldown rejected in the NOTE
+    # above: there the CoM-blind GN path needed the fallback as its repair
+    # channel; here the persistent balanced iterate is the repair channel.
+    _STALL_REFRESHES = 4
 
     def __init__(self, num_deps: int, pos_tol: float, rot_tol: float):
         self.pos_tol = pos_tol
         self.rot_tol = rot_tol
         self.refs = [None] * num_deps  # [B, 4, 4] target at previous refresh
         self.stats: List[dict] = []
+        self.fail_streak = [None] * num_deps  # [B] consecutive failing refreshes
+        self.since_fallback = [0] * num_deps
+
+    def stalled(self, dep_idx: int, ok: torch.Tensor):
+        """Advance ``dep_idx``'s failure streaks; return the ``[B]`` mask of
+        stalled rows when a fallback is due, else ``None``."""
+        streak = self.fail_streak[dep_idx]
+        if streak is None:
+            streak = torch.zeros_like(ok, dtype=torch.int32)
+        streak = torch.where(ok, torch.zeros_like(streak), streak + 1)
+        self.fail_streak[dep_idx] = streak
+        self.since_fallback[dep_idx] += 1
+        stalled = streak >= self._STALL_REFRESHES
+        if self.since_fallback[dep_idx] < self._STALL_REFRESHES or not bool(stalled.any()):
+            return None
+        self.since_fallback[dep_idx] = 0
+        return stalled
 
     def measure_drift(self, dep_idx: int, target: torch.Tensor):
         """``(pos_drift, rot_drift)`` vs the previous refresh's targets
@@ -222,11 +245,13 @@ class _ReikDriftGate:
         return curobo_pose_error(ref, target)
 
     def log_stat(self, step, q_name, batch, n_fail, solve_s, pos_drift, rot_drift,
-                 gn_fail=None, gn_fail_pose=None, gn_fail_com=None):
+                 gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
         rec = {
             "step": step, "conf": q_name, "batch": batch,
             "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
         }
+        if fallback is not None:
+            rec["fallback"] = fallback  # GN mode: did this refresh call cuRobo
         if gn_fail is not None:
             # GN refresh: rows the projection missed (they went to the cuRobo
             # fallback), split by which merge-gate criterion failed (a row can
@@ -294,17 +319,25 @@ class ParticleOptimizer:
                 pos_drift, rot_drift = gate.measure_drift(i, world_from_ee)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            n_gn_fail = n_gn_fail_pose = n_gn_fail_com = None
+            n_gn_fail = n_gn_fail_pose = n_gn_fail_com = fallback = None
             if gate is not None and self.config.reik_gn:
                 from cutamp.com_polygon_cost import compute_com_polygon_mask
-                # Gauss-Newton projection from the warm q (see gn_refresh.py);
-                # merge only rows that converged to checker tolerance (checker
-                # metric via _achieved_pose_errors) AND stayed CoM-in-polygon.
-                # The CoM term is load-bearing: GN has no CoM residual and the
-                # fallback is the only CoM-aware channel during Adam (covered
-                # Confs are out of the optimizer), so a pose-only gate would
-                # lock in confs that drift out of the support polygon.
-                q_gn = gn_project(
+                balance_first = self.config.reik_balance_first
+                # Gauss-Newton projection from the warm q (see gn_refresh.py).
+                # Default: merge only rows that converged to checker tolerance
+                # (checker metric via _achieved_pose_errors) AND stayed
+                # CoM-in-polygon. The CoM term is load-bearing: pose-only GN
+                # has no CoM residual and the fallback is the only CoM-aware
+                # channel during Adam (covered Confs are out of the optimizer),
+                # so a pose-only gate would lock in confs that drift out of the
+                # support polygon.
+                # Balance-first: GN itself keeps the CoM in, and every row's
+                # result is written back (a persistent lower-level iterate).
+                # An unconverged row resumes next refresh; an unreachable one
+                # sits at its closest balanced pose, and the kinematic cost
+                # pulls the placement toward it.
+                project = gn_project_balanced if balance_first else gn_project
+                q_gn = project(
                     world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
                 )
                 with torch.no_grad():
@@ -314,18 +347,25 @@ class ParticleOptimizer:
                     pose_ok = (pos_err < gate.pos_tol) & (rot_err < gate.rot_tol)
                     com_ok = compute_com_polygon_mask(world, q_gn)
                     ok = pose_ok & com_ok
-                    merged = torch.where(ok.view(-1, 1), q_gn, particles[dep.q_name])
+                    keep = torch.ones_like(ok) if balance_first else ok
+                    merged = torch.where(keep.view(-1, 1), q_gn, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
                     particles[dep.q_name].grad = None
                 n_gn_fail = int((~ok).sum().item())
                 n_gn_fail_pose = int((~pose_ok).sum().item())
                 n_gn_fail_com = int((~com_ok).sum().item())
                 n_fail = n_gn_fail
-                if n_gn_fail > 0:
-                    # cuRobo fallback for the rows GN missed. Full-batch call
-                    # (cuRobo pads sub-capacity batches to max_batch_size, so
-                    # subsets save nothing); only GN-missed rows that cuRobo
-                    # solved take its result.
+                # Rows offered to cuRobo: every GN miss (default), or only rows
+                # stalled for several refreshes, when a fallback is due.
+                if balance_first:
+                    repair = gate.stalled(i, ok)
+                else:
+                    repair = ~ok if n_gn_fail > 0 else None
+                fallback = repair is not None
+                if fallback:
+                    # Full-batch call (cuRobo pads sub-capacity batches to
+                    # max_batch_size, so subsets save nothing); only offered
+                    # rows that cuRobo solved take its result.
                     cheap = world.ik_refresh_solver is not world.ik_solver
                     ik_result = _ik_for_pose(
                         world, world_from_ee, dep.arm,
@@ -334,7 +374,16 @@ class ParticleOptimizer:
                         seed_from_current=cheap,
                     )
                     new_q = _ik_solution_to_full_q(ik_result, world).detach()
-                    take = (~ok) & _ik_success_mask(ik_result)
+                    take = repair & _ik_success_mask(ik_result)
+                    if balance_first:
+                        # cuRobo's success flag is CoM-blind; never trade a
+                        # balanced iterate for an unbalanced answer.
+                        with torch.no_grad():
+                            pe, re = _achieved_pose_errors(world, new_q, world_from_ee, dep.arm)
+                            take &= (
+                                (pe < gate.pos_tol) & (re < gate.rot_tol)
+                                & compute_com_polygon_mask(world, new_q)
+                            )
                     with torch.no_grad():
                         merged = torch.where(take.view(-1, 1), new_q, particles[dep.q_name])
                         particles[dep.q_name].copy_(merged)
@@ -391,6 +440,7 @@ class ParticleOptimizer:
                     step, dep.q_name, batch, n_fail,
                     time.perf_counter() - t0, pos_drift, rot_drift,
                     gn_fail=n_gn_fail, gn_fail_pose=n_gn_fail_pose, gn_fail_com=n_gn_fail_com,
+                    fallback=fallback,
                 )
 
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:

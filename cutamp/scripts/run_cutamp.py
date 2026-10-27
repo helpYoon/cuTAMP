@@ -131,6 +131,11 @@ def entrypoint():
     )
     parser.set_defaults(reik_gn=_defaults.reik_gn)
     parser.add_argument(
+        "--reik_balance_first", action="store_true",
+        help="Prototype: balance-first GN refresh (CoM in polygon before pose), persistent "
+             "iterates, cuRobo only for stalled rows.",
+    )
+    parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
         help="LBFGS iteration budget for the warm refresh/fallback solver "
              "(multiple of 20; 0 = cuRobo default 100).",
@@ -275,6 +280,7 @@ def entrypoint():
         reik_interval=args.reik_interval,
         reik_num_seeds=args.reik_num_seeds,
         reik_gn=args.reik_gn,
+        reik_balance_first=args.reik_balance_first,
         reik_lbfgs_iters=args.reik_lbfgs_iters,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
