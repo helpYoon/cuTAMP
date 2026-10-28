@@ -51,8 +51,10 @@ class TorchTimer:
     @contextmanager
     def time(self, metric: str, log_callback=None):
         self.start(metric)
-        yield
-        duration = self.stop(metric)
+        try:
+            yield
+        finally:  # a raising block (failed plan -> next-particle retry) must not leave it started
+            duration = self.stop(metric)
         if log_callback is not None:
             log_callback(f"{metric} took {duration:.2f}s")
 
