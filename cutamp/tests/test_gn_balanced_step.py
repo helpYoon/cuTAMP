@@ -10,7 +10,7 @@ import roma
 import torch
 
 from cutamp.com_polygon_cost import COM_HALF_EXTENTS
-from cutamp.gn_refresh import _balanced_step, _rotmat_to_rotvec, _row_layout
+from cutamp.gn_refresh import GN_MARGIN_DAMPING, _balanced_step, _rotmat_to_rotvec, _row_layout, _spd_solve
 from cutamp.robots.t1 import BASE_INDICES
 
 
@@ -65,6 +65,19 @@ def test_balanced_step_stack_matches_per_dep():
     for seed in range(10):
         stack, blocks = _synthetic(seed)                 # one [4B] stack + its 4 [B] blocks
         assert torch.equal(_balanced_step(*stack), torch.cat([_balanced_step(*b) for b in blocks]))
+
+    # That self-comparison can't see a mis-wired level-3 solve, the step's one
+    # hand-wired kernel, so check it against the library's LU on systems built
+    # like _margin_step's: m = sel * (projector onto the null space of 8 rows),
+    # with about 60% of its rows zeroed, then m m^T + damping I.
+    g = torch.Generator().manual_seed(0)
+    f64 = torch.float64
+    basis = torch.linalg.qr(torch.randn(256, 21, 8, generator=g, dtype=f64))[0]
+    sel = (torch.rand(256, 21, 1, generator=g) < 0.4).to(f64)
+    m = sel * (torch.eye(21, dtype=f64) - basis @ basis.mT)
+    M = m @ m.mT + GN_MARGIN_DAMPING * torch.eye(21, dtype=f64)
+    b = torch.randn(256, 21, 1, generator=g, dtype=f64)
+    assert torch.allclose(_spd_solve(M, b), torch.linalg.solve(M, b), rtol=1e-10, atol=1e-12)
 
 
 def test_balanced_step_moves_no_pinned_column():

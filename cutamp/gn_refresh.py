@@ -262,6 +262,14 @@ def _fraction_that_fits(base, extra):
     return room.amin(-1, keepdim=True).clamp(0.0, 1.0)
 
 
+def _spd_solve(M, b):
+    """``M^-1 b`` for a batch of SPD ``M``, by Cholesky and two triangular
+    solves: batched 21x21 f64 LU dispatches to MAGMA, which syncs."""
+    L = torch.linalg.cholesky_ex(M)[0]
+    y = torch.linalg.solve_triangular(L, b, upper=False)
+    return torch.linalg.solve_triangular(L.mT, y, upper=True)
+
+
 def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lower, upper):
     """Level 3: move joints with nonzero ``margin_err`` (rad to their margin
     band's edge) by at most ``GN_MARGIN_STEP``, on top of the levels 1-2
@@ -288,11 +296,8 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
         sel = (margin_err * free != 0).to(f64)
         m = sel.unsqueeze(-1) * proj                                # [B, dof, dof]
         rhs = sel * (margin_err - step).to(f64)
-        # m m^T + damping I is SPD, so Cholesky: batched 21x21 f64 LU
-        # dispatches to MAGMA, which syncs.
-        L = torch.linalg.cholesky_ex(m @ m.transpose(-1, -2) + GN_MARGIN_DAMPING * eye_dof)[0]
-        y = torch.linalg.solve_triangular(L, rhs.unsqueeze(-1), upper=False)
-        y = torch.linalg.solve_triangular(L.mT, y, upper=True)
+        # m m^T + damping I is SPD.
+        y = _spd_solve(m @ m.transpose(-1, -2) + GN_MARGIN_DAMPING * eye_dof, rhs.unsqueeze(-1))
         dq3 = (m.transpose(-1, -2) @ y).squeeze(-1).to(q.dtype)
         s3 = _fraction_that_fits(step, dq3) * dq3
         s3 = s3 * (GN_MARGIN_STEP / s3.abs().amax(-1, keepdim=True).clamp_min(GN_MARGIN_STEP))
