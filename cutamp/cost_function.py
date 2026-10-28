@@ -298,15 +298,18 @@ class CostFunction:
         # RetractFree: checks world + all movables
         # RetractHolding: checks world + movables excluding held object
         if self.retract_info and self._particles is not None:
-            for q_retract_name, is_holding, held_obj in self.retract_info:
-                q_retract = self._particles[q_retract_name]
-                num_particles = q_retract.shape[0]
-                
-                # Single kinematics covers all arms in v0.8.
-                kin_model = self.world.kinematics
-                robot_state = kin_model.compute_kinematics(JointState.from_position(q_retract))
-                retract_spheres = robot_state.robot_spheres  # already (b, h, n, 4) in v0.8
-                
+            # One FK for every retract conf, into fresh buffers. world.kinematics
+            # keeps FK outputs, backward state and returned gradients in one
+            # buffer set per batch shape, so separate same-shape calls (or one
+            # matching the rollout's FK shape) corrupt each other's gradients.
+            q_retracts = torch.cat([self._particles[name] for name, _, _ in self.retract_info])
+            num_particles = self._particles[self.retract_info[0][0]].shape[0]
+            kin_model = self.world.kinematics
+            kin_model.update_batch_size(q_retracts.shape[0], 1, reset_buffers=True)
+            all_retract_spheres = kin_model.compute_kinematics(JointState.from_position(q_retracts)).robot_spheres
+            for (q_retract_name, is_holding, held_obj), retract_spheres in zip(
+                self.retract_info, all_retract_spheres.split(num_particles)  # each (b, h, n, 4)
+            ):
                 # Robot to world collision - keep shape (num_particles, 1) for consistency
                 coll_values[f"{q_retract_name}_world"] = self.world.collision_fn(retract_spheres)
                 
@@ -324,7 +327,7 @@ class CostFunction:
                         activation_distance=self.config.gripper_activation_distance
                     )
                 else:
-                    coll_values[f"{q_retract_name}_movables"] = torch.zeros((num_particles, 1), device=q_retract.device)
+                    coll_values[f"{q_retract_name}_movables"] = torch.zeros((num_particles, 1), device=q_retracts.device)
 
         coll_cost = {
             "type": "constraint",

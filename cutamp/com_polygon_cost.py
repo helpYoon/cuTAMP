@@ -221,9 +221,8 @@ def compute_com_polygon_penalties(
     """Per-conf differentiable COM-polygon penalty.
 
     For every Conf-shaped particle in ``particles`` (name starts with
-    ``left_q``/``right_q``/``q`` and ``ndim == 2``), runs
-    ``world.kinematics.compute_kinematics`` once and computes
-    the per-particle COM-over-polygon penalty via
+    ``left_q``/``right_q``/``q`` and ``ndim == 2``), computes the
+    per-particle COM-over-polygon penalty, from one batched FK, via
     :func:`com_polygon_penalty`. Returns a dict mapping conf name to a
     ``[B]`` tensor of penalties in m². Tensors are differentiable
     through cuRobo's FK chain — calling ``.backward()`` on a function of
@@ -247,11 +246,18 @@ def compute_com_polygon_penalties(
         p for p in particles
         if p.startswith(("left_q", "right_q", "q")) and particles[p].ndim == 2
     ]
-    out: "dict[str, torch.Tensor]" = {}
-    for name in conf_names:
-        com_world, base_T = _fk_com_and_base(world, particles[name])
-        out[name] = com_polygon_penalty(
-            com_world, base_T, _half_extents(com_world.device, com_world.dtype),
-            COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT,
-        )
-    return out
+    if not conf_names:
+        return {}
+    # One FK for all confs, into fresh buffers. world.kinematics keeps FK
+    # outputs, backward state and returned gradients in one buffer set per
+    # batch shape, so same-shape calls before backward corrupt each other's
+    # gradients (one call per conf left all but the last one wrong).
+    qs = [particles[name] for name in conf_names]
+    q_all = torch.cat(qs)
+    world.kinematics.update_batch_size(q_all.shape[0], 1, reset_buffers=True)
+    com_world, base_T = _fk_com_and_base(world, q_all)
+    pen = com_polygon_penalty(
+        com_world, base_T, _half_extents(com_world.device, com_world.dtype),
+        COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT,
+    )
+    return dict(zip(conf_names, pen.split([q.shape[0] for q in qs])))

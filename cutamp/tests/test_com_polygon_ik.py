@@ -183,6 +183,81 @@ def test_compute_com_polygon_penalties_is_differentiable():
     )
 
 
+@needs_cuda
+def test_compute_com_polygon_penalties_grads_match_per_conf():
+    """With several confs, each conf's gradient must equal its gradient
+    computed alone. world.kinematics keeps FK outputs and backward state in
+    buffers shared by same-shape calls, so one FK call per conf left every
+    backward but the last reading the last call's link transforms."""
+    import torch
+    from cutamp.com_polygon_cost import compute_com_polygon_penalties
+
+    from curobo.types import JointState
+
+    torch.manual_seed(0)
+    world = make_blocks_t1_world()
+    home = world.q_init.detach().clone()
+    qs = {f"left_q{i}": (home + 0.4 * torch.randn(16, home.numel(), device=home.device)).requires_grad_(True)
+          for i in range(3)}
+    # An earlier FK of the batched call's shape (other q, so an overwrite shows).
+    earlier = world.kinematics.compute_kinematics(JointState.from_position(home.expand(48, -1).contiguous())).robot_spheres
+    snapshot = earlier.clone()
+    pens = compute_com_polygon_penalties(world, qs)
+    assert torch.equal(earlier, snapshot), "the batched FK overwrote an earlier same-shape FK's outputs"
+    assert all((p > 0).any() for p in pens.values())  # non-trivial gradients
+    sum(p.sum() for p in pens.values()).backward()
+    for name, q in qs.items():
+        together, q.grad = q.grad.clone(), None  # clone: FK may return grads in its buffers
+        compute_com_polygon_penalties(world, {name: q})[name].sum().backward()
+        torch.testing.assert_close(together, q.grad)
+
+
+@needs_cuda
+def test_retract_collision_grads_match_per_conf():
+    """Same check for the retract-collision FK in CostFunction.collision_costs.
+    In blocks_t1 the batched retract FK has the rollout FK's shape, so it must
+    also leave the rollout's FK outputs alone."""
+    import torch
+    from cutamp.config import TAMPConfiguration
+    from cutamp.cost_function import CostFunction
+    from cutamp.particle_initialization import ParticleInitializer
+    from cutamp.rollout import RolloutFunction
+    from cutamp.t1_domain import all_t1_operators
+    from cutamp.task_planning import task_plan_generator
+
+    world = make_blocks_t1_world()
+    config = TAMPConfiguration(num_particles=8)
+    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+    particles = ParticleInitializer(world, config)(skeleton)
+    cost_fn = CostFunction(skeleton, world, config)
+    retract_info = list(cost_fn.retract_info)
+    assert len(retract_info) > 1
+    # Init leaves every retract conf identical, which would hide the aliasing.
+    torch.manual_seed(0)
+    qs = {name: (particles[name] + 0.3 * torch.randn_like(particles[name])).requires_grad_(True)
+          for name, _, _ in retract_info}
+    particles.update(qs)
+    rollout = RolloutFunction(skeleton, world, config)(particles)
+    rollout_spheres = rollout["robot_spheres"].detach().clone()
+    # One big sphere per movable, around the robot, so every retract conf
+    # overlaps the movables and gets a non-zero gradient.
+    big = torch.tensor([0.3, 0.0, 0.8, 0.6], device=world.device)
+    obj_to_spheres = {name: big.expand(8, pose.shape[1], 1, 4) for name, pose in rollout["obj_to_pose"].items()}
+
+    def grads(info):
+        cost_fn.retract_info, cost_fn._particles = info, particles
+        vals = cost_fn.collision_costs(rollout, obj_to_spheres)["values"]
+        loss = sum(vals[f"{name}_{k}"].sum() for name, _, _ in info for k in ("world", "movables"))
+        # Clone: FK returns gradients in its own buffers, which later calls reuse.
+        return [g.clone() for g in torch.autograd.grad(loss, [qs[name] for name, _, _ in info])]
+
+    together = grads(retract_info)
+    assert torch.equal(rollout["robot_spheres"], rollout_spheres), "retract FK overwrote the rollout's FK outputs"
+    for info, g in zip(retract_info, together):
+        assert g.abs().sum() > 0
+        torch.testing.assert_close(g, grads([info])[0])
+
+
 def test_com_polygon_penalty_corner_equals_single_edge():
     # A COM ~1mm inside BOTH edges (near a corner) must score the same as
     # being on a single edge — NOT double. With the buggy summed barrier it
