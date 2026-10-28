@@ -262,21 +262,20 @@ def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
 
 
 def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
-    """Build and warm the trajopt planner. ~10 s; safe to run on a background
-    thread concurrently with Phase 1 (no CUDA graphs — see solve_curobo)."""
-    # Disable CUDA graphs: solve_curobo invokes plan_pose / plan_grasp /
-    # plan_cspace with varying batch+goalset shapes across operators, and
-    # SolverCore.reset_cuda_graph raises "CUDA graph reset is not available."
-    # CUDA graph capture would speed up identical-shape repeats, but our
-    # per-operator shape changes invalidate that.
-    planner = world.get_motion_planner(
+    """Build the trajopt planner, with CUDA graphs. Safe to run on a background
+    thread concurrently with Phase 1 because it runs no solves.
+
+    No ``planner.warmup()``: its solves would capture CUDA graphs on this
+    thread, and cuRobo captures in CUDA's global mode, where the main thread's
+    allocations and syncs fail mid-capture. The first ``plan_cspace`` captures
+    instead (~1 s), on the main thread after the join; every later segment has
+    the same shape and replays.
+    """
+    return world.get_motion_planner(
         collision_activation_distance=0.0,
-        use_cuda_graph=False,
         enable_com_polygon=config.enable_com_polygon,
         enable_joint_limit_margin=config.enable_joint_limit_margin,
     )
-    planner.warmup()
-    return planner
 
 
 def solve_curobo(

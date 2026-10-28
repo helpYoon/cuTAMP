@@ -345,6 +345,7 @@ def get_t1_ik_solver(
     enable_com_aware_ik: bool = True,
     num_seeds: int = 32,
     lbfgs_iters: int = 0,
+    use_cuda_graph: bool = False,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
     """InverseKinematics solver for T1 with the mobile base locked.
@@ -381,13 +382,12 @@ def get_t1_ik_solver(
         self_collision_check=True,
         max_batch_size=max_batch_size,
         device_cfg=device_cfg,
-        # CUDA graphs specialize for the input shape captured at first call.
-        # Particle initialization first warms IK without ``current_state``
-        # (no seed) and later wants to pass ``current_state`` (per-particle
-        # seed) for body chaining; that shape change can't be re-captured
-        # ("CUDA graph reset is not available."). Disable so each call
-        # accepts arbitrary current_state shapes.
-        use_cuda_graph=False,
+        # CUDA graphs specialize for the call structure captured at first call
+        # and can't be re-captured ("CUDA graph reset is not available.").
+        # Particle init mixes calls with and without ``current_state``, so the
+        # main solver runs without them; the refresh solver always gets the
+        # same full-batch warm-seeded call and opts in.
+        use_cuda_graph=use_cuda_graph,
         # CoM-aware seed-IK residual (fork): pulls the CoM toward the support
         # rectangle while the LM solver reaches the hand pose. The two weights
         # are the sole on/off gate (the fork derives compute_com from them);

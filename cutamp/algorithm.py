@@ -290,7 +290,7 @@ def setup_cutamp(
         check_tamp_world_not_in_collision(world)
 
     with timer.time("warmup_ik_solver", log_callback=_log.info):
-        world.warmup_ik_solver(config.num_particles)
+        world.warmup_ik_solver(config.num_particles, warm_refresh=config.coupled_reik)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -314,10 +314,10 @@ def run_cutamp(
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id)
     particle_initializer = ParticleInitializer(world, config)
 
-    # Build + warm the trajopt planner on a background thread, overlapped with
-    # particle init and Phase 1 (~10 s of serial wall-clock hidden). The build
-    # uses no CUDA graphs (see build_motion_planner). Concurrent cuRobo use is
-    # only safe with the fork's per-stream warp wrapper cache
+    # Build the trajopt planner on a background thread, overlapped with
+    # particle init and Phase 1. The build runs no solves, so no CUDA graph
+    # capture overlaps the main thread (see build_motion_planner). Concurrent
+    # cuRobo use is only safe with the fork's per-stream warp wrapper cache
     # (curobo/_src/util/warp.py): warp's stream registry is unlocked, and a
     # fresh wrapper per launch from two threads corrupts the heap. solve_curobo
     # joins via get_planner; its warmup timer then measures only the residual wait.

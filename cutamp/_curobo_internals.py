@@ -16,12 +16,15 @@ upgrade has exactly one place to audit.
 Documented public-API constraints (no helper needed; noted here so the next
 upgrade audit catches them):
 
-* ``InverseKinematicsCfg.create(use_cuda_graph=False)`` is required by the IK
-  solvers in ``cutamp.robots.t1``. CUDA graphs specialize for the input shape
-  captured at first call, but particle init first warms IK without
-  ``current_state`` and later passes ``current_state`` (per-particle seed) for
-  body chaining; that shape change can't be re-captured ("CUDA graph reset is
-  not available."). Re-enable cautiously.
+* CUDA graphs can't be re-captured ("CUDA graph reset is not available."), so
+  a solver whose call structure changes after its first solve must run
+  without them. The main IK solver in ``cutamp.robots.t1`` does (particle init
+  mixes calls with and without ``current_state``); the coupled-reIK refresh
+  solver and the motion planner each see one fixed call shape and use them.
+  cuRobo captures in CUDA's global mode, where another thread's allocations
+  and syncs fail mid-capture, so captures run only on the main thread while
+  the planner-build thread is not running (``TAMPWorld.warmup_ik_solver``,
+  ``motion_solver.build_motion_planner``).
 """
 
 from typing import Dict, Iterable, List

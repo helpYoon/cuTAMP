@@ -254,11 +254,18 @@ class TAMPWorld:
                 enable_com_aware_ik=self._enable_com_aware_ik,
                 num_seeds=self._reik_num_seeds,
                 lbfgs_iters=self._reik_lbfgs_iters,
+                use_cuda_graph=True,  # captured by warmup_ik_solver(warm_refresh=True)
             )
         return self._ik_refresh_solver
 
-    def warmup_ik_solver(self, num_particles: int):
-        """Warmup the multi-frame IK solver with a multi-frame FK goal."""
+    def warmup_ik_solver(self, num_particles: int, warm_refresh: bool = False):
+        """Warmup the multi-frame IK solver with a multi-frame FK goal.
+
+        ``warm_refresh`` also captures the refresh solver's CUDA graphs with
+        the exact call the coupled-reIK fallback makes. It must run before the
+        planner thread starts: a capture concurrent with another thread's CUDA
+        calls fails.
+        """
         ik = self.ik_solver
         max_bs = getattr(ik.config, "max_batch_size", num_particles)
         n = min(num_particles, max_bs)
@@ -269,6 +276,20 @@ class TAMPWorld:
         poses = {f: kin_state.tool_poses.get_link_pose(f) for f in all_frames}
         goal = GoalToolPose.from_poses(poses, ordered_tool_frames=all_frames)
         _ = ik.solve_pose(goal_tool_poses=goal)
+        if warm_refresh and self._reik_num_seeds > 0:
+            from cutamp.particle_initialization import _ik_for_pose  # import cycle at module level
+
+            refresh = self.ik_refresh_solver
+            # The seed here is already the answer; without this the LBFGS stage
+            # exits early, stays uncaptured, and captures mid-optimization.
+            exit_early, refresh.config.exit_early = refresh.config.exit_early, False
+            try:
+                ee = kin_state.tool_poses.get_link_pose(
+                    self.tool_frame_for_arm("left"), make_contiguous=True,
+                ).get_matrix()
+                _ik_for_pose(self, ee, "left", current_state_q=q, ik=refresh, seed_from_current=True)
+            finally:
+                refresh.config.exit_early = exit_early
 
     def get_motion_planner(
         self,
