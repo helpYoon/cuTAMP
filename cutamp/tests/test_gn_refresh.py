@@ -300,3 +300,49 @@ def test_gn_gate_matches_checker_helpers():
     assert torch.equal(com_ok, torch.cat([compute_com_polygon_mask(world, qi) for qi in q.split(8)]))
     assert pose_ok.any() and (~pose_ok).any() and com_ok.any() and (~com_ok).any()
     assert (pose_ok & ~com_ok).any()
+
+
+@needs_cuda
+# Sync debug mode warns that it misses some syncs; the profile is the oracle.
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
+def test_balanced_refresh_is_sync_free():
+    # A steady-state balance-first refresh makes no host syncs or copies: its
+    # profile holds only the profiler's own cudaDeviceSynchronize (an empty
+    # profile records exactly one). It writes every row of the projection
+    # back in place, and its deferred stats count the gate misses of the rows
+    # it wrote.
+    from torch.profiler import ProfilerActivity, profile
+
+    from cutamp.gn_refresh import gn_gate, gn_project_balanced
+    from cutamp.optimize_plan import IKDep, _ReikDriftGate, _refresh_balanced
+
+    world = make_blocks_t1_world()
+    q, T, arms = _four_dep_stack(world)
+    names = ["left_q1", "left_q2", "right_q3", "right_q4"]
+    deps = [IKDep(n, a, target_fn=lambda p, Ti=Ti: Ti) for n, a, Ti in zip(names, arms, T.split(8))]
+    particles = {n: qi.clone() for n, qi in zip(names, q.split(8))}
+    gate = _ReikDriftGate(4, pos_tol=0.005, rot_tol=0.05)
+    for step in (4, 9):  # warm-up: lazy kinematics, caches, allocations, the drift reference
+        _refresh_balanced(particles, deps, world, gate, step)
+    confs = [particles[n] for n in names]
+    before = torch.cat(confs)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            _refresh_balanced(particles, deps, world, gate, 14)
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+    events = [e.name for e in prof.events()]
+    assert [n for n in events if "Synchronize" in n] == ["cudaDeviceSynchronize"]
+    assert not [n for n in events if "DtoH" in n or "HtoD" in n]
+    # Every row, the far deps' unconverged ones too, in place (Adam state and
+    # grad_masks hold these tensors).
+    assert all(particles[n] is c for n, c in zip(names, confs))
+    assert torch.equal(torch.cat(confs), gn_project_balanced(world, before, T, arms))
+
+    gate.flush()
+    assert len(gate.stats) == 12
+    pose_ok, com_ok = gn_gate(world, torch.cat([particles[n] for n in names]), T, arms, 0.005, 0.05)
+    misses = (~(pose_ok & com_ok)).view(4, 8).sum(-1).tolist()
+    assert [(r["conf"], r["gn_fail"]) for r in gate.stats[-4:]] == list(zip(names, misses))

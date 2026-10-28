@@ -83,9 +83,8 @@ class TAMPConfiguration:
     reik_gn: bool = True
     # Balance-first GN refresh (gn_project_balanced, prototype): CoM-in-polygon
     # is GN's first priority and the pose is least squares inside it; every
-    # row's iterate is written back, and cuRobo runs only for rows stalled
-    # several refreshes, taking only answers that pass pose AND CoM. Needs
-    # reik_gn.
+    # row's iterate is written back, and no cuRobo runs during Adam (the final
+    # pre-check refresh still repairs). Needs reik_gn.
     reik_balance_first: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started

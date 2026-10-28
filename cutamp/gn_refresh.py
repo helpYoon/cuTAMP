@@ -28,26 +28,33 @@ through Cholesky (batched 21x21 f64 LU dispatches to MAGMA, which syncs),
 and its constants are cached on the device.
 
 What this deliberately does NOT do (the full cuRobo solver covers these at
-particle init, on per-refresh fallback, and at the final pre-check refresh):
+particle init, at the final pre-check refresh, and in default mode on the
+per-refresh fallback):
 
 - no self/world-collision vetting inside the update (the rollout's hard
   constraints still score every conf every step, so violations surface in
   the satisfying mask rather than silently passing),
-- no CoM residual — the CALLER must AND ``compute_com_polygon_mask`` into
-  its merge gate so out-of-polygon rows route to the CoM-aware cuRobo
-  fallback (a pose-only gate demonstrably locks in CoM decay: GN keeps pose
-  converged while the conf drifts out of the support polygon, and nothing
-  else re-centers covered Confs during Adam). An in-GN CoM residual row was
-  A/B-rejected 2026-08-04 (null runtime win, quality parity), but that
-  version's CoM Jacobian had its x row overwritten by the y row (see the
-  clone in ``gn_project_balanced``), so the rejection says nothing about a
-  correct CoM row,
-- no basin hopping (strictly local; rows that don't converge to checker
-  tolerance are handed to the cuRobo fallback by the caller).
+- no CoM residual in ``gn_project`` — its default-mode CALLER must AND
+  ``compute_com_polygon_mask`` into its merge gate so out-of-polygon rows
+  route to the CoM-aware cuRobo fallback (a pose-only gate demonstrably
+  locks in CoM decay: GN keeps pose converged while the conf drifts out of
+  the support polygon, and nothing else re-centers covered Confs during
+  Adam). An in-GN CoM residual row was A/B-rejected 2026-08-04 (null
+  runtime win, quality parity), but that version's CoM Jacobian had its x
+  row overwritten by the y row (see the clone in ``gn_project_balanced``),
+  so the rejection says nothing about a correct CoM row,
+- no basin hopping (strictly local; in default mode, rows that don't
+  converge to checker tolerance are handed to the cuRobo fallback by the
+  caller).
 
 ``gn_project_balanced`` is the balance-first variant behind
 ``config.reik_balance_first``: CoM-in-polygon is a hard first level, the
 pose is least squares inside it, and joint-limit margins use what is left.
+In that mode no cuRobo call runs during Adam: every row's iterate is written
+back, an unconverged row resumes at the next refresh, and the final
+pre-check refresh is the only cuRobo repair. ``gn_gate`` is its one-FK
+merge gate: the pose and CoM masks from one FK pass, which that mode only
+counts in its refresh stats.
 """
 
 from functools import lru_cache

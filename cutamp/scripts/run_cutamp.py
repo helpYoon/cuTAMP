@@ -133,7 +133,7 @@ def entrypoint():
     parser.add_argument(
         "--reik_balance_first", action="store_true",
         help="Prototype: balance-first GN refresh (CoM in polygon before pose), persistent "
-             "iterates, cuRobo only for stalled rows.",
+             "iterates, no cuRobo during Adam.",
     )
     parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,

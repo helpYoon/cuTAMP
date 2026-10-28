@@ -10,7 +10,7 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Literal, Tuple, TypedDict
+from typing import Callable, List, Literal, NamedTuple, Tuple, TypedDict
 
 import torch
 from torch.optim import Adam
@@ -26,7 +26,7 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
-from cutamp.gn_refresh import gn_project, gn_project_balanced
+from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced
 from cutamp.particle_initialization import (
     _achieved_pose_errors,
     _ik_for_pose,
@@ -184,6 +184,17 @@ class _BestSnapshot:
         return True
 
 
+class _QueuedRefresh(NamedTuple):
+    """One balance-first refresh's stats, queued by
+    ``_ReikDriftGate.log_batch`` until ``flush()``."""
+    step: int
+    q_names: Tuple[str, ...]
+    batch: int
+    packed: torch.Tensor  # [D, k] float32: the three miss counts, then any drift stats
+    start: torch.cuda.Event
+    end: torch.cuda.Event
+
+
 class _ReikDriftGate:
     """Per-refresh instrumentation for the re-IK subsystem, plus the checker
     tolerances the GN merge gate tests against.
@@ -193,47 +204,33 @@ class _ReikDriftGate:
     error fields cross-pair metres/radians on multi-tool-frame robots and
     must not be used), solve wall time, failure counts, and in GN mode the
     pose/CoM split of merge-gate misses. Lands in
-    ``opt_metrics["reik_refresh"]``.
+    ``opt_metrics["reik_refresh"]``. Balance-first refreshes are timed by
+    CUDA events and keep their stats on the device (:meth:`log_batch`; a
+    host read is a sync) until :meth:`flush` turns them into the same records
+    after the loop.
 
-    NOTE two removed mechanisms, both measured dead 2026-08-04 (git history
-    has the code): a triangle-inequality drift-SKIP path (cuRobo pads
-    sub-capacity batches so per-particle skips save nothing, and the
+    NOTE three removed mechanisms (git history has the code). Two were
+    measured dead 2026-08-04: a triangle-inequality drift-SKIP path (cuRobo
+    pads sub-capacity batches so per-particle skips save nothing, and the
     all-512-fresh dep-skip never fired in any run) and a fallback cooldown
     (fallbacks are dominated by fresh churn misses; withholding repair
-    starved the satisfying pool and the early-stop signal).
+    starved the satisfying pool and the early-stop signal). The third is
+    balance-first mode's stall gate, which sent rows failing several
+    consecutive refreshes to the cuRobo fallback. Stage 0 (2026-10-28,
+    blocks_t1, 12 seeds per arm at n=64 and n=256) found that never calling
+    cuRobo during Adam (arm E1) matched or beat it (arm E0) on satisfying
+    count and CoM feasibility, so that mode no longer does.
     """
 
     # Drift histogram bucket edges (metres) recorded per refresh.
     _BUCKETS = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
-    # Balance-first refresh only: a row failing this many consecutive
-    # refreshes is stalled, and a dep's cuRobo fallback runs at most once per
-    # this many refreshes. This revisits the cooldown rejected in the NOTE
-    # above: there the CoM-blind GN path needed the fallback as its repair
-    # channel; here the persistent balanced iterate is the repair channel.
-    _STALL_REFRESHES = 4
 
     def __init__(self, num_deps: int, pos_tol: float, rot_tol: float):
         self.pos_tol = pos_tol
         self.rot_tol = rot_tol
         self.refs = [None] * num_deps  # [B, 4, 4] target at previous refresh
         self.stats: List[dict] = []
-        self.fail_streak = [None] * num_deps  # [B] consecutive failing refreshes
-        self.since_fallback = [0] * num_deps
-
-    def stalled(self, dep_idx: int, ok: torch.Tensor):
-        """Advance ``dep_idx``'s failure streaks; return the ``[B]`` mask of
-        stalled rows when a fallback is due, else ``None``."""
-        streak = self.fail_streak[dep_idx]
-        if streak is None:
-            streak = torch.zeros_like(ok, dtype=torch.int32)
-        streak = torch.where(ok, torch.zeros_like(streak), streak + 1)
-        self.fail_streak[dep_idx] = streak
-        self.since_fallback[dep_idx] += 1
-        stalled = streak >= self._STALL_REFRESHES
-        if self.since_fallback[dep_idx] < self._STALL_REFRESHES or not bool(stalled.any()):
-            return None
-        self.since_fallback[dep_idx] = 0
-        return stalled
+        self._queued: List[_QueuedRefresh] = []  # log_batch refreshes awaiting flush()
 
     def measure_drift(self, dep_idx: int, target: torch.Tensor):
         """``(pos_drift, rot_drift)`` vs the previous refresh's targets
@@ -244,8 +241,18 @@ class _ReikDriftGate:
             return None, None
         return curobo_pose_error(ref, target)
 
-    def log_stat(self, step, q_name, batch, n_fail, solve_s, pos_drift, rot_drift,
-                 gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
+    def _drift_stats(self, pos_drift: torch.Tensor, rot_drift: torch.Tensor) -> List[torch.Tensor]:
+        """Drift summary over the last dim: pos mean, pos max, rot max, then
+        the fraction of pos drift under each ``_BUCKETS`` edge."""
+        return [
+            pos_drift.mean(-1), pos_drift.amax(-1), rot_drift.amax(-1),
+            *((pos_drift < b).float().mean(-1) for b in self._BUCKETS),
+        ]
+
+    def _append_record(self, step, q_name, batch, n_fail, solve_s, drift,
+                       gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
+        """Append one ``stats`` record. ``drift`` is :meth:`_drift_stats` as
+        Python floats, or ``None`` on the first refresh."""
         rec = {
             "step": step, "conf": q_name, "batch": batch,
             "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
@@ -253,23 +260,123 @@ class _ReikDriftGate:
         if fallback is not None:
             rec["fallback"] = fallback  # GN mode: did this refresh call cuRobo
         if gn_fail is not None:
-            # GN refresh: rows the projection missed (they went to the cuRobo
-            # fallback), split by which merge-gate criterion failed (a row can
-            # fail both). NOTE cross-mode stats caveat: in GN mode "n_ik_fail"
-            # counts rows still failing after GN + fallback; in cuRobo mode it
-            # counts solver success-flag failures. Presence of "gn_fail" marks
-            # which semantic a record uses.
+            # GN refresh: rows the projection missed, split by which
+            # merge-gate criterion failed (a row can fail both). In default
+            # mode the misses go to the cuRobo fallback and "n_ik_fail" counts
+            # rows still failing after GN + fallback; balance-first mode has
+            # no fallback (fallback=False, n_ik_fail == gn_fail). NOTE
+            # cross-mode stats caveat: in cuRobo mode "n_ik_fail" counts
+            # solver success-flag failures. Presence of "gn_fail" marks which
+            # semantic a record uses.
             rec["gn_fail"] = gn_fail
             rec["gn_fail_pose"] = gn_fail_pose
             rec["gn_fail_com"] = gn_fail_com
-        if pos_drift is not None:
-            rec["pos_drift_mean"] = pos_drift.mean().item()
-            rec["pos_drift_max"] = pos_drift.max().item()
-            rec["rot_drift_max"] = rot_drift.max().item()
-            rec["frac_drift_below"] = {
-                f"{b * 1e3:g}mm": (pos_drift < b).float().mean().item() for b in self._BUCKETS
-            }
+        if drift is not None:
+            pos_mean, pos_max, rot_max, *below = drift
+            rec["pos_drift_mean"] = pos_mean
+            rec["pos_drift_max"] = pos_max
+            rec["rot_drift_max"] = rot_max
+            rec["frac_drift_below"] = {f"{b * 1e3:g}mm": f for b, f in zip(self._BUCKETS, below)}
         self.stats.append(rec)
+
+    def log_stat(self, step, q_name, batch, n_fail, solve_s, pos_drift, rot_drift,
+                 gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
+        drift = None if pos_drift is None else [s.item() for s in self._drift_stats(pos_drift, rot_drift)]
+        self._append_record(step, q_name, batch, n_fail, solve_s, drift,
+                            gn_fail, gn_fail_pose, gn_fail_com, fallback)
+
+    def log_batch(self, step: int, q_names: List[str], batch: int, ok, pose_ok, com_ok,
+                  pos_drift, rot_drift, start, end) -> None:
+        """Queue one balance-first refresh's records for :meth:`flush`, without
+        a host read.
+
+        ``ok``, ``pose_ok`` and ``com_ok`` are ``[D*B]`` bool over
+        ``D = len(q_names)`` dep-major blocks of ``batch`` rows; the drifts
+        are ``[D*B]``, or ``None`` on the first refresh; ``start`` and ``end``
+        are the refresh's timing events. Each mask's miss count, and any
+        drift stats, go per dep into one ``[D, k]`` float32 device tensor.
+        """
+        D = len(q_names)
+        cols = [(~m).view(D, batch).sum(-1) for m in (ok, pose_ok, com_ok)]
+        if pos_drift is not None:
+            cols += self._drift_stats(pos_drift.view(D, batch), rot_drift.view(D, batch))
+        packed = torch.stack([c.float() for c in cols], dim=-1)
+        self._queued.append(_QueuedRefresh(step, tuple(q_names), batch, packed, start, end))
+
+    def flush(self) -> None:
+        """Append the queued :meth:`log_batch` refreshes to ``stats`` in
+        refresh order, as the records :meth:`log_stat` writes, and clear the
+        queue. Its only host syncs: one wait on the last end event and one
+        device-to-host copy. No cuRobo ran, so ``fallback=False`` and
+        ``n_ik_fail == gn_fail``; ``solve_s`` is the refresh's event time
+        split evenly over its deps, so per-run sums still hold. A no-op with
+        nothing queued."""
+        if not self._queued:
+            return
+        self._queued[-1].end.synchronize()  # elapsed_time needs both events done
+        values = iter(torch.cat([r.packed.view(-1) for r in self._queued]).tolist())
+        for r in self._queued:
+            D, k = r.packed.shape
+            solve_s = r.start.elapsed_time(r.end) / 1e3 / D  # ms -> s, per dep
+            for q_name in r.q_names:
+                gn_fail, gn_fail_pose, gn_fail_com, *drift = (next(values) for _ in range(k))
+                gn_fail = int(gn_fail)
+                self._append_record(r.step, q_name, r.batch, gn_fail, solve_s, drift or None,
+                                    gn_fail, int(gn_fail_pose), int(gn_fail_com), fallback=False)
+        self._queued.clear()
+
+
+def _refresh_balanced(
+    particles: dict, ik_deps: List[IKDep], world: TAMPWorld, gate: _ReikDriftGate, step: int,
+) -> None:
+    """Balance-first refresh (``config.reik_balance_first``): one
+    :func:`gn_project_balanced` call over every dep's covered Conf, as a
+    dep-major stack.
+
+    GN itself keeps the CoM in, and every row's result is written back (a
+    persistent lower-level iterate): an unconverged row resumes next
+    refresh; an unreachable one sits at its closest balanced pose, and the
+    kinematic cost pulls the placement toward it. No cuRobo runs here (see
+    :class:`_ReikDriftGate` for why): the final pre-check refresh is the
+    only cuRobo repair, and :func:`gn_gate`'s masks only feed the stats.
+
+    Makes no host syncs once gn_refresh's cached constants exist, since the
+    Adam loop is host-launch-bound: CUDA events time it, and
+    ``gate.log_batch`` keeps the stats on the device until ``gate.flush()``.
+    The ``copy_`` keeps each Conf's tensor identity, which ``grad_masks`` and
+    Adam state depend on.
+    """
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    q_names = [dep.q_name for dep in ik_deps]
+    assert len(set(q_names)) == len(q_names), f"one dep per covered Conf, got {q_names}"
+    # Detached: nothing may flow into the Pose / Grasp leaves.
+    targets = [dep.target_fn(particles).detach() for dep in ik_deps]
+    batch = targets[0].shape[0]
+    assert all(t.shape[0] == batch for t in targets), [t.shape[0] for t in targets]
+    pos_drifts, rot_drifts = zip(*(gate.measure_drift(i, t) for i, t in enumerate(targets)))
+    first_refresh = pos_drifts[0] is None
+    assert all((d is None) == first_refresh for d in pos_drifts), "deps share their first refresh"
+
+    world_from_ee = torch.cat(targets)
+    arms = tuple(dep.arm for dep in ik_deps)
+    q = gn_project_balanced(
+        world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms,
+    )
+    pose_ok, com_ok = gn_gate(world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol)
+    with torch.no_grad():
+        for name, q_dep in zip(q_names, q.split(batch)):
+            particles[name].copy_(q_dep)
+            # Dropped from the optimizer, so .grad has no consumer.
+            particles[name].grad = None
+    end.record()
+
+    gate.log_batch(
+        step, q_names, batch, pose_ok & com_ok, pose_ok, com_ok,
+        None if first_refresh else torch.cat(pos_drifts),
+        None if first_refresh else torch.cat(rot_drifts),
+        start, end,
+    )
 
 
 class ParticleOptimizer:
@@ -299,7 +406,10 @@ class ParticleOptimizer:
 
         When ``gate`` is given, refreshes run GN-first on
         ``world.ik_refresh_solver`` (a cheap warm-seeded low-seed solver when
-        ``reik_num_seeds > 0``) and record per-dep drift/timing stats.
+        ``reik_num_seeds > 0``) and record per-dep drift/timing stats. In
+        balance-first mode (``config.reik_balance_first``) a gated refresh is
+        :func:`_refresh_balanced` instead: one GN call over all deps that
+        writes every row back, with no cuRobo and no host syncs.
         ``gate=None`` refreshes everything on the full-strength main solver —
         used for the final pre-check refresh.
 
@@ -310,6 +420,8 @@ class ParticleOptimizer:
         """
         if not ik_deps:
             return
+        if gate is not None and self.config.reik_balance_first:
+            return _refresh_balanced(particles, ik_deps, world, gate, step)
         for i, dep in enumerate(ik_deps):
             # Detach the target so IK's backward doesn't try to flow into
             # Pose / Grasp particles (which are leaves in our autograd graph).
@@ -322,22 +434,15 @@ class ParticleOptimizer:
             n_gn_fail = n_gn_fail_pose = n_gn_fail_com = fallback = None
             if gate is not None and self.config.reik_gn:
                 from cutamp.com_polygon_cost import compute_com_polygon_mask
-                balance_first = self.config.reik_balance_first
                 # Gauss-Newton projection from the warm q (see gn_refresh.py).
-                # Default: merge only rows that converged to checker tolerance
+                # Merge only rows that converged to checker tolerance
                 # (checker metric via _achieved_pose_errors) AND stayed
                 # CoM-in-polygon. The CoM term is load-bearing: pose-only GN
                 # has no CoM residual and the fallback is the only CoM-aware
                 # channel during Adam (covered Confs are out of the optimizer),
                 # so a pose-only gate would lock in confs that drift out of the
                 # support polygon.
-                # Balance-first: GN itself keeps the CoM in, and every row's
-                # result is written back (a persistent lower-level iterate).
-                # An unconverged row resumes next refresh; an unreachable one
-                # sits at its closest balanced pose, and the kinematic cost
-                # pulls the placement toward it.
-                project = gn_project_balanced if balance_first else gn_project
-                q_gn = project(
+                q_gn = gn_project(
                     world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
                 )
                 with torch.no_grad():
@@ -347,20 +452,15 @@ class ParticleOptimizer:
                     pose_ok = (pos_err < gate.pos_tol) & (rot_err < gate.rot_tol)
                     com_ok = compute_com_polygon_mask(world, q_gn)
                     ok = pose_ok & com_ok
-                    keep = torch.ones_like(ok) if balance_first else ok
-                    merged = torch.where(keep.view(-1, 1), q_gn, particles[dep.q_name])
+                    merged = torch.where(ok.view(-1, 1), q_gn, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
                     particles[dep.q_name].grad = None
                 n_gn_fail = int((~ok).sum().item())
                 n_gn_fail_pose = int((~pose_ok).sum().item())
                 n_gn_fail_com = int((~com_ok).sum().item())
                 n_fail = n_gn_fail
-                # Rows offered to cuRobo: every GN miss (default), or only rows
-                # stalled for several refreshes, when a fallback is due.
-                if balance_first:
-                    repair = gate.stalled(i, ok)
-                else:
-                    repair = ~ok if n_gn_fail > 0 else None
+                # Rows offered to cuRobo: every GN miss.
+                repair = ~ok if n_gn_fail > 0 else None
                 fallback = repair is not None
                 if fallback:
                     # Full-batch call (cuRobo pads sub-capacity batches to
@@ -375,15 +475,6 @@ class ParticleOptimizer:
                     )
                     new_q = _ik_solution_to_full_q(ik_result, world).detach()
                     take = repair & _ik_success_mask(ik_result)
-                    if balance_first:
-                        # cuRobo's success flag is CoM-blind; never trade a
-                        # balanced iterate for an unbalanced answer.
-                        with torch.no_grad():
-                            pe, re = _achieved_pose_errors(world, new_q, world_from_ee, dep.arm)
-                            take &= (
-                                (pe < gate.pos_tol) & (re < gate.rot_tol)
-                                & compute_com_polygon_mask(world, new_q)
-                            )
                     with torch.no_grad():
                         merged = torch.where(take.view(-1, 1), new_q, particles[dep.q_name])
                         particles[dep.q_name].copy_(merged)
@@ -699,6 +790,8 @@ class ParticleOptimizer:
         # restore_if_better may have rewritten particles, making gate refs stale.
         if ik_deps:
             self._refresh_ik_deps(particles, ik_deps, world)
+        if reik_gate is not None:
+            reik_gate.flush()  # balance-first records sit on the device until here
         if reik_gate is not None and reik_gate.stats:
             opt_metrics["reik_refresh"] = reik_gate.stats
             total_s = sum(r["solve_s"] for r in reik_gate.stats)
