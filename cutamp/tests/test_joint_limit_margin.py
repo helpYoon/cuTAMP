@@ -210,7 +210,7 @@ class TestTrajoptCost:
         from cutamp.tests.conftest import make_blocks_t1_world
 
         world = make_blocks_t1_world()
-        planner = world.get_motion_planner(collision_activation_distance=0.0)
+        planner = world.get_motion_planner(collision_activation_distance=0.0025)
         for obj in world.movables:
             planner.scene_collision_checker.enable_obstacle(name=obj.name, enable=False)
         names = world.kinematics.joint_names

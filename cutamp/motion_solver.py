@@ -293,7 +293,12 @@ def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
     the same shape and replays.
     """
     return world.get_motion_planner(
-        collision_activation_distance=0.0,
+        # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (the
+        # planner's own default, 0.01, is untested here). It only shapes the
+        # optimizers' collision cost: cuRobo still judges success at 0
+        # (metrics_base.yml). At 0 the optimum hugs obstacles, and retracts after
+        # a place grazed the block just released by up to 0.2 mm.
+        collision_activation_distance=0.0025,
         enable_com_polygon=config.enable_com_polygon,
         enable_joint_limit_margin=config.enable_joint_limit_margin,
     )
