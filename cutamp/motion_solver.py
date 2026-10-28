@@ -68,7 +68,6 @@ def _plan_arm_to_conf(
     full_joint_names,
     *,
     disable_obstacle: Optional[str],
-    retries: int,
     ground_op,
 ):
     """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
@@ -77,19 +76,19 @@ def _plan_arm_to_conf(
     redundancy solution. Mirrors the retract branch. ``disable_obstacle`` (if
     given) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
-    cuRobo result; raises ``RuntimeError`` if no attempt succeeds.
+    cuRobo result; raises ``RuntimeError`` if it fails.
+
+    One call: plan_cspace already makes 5 attempts (4 graph-seeded), and
+    calling it again with the same start and goal returns the same trajectory
+    (blocks_t1: 54 of 54 repeats bit-identical, none succeeded).
     """
     target_js = _planner_js_from_full(planner, conf_full, full_joint_names)
-    result = None
     # _disabled_world_obstacle no-ops on name=None.
     with _disabled_world_obstacle(planner, disable_obstacle):
-        for _ in range(retries):
-            result = planner.plan_cspace(
-                target_js, last_js,
-            )
-            if _cspace_plan_succeeded(result):
-                return result
-    raise RuntimeError(f"cspace-anchored plan failed for {ground_op}")
+        result = planner.plan_cspace(target_js, last_js)
+    if not _cspace_plan_succeeded(result):
+        raise RuntimeError(f"cspace-anchored plan failed for {ground_op}")
+    return result
 
 
 @contextlib.contextmanager
@@ -128,12 +127,6 @@ _ATTACH_LINK_FOR_ARM = {
     "left": "attached_object_left",
     "right": "attached_object_right",
 }
-
-# Retry budgets ported from the v0.7-era MotionGenPlanConfig that made the
-# T1 blocks demo robust (commit b45a4bc — graph planner fallback). v0.8
-# defaults are 5 attempts / graph at attempt 1, which is far too tight for
-# constrained dual-arm trajopt.
-GRASP_RETRY = 4                   # outer retry around the cspace-anchored grasp plan
 
 
 def _plan_dt(result, default=0.05):
@@ -218,14 +211,17 @@ def _detach_object(planner, link_name: str):
 
 
 def _reset_attachment_state(planner, world) -> None:
-    """Reset gripper attachments and re-enable all movables in the scene.
+    """Reset gripper attachments and put every movable back, enabled, at its
+    original pose.
 
     cuRobo's AttachmentManager tracks only the most recent attach (single
     ``_attached_link_name`` field). On the T1 we attach to both arms; a prior
     ``solve_curobo`` that failed mid-plan can leave stale link spheres on the
-    arm whose attach was overwritten, plus a disabled world obstacle whose
-    bookkeeping was lost. Force-detach both attachment links and re-enable
-    every movable so the next solve starts from a clean planner state.
+    arm whose attach was overwritten, a disabled world obstacle whose
+    bookkeeping was lost, and blocks its Places moved to the failed particle's
+    placements (``_update_world_obstacle_pose``). Force-detach both attachment
+    links and restore every movable so the next solve starts from a clean
+    planner state.
     """
     am = _get_attachment_manager(planner)
     if am is not None:
@@ -241,6 +237,7 @@ def _reset_attachment_state(planner, world) -> None:
                 sc.enable_obstacle(name=obj.name, enable=True)
             except Exception as e:
                 _log.debug(f"enable_obstacle({obj.name}) during reset: {e}")
+            _update_world_obstacle_pose(planner, obj.name, world.get_object_pose(obj))
 
 
 def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
@@ -300,10 +297,11 @@ def solve_curobo(
         planner = get_planner() if get_planner is not None else build_motion_planner(world, config)
 
     # Defensive reset in case a prior solve_curobo aborted mid-plan and left the
-    # planner with stale attached objects or disabled world obstacles. Required
-    # by the outer-retry loop in algorithm.py — without this, a failure on the
-    # best particle leaves attached spheres on an arm link and a disabled
-    # movable, both of which corrupt the retry attempt.
+    # planner with stale attached objects, disabled world obstacles, or placed
+    # blocks. Required by the outer-retry loop in algorithm.py — without this,
+    # a failure on the best particle leaves attached spheres on an arm link, a
+    # disabled movable, and blocks at its placements, all of which corrupt the
+    # retry attempt.
     _reset_attachment_state(planner, world)
 
     # Build initial state. Planner is in active-cspace (mobile base locked);
@@ -376,7 +374,7 @@ def solve_curobo(
                     grasp_result = _plan_arm_to_conf(
                         planner, best_particle[q_name].clone(), last_js,
                         full_joint_names,
-                        disable_obstacle=obj_name, retries=GRASP_RETRY, ground_op=ground_op,
+                        disable_obstacle=obj_name, ground_op=ground_op,
                     )
 
                 # Attach AT the grasp conf. Block tracking from this point uses
@@ -414,7 +412,7 @@ def solve_curobo(
                     place_result = _plan_arm_to_conf(
                         planner, best_particle[q_name].clone(), last_js,
                         full_joint_names,
-                        disable_obstacle=surface_name, retries=1, ground_op=ground_op,
+                        disable_obstacle=surface_name, ground_op=ground_op,
                     )
 
                 plan = _interp_plan(place_result)
@@ -441,6 +439,9 @@ def solve_curobo(
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
 
+        except RuntimeError as e:
+            e.op_idx = idx  # lets _motion_plan_with_retries skip candidates that repeat ops 0..idx
+            raise
         finally:
             if arm is not None:
                 state.unpin()

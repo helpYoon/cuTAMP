@@ -208,7 +208,11 @@ def _motion_plan_with_retries(
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
     its internal retries; a different particle gives a different pair and
-    usually succeeds.
+    usually succeeds. The same pair fails the same way (plan_cspace is
+    deterministic), so a candidate whose values for the failing op and every
+    op before it equal a failed candidate's is skipped: particles often share
+    confs (on blocks_t1 seed 1, every satisfying particle had the same
+    ``left_q1``).
 
     Returns ``(curobo_plan, audit, skip_plan, attempts)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
@@ -217,10 +221,15 @@ def _motion_plan_with_retries(
         ``solve_curobo``, or ``None`` if all candidates failed.
       - ``skip_plan``: ``True`` if a ``NotImplementedError`` was raised — the
         caller should skip this plan_skeleton entirely and move on.
-      - ``attempts``: number of candidates actually tried (retries used).
+      - ``attempts``: number of candidates actually planned (skips excluded).
     """
-    last_err = None
+    skeleton = plan_info["plan_skeleton"]
+    last_err, tried, failed = None, 0, []
     for rank, particle in enumerate(candidates):
+        if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed):
+            _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
+            continue
+        tried += 1
         try:
             curobo_plan, audit = solve_curobo(
                 plan_info, particle, world, config, timer, visualizer,
@@ -230,22 +239,28 @@ def _motion_plan_with_retries(
                 _log.warning(
                     f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
                 )
-            return curobo_plan, audit, False, rank + 1
+            return curobo_plan, audit, False, tried
         except NotImplementedError as e:
             _log.warning(
                 f"Motion planning not supported for this plan: {e}. Trying next plan..."
             )
-            return None, None, True, rank + 1
+            return None, None, True, tried
         except RuntimeError as e:
             _log.warning(
                 f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
             )
             last_err = e
+            # ponytail: keys on every value read up to the failing op (all ops if untagged), so
+            # a candidate differing only in values that op never sees (a pick conf before a
+            # shared retract) still replans; key on the op's own start/goal/world if that matters.
+            ops = skeleton[: getattr(e, "op_idx", len(skeleton)) + 1]
+            used = {"left_q0"} | {v for op in ops for v in op.values if v in particle}
+            failed.append({k: particle[k] for k in used})
     _log.error(
-        f"Exhausted {len(candidates)} particle retries; giving up on this plan. "
+        f"Exhausted {len(candidates)} particle retries ({tried} planned); giving up on this plan. "
         f"Last error: {last_err}"
     )
-    return None, None, False, len(candidates)
+    return None, None, False, tried
 
 
 def setup_cutamp(

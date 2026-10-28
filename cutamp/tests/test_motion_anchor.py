@@ -25,7 +25,7 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
 
     res = ms._plan_arm_to_conf(
         FakePlanner(), torch.zeros(21), last_js="LAST", full_joint_names=["a"],
-        disable_obstacle=None, retries=1, ground_op="OP",
+        disable_obstacle=None, ground_op="OP",
     )
     assert res == "FAKE_RESULT"
     assert calls["target_js"] is sentinel_target  # planned to the conf, not a pose
@@ -46,8 +46,8 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
     fp = FakePlanner()
     with pytest.raises(RuntimeError, match="cspace-anchored"):
         ms._plan_arm_to_conf(fp, torch.zeros(21), "LAST", ["a"],
-                             disable_obstacle=None, retries=3, ground_op="OP")
-    assert fp.n == 3  # retried `retries` times before raising
+                             disable_obstacle=None, ground_op="OP")
+    assert fp.n == 1  # no repeat: the same start and goal plan the same way
 
 
 def _generate_plan_segments(seed: int):
