@@ -21,3 +21,22 @@ def test_attached_spheres_sit_on_the_block():
         err = float((spheres[:, :3].mean(0) - world.get_object_pose(block)[:3, 3]).norm())
         assert err < 0.01, f"{arm}: attached spheres are {err:.3f} m from {block}"
 
+
+@needs_cuda
+def test_place_reenables_only_the_placed_block():
+    # Both arms hold a block, as after RightPick. Placing the left one must
+    # re-enable block3 only: block2 is still in the right hand.
+    world = make_blocks_t1_world()
+    planner = world.get_motion_planner()
+    cub = planner.scene_collision_checker.data.cuboids
+    js = ms._planner_js_from_full(planner, world.q_init, world.kinematics.joint_names)
+    ms._attach_object(planner, "block3", js, "left")
+    ms._attach_object(planner, "block2", js, "right")
+
+    def enabled():
+        return {b: bool(cub.enable[0, cub.get_idx(b)]) for b in ("block2", "block3")}
+
+    ms._detach_object(planner, "block3", "left")
+    assert enabled() == {"block2": False, "block3": True}, "after LeftPlace"
+    ms._detach_object(planner, "block2", "right")
+    assert enabled() == {"block2": True, "block3": True}, "after RightPlace"

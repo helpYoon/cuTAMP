@@ -215,13 +215,21 @@ def _attach_object(
         _log.warning(f"attach({obj_name}) failed: {e}")
 
 
-def _detach_object(planner, link_name: str):
-    """Detach object from gripper link. Re-enables the world obstacle."""
+def _detach_object(planner, obj_name: str, arm: str):
+    """Detach ``obj_name`` from ``arm``'s attach link and re-enable it as a
+    world obstacle.
+
+    cuRobo's own re-enable breaks with two held blocks: it re-enables the most
+    recent attach's obstacles, which can be the other arm's block, and after
+    one detach its env count is 0, so a named re-enable then does nothing.
+    Naming ``obj_name`` stops the stale re-enable; we enable it ourselves.
+    """
     am = _get_attachment_manager(planner)
     if am is None:
         return
     try:
-        am.detach(link_name=link_name)
+        am.detach(link_name=_ATTACH_LINK_FOR_ARM[arm], enable_obstacle_names=[obj_name])
+        planner.scene_collision_checker.enable_obstacle(name=obj_name, enable=True)
     except Exception as e:
         _log.warning(f"detach failed: {e}")
 
@@ -447,8 +455,7 @@ def solve_curobo(
                 # the world obstacle. But the obstacle's stored pose is
                 # still the original pickup pose, so update it to the
                 # placement target before continuing.
-                attach_link = _ATTACH_LINK_FOR_ARM[arm]
-                _detach_object(planner, link_name=attach_link)
+                _detach_object(planner, obj_name, arm)
                 _update_world_obstacle_pose(planner, obj_name, world_from_obj_target)
 
             else:
