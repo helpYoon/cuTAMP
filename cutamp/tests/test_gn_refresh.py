@@ -5,6 +5,7 @@ check is the load-bearing regression (GN silently diverges if cuRobo ever
 changes row order or frame).
 """
 import math
+import warnings
 from unittest import mock
 
 import pytest
@@ -326,8 +327,17 @@ def test_balanced_refresh_is_sync_free():
         _refresh_balanced(particles, deps, world, gate, step)
     confs = [particles[n] for n in names]
     before = torch.cat(confs)
+    for c in confs:
+        c.grad = torch.ones_like(c)  # stale buffers the refresh must drop
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    # CUPTI sync activities also catch driver-API waits (cuRobo launches FK
+    # through cuda.core), which the runtime-API names and sync debug mode miss.
+    # The config is a private API, hence the guard.
+    try:
+        sync_events = {"experimental_config": torch._C._profiler._ExperimentalConfig(enable_cuda_sync_events=True)}
+    except (AttributeError, TypeError):
+        sync_events = {}
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **sync_events) as prof:
         torch.cuda.set_sync_debug_mode("error")
         try:
             _refresh_balanced(particles, deps, world, gate, 14)
@@ -336,6 +346,11 @@ def test_balanced_refresh_is_sync_free():
     events = [e.name for e in prof.events()]
     assert [n for n in events if "Synchronize" in n] == ["cudaDeviceSynchronize"]
     assert not [n for n in events if "DtoH" in n or "HtoD" in n]
+    if sync_events:  # the profiler's own cudaDeviceSynchronize is the one Context Sync
+        assert [n for n in events if n.endswith(" Sync")] == ["Context Sync"]
+    else:
+        warnings.warn("no torch profiler _ExperimentalConfig(enable_cuda_sync_events=...): driver-API syncs unchecked")
+    assert all(particles[n].grad is None for n in names)
     # Every row, the far deps' unconverged ones too, in place (Adam state and
     # grad_masks hold these tensors).
     assert all(particles[n] is c for n, c in zip(names, confs))
@@ -343,6 +358,8 @@ def test_balanced_refresh_is_sync_free():
 
     gate.flush()
     assert len(gate.stats) == 12
+    # Drift from the second refresh on, so the profiled call took the drift path.
+    assert ["pos_drift_mean" in r for r in gate.stats] == [False] * 4 + [True] * 8
     pose_ok, com_ok = gn_gate(world, torch.cat([particles[n] for n in names]), T, arms, 0.005, 0.05)
     misses = (~(pose_ok & com_ok)).view(4, 8).sum(-1).tolist()
     assert [(r["conf"], r["gn_fail"]) for r in gate.stats[-4:]] == list(zip(names, misses))

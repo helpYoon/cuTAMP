@@ -84,9 +84,12 @@ def test_log_batch_flush_matches_log_stat():
     rot_drift = torch.zeros(D * B, device="cuda")
     gate = _ReikDriftGate(D, pos_tol=0.005, rot_tol=0.05)
     events = []
-    # GPU waits of different lengths, so solve_s is nonzero and tells the
-    # two refreshes apart.
-    for step, drift, cycles in ((7, (pos_drift, rot_drift), 2_000_000), (12, (None, None), 6_000_000)):
+    # GPU waits of different lengths (about 0.4 ms vs 35 ms on a 4090), so
+    # solve_s is nonzero and only a host stall of tens of ms inside the first
+    # window could flip the two refreshes. Warm the spin kernel and drain first.
+    torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+    for step, drift, cycles in ((7, (pos_drift, rot_drift), 1_000_000), (12, (None, None), 100_000_000)):
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
         torch.cuda._sleep(cycles)
@@ -117,3 +120,28 @@ def test_log_batch_flush_matches_log_stat():
     drift_keys = {"pos_drift_mean", "pos_drift_max", "rot_drift_max", "frac_drift_below"}
     for rec in gate.stats[2:]:
         assert rec.keys() == ref.keys() - drift_keys
+    # Key order too (the views above compare as sets).
+    base = ["step", "conf", "batch", "n_ik_fail", "solve_s", "fallback", "gn_fail", "gn_fail_pose", "gn_fail_com"]
+    full = base + ["pos_drift_mean", "pos_drift_max", "rot_drift_max", "frac_drift_below"]
+    assert [list(r) for r in gate.stats] == [full, full, base, base]
+    assert list(gate.stats[0]["frac_drift_below"]) == ["0.5mm", "1mm", "2mm", "5mm", "10mm"]
+    gate.flush()  # the queue is empty now: nothing is appended twice
+    assert len(gate.stats) == 4
+
+    # Drift that differs per dep, rotation included: each record holds its own
+    # dep's stats. The values are hand-computed, so this checks the drift math.
+    d = torch.tensor([0.0004, 0.0015, 0.003, 0.02], device="cuda")
+    rot = torch.tensor([0, 0.01, 0, 0.02, 0.03, 0, 0, 0], device="cuda")
+    gate = _ReikDriftGate(D, pos_tol=0.005, rot_tol=0.05)
+    # Any recorded event pair will do; solve_s is checked above.
+    gate.log_batch(7, names, B, pose_ok & com_ok, pose_ok, com_ok, torch.cat([d, 2 * d]), rot, start, end)
+    gate.flush()
+    expected = [
+        (0.006225, 0.02, 0.02, [0.25, 0.25, 0.5, 0.75, 0.75]),
+        (0.01245, 0.04, 0.03, [0.0, 0.25, 0.25, 0.5, 0.75]),
+    ]
+    assert len(gate.stats) == len(expected)
+    for rec, (mean, pos_max, rot_max, below) in zip(gate.stats, expected):
+        stats = (rec["pos_drift_mean"], rec["pos_drift_max"], rec["rot_drift_max"])
+        assert stats == pytest.approx((mean, pos_max, rot_max), rel=1e-6)
+        assert list(rec["frac_drift_below"].values()) == below

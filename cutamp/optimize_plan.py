@@ -202,8 +202,8 @@ class _ReikDriftGate:
     Records per dep-refresh: target drift since the previous refresh
     (``curobo_pose_error`` — the checker's own metric; cuRobo's result
     error fields cross-pair metres/radians on multi-tool-frame robots and
-    must not be used), solve wall time, failure counts, and in GN mode the
-    pose/CoM split of merge-gate misses. Lands in
+    must not be used), solve time (see ``_append_record``), failure counts,
+    and in GN mode the pose/CoM split of merge-gate misses. Lands in
     ``opt_metrics["reik_refresh"]``. Balance-first refreshes are timed by
     CUDA events and keep their stats on the device (:meth:`log_batch`; a
     host read is a sync) until :meth:`flush` turns them into the same records
@@ -253,6 +253,10 @@ class _ReikDriftGate:
                        gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
         """Append one ``stats`` record. ``drift`` is :meth:`_drift_stats` as
         Python floats, or ``None`` on the first refresh."""
+        # solve_s: in default mode, per-dep wall time from after measure_drift
+        # to after the merge or fallback; in balance-first mode, the refresh's
+        # CUDA-event span (target build through write-back) / D. Per-run sums
+        # are meaningful; per-dep values and cross-mode comparisons are not.
         rec = {
             "step": step, "conf": q_name, "batch": batch,
             "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
@@ -402,14 +406,16 @@ class ParticleOptimizer:
     ) -> None:
         """Re-solve IK for each ``IKDep`` and write the result into the
         corresponding Conf particle in-place. Failed particles keep their
-        previous q (per-particle masked write).
+        previous q (per-particle masked write), except in a balance-first
+        gated refresh (below).
 
         When ``gate`` is given, refreshes run GN-first on
         ``world.ik_refresh_solver`` (a cheap warm-seeded low-seed solver when
         ``reik_num_seeds > 0``) and record per-dep drift/timing stats. In
         balance-first mode (``config.reik_balance_first``) a gated refresh is
         :func:`_refresh_balanced` instead: one GN call over all deps that
-        writes every row back, with no cuRobo and no host syncs.
+        writes every row back, with no cuRobo and, once gn_refresh's cached
+        constants exist, no host syncs.
         ``gate=None`` refreshes everything on the full-strength main solver —
         used for the final pre-check refresh.
 

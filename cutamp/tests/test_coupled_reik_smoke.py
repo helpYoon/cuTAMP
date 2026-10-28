@@ -68,6 +68,9 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         assert calls["_refresh_balanced"] >= 1 and calls["gn_project"] == 0, calls
         # No cuRobo during Adam: every GN miss stays a miss.
         assert all(r["fallback"] is False and r["n_ik_fail"] == r["gn_fail"] for r in records)
+        # Drift needs a previous target: every record but the first refresh's has it.
+        first = min(r["step"] for r in records)
+        assert all(("pos_drift_mean" in r) == (r["step"] != first) for r in records)
     else:
         assert calls["_refresh_balanced"] == 0 and calls["gn_project"] >= 1, calls
 
