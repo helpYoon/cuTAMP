@@ -33,7 +33,7 @@ from cutamp._curobo_internals import (
 )
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
-from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
+from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM
 from cutamp.t1_state import T1State
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.common import (
@@ -164,19 +164,23 @@ def _attach_object(
     planner,
     obj_name: str,
     last_js: JointState,
-    link_name: str,
+    arm: str,
     num_spheres: int = 6,
 ):
-    """Attach a scene obstacle to the gripper link via cuRobo's v0.8 attach.
+    """Attach a scene obstacle to ``arm``'s attach link via cuRobo's v0.8 attach.
 
-    ``attach_from_scene`` does the principled thing: fits spheres for the
-    obstacle, mounts them on ``link_name`` (which has reserved sphere slots
-    in t1_planar_base.yml), and auto-disables the obstacle in the world
-    collision checker so it isn't double-counted. The held block then
-    travels with the robot in subsequent plans, retains collision against
-    the rest of the world (table, other blocks), and the world-disable +
-    re-enable bookkeeping is handled internally — no need for our own
-    enable_obstacle hack.
+    ``attach_from_scene`` fits spheres for the obstacle, mounts them on the
+    attach link (which has reserved sphere slots in t1_planar_base.yml), and
+    auto-disables the obstacle in the world collision checker so it isn't
+    double-counted; ``_detach_object`` undoes both. The held block then
+    travels with the robot in subsequent plans and keeps collision against the
+    rest of the world (table, other blocks).
+
+    cuRobo fits the spheres to the mesh posed in WORLD frame but writes those
+    centers unchanged as link-local offsets, so FK would put the held block
+    ~0.5 m off the hand. We rewrite them as ``inv(world_from_link) @ p`` at
+    the attach conf. (cuRobo's ``world_objects_pose_offset`` doesn't fix it:
+    it resolves the link as ``tool_frames[0]``, the left hand, for both arms.)
 
     ``VOXEL`` (interior-voxel grid with inscribed radii) gives a tight,
     cube-shaped sphere set for the small block geometry — much less prone
@@ -187,6 +191,7 @@ def _attach_object(
     if am is None:
         _log.warning(f"attach({obj_name}) skipped: no attachment_manager")
         return
+    link_name = _ATTACH_LINK_FOR_ARM[arm]
     try:
         am.attach_from_scene(
             joint_states=last_js,
@@ -195,6 +200,17 @@ def _attach_object(
             num_spheres=num_spheres,
             sphere_fit_type=SphereFitType.VOXEL,
         )
+        # The attach link is a FIXED identity child of the arm's tool frame
+        # (t1_planar_base.yml), so the tool-frame pose is the link pose.
+        world_from_link = planner.kinematics.compute_kinematics(last_js).tool_poses.get_link_pose(
+            TOOL_FRAME_FOR_ARM[arm]
+        )
+        kp = am.kinematics_params
+        idx = kp.get_sphere_index_from_link_name(link_name)
+        idx = idx[kp.link_spheres[0, idx, 3] > 0]  # fitted spheres, not the radius -100 padding
+        kp.link_spheres[0, idx, :3] = world_from_link.inverse().transform_points(
+            kp.link_spheres[0, idx, :3]
+        ).view(-1, 3)
     except Exception as e:
         _log.warning(f"attach({obj_name}) failed: {e}")
 
@@ -388,8 +404,7 @@ def solve_curobo(
                 })
                 last_js = _last_timestep_js(grasp_plan, planner)
 
-                attach_link = _ATTACH_LINK_FOR_ARM[arm]
-                _attach_object(planner, obj_name, last_js, link_name=attach_link)
+                _attach_object(planner, obj_name, last_js, arm)
                 grasp_from_obj = torch.inverse(obj_from_grasp).clone()
                 state.current_js = last_js
                 state.arm_holding[arm] = obj_name
