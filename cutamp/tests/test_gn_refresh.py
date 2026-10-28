@@ -5,6 +5,7 @@ check is the load-bearing regression (GN silently diverges if cuRobo ever
 changes row order or frame).
 """
 import math
+from unittest import mock
 
 import pytest
 import roma
@@ -268,9 +269,10 @@ def test_gn_project_balanced_pins_per_row():
 @needs_cuda
 def test_gn_gate_matches_checker_helpers():
     # One FK over the whole stack gives the checker helpers' masks: per-dep
-    # _achieved_pose_errors on each row's own arm, and compute_com_polygon_mask.
-    # The lean is forward: on this IK draw (seeded, so the same each run), a
-    # 0.45 rad back-lean leaves every leaned CoM inside and com_ok all True.
+    # _achieved_pose_errors on each row's own arm, and compute_com_polygon_mask
+    # on the stack and per dep. The lean is forward: a 0.45 rad back-lean
+    # leaves every leaned CoM inside on this seeded draw; forward, every leaned
+    # CoM was out on each of 20 draws (114 mm out on this one).
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_gate
     from cutamp.particle_initialization import _achieved_pose_errors
@@ -279,8 +281,22 @@ def test_gn_gate_matches_checker_helpers():
     q, T, arms = _four_dep_stack(world)
     q = q.clone()
     q[::3, 3] -= 0.45  # lean the ankle on every third row: CoM leaves the polygon
-    pose_ok, com_ok = gn_gate(world, q, T, arms, 0.005, 0.05)
+    # Make every term of the masks matter: unleaned warm rows 1 and 2 (3.9 mm
+    # off) get rotation-only errors between and beyond the tolerances, and
+    # leaned row 0 aims at its own tool pose, so it is pose-ok but CoM-out.
+    T = T.clone()
+    for row, ang in ((1, 0.02), (2, 0.1)):
+        T[row, :3, :3] = roma.rotvec_to_rotmat(torch.tensor([0.0, 0.0, ang], device="cuda")) @ T[row, :3, :3]
+    pos, quat, _ = _fk_pose(world, q[:8], world.tool_frame_for_arm("left"))
+    T[0, :3, :3] = _quat_to_mat(quat[0])
+    T[0, :3, 3] = pos[0]
+    kin = world.kinematics
+    with mock.patch.object(kin, "compute_kinematics", wraps=kin.compute_kinematics) as fk:
+        pose_ok, com_ok = gn_gate(world, q, T, arms, 0.005, 0.05)
+    assert fk.call_count == 1  # both masks from one FK
     ref = [_achieved_pose_errors(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)]
     assert torch.equal(pose_ok, torch.cat([(p < 0.005) & (r < 0.05) for p, r in ref]))
     assert torch.equal(com_ok, compute_com_polygon_mask(world, q))
+    assert torch.equal(com_ok, torch.cat([compute_com_polygon_mask(world, qi) for qi in q.split(8)]))
     assert pose_ok.any() and (~pose_ok).any() and com_ok.any() and (~com_ok).any()
+    assert (pose_ok & ~com_ok).any()

@@ -472,7 +472,10 @@ def gn_gate(
 
     Args:
         world: TAMPWorld (uses ``kinematics``, the CoM-enabled FK).
-        q_full: ``[N, dof]`` full-cspace joint positions.
+        q_full: ``[N, dof]`` full-cspace joint positions, contiguous float32
+            on the kinematics device: cuRobo's FK raises otherwise.
+            ``compute_com_polygon_mask`` moves and copies ``q``; this gate
+            passes it straight through.
         world_from_ee: ``[N, 4, 4]`` target tool poses.
         arms: one arm per IK dep, rows in dep-major blocks, as in
             :func:`gn_project_balanced`.
