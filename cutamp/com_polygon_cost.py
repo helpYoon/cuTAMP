@@ -25,6 +25,7 @@ Requires:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Type
 
 import torch
@@ -42,6 +43,13 @@ COM_HALF_EXTENTS = (0.1115, 0.156)   # (X, Y) half-extents in mobile_base_link f
 COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
 COM_TOL = 4e-4                       # == COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2 (on-boundary penalty)
+
+
+@lru_cache
+def _half_extents(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """``COM_HALF_EXTENTS`` on ``device``, made once: ``torch.tensor`` from a
+    Python tuple is a blocking host-to-device copy. Shared; never mutate."""
+    return torch.tensor(COM_HALF_EXTENTS, device=device, dtype=dtype)
 
 
 @dataclass
@@ -184,7 +192,7 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
     # post-IK COM-safe check and ConstraintChecker can never diverge. With the
     # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
-    half = torch.tensor(COM_HALF_EXTENTS, device=com.device, dtype=com.dtype)
+    half = _half_extents(com.device, com.dtype)
     pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT)
     return pen <= COM_TOL
 
@@ -193,9 +201,7 @@ def com_margin_from_base(com_in_base: torch.Tensor) -> torch.Tensor:
     """Static stability margin (McGhee & Frank): min over the two axes of
     ``h - |c|`` for base-frame CoM points ``[N, >=2]``. Positive inside the
     support rectangle, zero on an edge, negative outside. Metres."""
-    half = torch.tensor(
-        COM_HALF_EXTENTS, device=com_in_base.device, dtype=com_in_base.dtype
-    )
+    half = _half_extents(com_in_base.device, com_in_base.dtype)
     return (half - com_in_base[..., :2].abs()).min(dim=-1).values
 
 
@@ -244,8 +250,8 @@ def compute_com_polygon_penalties(
     out: "dict[str, torch.Tensor]" = {}
     for name in conf_names:
         com_world, base_T = _fk_com_and_base(world, particles[name])
-        half = torch.tensor(COM_HALF_EXTENTS, device=com_world.device, dtype=com_world.dtype)
         out[name] = com_polygon_penalty(
-            com_world, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT,
+            com_world, base_T, _half_extents(com_world.device, com_world.dtype),
+            COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT,
         )
     return out

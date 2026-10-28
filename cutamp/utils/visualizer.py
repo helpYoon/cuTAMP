@@ -63,9 +63,7 @@ class Visualizer:
         pass
 
     def log_cost_dict(self, cost_dict: dict):
-        for cost_type, cost_info in cost_dict.items():
-            for name, vals in cost_info["values"].items():
-                self.log_scalar(f"{cost_type}/{name}", vals.mean().item())
+        pass
 
 
 class RerunVisualizer(Visualizer):
@@ -139,6 +137,11 @@ class RerunVisualizer(Visualizer):
 
     def log_scalar(self, name: str, value: float):
         rr.log(name, rr.Scalars(value))
+
+    def log_cost_dict(self, cost_dict: dict):
+        for cost_type, cost_info in cost_dict.items():
+            for name, vals in cost_info["values"].items():
+                self.log_scalar(f"{cost_type}/{name}", vals.mean().item())
 
 
 def rr_log_tamp_world(world: TAMPWorld, log_spheres: bool = True, log_arrows: bool = True):

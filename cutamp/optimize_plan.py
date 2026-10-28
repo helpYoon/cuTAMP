@@ -499,10 +499,9 @@ class ParticleOptimizer:
             if param in initial_confs:
                 continue  # we don't optimize the initial configuration(s)
             if param in dropped_conf_names:
-                # Coupled re-IK: q is determined by IK from current Pose/Grasp.
-                # requires_grad stays True so cost evaluation differentiates
-                # through it; we just don't update it via Adam.
-                val.requires_grad = True
+                # Coupled re-IK: q is determined by IK from current Pose/Grasp,
+                # not by Adam, so nothing reads its gradient; skip computing it.
+                val.requires_grad = False
                 continue
             param_msg.append(f"(param: {param} = {tuple(val.shape)})")
             group = {"params": val}
@@ -602,7 +601,15 @@ class ParticleOptimizer:
             cost_dict = cost_fn(rollout, particles)
             costs = self.cost_reducer(cost_dict, consider_types=consider_types)
             satisfying_mask = self.get_satisfying_mask(cost_dict, verbose=False)
-            num_satisfying = satisfying_mask.sum().item()
+            loss = costs.mean()
+            # Every per-step scalar in one device-to-host copy: each .item()
+            # blocks the host until the GPU drains.
+            scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
+            if self.config.soft_cost is not None:
+                soft_costs = self.cost_reducer.soft_costs(cost_dict)
+                scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
+            num_satisfying, loss_val, min_cost, *best_soft = torch.stack(scalars).tolist()
+            num_satisfying = int(num_satisfying)
             opt_metrics["num_satisfying"].append(num_satisfying)
 
             if num_satisfying > 0 and not found_solution:
@@ -614,21 +621,18 @@ class ParticleOptimizer:
                 opt_metrics["opt_start_to_first_sol"] = time.perf_counter() - start_time
                 found_solution = True
 
-            loss = costs.mean()
-            opt_metrics["loss"].append(loss.item())
+            opt_metrics["loss"].append(loss_val)
 
-            # Compute soft costs if required (even if we don't optimize them)
+            # Soft costs are recorded even if we don't optimize them.
             if self.config.soft_cost is not None:
-                soft_costs = self.cost_reducer.soft_costs(cost_dict)
-                best_soft_cost = soft_costs[satisfying_mask].min().item() if num_satisfying > 0 else None
-                opt_metrics["best_soft_costs"].append(best_soft_cost)
+                opt_metrics["best_soft_costs"].append(best_soft[0] if num_satisfying > 0 else None)
 
             torch.cuda.synchronize()
             opt_metrics["elapsed"].append(time.perf_counter() - start_time)
 
             # Best-seen snapshot + early-stop bookkeeping. Measured state is
             # pre-step, so the clone is consistent with num_satisfying.
-            best_snapshot.update(step, num_satisfying, costs.min().item(), particles)
+            best_snapshot.update(step, num_satisfying, min_cost, particles)
             if best_snapshot.should_stop(step, self.config.early_stop_patience):
                 _log.info(
                     f"Early stop at step {step}: no meaningful progress for "
@@ -662,7 +666,7 @@ class ParticleOptimizer:
                     visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
 
                 visualizer.log_cost_dict(cost_dict)
-                visualizer.log_scalar("loss", loss.item())
+                visualizer.log_scalar("loss", loss_val)
                 timer.stop("visualize_opt_rollout")
 
             # Compute gradients and step the optimizer.
@@ -675,7 +679,7 @@ class ParticleOptimizer:
                 self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
             timer.stop("optimization_step")
             pbar.set_description(
-                f"Loss: {loss:.3f}, Min: {costs.min():.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
+                f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
             )
 
         # Restore the best-seen state if the loop ended on a dip of the

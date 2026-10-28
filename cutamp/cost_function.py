@@ -9,6 +9,7 @@
 
 import itertools
 from collections import defaultdict
+from functools import lru_cache
 from typing import Dict, Optional, Union
 
 import roma
@@ -35,6 +36,13 @@ from cutamp.task_planning.constraints import (
 )
 from cutamp.task_planning.costs import TrajectoryLength
 from cutamp.utils.common import transform_spheres
+
+
+@lru_cache
+def _device_const(values: tuple, device, dtype=None) -> torch.Tensor:
+    """``values`` on ``device``, made once: ``torch.tensor`` from a Python
+    sequence is a blocking host-to-device copy. Shared; never mutate."""
+    return torch.tensor(values, device=device, dtype=dtype)
 
 
 class CostFunction:
@@ -267,7 +275,7 @@ class CostFunction:
         coll_values["movable_to_world"] = self.world.collision_fn(all_movable_spheres)
 
         # Collision between robot and movables, need to expand poses to full timesteps
-        all_pose_ts = list(rollout["ts_to_pose_ts"].values())
+        all_pose_ts = _device_const(tuple(rollout["ts_to_pose_ts"].values()), all_movable_spheres.device)
         coll_values["robot_to_movables"] = sphere_to_sphere_overlap(
             robot_spheres,
             all_movable_spheres[:, all_pose_ts],
@@ -418,7 +426,7 @@ class CostFunction:
                 raise RuntimeError("Particles must be provided for retract_close_to_home soft cost")
 
             from cutamp.robots.t1 import BASE_DOF, t1_home
-            home_t = torch.tensor(t1_home, device=device)
+            home_t = _device_const(t1_home, device)
             # Penalize body (leg+torso+arms) deviation; ignore base x/y/yaw.
             body_slice = slice(BASE_DOF, len(t1_home))
             home_body = home_t[body_slice]
@@ -436,9 +444,7 @@ class CostFunction:
                 raise RuntimeError("Particles must be provided for minimize_body_movement soft cost")
 
             from cutamp.robots.t1 import BODY_INDICES, t1_home
-            home_body = torch.tensor(
-                t1_home[BODY_INDICES.start:BODY_INDICES.stop], device=device
-            )
+            home_body = _device_const(t1_home[BODY_INDICES], device)
 
             config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
             if config_params:
@@ -463,8 +469,8 @@ class CostFunction:
             return joint_limit_margin_soft_cost(
                 self._particles,
                 limits,
-                torch.tensor(T1_LIMIT_MARGIN_LOWER, device=device, dtype=limits.dtype),
-                torch.tensor(T1_LIMIT_MARGIN_UPPER, device=device, dtype=limits.dtype),
+                _device_const(T1_LIMIT_MARGIN_LOWER, device, limits.dtype),
+                _device_const(T1_LIMIT_MARGIN_UPPER, device, limits.dtype),
                 num_particles,
                 device,
             )
