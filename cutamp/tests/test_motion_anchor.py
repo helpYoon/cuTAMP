@@ -14,7 +14,7 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
     sentinel_target = object()
     monkeypatch.setattr(ms, "_planner_js_from_full",
                         lambda planner, conf, names: sentinel_target)
-    monkeypatch.setattr(ms, "_cspace_plan_succeeded", lambda result, target: True)
+    monkeypatch.setattr(ms, "_cspace_plan_succeeded", lambda result: True)
     calls = {}
 
     class FakePlanner:

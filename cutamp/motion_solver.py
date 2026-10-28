@@ -77,7 +77,7 @@ def _plan_arm_to_conf(
     redundancy solution. Mirrors the retract branch. ``disable_obstacle`` (if
     given) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
-    cuRobo result; raises ``RuntimeError`` if no attempt converges.
+    cuRobo result; raises ``RuntimeError`` if no attempt succeeds.
     """
     target_js = _planner_js_from_full(planner, conf_full, full_joint_names)
     result = None
@@ -87,7 +87,7 @@ def _plan_arm_to_conf(
             result = planner.plan_cspace(
                 target_js, last_js,
             )
-            if _cspace_plan_succeeded(result, target_js):
+            if _cspace_plan_succeeded(result):
                 return result
     raise RuntimeError(f"cspace-anchored plan failed for {ground_op}")
 
@@ -349,7 +349,7 @@ def solve_curobo(
                     result = planner.plan_cspace(
                         target_js, last_js,
                     )
-                if not _cspace_plan_succeeded(result, target_js):
+                if not _cspace_plan_succeeded(result):
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
                 plan = _interp_plan(result)
                 dt = _plan_dt(result)

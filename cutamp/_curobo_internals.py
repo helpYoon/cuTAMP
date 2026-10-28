@@ -46,60 +46,18 @@ def get_attachment_manager(planner):
     return None
 
 
-# Tolerance for the cspace-success override. Tight enough that real failures
-# still propagate, loose enough to accept trajectories that ended on goal
-# despite cuRobo's metric crash.
-CSPACE_OVERRIDE_TOL = 1e-3
-
-
-# TODO: file upstream issue against cuRobo. plan_cspace can leave
-# ``result.cspace_error = None`` when the metrics_rollout batch shape mismatches
-# the trajopt_solver's, marking the plan as failed even when the trajectory
-# converged. Override only when that specific broken-metric path is hit AND
-# the trajectory actually ends within tolerance of the cspace goal.
-def cspace_plan_succeeded(result, target_js, tol: float = CSPACE_OVERRIDE_TOL) -> bool:
-    """True if cuRobo says success, OR if its metric crashed yet the trajectory
-    ends within ``tol`` of ``target_js`` (the cspace goal).
-    """
-    if result is None:
-        return False
-    if bool(result.success.any()):
-        return True
-    if getattr(result, "cspace_error", None) is not None:
-        return False  # cuRobo computed the metric and it's a real failure.
-    plan = (
-        getattr(result, "interpolated_trajectory", None)
-        or getattr(result, "js_solution", None)
-    )
-    if plan is None:
-        return False
-    pos = plan.position
-    # cuRobo plans are [..., T, dof]. Take the last timestep along the time
-    # axis (second-to-last). After this, `end` is [B?, dof]. We then check
-    # whether ANY batch element lands within tolerance — previously the
-    # `> 2` vs `else end[-1]` squeeze loop dropped all but the last batch.
-    if pos.dim() >= 2:
-        end = pos[..., -1, :]
-    else:
-        end = pos
-    if end.dim() == 1:
-        end = end.unsqueeze(0)   # treat single-batch as [1, dof]
-    # Align dims: ``end`` may be in the planner's all-articulated order
-    # (e.g., 31 with locked joints) while ``target_js`` is in active cspace
-    # (e.g., 18). Pick out the active-cspace entries from ``end`` by name.
-    plan_names = getattr(plan, "joint_names", None)
-    target_names = getattr(target_js, "joint_names", None)
-    if end.shape[-1] != target_js.position.shape[-1]:
-        if plan_names is None or target_names is None:
-            return False
-        idx = [plan_names.index(n) for n in target_names if n in plan_names]
-        if len(idx) != target_js.position.shape[-1]:
-            return False
-        end = end[..., idx]
-    goal = target_js.position.view(-1).to(end)
-    # Per-batch max-abs-error against goal; True if any batch is within tol.
-    per_batch_err = torch.max(torch.abs(end - goal), dim=-1).values
-    return bool((per_batch_err < tol).any().item())
+# Kept here for the upgrade audit: in cuRobo 0.8, ``result.success`` from
+# plan_cspace is already the full feasibility test (TrajOptSolverResult.
+# _process_metrics): last step converged on every tool frame, AND every
+# constraint (scene/self collision, joint limits) satisfied over the
+# optimized AND the interpolated trajectory.
+# Don't second-guess it: ``result.cspace_error`` is declared but never set
+# (always None), and a trajectory ending on the goal proves nothing because
+# cuRobo pins the last waypoint to it. A rejected T1 plan is a real violation
+# (e.g. ankle_pitch past its 0 rad upper limit mid-path); fix the planner.
+def cspace_plan_succeeded(result) -> bool:
+    """True iff cuRobo reports a successful (converged and feasible) plan."""
+    return result is not None and bool(result.success.any())
 
 
 # TODO: file upstream issue against cuRobo. The per-DOF target weight tensor
