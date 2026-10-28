@@ -56,7 +56,7 @@ from typing import Sequence
 import roma
 import torch
 
-from curobo.types import JointState
+from curobo.types import JointState, Pose
 
 from cutamp.robots.t1 import (
     BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES, T1_LIMIT_MARGIN_LOWER, T1_LIMIT_MARGIN_UPPER,
@@ -92,6 +92,15 @@ GN_MARGIN_DAMPING = 1e-2
 # their pose per refresh; 0-2 at this cap). Margins need ~0.1 rad and get a
 # refresh every 5 Adam steps, so small steps cost little.
 GN_MARGIN_STEP = 0.03
+
+
+def _dep_arms(arms: str | Sequence[str], rows: int) -> tuple[str, ...]:
+    """``arms`` as one arm per IK dep (a bare ``str`` is one dep).
+    ``ValueError`` if ``rows`` doesn't split into that many equal dep blocks."""
+    arms = (arms,) if isinstance(arms, str) else tuple(arms)
+    if not arms or rows % len(arms):
+        raise ValueError(f"{rows} rows don't split into {len(arms)} equal dep blocks")
+    return arms
 
 
 @lru_cache
@@ -402,10 +411,8 @@ def gn_project_balanced(
     """
     from cutamp.com_polygon_cost import _project_com_to_base
 
-    arms = (arms,) if isinstance(arms, str) else tuple(arms)
     N = q_full.shape[0]
-    if not arms or N % len(arms):
-        raise ValueError(f"{N} rows don't split into {len(arms)} equal dep blocks")
+    arms = _dep_arms(arms, N)
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
     margin_lower, margin_upper = _limit_margins(q.device, q.dtype)
     band_lo = lower + margin_lower
@@ -433,3 +440,53 @@ def gn_project_balanced(
             q = (q + step).clamp(lower, upper)
 
     return q.detach()
+
+
+def gn_gate(
+    world,
+    q_full: torch.Tensor,
+    world_from_ee: torch.Tensor,
+    arms: str | Sequence[str],
+    pos_tol: float,
+    rot_tol: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge gate for :func:`gn_project_balanced`'s output, from one FK pass.
+
+    ``pose_ok`` holds where the row's ``_achieved_pose_errors``
+    (particle_initialization.py, the checker's metric, on the row's own
+    arm's tool frame) are strictly under both tolerances; ``com_ok`` is
+    ``compute_com_polygon_mask``. These are the masks those helpers give
+    with one FK per dep and one more for the CoM. No host syncs once its
+    cached constants exist: unlike ``compute_com_polygon_mask``, it skips
+    ``get_active_js``, an identity reorder for these joint names whose
+    index is a host-to-device copy.
+
+    Args:
+        world: TAMPWorld (uses ``kinematics``, the CoM-enabled FK).
+        q_full: ``[N, dof]`` full-cspace joint positions.
+        world_from_ee: ``[N, 4, 4]`` target tool poses.
+        arms: one arm per IK dep, rows in dep-major blocks, as in
+            :func:`gn_project_balanced`.
+        pos_tol: position tolerance (metres).
+        rot_tol: rotation tolerance (radians).
+
+    Returns:
+        ``(pose_ok [N] bool, com_ok [N] bool)``.
+    """
+    from cutamp.com_polygon_cost import com_polygon_mask_from_state
+    from cutamp.costs import curobo_pose_error
+
+    N = q_full.shape[0]
+    arms = _dep_arms(arms, N)
+    _, is_left = _row_layout(arms, N // len(arms), q_full.shape[1], q_full.device, q_full.dtype)
+    state = world.kinematics.compute_kinematics(
+        JointState.from_position(q_full, joint_names=list(world.kinematics.joint_names))
+    )
+    pose_l = state.tool_poses.get_link_pose(world.tool_frame_for_arm("left"))
+    pose_r = state.tool_poses.get_link_pose(world.tool_frame_for_arm("right"))
+    row = is_left.view(N, 1)
+    pos = torch.where(row, pose_l.position.reshape(N, 3), pose_r.position.reshape(N, 3))
+    quat = torch.where(row, pose_l.quaternion.reshape(N, 4), pose_r.quaternion.reshape(N, 4))
+    ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
+    pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
+    return (pos_err < pos_tol) & (rot_err < rot_tol), com_polygon_mask_from_state(state)

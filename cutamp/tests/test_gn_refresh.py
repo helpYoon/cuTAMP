@@ -263,3 +263,24 @@ def test_gn_project_balanced_pins_per_row():
         assert bool((pos < 2e-3).all() & (rot < 2e-2).all()), (
             f"{arm}: pos {pos.max().item():.4f} rot {rot.max().item():.4f}"
         )
+
+
+@needs_cuda
+def test_gn_gate_matches_checker_helpers():
+    # One FK over the whole stack gives the checker helpers' masks: per-dep
+    # _achieved_pose_errors on each row's own arm, and compute_com_polygon_mask.
+    # The lean is forward: on this IK draw (seeded, so the same each run), a
+    # 0.45 rad back-lean leaves every leaned CoM inside and com_ok all True.
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    from cutamp.gn_refresh import gn_gate
+    from cutamp.particle_initialization import _achieved_pose_errors
+
+    world = make_blocks_t1_world()
+    q, T, arms = _four_dep_stack(world)
+    q = q.clone()
+    q[::3, 3] -= 0.45  # lean the ankle on every third row: CoM leaves the polygon
+    pose_ok, com_ok = gn_gate(world, q, T, arms, 0.005, 0.05)
+    ref = [_achieved_pose_errors(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)]
+    assert torch.equal(pose_ok, torch.cat([(p < 0.005) & (r < 0.05) for p, r in ref]))
+    assert torch.equal(com_ok, compute_com_polygon_mask(world, q))
+    assert pose_ok.any() and (~pose_ok).any() and com_ok.any() and (~com_ok).any()

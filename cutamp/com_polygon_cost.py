@@ -148,17 +148,22 @@ class ComOverBasePolygonCost(BaseCost):
 ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
 
 
-def _fk_com_and_base(world, q_batch: torch.Tensor):
-    """FK ``q_batch`` through ``world.kinematics``; return
-    ``(com_world [B,3], base_T [B,4,4])`` — the inputs every COM-polygon
-    helper needs. Differentiable through cuRobo's FK chain."""
+def _fk_state(world, q_batch: torch.Tensor):
+    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through
+    ``world.kinematics``; return its kinematics state. Differentiable
+    through cuRobo's FK chain."""
     from curobo.types import JointState
     kin = world.kinematics
     q_batch = q_batch.to(kin.device_cfg.device)
     if q_batch.ndim == 1:
         q_batch = q_batch.unsqueeze(0)
     js = JointState.from_position(q_batch, joint_names=list(world.kinematics.joint_names))
-    ks = kin.compute_kinematics(kin.get_active_js(js))
+    return kin.compute_kinematics(kin.get_active_js(js))
+
+
+def _com_and_base_from_state(ks):
+    """``(com_world [B,3], base_T [B,4,4])`` from a ``world.kinematics``
+    state: the inputs every COM-polygon helper needs."""
     com_world = ks.robot_com[..., :3].reshape(-1, 3)
     base_T = (
         ks.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
@@ -166,6 +171,26 @@ def _fk_com_and_base(world, q_batch: torch.Tensor):
         .reshape(-1, 4, 4)
     )
     return com_world, base_T
+
+
+def _fk_com_and_base(world, q_batch: torch.Tensor):
+    """FK ``q_batch`` through ``world.kinematics``; return
+    ``(com_world [B,3], base_T [B,4,4])`` — the inputs every COM-polygon
+    helper needs. Differentiable through cuRobo's FK chain."""
+    return _com_and_base_from_state(_fk_state(world, q_batch))
+
+
+def com_polygon_mask_from_state(ks) -> torch.Tensor:
+    """:func:`compute_com_polygon_mask` on a kinematics state that
+    ``world.kinematics`` already computed, so a caller that needs the FK for
+    other checks too runs it once. ``[B]`` bool."""
+    com, base_T = _com_and_base_from_state(ks)
+    # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
+    # post-IK COM-safe check and ConstraintChecker can never diverge. With the
+    # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
+    half = _half_extents(com.device, com.dtype)
+    pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT)
+    return pen <= COM_TOL
 
 
 def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
@@ -188,13 +213,7 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
         ``<= COM_TOL`` (COM inside-or-on the support hull) — the same gate
         the hard ComPolygon constraint uses, so the two cannot diverge.
     """
-    com, base_T = _fk_com_and_base(world, q_batch)
-    # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
-    # post-IK COM-safe check and ConstraintChecker can never diverge. With the
-    # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
-    half = _half_extents(com.device, com.dtype)
-    pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT)
-    return pen <= COM_TOL
+    return com_polygon_mask_from_state(_fk_state(world, q_batch))
 
 
 def com_margin_from_base(com_in_base: torch.Tensor) -> torch.Tensor:
