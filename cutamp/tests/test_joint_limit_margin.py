@@ -199,6 +199,35 @@ class TestTrajoptCost:
         assert out[0].sum() == 0.0                      # inside everywhere
         assert torch.allclose(out[1, 3, 0], torch.tensor(2.0 * 0.25, device=dc.device, dtype=dc.dtype))
 
+    @needs_cuda
+    def test_planner_keeps_ankle_under_upper_limit(self):
+        # Seed-1 LeftPlace conf, the worst seed-1 case: with a zero ankle-upper
+        # band the COM-polygon cost pushed the ankle +5.7 mrad past its 0 rad
+        # limit late in the path, and cuRobo rejected the plan
+        # (T1_TRAJOPT_ANKLE_UPPER_MARGIN). Movables are disabled and nothing is
+        # attached: only the cost balance is under test.
+        from cutamp.motion_solver import _planner_js_from_full
+        from cutamp.tests.conftest import make_blocks_t1_world
+
+        world = make_blocks_t1_world()
+        planner = world.get_motion_planner(collision_activation_distance=0.0)
+        for obj in world.movables:
+            planner.scene_collision_checker.enable_obstacle(name=obj.name, enable=False)
+        names = world.kinematics.joint_names
+        home = torch.tensor(t1_home, device=world.device).view(1, -1)
+        place = torch.tensor([
+            0.0, 0.0, 0.0, -0.000876, 0.125940, -1.256779, -0.914472,
+            -1.294457, -0.780726, -0.645564, -0.472266, -0.965657, 0.231727, 0.644361,
+            -0.085731, 1.281193, 0.194918, 1.131778, -0.168810, 0.564520, 0.245527,
+        ], device=world.device).view(1, -1)
+        result = planner.plan_cspace(
+            _planner_js_from_full(planner, place, names), _planner_js_from_full(planner, home, names),
+        )
+        plan = result.get_interpolated_plan()
+        ankle = plan.position[..., list(plan.joint_names).index("ankle_pitch")]
+        assert bool(result.success.any()), f"ankle max {float(ankle.max()):+.4f} rad"
+        assert float(ankle.max()) <= 0.0
+
 
 class TestSoftCostWiring:
     def test_registered_default_on_and_weighted(self):

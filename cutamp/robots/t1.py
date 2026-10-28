@@ -147,6 +147,14 @@ assert len(T1_LIMIT_MARGIN_LOWER) == CUROBO_DOF
 assert len(T1_LIMIT_MARGIN_UPPER) == CUROBO_DOF
 del _M
 
+# Trajopt-only band on ankle_pitch's upper bound, which the margins above
+# leave at 0. With a zero band the COM-polygon cost leans the body back past
+# 0 late in the path (seed 1: +0.9 to +5.7 mrad), and cuRobo rejects the
+# plan. 0.02 removes that bump: the ankle then reaches its goal from below,
+# after a deeper mid-path dip (seed 1: -39 vs -12 mrad). 0.01 still left
+# +0.1 mrad. Start and goal are pinned, so the band only shapes the interior.
+T1_TRAJOPT_ANKLE_UPPER_MARGIN = 0.02
+
 
 # =============================================================================
 # Config loading
@@ -239,7 +247,8 @@ def get_t1_motion_planner(
 
     ``enable_joint_limit_margin`` (default True) additionally registers a
     hinge² cost that keeps the trajectory interior a soft 0.1 rad band away
-    from joint position limits (zero band on the home-side bounds).
+    from joint position limits (zero band on the home-side bounds, except
+    ``T1_TRAJOPT_ANKLE_UPPER_MARGIN`` on ankle-upper).
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
@@ -303,8 +312,9 @@ def get_t1_motion_planner(
         # above). Endpoint configs are handled by the cutamp-side soft cost;
         # this keeps the trajectory INTERIOR away from limits between
         # endpoints. Home-side bounds carry zero margin, so the home dwell
-        # waypoints that legitimately sit ON the ankle/knee/torso bounds
-        # cost nothing. Optimizer-objective only: extra costs never reach
+        # waypoints that legitimately sit ON the knee/torso bounds cost
+        # nothing; ankle-upper gets T1_TRAJOPT_ANKLE_UPPER_MARGIN instead
+        # (see there). Optimizer-objective only: extra costs never reach
         # the feasibility/success gate (see _curobo_internals.add_extra_cost).
         rollout = planner.trajopt_solver.optimizer_rollouts[0]
         limits = rollout.transition_model.joint_limits.position  # [2, dof_active]
@@ -322,6 +332,7 @@ def get_t1_motion_planner(
             [T1_LIMIT_MARGIN_UPPER[i] for i in full_idx],
             device=limits.device, dtype=limits.dtype,
         )
+        m_hi[active_names.index("ankle_pitch")] = T1_TRAJOPT_ANKLE_UPPER_MARGIN
         jl_weight = 1.0e5  # tuned 1e4→1e5 in verification: kills interior excursions (cuRobo's own bound cost runs 1e4)
         jl_cfg = JointLimitMarginCostCfg(
             weight=[jl_weight],
