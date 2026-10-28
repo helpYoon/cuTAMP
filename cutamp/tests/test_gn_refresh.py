@@ -6,10 +6,36 @@ changes row order or frame).
 """
 import math
 
+import pytest
 import roma
 import torch
 
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
+
+
+def _four_dep_stack(world):
+    """A refresh's dep-major stack of four 8-row IK deps: ``(q [32, 21],
+    T [32, 4, 4], arms)``. Per arm, one IK solution for an identity-rotation
+    target at (0.35, +-0.25, 0.25) feeds a warm dep (its target drifted by mm,
+    as between refreshes) and a far dep (x = 0.9, out of balanced reach)."""
+    from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask
+
+    B = 8
+    qs, targets = [], []
+    for arm, y in (("left", 0.25), ("right", -0.25)):
+        target = torch.eye(4, device="cuda").unsqueeze(0).expand(B, 4, 4).contiguous()
+        target[:, :3, 3] = torch.tensor([0.35, y, 0.25], device="cuda")
+        ik_result = _ik_for_pose(world, target, arm)
+        assert bool(_ik_success_mask(ik_result).all()), arm
+        q0 = _ik_solution_to_full_q(ik_result, world)
+        moved = target.clone()
+        moved[:, 0, 3] += 0.003
+        moved[:, 2, 3] += 0.0025
+        far = target.clone()
+        far[:, 0, 3] = 0.9
+        qs += [q0, q0]
+        targets += [moved, far]
+    return torch.cat(qs), torch.cat(targets), ("left", "left", "right", "right")
 
 
 def _quat_to_mat(q_wxyz):
@@ -180,3 +206,60 @@ def test_gn_project_balanced_leaves_margin_bands_holding_pose_and_com():
     pos_err, rot_err = _achieved_pose_errors(world, q, held, "left")
     assert bool((pos_err < 0.005).all() & (rot_err < 0.05).all()), f"pos {pos_err.max().item():.4f}"
     assert bool(compute_com_polygon_mask(world, q).all())
+
+
+@needs_cuda
+def test_gn_project_balanced_stack_matches_per_dep():
+    # One call on a refresh's whole dep-major stack matches one call per dep,
+    # and so does a stack with no right-arm rows (measured bitwise; the bound
+    # leaves room for GPU kernels whose reduction order depends on the batch).
+    from cutamp.gn_refresh import gn_project_balanced
+
+    world = make_blocks_t1_world()
+    q, T, arms = _four_dep_stack(world)
+    per_dep = torch.cat([gn_project_balanced(world, qi, Ti, a)
+                         for qi, Ti, a in zip(q.split(8), T.split(8), arms)])
+    assert (gn_project_balanced(world, q, T, arms) - per_dep).abs().max().item() <= 1e-5
+    left_only = gn_project_balanced(world, q[:16], T[:16], arms[:2])
+    assert (left_only - per_dep[:16]).abs().max().item() <= 1e-5
+
+
+@needs_cuda
+def test_gn_project_balanced_accepts_bare_arm():
+    # Today's call style: a bare arm is one dep, not ("l", "e", "f", "t").
+    # Rows that don't split into equal dep blocks, or an arm that is neither
+    # left nor right, raise instead of picking a frame.
+    from cutamp.gn_refresh import gn_project_balanced
+
+    world = make_blocks_t1_world()
+    q, T, arms = _four_dep_stack(world)
+    assert torch.equal(gn_project_balanced(world, q[:8], T[:8], "left"),
+                       gn_project_balanced(world, q[:8], T[:8], ("left",)))
+    with pytest.raises(ValueError):
+        gn_project_balanced(world, q[:10], T[:10], arms)
+    with pytest.raises(ValueError):
+        gn_project_balanced(world, q[:8], T[:8], "up")
+
+
+@needs_cuda
+def test_gn_project_balanced_pins_per_row():
+    # Each row keeps its own dep's cspace pin and tool frame: the base never
+    # moves, each arm moves only in its own deps' rows, and both warm deps
+    # close their 3.9 mm drift on their own arm's frame (a right row on the
+    # left frame would chase a target half a metre away).
+    from cutamp.gn_refresh import gn_project_balanced
+    from cutamp.particle_initialization import _achieved_pose_errors
+    from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
+
+    world = make_blocks_t1_world()
+    q, T, arms = _four_dep_stack(world)
+    q1 = gn_project_balanced(world, q, T, arms)
+    assert torch.equal(q1[:, BASE_INDICES], q[:, BASE_INDICES])
+    assert torch.equal(q1[:16, RIGHT_ARM_INDICES], q[:16, RIGHT_ARM_INDICES])
+    assert torch.equal(q1[16:, LEFT_ARM_INDICES], q[16:, LEFT_ARM_INDICES])
+    assert not torch.equal(q1[:16, LEFT_ARM_INDICES], q[:16, LEFT_ARM_INDICES])
+    for rows, arm in ((slice(0, 8), "left"), (slice(16, 24), "right")):
+        pos, rot = _achieved_pose_errors(world, q1[rows], T[rows], arm)
+        assert bool((pos < 2e-3).all() & (rot < 2e-2).all()), (
+            f"{arm}: pos {pos.max().item():.4f} rot {rot.max().item():.4f}"
+        )
