@@ -186,17 +186,26 @@ def _rotmat_to_rotvec(R: torch.Tensor) -> torch.Tensor:
     return (scale[:, None] * quat[:, :3]).reshape(R.shape[:-2] + (3,))
 
 
+def _row_tool_pose(state, left: str, right: str, is_left):
+    """Each row's own arm's tool pose ``(position [N, 3], quaternion [N, 4]
+    wxyz)``: frame ``left`` where ``is_left``, else ``right``."""
+    N = is_left.shape[0]
+    pose_l = state.tool_poses.get_link_pose(left)
+    pose_r = state.tool_poses.get_link_pose(right)
+    row = is_left.view(N, 1)
+    return (
+        torch.where(row, pose_l.position.reshape(N, 3), pose_r.position.reshape(N, 3)),
+        torch.where(row, pose_l.quaternion.reshape(N, 4), pose_r.quaternion.reshape(N, 4)),
+    )
+
+
 def _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left):
     """World-frame residual ``[Δpos; rotvec(R* R^T)]`` ``[N, 6]`` and the
     column-masked tool Jacobian ``[N, 6, dof]``, each row on its own arm's
     tool frame (``frames``, ``is_left`` and ``col_mask`` from :func:`_setup`)."""
     N = world_from_ee.shape[0]
     (left, left_idx), (right, right_idx) = frames
-    pose_l = state.tool_poses.get_link_pose(left)
-    pose_r = state.tool_poses.get_link_pose(right)
-    row = is_left.view(N, 1)
-    pos = torch.where(row, pose_l.position.reshape(N, 3), pose_r.position.reshape(N, 3))
-    quat = torch.where(row, pose_l.quaternion.reshape(N, 4), pose_r.quaternion.reshape(N, 4))
+    pos, quat = _row_tool_pose(state, left, right, is_left)
     # cuRobo quaternions are wxyz; roma expects xyzw.
     rot = roma.unitquat_to_rotmat(quat.roll(-1, dims=-1))
     r_pos = world_from_ee[:, :3, 3] - pos
@@ -482,11 +491,9 @@ def gn_gate(
     state = world.kinematics.compute_kinematics(
         JointState.from_position(q_full, joint_names=list(world.kinematics.joint_names))
     )
-    pose_l = state.tool_poses.get_link_pose(world.tool_frame_for_arm("left"))
-    pose_r = state.tool_poses.get_link_pose(world.tool_frame_for_arm("right"))
-    row = is_left.view(N, 1)
-    pos = torch.where(row, pose_l.position.reshape(N, 3), pose_r.position.reshape(N, 3))
-    quat = torch.where(row, pose_l.quaternion.reshape(N, 4), pose_r.quaternion.reshape(N, 4))
+    pos, quat = _row_tool_pose(
+        state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left,
+    )
     ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
     pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
     return (pos_err < pos_tol) & (rot_err < rot_tol), com_polygon_mask_from_state(state)
