@@ -68,7 +68,8 @@ class TAMPConfiguration:
     # near-answer, so the 32-seed global search is wasted there). Cost scales
     # ~linearly with seeds. Particle init and the final pre-check refresh
     # always use the full 32-seed solver. 0 = refreshes use the main solver.
-    # No effect with reik_balance_first: balance-first runs no cuRobo during Adam.
+    # No effect with reik_balance_first beyond validation (still >= 0):
+    # balance-first runs no cuRobo during Adam.
     # Default 4 (= current q + 3 random): A/B on blocks_t1 @512 particles
     # showed 407 -> 251 ms/step with best-satisfying / best-soft-cost equal
     # or better than the 32-seed refresh (2026-08-04).
@@ -96,8 +97,9 @@ class TAMPConfiguration:
     # the CoM re-centering inside LBFGS doesn't converge (CoM-in-polygon
     # collapsed to 407/512). Must be a multiple of the LBFGS inner_iters
     # (20, lbfgs_ik.yml). Init and the final pre-check refresh keep the
-    # full 100-iteration schedule. No effect with reik_balance_first:
-    # balance-first runs no cuRobo during Adam.
+    # full 100-iteration schedule. No effect with reik_balance_first beyond
+    # validation (still a non-negative multiple of 20): balance-first runs no
+    # cuRobo during Adam.
     reik_lbfgs_iters: int = 40
 
     ## Task Planning

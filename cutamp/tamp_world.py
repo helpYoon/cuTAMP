@@ -261,10 +261,12 @@ class TAMPWorld:
     def warmup_ik_solver(self, num_particles: int, warm_refresh: bool = False):
         """Warmup the multi-frame IK solver with a multi-frame FK goal.
 
-        ``warm_refresh`` also captures the refresh solver's CUDA graphs with
-        the exact call the coupled-reIK fallback makes. It must run before the
-        planner thread starts: a capture concurrent with another thread's CUDA
-        calls fails.
+        When the world has a refresh solver (``reik_num_seeds > 0``),
+        ``warm_refresh`` also captures its CUDA graphs with the exact call the
+        coupled-reIK fallback makes; with 0 seeds (balance-first setup builds
+        its world that way) there is nothing to capture. The capture must run
+        before the planner thread starts: a capture concurrent with another
+        thread's CUDA calls fails.
         """
         ik = self.ik_solver
         max_bs = getattr(ik.config, "max_batch_size", num_particles)
