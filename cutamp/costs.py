@@ -84,6 +84,7 @@ def sphere_to_sphere_overlap(
     # Every batch's overlap, kept where the AABBs intersect. Computing only those
     # batches took host syncs (intersect.any(), and the boolean-mask gathers and
     # write), which a CUDA graph can't capture.
+    # A NaN sphere on a non-intersecting row now gets NaN grads: where's backward multiplies by 0.
     output = torch.where(intersect, _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance), 0.0)
     return output
 

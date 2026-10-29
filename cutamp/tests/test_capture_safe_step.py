@@ -8,8 +8,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
-    SpyVis, assert_bitwise, clone_particles, cupti_sync_events, make_plan_info, needs_cuda, run_optimizer,
-    sync_debug_error,
+    SpyVis, clone_particles, cupti_sync_events, make_plan_info, needs_cuda, run_optimizer, sync_debug_error,
 )
 from cutamp.tests.test_step_lockstep import _head_sphere_to_sphere_overlap, _head_upper_sum
 
@@ -28,34 +27,51 @@ def test_noop_visualizer_skips_vis_block(blocks_t1_plan):
     assert vis.opt_steps == [0, 10, 11]
 
 
-def _spheres(seed=0):
-    """[64, 3, 50, 4] sphere pairs; about half of the [64, 3] rows have intersecting AABBs."""
+def _spheres(k=None, seed=0):
+    """[64, 3, 50, 4] sphere pairs, and the [64, 3] rows whose AABBs intersect: the first ``k`` of the
+    192 rows in row-major order, or about half of them at random when ``k`` is None."""
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def make():
         return torch.cat([0.1 * torch.randn(64, 3, 50, 3, device="cuda", generator=g),
                           0.02 + 0.03 * torch.rand(64, 3, 50, 1, device="cuda", generator=g)], -1)
     s1, s2 = make(), make()
-    s2[..., 0] += torch.where(torch.rand(64, 3, 1, device="cuda", generator=g) < 0.5, 0.05, 3.0)
-    return s1, s2
+    if k is None:
+        near = torch.rand(64, 3, 1, device="cuda", generator=g) < 0.5
+    else:
+        near = (torch.arange(64 * 3, device="cuda") < k).view(64, 3, 1)
+    s2[..., 0] += torch.where(near, 0.05, 3.0)  # the far rows' AABBs are metres apart
+    return s1, s2, near.squeeze(-1)
 
 
 @needs_cuda
 def test_dense_aabb_overlap_matches_masked(monkeypatch):            # P1
+    # Not bitwise (deviation D3): the masked form ran the overlap on only the intersecting rows, so
+    # cdist's TF32 GEMMs and the reduction batch differently. Measured at [64, 50, 4] with TF32: grads
+    # differ by ~1e-4 relative at k=1 intersecting rows, and the forward by under 1 ulp at k=8. Rows
+    # whose AABBs don't intersect are exactly 0, in the output and both grads.
     from cutamp.costs import sphere_to_sphere_overlap
 
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)   # the loop's regime
-    s1, s2 = _spheres()
-    for act in (None, 0.0, 0.02):
-        a, b = s1.clone().requires_grad_(), s2.clone().requires_grad_()
-        want = _head_sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
-        assert 0.3 < (want > 0).float().mean() < 0.7                # mixed rows, not the trivial case
-        w = torch.rand_like(want)
-        gw = torch.autograd.grad((want * w).sum(), (a, b))
-        with sync_debug_error():                                    # RED: costs.py:85 intersect.any()
-            got = sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
-            gg = torch.autograd.grad((got * w).sum(), (a, b))
-        assert_bitwise({"out": got, "grads": gg}, {"out": want, "grads": gw}, f"activation {act}")
+    for k in (None, 1, 2, 5):
+        s1, s2, near = _spheres(k)
+        if k is None:
+            assert 0.3 < near.float().mean() < 0.7                  # mixed rows, not the trivial case
+        for act in (None, 0.0, 0.02):
+            case = f"k={k}, activation {act}"
+            a, b = s1.clone().requires_grad_(), s2.clone().requires_grad_()
+            want = _head_sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
+            assert torch.equal(want > 0, near), case                # the near rows overlap, the far ones don't
+            w = torch.rand_like(want)
+            gw = torch.autograd.grad((want * w).sum(), (a, b))
+            with sync_debug_error():                                # RED: costs.py:85 intersect.any()
+                got = sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
+                gg = torch.autograd.grad((got * w).sum(), (a, b))
+            assert (got[~near] == 0).all() and all((g[~near] == 0).all() for g in gg), case
+            for name, x, y in (("out", got, want), ("grad 1", gg[0], gw[0]), ("grad 2", gg[1], gw[1])):
+                torch.testing.assert_close(x, y, rtol=1e-3, atol=1e-3 * y.abs().max().item(),
+                                           msg=lambda m: f"{case}, {name}: {m}")
+    s1, s2, _ = _spheres()
     a = s1.clone().requires_grad_()
     b = (s2 + torch.tensor([10.0, 0, 0, 0], device="cuda")).requires_grad_()
     miss = sphere_to_sphere_overlap(a, b, use_aabb_check=True)

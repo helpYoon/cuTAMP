@@ -1,10 +1,12 @@
 """Lockstep of the in-loop Adam step against HEAD's math.
 
-HEAD's math is cfa7a46 + B0 (ruling 11): goal_in_xy summed per object in a
-fixed order, frozen here as :func:`_head_per_object_sum`. No oracle may vendor
-``stable_placement_costs`` or restore ``scatter_add_``. The sync-free edits'
-HEAD forms are frozen here too: :func:`_head_sphere_to_sphere_overlap`,
-:func:`_head_fk_state` and :func:`_head_upper_sum`.
+HEAD's math is cfa7a46 + B0 + P1 (ruling 11, deviation D3): goal_in_xy summed
+per object in a fixed order, frozen here as :func:`_head_per_object_sum`, and
+production's dense AABB sphere overlap. No oracle may vendor
+``stable_placement_costs`` or restore ``scatter_add_``. Two more sync-free
+edits' HEAD forms are frozen here: :func:`_head_fk_state` and
+:func:`_head_upper_sum`. :func:`_head_sphere_to_sphere_overlap`, cfa7a46's
+masked overlap, is only the reference of P1's unit test.
 
 Every in-loop step, one ``_StepBody`` call, first runs twice more on clones of
 its particles: once under :func:`_head_math`, and once as the code now runs it
@@ -59,7 +61,8 @@ def _head_per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tens
 
 
 # A verbatim copy of cutamp.costs.sphere_to_sphere_overlap at cfa7a46 (costs.py:61-88):
-# the AABB branch's host-synced form, which P1 replaces with a dense torch.where.
+# the AABB branch's host-synced form, which P1 replaces with a dense torch.where. Not in
+# _head_math (D3): only test_dense_aabb_overlap_matches_masked compares against it.
 def _head_sphere_to_sphere_overlap(
     spheres_1: torch.Tensor,
     spheres_2: torch.Tensor,
@@ -114,19 +117,19 @@ def _head_upper_sum(x: torch.Tensor) -> torch.Tensor:
 
 @contextmanager
 def _head_math(world):
-    """HEAD's math: every FK site on the one shared ``world.kinematics``, and
-    the frozen HEAD functions: :func:`_head_per_object_sum` for goal_in_xy's
-    sum, :func:`_head_sphere_to_sphere_overlap` for the collision costs,
-    :func:`_head_fk_state` for the CoM FK and :func:`_head_upper_sum` for the
-    triu soft costs. Never vendor ``stable_placement_costs`` here, or restore
-    ``scatter_add_`` (ruling 11): B0's sum is HEAD's. The reset before each FK
-    call keeps two live calls off one set of buffers, the job HEAD's two resets
-    did; which buffers a call uses doesn't change its values. Yields the shared
-    :class:`_ResetFK`."""
+    """HEAD's math, cfa7a46 + B0 + P1 (ruling 11, D3): every FK site on the
+    one shared ``world.kinematics``, and the frozen HEAD functions:
+    :func:`_head_per_object_sum` for goal_in_xy's sum, :func:`_head_fk_state`
+    for the CoM FK and :func:`_head_upper_sum` for the triu soft costs. P1's
+    dense AABB overlap is production's own, unpatched: D3 approved its change
+    from cfa7a46's masked form. Never vendor ``stable_placement_costs`` here,
+    or restore ``scatter_add_`` (ruling 11): B0's sum is HEAD's. The reset
+    before each FK call keeps two live calls off one set of buffers, the job
+    HEAD's two resets did; which buffers a call uses doesn't change its
+    values. Yields the shared :class:`_ResetFK`."""
     shared = _ResetFK(world.kinematics)
     with mock.patch.object(world, "site_kinematics", lambda name: shared), \
             mock.patch("cutamp.cost_function._per_object_sum", _head_per_object_sum), \
-            mock.patch("cutamp.cost_function.sphere_to_sphere_overlap", _head_sphere_to_sphere_overlap), \
             mock.patch("cutamp.com_polygon_cost._fk_state", _head_fk_state), \
             mock.patch("cutamp.cost_function._pairwise_upper_sum", _head_upper_sum):
         yield shared
