@@ -49,7 +49,9 @@ def _per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
     """``[B, len(counts)]``: the sums of ``x`` ``[B, sum(counts)]`` over consecutive
     column blocks of ``counts[i]`` columns, one fixed-order reduction per block.
     Bitwise run to run and under CUDA-graph replay, which ``scatter_add_`` is not:
-    its CUDA atomics add in a varying order, so its rounding varies. The backward
+    its CUDA atomics add in a varying order, so its rounding varies. For a block
+    wider than 128 columns, the reduction's split also depends on each row's
+    address mod 16 bytes, which is fixed for a freshly allocated ``x``. The backward
     gives each column its block's upstream grad, the gather ``scatter_add_``'s
     backward gives. ``counts`` are Python ints, so there is no host read."""
     return torch.stack([block.sum(-1) for block in x.split(counts, dim=1)], dim=1)

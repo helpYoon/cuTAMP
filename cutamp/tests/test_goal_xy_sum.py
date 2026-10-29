@@ -6,8 +6,11 @@ HEAD's form has no fixed bits to match, so the new op is gated by: determinism
 over repeats (HEAD's form is the positive control), a float64-reference error
 within HEAD's own spread and error, bitwise grads, sync-free capture, and
 run-to-run bitwise in the real cost function, with and without grad, through
-the call site it uses."""
+the call site it uses, where the particle grads are the ones cfa7a46's form gives."""
 
+import os
+
+import numpy as np
 import pytest
 import torch
 
@@ -15,7 +18,8 @@ from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
-_CASES = [(counts, b) for counts in ((50, 50), (37, 50, 13)) for b in (64, 256)]
+# (200, 56) has a block over 128 columns: the reduction's vectorized path (_per_object_sum's docstring).
+_CASES = [(counts, b) for counts in ((50, 50), (37, 50, 13), (200, 56)) for b in (64, 256)]
 
 
 def _block_index(counts, b):
@@ -33,6 +37,20 @@ def _not_equal(got, want):
     assert got.keys() == want.keys(), got.keys() ^ want.keys()
     return {k: (got[k].double() - want[k].double()).abs().max().item()
             for k in want if not torch.equal(got[k], want[k])}
+
+
+def _grads(out):
+    """The ``("grad", name)`` entries of a :func:`test_cost_function_is_run_to_run_bitwise` output."""
+    return {k: v for k, v in out.items() if k[0] == "grad"}
+
+
+@pytest.fixture
+def _numpy_rng_restored():
+    """Puts numpy's global RNG back as the test found it, so the tests after one
+    that seeds it keep their own draws."""
+    state = np.random.get_state()
+    yield
+    np.random.set_state(state)
 
 
 @needs_cuda
@@ -74,40 +92,44 @@ def test_per_object_sum_is_fixed_order():
         err = (want.double().cpu() - ref).abs().max().item()
         spread = (heads.amax(0) - heads.amin(0)).max().item()
         head_err = (heads.double().cpu() - ref).abs().max().item()
-        assert err <= spread and err <= head_err, (counts, b, err, spread, head_err)
+        assert err <= head_err, f"{counts}, B={b}: B0 error {err:.3g} exceeds HEAD's {head_err:.3g}"
+        assert err <= spread, (
+            f"{counts}, B={b}: HEAD's spread {spread:.3g} is below B0's error {err:.3g}: "
+            "HEAD's atomics vary too little on this GPU for the spread bound")
 
 
 @needs_cuda
 def test_per_object_sum_replays_like_eager():
     from cutamp.cost_function import _per_object_sum
-    counts, g = (50, 50), torch.Generator(device="cuda").manual_seed(0)
-    x = torch.rand(64, 100, device="cuda", generator=g).requires_grad_()
-    gy = torch.rand(64, 2, device="cuda", generator=g)
+    g, side = torch.Generator(device="cuda").manual_seed(0), torch.cuda.Stream()
+    for counts in ((50, 50), (200, 56)):     # the second has a block over 128 columns
+        n, k = sum(counts), len(counts)
+        x = torch.rand(64, n, device="cuda", generator=g).requires_grad_()
+        gy = torch.rand(64, k, device="cuda", generator=g)
 
-    def body():
-        y = _per_object_sum(x, counts)
-        return y, torch.autograd.grad(y, x, gy)[0]
+        def body():
+            y = _per_object_sum(x, counts)
+            return y, torch.autograd.grad(y, x, gy)[0]
 
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(3):
-            body()
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=side, capture_error_mode="global"):
-        y_static, gx_static = body()
-    for k in range(10):                      # fresh inputs each time, as Adam moves them
-        with torch.no_grad():
-            x.copy_(torch.rand(64, 100, device="cuda", generator=g))
-            gy.copy_(torch.rand(64, 2, device="cuda", generator=g))
-        graph.replay()
-        y, gx = body()
-        assert torch.equal(y_static, y) and torch.equal(gx_static, gx), k
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                body()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side, capture_error_mode="global"):
+            y_static, gx_static = body()
+        for r in range(10):                  # fresh inputs each time, as Adam moves them
+            with torch.no_grad():
+                x.copy_(torch.rand(64, n, device="cuda", generator=g))
+                gy.copy_(torch.rand(64, k, device="cuda", generator=g))
+            graph.replay()
+            y, gx = body()
+            assert torch.equal(y_static, y) and torch.equal(gx_static, gx), (counts, r)
 
 
 @needs_cuda
-def test_cost_function_is_run_to_run_bitwise(monkeypatch):
+def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
     from cutamp.config import TAMPConfiguration
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_function import CostFunction
@@ -119,8 +141,10 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch):
     from cutamp.t1_domain import all_t1_operators
     from cutamp.task_planning import task_plan_generator
 
+    np.random.seed(0)  # the world's block spheres are sampled from numpy's global RNG: a recreatable state
     world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
     skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+    where = f"skeleton {' | '.join(map(str, skeleton))}; PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}"
     config = TAMPConfiguration(num_particles=64)
     torch.manual_seed(0)
     particles = ParticleInitializer(world, config)(skeleton)
@@ -128,7 +152,11 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch):
     reducer = CostReducer(default_constraint_to_mult.copy())
     checker = ConstraintChecker(default_constraint_to_tol.copy())
 
-    def outputs():  # the init state: the most nonzero sphere terms per sum (up to 35)
+    # The init state, where sums have the most nonzero sphere terms. Asserted: 8 repeats bitwise
+    # equal to `want`. With cfa7a46's atomics patched in at this seeded state, a probe's 400 calls
+    # gave 28-39 distinct goal_in_xy results (PYTHONHASHSEED 0, 2) and 5-8 (PYTHONHASHSEED 1, the
+    # other skeleton); in its 5-result run, 8 repeats would all agree with probability 0.25.
+    def outputs():
         with torch.no_grad():
             cost_dict = cost_fn(rollout_fn(particles), particles)
             out = {(c, n): v.clone() for c, e in cost_dict.items() for n, v in e["values"].items()}
@@ -141,7 +169,7 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch):
     assert ("StablePlacement", "goal_in_xy") in want
     for r in range(8):
         bad = _not_equal(outputs(), want)
-        assert not bad, f"repeat {r}: not bitwise run to run: {bad}"   # RED at cfa7a46: goal_in_xy
+        assert not bad, f"repeat {r}: not bitwise run to run: {bad} ({where})"   # RED at cfa7a46: goal_in_xy
     for surface, placements in cost_fn.surface_to_placements.items():  # the blocks the split assumes
         counts = cost_fn.surface_to_sphere_counts[surface]
         assert counts == tuple(world.get_collision_spheres(o).shape[0] for o, _ in placements)
@@ -165,7 +193,7 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch):
             values = cost_fn(rollout_fn(particles), particles)["StablePlacement"]["values"]
     assert len(calls) == len(cost_fn.surface_to_placements), [c[:2] for c in calls]
     for surface, (shape, counts, result) in zip(cost_fn.surface_to_placements, calls):
-        assert counts == cost_fn.surface_to_sphere_counts[surface] and shape == (64, sum(counts)), (surface, shape)
+        assert counts is cost_fn.surface_to_sphere_counts[surface] and shape == (64, sum(counts)), (surface, shape)
         assert values[f"{surface}_in_xy"] is result, surface
 
     def grad_outputs():  # with grad, on fresh leaf clones: TorchScript specializes on requires_grad
@@ -181,6 +209,17 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch):
 
     grad_outputs()                              # warm-up, as for the no_grad repeats
     want = grad_outputs()
-    assert any(k[0] == "grad" for k in want)
-    bad = _not_equal(grad_outputs(), want)
-    assert not bad, f"grad-enabled repeat: not bitwise run to run: {bad}"
+    assert _grads(want)
+    for r in range(8):
+        bad = _not_equal(grad_outputs(), want)
+        assert not bad, f"grad-enabled repeat {r}: not bitwise run to run: {bad} ({where})"
+
+    # In situ, B0 leaves the particle grads as cfa7a46's form gives them: its zeros + scatter_add_,
+    # on each surface's own idx map. Only the grads are compared: that form's values vary.
+    idx_for = {c: cost_fn.surface_to_sphere_idx_map[s][None].expand(64, -1)
+               for s, c in cost_fn.surface_to_sphere_counts.items()}
+    with monkeypatch.context() as m:
+        m.setattr("cutamp.cost_function._per_object_sum", lambda x, c: _head_sum(x, idx_for[c], len(c)))
+        head = grad_outputs()
+    bad = _not_equal(_grads(head), _grads(want))
+    assert not bad, f"particle grads under cfa7a46's scatter_add_ differ from B0's: {bad} ({where})"
