@@ -94,10 +94,12 @@ def capture(name: str, body: Callable[[], Any], warmup: Callable[[], None], ptrs
 
     A failed capture leaves the side stream current (the stream context's exit
     never runs once ``capture_end`` raises), so this sets the caller's stream
-    back, then raises a ``RuntimeError`` naming ``--cuda_graphs``: there is no
-    switch to eager, since a failed capture also leaves torch's CUDA RNG
-    unusable until a later capture succeeds (design 4.8). A warm-up's error
-    propagates as it is.
+    back, then raises a ``RuntimeError`` naming ``--cuda_graphs``. There is no
+    switch to eager, for two reasons. A failed capture leaves torch's CUDA RNG
+    unusable until a later capture succeeds (design 4.8). It also leaves the
+    caching allocator in capture mode until the process exits: on torch 2.9.1,
+    ``empty_cache()`` stops releasing the default pool, and the failed graph's
+    private pool keeps its segment. A warm-up's error propagates as it is.
     """
     side = side_stream()
     t0 = time.perf_counter()

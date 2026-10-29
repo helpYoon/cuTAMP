@@ -3,9 +3,11 @@ replayed, against its eager twin bitwise at every replay."""
 
 import gc
 import itertools
+import subprocess
 import sys
 import weakref
 from collections import Counter
+from pathlib import Path
 
 import pytest
 import torch
@@ -39,16 +41,31 @@ def test_cli_passes_cuda_graphs(monkeypatch):
         assert seen[-1].cuda_graphs is want
 
 
+# The failing capture's process: cwd is this tree's root, so ``-c`` imports this tree's cutamp.
+_FAILED_CAPTURE_CHILD = """
+import os
+import pytest
+import torch
+import cutamp
+from cutamp.cuda_graphs import capture
+from cutamp.tests.conftest import repair_cuda_rng
+assert os.path.realpath(cutamp.__file__).startswith(os.getcwd() + os.sep), cutamp.__file__
+with pytest.raises(RuntimeError, match="--cuda_graphs"):
+    capture("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
+assert torch.cuda.current_stream() == torch.cuda.default_stream()
+repair_cuda_rng()
+assert torch.rand(4, device="cuda").isfinite().all()
+"""
+
+
 @needs_cuda
 def test_failed_capture_restores_default_stream():
-    from cutamp.cuda_graphs import capture
-    try:
-        with pytest.raises(RuntimeError, match="--cuda_graphs"):
-            capture("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
-        assert torch.cuda.current_stream() == torch.cuda.default_stream()
-    finally:
-        repair_cuda_rng()
-    assert torch.rand(4, device="cuda").isfinite().all()
+    # A failed capture leaves its process's allocator in capture mode until the process exits
+    # (cuda_graphs.capture), so it runs in a child. No flock there: the child runs inside this
+    # process's GPU lock, and a second flock on the same file would deadlock.
+    child = subprocess.run([sys.executable, "-c", _FAILED_CAPTURE_CHILD], cwd=Path(__file__).resolve().parents[2],
+                           capture_output=True, text=True, timeout=120)
+    assert child.returncode == 0, child.stderr
 
 
 @needs_cuda
@@ -129,6 +146,7 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch, record
                               visualizer=SpyVis(config), planner_busy=lambda: next(busy2) < 7)
         outcome = f"captured at step {m2['capture_step']}"
     except RuntimeError as e:
+        # A failed capture leaves this process's allocator in capture mode for every later test: a finding, not a pass.
         outcome = f"capture failed: {e.__cause__!r}"
         repair_cuda_rng()
     print("deferred capture without the penalties-cache clear:", outcome)
