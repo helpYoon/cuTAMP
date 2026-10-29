@@ -94,11 +94,13 @@ class TAMPConfiguration:
     # row's iterate is written back, and no cuRobo runs during Adam (the final
     # pre-check refresh still repairs). Needs reik_gn.
     reik_balance_first: bool = False
-    # Replay the balance-first Adam step as a CUDA graph (cutamp/cuda_graphs.py):
-    # captured in each optimize call once the motion-planner build thread has
-    # ended, and released at loop exit. Needs reik_balance_first (default mode
-    # stays eager) and rejects CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS. A failed
-    # capture ends the run: there is no switch to eager mid-run.
+    # Replay the balance-first Adam step (G_step) and the balance-first re-IK
+    # refresh (G_refresh) as CUDA graphs (cutamp/cuda_graphs.py). In each
+    # optimize call, G_step is captured once the motion-planner build thread has
+    # ended, and G_refresh at the first refresh after that; both are released at
+    # loop exit. Needs reik_balance_first (default mode stays eager) and rejects
+    # CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS. A failed capture ends the run: there is
+    # no switch to eager mid-run.
     cuda_graphs: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started

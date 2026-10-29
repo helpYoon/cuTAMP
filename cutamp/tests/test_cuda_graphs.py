@@ -1,5 +1,5 @@
-"""``--cuda_graphs`` (Mode H): the balance-first Adam step, captured as G_step and
-replayed, against its eager twin bitwise at every replay."""
+"""``--cuda_graphs`` (Mode H): the balance-first Adam step and re-IK refresh, captured
+as G_step and G_refresh and replayed, each replay against its eager counterpart bitwise."""
 
 import gc
 import itertools

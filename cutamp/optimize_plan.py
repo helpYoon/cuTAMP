@@ -300,9 +300,11 @@ class _ReikDriftGate:
     def __init__(self, num_deps: int, pos_tol: float, rot_tol: float):
         self.pos_tol = pos_tol
         self.rot_tol = rot_tol
-        self.refs = [None] * num_deps  # [B, 4, 4] target at previous refresh
+        # [B, 4, 4] target at previous refresh. Stale once G_refresh is captured:
+        # the graph advances _StaticRefresh.refs instead.
+        self.refs = [None] * num_deps
         self.stats: List[dict] = []
-        self._queued: List[_QueuedRefresh] = []  # log_batch refreshes awaiting flush()
+        self._queued: List[_QueuedRefresh] = []  # log_batch's and G_refresh replays' records, awaiting flush()
 
     def measure_drift(self, dep_idx: int, target: torch.Tensor):
         """``(pos_drift, rot_drift)`` vs the previous refresh's targets
@@ -390,13 +392,13 @@ class _ReikDriftGate:
         self._queued.append(_QueuedRefresh(step, tuple(q_names), batch, packed, start, end))
 
     def flush(self) -> None:
-        """Append the queued :meth:`log_batch` refreshes to ``stats`` in
-        refresh order, as the records :meth:`log_stat` writes, and clear the
-        queue. Its only host syncs: one wait on the last end event and one
-        device-to-host copy. No cuRobo ran, so ``fallback=False`` and
-        ``n_ik_fail == gn_fail``; ``solve_s`` is the refresh's event time
-        split evenly over its deps, so per-run sums still hold. A no-op with
-        nothing queued."""
+        """Append the queued refreshes, :meth:`log_batch`'s and G_refresh
+        replays' (:class:`_StaticRefresh`), to ``stats`` in refresh order, as
+        the records :meth:`log_stat` writes, and clear the queue. Its only
+        host syncs: one wait on the last end event and one device-to-host
+        copy. No cuRobo ran, so ``fallback=False`` and ``n_ik_fail ==
+        gn_fail``; ``solve_s`` is the refresh's event time split evenly over
+        its deps, so per-run sums still hold. A no-op with nothing queued."""
         if not self._queued:
             return
         self._queued[-1].end.synchronize()  # elapsed_time needs both events done
