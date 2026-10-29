@@ -10,7 +10,7 @@
 import itertools
 from collections import defaultdict
 from functools import lru_cache
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import roma
 import torch
@@ -43,6 +43,16 @@ def _device_const(values: tuple, device, dtype=None) -> torch.Tensor:
     """``values`` on ``device``, made once: ``torch.tensor`` from a Python
     sequence is a blocking host-to-device copy. Shared; never mutate."""
     return torch.tensor(values, device=device, dtype=dtype)
+
+
+def _per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
+    """``[B, len(counts)]``: the sums of ``x`` ``[B, sum(counts)]`` over consecutive
+    column blocks of ``counts[i]`` columns, one fixed-order reduction per block.
+    Bitwise run to run and under CUDA-graph replay, which ``scatter_add_`` is not:
+    its CUDA atomics add in a varying order, so its rounding varies. The backward
+    gives each column its block's upstream grad, the gather ``scatter_add_``'s
+    backward gives. ``counts`` are Python ints, so there is no host read."""
+    return torch.stack([block.sum(-1) for block in x.split(counts, dim=1)], dim=1)
 
 
 class CostFunction:
@@ -104,8 +114,9 @@ class CostFunction:
 
         # Compute the AABB and surface z-position for the placement surfaces.
         # Also precompute the static per-surface placement grouping used by
-        # stable_placement_costs: ordered (obj, placement_param) pairs and the
-        # per-sphere → per-object index map (sphere counts are static).
+        # stable_placement_costs: ordered (obj, placement_param) pairs, each
+        # object's sphere count, and the per-sphere → per-object index map
+        # (sphere counts are static).
         self.surface_to_aabb = {}
         self.surface_to_target_z = {}
         self.surface_to_placements = defaultdict(list)
@@ -125,13 +136,14 @@ class CostFunction:
             self.surface_to_target_z[surface] = target_z
 
         self.surface_to_sphere_idx_map = {}
+        # Each placed object's sphere count, in placement order: the column blocks of
+        # stable_placement_costs' torch.cat(surface_spheres, dim=1). Python ints.
+        self.surface_to_sphere_counts: Dict[str, Tuple[int, ...]] = {}
         for surface, placements in self.surface_to_placements.items():
-            sphere_idx_map = []
-            for o_idx, (obj, _) in enumerate(placements):
-                num_spheres = world.get_collision_spheres(obj).shape[0]
-                sphere_idx_map.extend([o_idx] * num_spheres)
+            counts = tuple(world.get_collision_spheres(obj).shape[0] for obj, _ in placements)
+            self.surface_to_sphere_counts[surface] = counts
             self.surface_to_sphere_idx_map[surface] = torch.tensor(
-                sphere_idx_map, dtype=torch.int64, device=world.device
+                [o_idx for o_idx, n in enumerate(counts) for _ in range(n)], dtype=torch.int64, device=world.device
             )
 
         # All conf parameters for trajectory length costs, we check rollout matches
@@ -231,13 +243,10 @@ class CostFunction:
             spheres = torch.cat(surface_spheres, dim=1)
             spheres_xy = spheres[..., :2]
 
-            # Within goal xy bounds, need to gather by the spheres for each object
+            # Within goal xy bounds: sum each object's per-sphere distances over its
+            # block of `spheres`, in a fixed order (cfa7a46's scatter_add_ used atomics).
             in_goal_xy = dist_from_bounds_jit(spheres_xy, *self.surface_to_aabb[surface])
-            obj_in_goal_xy = torch.zeros(
-                (num_particles, len(placements)), dtype=in_goal_xy.dtype, device=in_goal_xy.device
-            )
-            obj_in_goal_xy.scatter_add_(1, sphere_idx_map_expand, in_goal_xy)
-            support_vals[f"{surface}_in_xy"] = obj_in_goal_xy
+            support_vals[f"{surface}_in_xy"] = _per_object_sum(in_goal_xy, self.surface_to_sphere_counts[surface])
 
             # Distance between bottom of spheres and z-position of the surface
             spheres_bottom = spheres[..., 2] - spheres[..., 3]
