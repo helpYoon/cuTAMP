@@ -20,6 +20,11 @@ SUPPORTED_SOFT_COSTS = (
     "minimize_body_movement", "joint_limit_margin",
 )
 
+# Soft costs cuda_graphs rejects (validate_tamp_config): the step can't be captured
+# with them on. align_yaw's roma.rotmat_to_euler syncs the host inside roma, on
+# rotmat_to_unitquat's nonzero and unitquat_to_euler's boolean-mask writes.
+CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS = ("align_yaw",)
+
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
@@ -89,6 +94,12 @@ class TAMPConfiguration:
     # row's iterate is written back, and no cuRobo runs during Adam (the final
     # pre-check refresh still repairs). Needs reik_gn.
     reik_balance_first: bool = False
+    # Replay the balance-first Adam step as a CUDA graph (cutamp/cuda_graphs.py):
+    # captured in each optimize call once the motion-planner build thread has
+    # ended, and released at loop exit. Needs reik_balance_first (default mode
+    # stays eager) and rejects CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS. A failed
+    # capture ends the run: there is no switch to eager mid-run.
+    cuda_graphs: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started
     # repair work. Default 40: full A/B (2026-08-04, blocks_t1 @512, two runs
@@ -192,6 +203,15 @@ def validate_tamp_config(config: TAMPConfiguration):
         )
     if config.reik_balance_first and not config.reik_gn:
         raise ValueError("reik_balance_first needs reik_gn (it replaces the GN refresh step)")
+    if config.cuda_graphs and not config.reik_balance_first:
+        raise ValueError("cuda_graphs needs reik_balance_first (it captures the balance-first Adam step)")
+    if config.cuda_graphs:
+        unsupported = [name for name in (config.soft_cost or []) if name in CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS]
+        if unsupported:
+            raise ValueError(
+                f"cuda_graphs can't capture the soft cost(s) {', '.join(unsupported)}: roma's rotmat_to_unitquat "
+                f"syncs the host on nonzero; run them without cuda_graphs"
+            )
     if config.reik_gn and not config.coupled_reik:
         # GN refresh only runs inside the coupled-reIK loop. Now that reik_gn
         # defaults ON, this combination just means "no refreshes at all" —

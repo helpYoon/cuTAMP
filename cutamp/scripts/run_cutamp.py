@@ -137,6 +137,11 @@ def entrypoint():
              "iterates, no cuRobo during Adam.",
     )
     parser.add_argument(
+        "--cuda_graphs", action="store_true",
+        help="Replay the balance-first Adam step as a CUDA graph, captured once the motion-planner "
+             "build has ended. Needs --reik_balance_first; rejects the align_yaw soft cost.",
+    )
+    parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
         help="LBFGS iteration budget for the warm refresh/fallback solver "
              "(multiple of 20; 0 = cuRobo default 100; no effect with --reik_balance_first "
@@ -283,6 +288,7 @@ def entrypoint():
         reik_num_seeds=args.reik_num_seeds,
         reik_gn=args.reik_gn,
         reik_balance_first=args.reik_balance_first,
+        cuda_graphs=args.cuda_graphs,
         reik_lbfgs_iters=args.reik_lbfgs_iters,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,

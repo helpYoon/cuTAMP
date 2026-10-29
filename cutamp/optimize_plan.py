@@ -16,6 +16,7 @@ import torch
 from torch.optim import Adam
 from tqdm import tqdm
 
+from cutamp import cuda_graphs
 from cutamp.conf_locking import apply_grad_masks, build_grad_masks
 from cutamp.utils.common import (
     Particles,
@@ -175,6 +176,18 @@ class _StepBody:
         loss.backward()
         apply_grad_masks([{"params": self.params}], self.grad_masks)
         return packed, ((rollout, cost_dict, costs, satisfying_mask) if self.keep_vis else None)
+
+
+def _clear_step_autograd(cost_fn: CostFunction, params: List[torch.Tensor]) -> None:
+    """Drop the autograd state a step leaves behind: ``cost_fn``'s CoM
+    penalties cache, which holds the last forward's tensors and their graph
+    (P9, ruling 6), and every param's ``.grad`` (P10). Before G_step's
+    warm-ups, that graph would carry an eager step's AccumulateGrad nodes
+    into the capture; after the release, the cache and the grads hold blocks
+    of G_step's pool."""
+    cost_fn._com_polygon_penalties_cache = None
+    for p in params:
+        p.grad = None
 
 
 class PlanContainer(TypedDict):
@@ -449,11 +462,16 @@ def _refresh_balanced(
 class ParticleOptimizer:
     """Attempts to optimize particles for a plan skeleton."""
 
-    def __init__(self, config: TAMPConfiguration, cost_reducer: CostReducer, constraint_checker: ConstraintChecker):
+    def __init__(self, config: TAMPConfiguration, cost_reducer: CostReducer, constraint_checker: ConstraintChecker,
+                 planner_busy: Optional[Callable[[], bool]] = None):
         self.config = config
         self.cost_reducer = cost_reducer
         self.constraint_checker = constraint_checker
         self.get_satisfying_mask = self.constraint_checker.get_mask
+        # True while the motion-planner build thread runs (None: there is none). No CUDA
+        # graph is captured until it returns False: a global-mode capture fails on another
+        # thread's CUDA work (P11, design 4.6).
+        self.planner_busy = planner_busy
 
         # Types to optimize
         self.types_to_optimize = {Pose, Conf}
@@ -604,6 +622,31 @@ class ParticleOptimizer:
                     gn_fail=n_gn_fail, gn_fail_pose=n_gn_fail_pose, gn_fail_com=n_gn_fail_com,
                     fallback=fallback,
                 )
+
+    def _capture_step(self, body: _StepBody, cost_fn: CostFunction, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
+        """Capture ``body`` as G_step (design 4.3); every optimize call captures its own.
+
+        Each warm-up runs ``body`` and then drops every ``.grad``, so it takes
+        no Adam step and leaves no grad: the captured AccumulateGrad then gives
+        each param a graph-owned ``.grad``, which every replay rewrites in place
+        (P10). The guard covers every particle, those grads, and the step's three
+        FK sites. A site is dedicated and never reset, so its buffers change only
+        with its batch (``TAMPWorld.site_kinematics``), and the guard asserts them.
+        """
+        _clear_step_autograd(cost_fn, body.params)
+
+        def warmup() -> None:
+            body()
+            for p in body.params:
+                p.grad = None
+
+        return cuda_graphs.capture(
+            "G_step", body, warmup,
+            ptrs=lambda: cuda_graphs.graph_ptrs(
+                [*body.particles.values(), *(p.grad for p in body.params)],
+                [world.site_kinematics(s) for s in ("rollout", "retract", "com")],
+            ),
+        )
 
     def _visualize_step(self, visualizer: Visualizer, step: int, vis: tuple, num_satisfying: int,
                         loss_val: float, indices: torch.Tensor) -> None:
@@ -784,66 +827,84 @@ class ParticleOptimizer:
             # P13: the no-op Visualizer skips the vis block, and with it the block's syncs.
             keep_vis=type(visualizer) is not Visualizer,
         )
-        for step in pbar:
-            if self.config.max_loop_dur is not None and timer.elapsed("start_optimization") >= self.config.max_loop_dur:
-                _log.warning(f"Optimization exceeded max time of {self.config.max_loop_dur:.2f}s")
-                time_exceeded = True
-                break
-            timer.start("optimization_step")
-            optimizer.zero_grad()
-            packed, vis = body()
-            num_satisfying, loss_val, min_cost, *best_soft = packed.tolist()  # every scalar in one read
-            num_satisfying = int(num_satisfying)
-            opt_metrics["num_satisfying"].append(num_satisfying)
+        # --cuda_graphs (Mode H): G_step replaces the eager step from its capture on.
+        step_graph = None
+        if self.config.cuda_graphs:
+            opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
+        try:
+            for step in pbar:
+                if (self.config.max_loop_dur is not None
+                        and timer.elapsed("start_optimization") >= self.config.max_loop_dur):
+                    _log.warning(f"Optimization exceeded max time of {self.config.max_loop_dur:.2f}s")
+                    time_exceeded = True
+                    break
+                timer.start("optimization_step")  # a capture's cost lands in its step
+                if self.config.cuda_graphs and step_graph is None and not (self.planner_busy and self.planner_busy()):
+                    step_graph = self._capture_step(body, cost_fn, world)  # P11: the planner thread has ended
+                    opt_metrics["capture_s"], opt_metrics["capture_step"] = step_graph.capture_s, step
+                if step_graph is not None:
+                    step_graph.replay()  # never zero_grad after the capture: the graph owns .grad (P10)
+                    packed, vis = step_graph.outputs
+                else:
+                    optimizer.zero_grad()
+                    packed, vis = body()
+                num_satisfying, loss_val, min_cost, *best_soft = packed.tolist()  # every scalar in one read
+                num_satisfying = int(num_satisfying)
+                opt_metrics["num_satisfying"].append(num_satisfying)
 
-            if num_satisfying > 0 and not found_solution:
-                if timer.has_timer("first_solution"):
-                    time_to_first_sol = timer.stop("first_solution")
-                    _log.info(f"Found first solution in {time_to_first_sol:.2f}s after sampling plans")
+                if num_satisfying > 0 and not found_solution:
+                    if timer.has_timer("first_solution"):
+                        time_to_first_sol = timer.stop("first_solution")
+                        _log.info(f"Found first solution in {time_to_first_sol:.2f}s after sampling plans")
+
+                    torch.cuda.synchronize()
+                    opt_metrics["opt_start_to_first_sol"] = time.perf_counter() - start_time
+                    found_solution = True
+
+                opt_metrics["loss"].append(loss_val)
+
+                # Soft costs are recorded even if we don't optimize them.
+                if self.config.soft_cost is not None:
+                    opt_metrics["best_soft_costs"].append(best_soft[0] if num_satisfying > 0 else None)
 
                 torch.cuda.synchronize()
-                opt_metrics["opt_start_to_first_sol"] = time.perf_counter() - start_time
-                found_solution = True
+                opt_metrics["elapsed"].append(time.perf_counter() - start_time)
 
-            opt_metrics["loss"].append(loss_val)
+                # Best-seen snapshot + early-stop bookkeeping. Measured state is
+                # pre-step, so the clone is consistent with num_satisfying.
+                best_snapshot.update(step, num_satisfying, min_cost, particles)
+                if best_snapshot.should_stop(step, self.config.early_stop_patience):
+                    _log.info(
+                        f"Early stop at step {step}: no meaningful progress for "
+                        f"{self.config.early_stop_patience} steps (best "
+                        f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step})"
+                    )
+                    opt_metrics["early_stopped_at"] = step
+                    # Close it: the next skeleton reuses this timer.
+                    timer.stop("optimization_step")
+                    break
 
-            # Soft costs are recorded even if we don't optimize them.
-            if self.config.soft_cost is not None:
-                opt_metrics["best_soft_costs"].append(best_soft[0] if num_satisfying > 0 else None)
+                # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
+                if vis is not None and (step % vis_every == 0 or step == num_steps - 1):
+                    with timer.time("visualize_opt_rollout"):
+                        self._visualize_step(visualizer, step, vis, num_satisfying, loss_val, indices)
 
-            torch.cuda.synchronize()
-            opt_metrics["elapsed"].append(time.perf_counter() - start_time)
-
-            # Best-seen snapshot + early-stop bookkeeping. Measured state is
-            # pre-step, so the clone is consistent with num_satisfying.
-            best_snapshot.update(step, num_satisfying, min_cost, particles)
-            if best_snapshot.should_stop(step, self.config.early_stop_patience):
-                _log.info(
-                    f"Early stop at step {step}: no meaningful progress for "
-                    f"{self.config.early_stop_patience} steps (best "
-                    f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step})"
-                )
-                opt_metrics["early_stopped_at"] = step
-                # Close it: the next skeleton reuses this timer.
+                # The body already ran the backward and the grad masks.
+                optimizer.step()
+                # Counts from 1 so the first refresh lands at step K-1 (after
+                # the first batch of pose updates), not step 0.
+                if ik_deps and (step + 1) % self.config.reik_interval == 0:
+                    self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
                 timer.stop("optimization_step")
-                break
-
-            # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
-            if vis is not None and (step % vis_every == 0 or step == num_steps - 1):
-                with timer.time("visualize_opt_rollout"):
-                    self._visualize_step(visualizer, step, vis, num_satisfying, loss_val, indices)
-
-            # The body already ran the backward and the grad masks.
-            optimizer.step()
-            # Counts from 1 so the first refresh lands at step K-1 (after
-            # the first batch of pose updates), not step 0.
-            if ik_deps and (step + 1) % self.config.reik_interval == 0:
-                self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
-            timer.stop("optimization_step")
-            pbar.set_description(
-                f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
-            )
-            vis = None  # P9: no eager step leaves an autograd graph alive for a later capture
+                pbar.set_description(
+                    f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, "
+                    f"{num_satisfying}/{self.config.num_particles} satisfying"
+                )
+                vis = None  # P9: no eager step leaves an autograd graph alive for a later capture
+        finally:  # also on early stop and on errors: no graph outlives the loop
+            if step_graph is not None:
+                step_graph.release()
+                _clear_step_autograd(cost_fn, body.params)
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).

@@ -1,0 +1,191 @@
+"""``--cuda_graphs`` (Mode H): the balance-first Adam step, captured as G_step and
+replayed, against its eager twin bitwise at every replay."""
+
+import gc
+import itertools
+import sys
+import weakref
+from collections import Counter
+
+import pytest
+import torch
+
+from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
+from cutamp.tests.conftest import (
+    SpyVis, clone_particles, install_step_replay_spy, make_optimizer, make_plan_info, needs_cuda, repair_cuda_rng,
+    run_optimizer,
+)
+from cutamp.tests.test_step_lockstep import _site_ptrs
+
+
+def test_cuda_graphs_validation():
+    from cutamp.config import TAMPConfiguration, validate_tamp_config
+    assert TAMPConfiguration().cuda_graphs is False
+    with pytest.raises(ValueError, match="cuda_graphs needs reik_balance_first"):
+        validate_tamp_config(TAMPConfiguration(cuda_graphs=True))
+    with pytest.raises(ValueError, match="align_yaw"):
+        validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True, soft_cost=["align_yaw"]))
+    validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True))
+    validate_tamp_config(TAMPConfiguration(soft_cost=["align_yaw"]))  # eager mode keeps align_yaw
+
+
+def test_cli_passes_cuda_graphs(monkeypatch):
+    import cutamp.scripts.run_cutamp as rc
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
+    for argv, want in ((["--reik_balance_first", "--cuda_graphs"], True), (["--reik_balance_first"], False)):
+        monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
+        rc.entrypoint()
+        assert seen[-1].cuda_graphs is want
+
+
+@needs_cuda
+def test_failed_capture_restores_default_stream():
+    from cutamp.cuda_graphs import capture
+    try:
+        with pytest.raises(RuntimeError, match="--cuda_graphs"):
+            capture("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
+        assert torch.cuda.current_stream() == torch.cuda.default_stream()
+    finally:
+        repair_cuda_rng()
+    assert torch.rand(4, device="cuda").isfinite().all()
+
+
+@needs_cuda
+def test_guard_trips_on_resize():
+    from curobo.types import JointState
+    from cutamp.cuda_graphs import capture, graph_ptrs
+    from cutamp.robots.t1 import get_t1_kinematics
+    kin = get_t1_kinematics()
+    q = (0.1 * torch.randn(4, len(kin.joint_names), device="cuda")).requires_grad_()
+
+    def body():  # square(): cuRobo's FK backward needs a contiguous grad, and sum()'s is expanded
+        kin.compute_kinematics(JointState.from_position(q)).robot_spheres.square().sum().backward()
+
+    def warmup():
+        body()
+        q.grad = None
+
+    for breaker in ("resize", "drop grad"):
+        q.grad = None
+        g = capture("toy", body, warmup, ptrs=lambda: graph_ptrs([q, q.grad], [kin]))
+        g.replay()
+        if breaker == "resize":
+            kin.update_batch_size(8, 1)
+        else:
+            q.grad = None
+        with pytest.raises(AssertionError, match="toy"):
+            g.replay()
+        g.release()
+
+
+def _graph_config(**kw):
+    return TAMPConfiguration(**{**dict(num_particles=64, early_stop_patience=0, reik_balance_first=True,
+                                       cuda_graphs=True, enable_visualizer=False), **kw})
+
+
+@needs_cuda
+@pytest.mark.parametrize("sc", [None, *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
+def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):  # Review Focus 4
+    world, skeleton, base = blocks_t1_plan
+    config = _graph_config(num_opt_steps=2, soft_cost=None if sc is None else [sc])
+    replays = install_step_replay_spy(monkeypatch)
+    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
+                         visualizer=SpyVis(config))
+    assert m["capture_step"] == 0 and replays == [[0, 1]]  # replay 1 runs on inputs Adam has moved
+
+
+@needs_cuda
+def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):            # Review Focus 1
+    world, skeleton, base = blocks_t1_plan
+    config = _graph_config(num_opt_steps=25)
+    replays, vis = install_step_replay_spy(monkeypatch), SpyVis(config)
+    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
+    assert m["capture_step"] == 0 and m["capture_s"] > 0
+    assert replays == [list(range(25))]             # one graph; step 0 too: the capture itself runs nothing
+    assert vis.opt_steps == [0, 10, 20, 24]
+    assert vis.losses == [m["loss"][s] for s in vis.opt_steps]
+
+
+@needs_cuda
+def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch, record_property):
+    import cutamp.optimize_plan as optimize_plan
+
+    world, skeleton, base = blocks_t1_plan
+    config = _graph_config(num_opt_steps=20)
+    replays = install_step_replay_spy(monkeypatch)
+    busy = itertools.count()
+    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
+                         visualizer=SpyVis(config), planner_busy=lambda: next(busy) < 7)
+    assert m["capture_step"] == 7 and replays == [list(range(13))]
+    assert next(busy) == 8                           # consulted once per step, until the capture
+    # Ruling 6 / design open question 1: report, don't assert, whether the deferred capture
+    # also succeeds without the penalties-cache clear. The clear stays either way.
+    monkeypatch.setattr(optimize_plan, "_clear_step_autograd",
+                        lambda cost_fn, params: [setattr(p, "grad", None) for p in params])
+    busy2 = itertools.count()
+    try:
+        m2, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
+                              visualizer=SpyVis(config), planner_busy=lambda: next(busy2) < 7)
+        outcome = f"captured at step {m2['capture_step']}"
+    except RuntimeError as e:
+        outcome = f"capture failed: {e.__cause__!r}"
+        repair_cuda_rng()
+    print("deferred capture without the penalties-cache clear:", outcome)
+    record_property("capture_without_penalties_cache_clear", outcome)
+
+
+@needs_cuda
+def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):  # Review Focus 2
+    from cutamp.cuda_graphs import CapturedGraph
+    world, skeleton, base = blocks_t1_plan
+    config = _graph_config(num_opt_steps=10)
+    plan_info, mem, sites, released = make_plan_info(world, skeleton, clone_particles(base), config), [], [], []
+    orig = CapturedGraph.release
+
+    def release(self):                               # what each release must free; no strong refs kept
+        outs = [weakref.ref(t) for t in (self.outputs or ()) if isinstance(t, torch.Tensor)]
+        released.append((self.name, self.cuda_graph.pool(), outs))
+        orig(self)
+
+    monkeypatch.setattr(CapturedGraph, "release", release)
+    opt = make_optimizer(config)
+    for call in range(2):
+        m, _ = run_optimizer(plan_info, config, optimizer=opt)
+        assert m["capture_step"] == 0 and m["capture_s"] > 0
+        assert Counter(n for n, _, _ in released) == {"G_step": call + 1}   # once per graph per call
+        assert all(v.grad is None for v in plan_info["particles"].values())
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        assert all(r() is None for _, _, outs in released for r in outs)  # no static output outlives its call
+        pools = {p for _, p, _ in released}
+        assert not [s for s in torch.cuda.memory_snapshot() if s["segment_pool_id"] in pools]  # nor a pool block
+        mem.append(torch.cuda.memory_allocated())
+        sites.append(_site_ptrs(world))
+    # The FK sites outlive the call, sized by the batch they last ran. Same plan, so the same
+    # buffers after both calls: they count the same in both readings and can't hide a leak.
+    assert sites[1] == sites[0]
+    assert mem[1] == mem[0]                          # and nothing grows from call to call
+
+
+@needs_cuda
+def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):     # Review Focus 3
+    from cutamp.cuda_graphs import CapturedGraph
+    world, skeleton, base = blocks_t1_plan
+    released, orig = [], CapturedGraph.release
+    monkeypatch.setattr(CapturedGraph, "release", lambda self: released.append(self.name) or orig(self))
+    keys = ("capture_s", "capture_step", "refresh_capture_s", "refresh_capture_step")
+
+    def run(planner_busy=None, **kw):
+        config = _graph_config(**kw)
+        info = make_plan_info(world, skeleton, clone_particles(base), config)
+        return (*run_optimizer(info, config, planner_busy=planner_busy), info["particles"])
+    m, _, _ = run(planner_busy=lambda: True, num_opt_steps=8)          # planner busy all loop
+    assert [m[k] for k in keys] == [None] * 4 and released == []
+    m, _, _ = run(num_opt_steps=3)                                     # ends before refresh #1
+    assert m["capture_step"] == 0 and released == ["G_step"]
+    m, timer, parts = run(num_opt_steps=50, early_stop_patience=1)     # early stop
+    assert m.get("early_stopped_at") is not None and not timer.has_timer("optimization_step")
+    assert len(released) == 1 + sum(m[k] is not None for k in ("capture_step", "refresh_capture_step"))
+    assert all(v.grad is None for v in parts.values())

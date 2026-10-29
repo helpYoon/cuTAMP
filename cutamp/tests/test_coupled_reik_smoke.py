@@ -6,8 +6,8 @@ from cutamp.tests.conftest import needs_cuda
 
 
 @needs_cuda
-@pytest.mark.parametrize("reik_balance_first", [False, True])
-def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_first):
+@pytest.mark.parametrize(("reik_balance_first", "cuda_graphs"), [(False, False), (True, False), (True, True)])
+def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_first, cuda_graphs):
     """Run cutamp_demo with --coupled_reik for a few Adam steps. Assert no
     exception, and that each mode refreshes through its own path: balance-first
     through ``_refresh_balanced``, default through the per-dep ``gn_project``.
@@ -54,6 +54,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         coupled_reik=True,
         reik_interval=2,
         reik_balance_first=reik_balance_first,
+        cuda_graphs=cuda_graphs,
         optimize_soft_costs=True,
         soft_cost=["place_close_to_base"],
         enable_visualizer=False,
@@ -75,6 +76,12 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     assert "best_com_margin" in opt_metrics
     assert "best_soft_cost_com_feasible" in opt_metrics
     assert opt_metrics["num_satisfying_com_feasible"] <= opt_metrics["num_satisfying_final"]
+
+    # Without --motion_plan there is no planner thread, so G_step is captured at step 0.
+    if cuda_graphs:
+        assert opt_metrics["capture_step"] == 0
+    else:
+        assert "capture_step" not in opt_metrics
 
     # Balance-first records reach opt_metrics only through the post-loop flush().
     records = opt_metrics.get("reik_refresh")

@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import os
 import sys
+import weakref
 from contextlib import contextmanager
 
 import pytest
@@ -255,6 +256,47 @@ def sync_debug_error():
         yield
     finally:
         torch.cuda.set_sync_debug_mode(0)
+
+
+def install_step_replay_spy(monkeypatch) -> list:
+    """Wrap ``CapturedGraph.replay`` so every G_step replay checks itself
+    bitwise against its twin's eager body (:func:`twin_body`), on clones of
+    the particles. The twin runs first, and its outputs are cloned
+    (:func:`step_outputs`) before the replay, since the twin shares the FK
+    sites' buffers. Then the replay, and :func:`assert_bitwise` on the graph's
+    static outputs and the params' ``.grad``. Returns one list per G_step
+    graph, in capture order, of the replay indices it compared: ``0, 1, ...``,
+    counted per graph. Other graphs replay unchecked. It keeps no strong
+    reference to a graph, so a release still frees it."""
+    from cutamp.cuda_graphs import CapturedGraph
+    from cutamp.optimize_plan import _StepBody
+
+    orig, replays, of_graph = CapturedGraph.replay, [], weakref.WeakKeyDictionary()
+
+    def spy(self):
+        if self.name != "G_step":
+            return orig(self)
+        if self not in of_graph:  # the graph's first replay opens its list
+            of_graph[self] = []
+            replays.append(of_graph[self])
+        mine = of_graph[self]
+        k = len(mine)
+        twin = twin_body(self.body)
+        want = step_outputs(*_StepBody.__call__(twin), twin.params)
+        orig(self)
+        assert_bitwise(step_outputs(*self.outputs, self.body.params), want, f"G_step replay {k}")
+        mine.append(k)
+
+    monkeypatch.setattr(CapturedGraph, "replay", spy)
+    return replays
+
+
+def repair_cuda_rng() -> None:
+    """One trivial capture that succeeds, for a test that just made one fail: a
+    failed capture leaves torch's CUDA RNG unusable until a later capture
+    succeeds (design 4.8)."""
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        torch.zeros(1, device="cuda") + 1
 
 
 def cupti_sync_events() -> dict:

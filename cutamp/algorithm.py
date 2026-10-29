@@ -337,7 +337,10 @@ def run_cutamp(
     # (curobo/_src/util/warp.py): warp's stream registry is unlocked, and a
     # fresh wrapper per launch from two threads corrupts the heap. solve_curobo
     # joins via get_planner; its warmup timer then measures only the residual wait.
+    # --cuda_graphs captures only once the thread has ended (planner_busy, design 4.6):
+    # a global-mode capture fails on another thread's CUDA work.
     get_planner = None
+    planner_busy = None
     if config.curobo_plan:
         import threading
 
@@ -353,6 +356,7 @@ def run_cutamp(
             target=_build_planner_bg, daemon=True, name="motion-planner-warmup",
         )
         planner_thread.start()
+        planner_busy = planner_thread.is_alive
 
         def get_planner():
             planner_thread.join()
@@ -423,7 +427,7 @@ def run_cutamp(
         overall_metrics["motion_plan_success"] = False
     curobo_plan = None
     found_solution = False
-    particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker)
+    particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker, planner_busy=planner_busy)
     timer.start("first_solution")
     if found_solution_initially:
         found_solution = True
