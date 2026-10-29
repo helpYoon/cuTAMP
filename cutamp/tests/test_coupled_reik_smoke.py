@@ -12,11 +12,12 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     exception, and that each mode refreshes through its own path: balance-first
     through ``_refresh_balanced``, default through the per-dep ``gn_project``.
     Also pin when the cuRobo refresh solver is built. Default mode: setup
-    passes ``reik_num_seeds`` through and its warmup builds the solver, so it
-    exists at every refresh instead of being built by a mid-run fallback; the
-    capture of its CUDA graphs is not checked. Balance-first runs no cuRobo
-    during Adam: its world has 0 seeds, no refresh solver at any refresh or at
-    the end, and ``ik_refresh_solver`` is the main solver."""
+    passes ``reik_num_seeds`` through, and every gated refresh sees the one
+    solver that warmup built (the property's only setup-time reader), not one
+    built or rebuilt by a mid-run fallback; the capture of its CUDA graphs is
+    not checked. Balance-first runs no cuRobo during Adam: its world has 0
+    seeds, no refresh solver at any gated refresh or at the end, and
+    ``ik_refresh_solver`` is the main solver."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
     import os
@@ -27,7 +28,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
 
     calls = {"_refresh_balanced": 0, "gn_project": 0}
     worlds = []  # the TAMPWorld every refresh ran on
-    built_before = []  # per call: did that world already have its refresh solver when the call started?
+    solvers = []  # per call: the refresh solver that world had when the call started (None if not built)
     # Where the world sits in each call: _refresh_balanced(particles, ik_deps, world, gate, step)
     # and gn_project(world, q_full, world_from_ee, arm).
     world_arg = {"_refresh_balanced": 2, "gn_project": 0}
@@ -39,7 +40,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
             calls[name] += 1
             world = args[world_arg[name]]
             worlds.append(world)
-            built_before.append(world._ik_refresh_solver is not None)
+            solvers.append(world._ik_refresh_solver)
             return original(*args, **kwargs)
 
         monkeypatch.setattr(optimize_plan, name, counted)
@@ -92,19 +93,27 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         # saw one, the run ended without one, and an access returns the main solver instead of
         # starting a lazy, mid-run capture.
         assert world._reik_num_seeds == 0
-        assert not any(built_before)
+        assert all(s is None for s in solvers)
         assert world._ik_refresh_solver is None
         assert world.ik_refresh_solver is world.ik_solver
     else:
         assert calls["_refresh_balanced"] == 0 and calls["gn_project"] >= 1, calls
-        # Setup passes the configured seed count through, and the refresh solver exists at every
-        # refresh. The first spied call runs before any fallback reads the property, so warmup built
-        # it, and later refreshes find it still there. Built by a GN-miss fallback instead, its CUDA
-        # graphs would be captured mid-run, where a --motion_plan run has the planner-build thread
-        # going and a concurrent capture fails. This pins the build, not the capture: whether warmup
-        # captured the graphs is not checked here.
+        # Setup passes the configured seed count through, and every gated refresh sees one and the
+        # same refresh solver. The first spied call runs before any fallback reads the property, so
+        # that solver is the one warmup built (warmup is the property's only setup-time reader). A
+        # solver first built by a GN-miss fallback fails the first assert, and one replaced mid-run
+        # fails the second. Built by a fallback, its CUDA graphs would be captured mid-run, where a
+        # --motion_plan run has the planner-build thread going and a concurrent capture fails. This
+        # pins the build and the solver's identity, not the capture: whether warmup captured the
+        # graphs is not checked here.
         assert world._reik_num_seeds == config.reik_num_seeds
-        assert all(built_before), f"setup did not build the refresh solver (reik_num_seeds={world._reik_num_seeds})"
+        assert solvers[0] is not None, (
+            f"setup did not build the refresh solver (reik_num_seeds={world._reik_num_seeds})"
+        )
+        assert all(s is solvers[0] for s in solvers), (
+            f"a refresh saw a different refresh solver than the first one: calls "
+            f"{[i for i, s in enumerate(solvers) if s is not solvers[0]]} of {len(solvers)}"
+        )
 
 
 @needs_cuda
