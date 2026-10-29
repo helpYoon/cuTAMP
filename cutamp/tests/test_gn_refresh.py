@@ -19,7 +19,10 @@ def _four_dep_stack(world):
     """A refresh's dep-major stack of four 8-row IK deps: ``(q [32, 21],
     T [32, 4, 4], arms)``. Per arm, one IK solution for an identity-rotation
     target at (0.35, +-0.25, 0.25) feeds a warm dep (its target drifted by mm,
-    as between refreshes) and a far dep (x = 0.9, out of balanced reach)."""
+    as between refreshes) and a far dep (x = 0.9, out of balanced reach).
+    The deps are arm-sorted, ``("left", "left", "right", "right")``, unlike a
+    real blocks_t1 refresh, which interleaves the arms (left_q1, right_q1,
+    left_q3, right_q3)."""
     from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask
 
     B = 8
@@ -265,6 +268,11 @@ def test_gn_project_balanced_pins_per_row():
         assert bool((pos < 2e-3).all() & (rot < 2e-2).all()), (
             f"{arm}: pos {pos.max().item():.4f} rot {rot.max().item():.4f}"
         )
+    # A real blocks_t1 refresh interleaves the arms (left_q1, right_q1, left_q3, right_q3).
+    perm = torch.cat([torch.arange(8, device="cuda") + 8 * b for b in (0, 2, 1, 3)])
+    inter = ("left", "right", "left", "right")
+    q_int = gn_project_balanced(world, q[perm], T[perm], inter)
+    assert (q_int - q1[perm]).abs().max().item() <= 1e-5
 
 
 @needs_cuda
@@ -301,6 +309,14 @@ def test_gn_gate_matches_checker_helpers():
     assert torch.equal(com_ok, torch.cat([compute_com_polygon_mask(world, qi) for qi in q.split(8)]))
     assert pose_ok.any() and (~pose_ok).any() and com_ok.any() and (~com_ok).any()
     assert (pose_ok & ~com_ok).any()
+    # A real blocks_t1 refresh interleaves the arms (left_q1, right_q1, left_q3,
+    # right_q3). The unleaned right warm rows are pose-ok on their own frame
+    # (3.9 mm off) and 0.65 m off on the left one.
+    perm = torch.cat([torch.arange(8, device="cuda") + 8 * b for b in (0, 2, 1, 3)])
+    inter = ("left", "right", "left", "right")
+    pose_int, com_int = gn_gate(world, q[perm], T[perm], inter, 0.005, 0.05)
+    assert torch.equal(pose_int, pose_ok[perm])
+    assert torch.equal(com_int, com_ok[perm])
 
 
 @needs_cuda
@@ -363,3 +379,38 @@ def test_balanced_refresh_is_sync_free():
     pose_ok, com_ok = gn_gate(world, torch.cat([particles[n] for n in names]), T, arms, 0.005, 0.05)
     misses = (~(pose_ok & com_ok)).view(4, 8).sum(-1).tolist()
     assert [(r["conf"], r["gn_fail"]) for r in gate.stats[-4:]] == list(zip(names, misses))
+
+
+@needs_cuda
+def test_balanced_refresh_on_each_dep_layout():
+    # One dep, a one-arm stack, and a real blocks_t1 refresh's interleaved arm
+    # order (left_q1, right_q1, left_q3, right_q3): each refresh writes back its
+    # stack's projection and flushes one record per dep, in dep order, counting
+    # the gate misses of the rows it wrote. The second refresh takes the drift path.
+    from cutamp.gn_refresh import gn_gate, gn_project_balanced
+    from cutamp.optimize_plan import IKDep, _ReikDriftGate, _refresh_balanced
+
+    world = make_blocks_t1_world()
+    q, T, arms = _four_dep_stack(world)
+    q_blocks, T_blocks = q.split(8), T.split(8)
+    all_names = ["left_q1", "left_q2", "right_q3", "right_q4"]
+    for idx in ([0], [2, 3], [0, 2, 1, 3]):
+        names = [all_names[i] for i in idx]
+        arms_sub = tuple(arms[i] for i in idx)
+        T_sub = torch.cat([T_blocks[i] for i in idx])
+        deps = [IKDep(n, a, target_fn=lambda p, Ti=T_blocks[i]: Ti) for n, a, i in zip(names, arms_sub, idx)]
+        particles = {n: q_blocks[i].clone() for n, i in zip(names, idx)}
+        gate = _ReikDriftGate(len(idx), 0.005, 0.05)
+        _refresh_balanced(particles, deps, world, gate, 4)
+        confs = [particles[n] for n in names]
+        before = torch.cat(confs)
+        _refresh_balanced(particles, deps, world, gate, 9)
+        written = torch.cat(confs)
+        assert torch.equal(written, gn_project_balanced(world, before, T_sub, arms_sub)), idx
+        gate.flush()
+        assert len(gate.stats) == 2 * len(idx), idx
+        assert [(r["step"], r["conf"]) for r in gate.stats] == [(s, n) for s in (4, 9) for n in names], idx
+        assert ["pos_drift_mean" in r for r in gate.stats] == [False] * len(idx) + [True] * len(idx), idx
+        pose_ok, com_ok = gn_gate(world, written, T_sub, arms_sub, 0.005, 0.05)
+        misses = (~(pose_ok & com_ok)).view(len(idx), 8).sum(-1).tolist()
+        assert [r["gn_fail"] for r in gate.stats[len(idx):]] == misses, idx

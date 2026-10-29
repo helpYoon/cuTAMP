@@ -98,8 +98,8 @@ def test_log_batch_flush_matches_log_stat():
         gate.log_batch(step, names, B, pose_ok & com_ok, pose_ok, com_ok, *drift, start, end)
     gate.flush()
 
-    assert [(r["step"], r["conf"]) for r in gate.stats] == [
-        (7, names[0]), (7, names[1]), (12, names[0]), (12, names[1]),
+    assert [(r["step"], r["conf"], r["batch"]) for r in gate.stats] == [
+        (7, names[0], B), (7, names[1], B), (12, names[0], B), (12, names[1], B),
     ]
     for rec, counts, (start, end) in zip(gate.stats, [(2, 1, 1), (2, 2, 1)] * 2, events):
         assert (rec["gn_fail"], rec["gn_fail_pose"], rec["gn_fail_com"]) == counts

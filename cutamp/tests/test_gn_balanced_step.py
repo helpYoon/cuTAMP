@@ -1,8 +1,10 @@
 """CPU tests for the balance-first GN core (cutamp/gn_refresh.py).
 
-The refresh stacks every IK dep into one sync-free call, which rests on two
-claims pinned here: the branch-free rotation log map is roma's, bit for bit,
-and a dep-major stack steps every row exactly as its dep's own call would.
+The refresh stacks every IK dep into one sync-free call, which rests on
+three claims pinned here: the branch-free rotation log map is roma's, bit
+for bit; a dep-major stack steps every row exactly as its dep's own call
+would; and each row's pins and frame follow its own dep's arm, in any arm
+order.
 """
 import math
 
@@ -11,7 +13,7 @@ import torch
 
 from cutamp.com_polygon_cost import COM_HALF_EXTENTS
 from cutamp.gn_refresh import GN_MARGIN_DAMPING, _balanced_step, _rotmat_to_rotvec, _row_layout, _spd_solve
-from cutamp.robots.t1 import BASE_INDICES
+from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
 
 
 def _synthetic(seed, dof=21, B=64):
@@ -85,3 +87,16 @@ def test_balanced_step_moves_no_pinned_column():
     step, col_mask = _balanced_step(*stack), stack[-1]
     assert torch.all(step[col_mask == 0] == 0)
     assert torch.any(step[col_mask == 1] != 0)  # not vacuous: the free columns move
+
+    # The pins themselves, in a real blocks_t1 refresh's interleaved arm order
+    # (left_q1, right_q1, left_q3, right_q3), against a layout built block by
+    # block: the base and each block's inactive arm pinned, its own arm's frame.
+    layout, is_left = _row_layout(("left", "right", "left", "right"), 3, 21, torch.device("cpu"), torch.float32)
+    expected = torch.ones(12, 21)
+    expected[:, BASE_INDICES] = 0
+    expected[0:3, RIGHT_ARM_INDICES] = 0
+    expected[3:6, LEFT_ARM_INDICES] = 0
+    expected[6:9, RIGHT_ARM_INDICES] = 0
+    expected[9:12, LEFT_ARM_INDICES] = 0
+    assert torch.equal(layout, expected)
+    assert torch.equal(is_left, torch.tensor([True, False, True, False]).repeat_interleave(3))

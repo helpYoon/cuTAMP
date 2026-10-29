@@ -6,9 +6,12 @@ import os
 import pytest
 import torch
 
-#: Shared GPU-required marker (CUDA device visible or /dev/nvidia0 present).
+_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+#: Shared GPU-required marker: skips when CUDA_VISIBLE_DEVICES hides every GPU
+#: ('' or '-1'), or is unset and /dev/nvidia0 is missing. It reads no CUDA
+#: state, so collection initializes no CUDA.
 needs_cuda = pytest.mark.skipif(
-    not os.environ.get("CUDA_VISIBLE_DEVICES") and not os.path.exists("/dev/nvidia0"),
+    _cvd in ("", "-1") or (_cvd is None and not os.path.exists("/dev/nvidia0")),
     reason="Requires a CUDA device.",
 )
 
