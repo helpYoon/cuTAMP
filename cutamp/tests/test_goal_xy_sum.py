@@ -152,10 +152,12 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
     reducer = CostReducer(default_constraint_to_mult.copy())
     checker = ConstraintChecker(default_constraint_to_tol.copy())
 
-    # The init state, where sums have the most nonzero sphere terms. Asserted: 8 repeats bitwise
-    # equal to `want`. With cfa7a46's atomics patched in at this seeded state, a probe's 400 calls
-    # gave 28-39 distinct goal_in_xy results (PYTHONHASHSEED 0, 2) and 5-8 (PYTHONHASHSEED 1, the
-    # other skeleton); in its 5-result run, 8 repeats would all agree with probability 0.25.
+    # The init state, where sums have the most nonzero sphere terms. Asserted: 256 repeats bitwise
+    # equal to `want`. Power against cfa7a46's atomics patched in at this seeded state, at the
+    # PYTHONHASHSEED=1 skeleton: 8 repeats would miss (all agree with `want`) with probability
+    # above 1% in 6 of 9 processes, and 0.78 in the weakest (its top result in 973 of 1000 calls);
+    # 244 bound that state's miss below 1% at the Wilson 95% upper bound. The grad-enabled repeats
+    # below vary more under those atomics, and 8 of them miss under 1% in every measured state.
     def outputs():
         with torch.no_grad():
             cost_dict = cost_fn(rollout_fn(particles), particles)
@@ -167,7 +169,7 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
     outputs()                                   # warm-up: TorchScript's profiling run
     want = outputs()
     assert ("StablePlacement", "goal_in_xy") in want
-    for r in range(8):
+    for r in range(256):
         bad = _not_equal(outputs(), want)
         assert not bad, f"repeat {r}: not bitwise run to run: {bad} ({where})"   # RED at cfa7a46: goal_in_xy
     for surface, placements in cost_fn.surface_to_placements.items():  # the blocks the split assumes
