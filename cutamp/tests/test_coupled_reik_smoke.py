@@ -13,10 +13,10 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     through ``_refresh_balanced``, default through the per-dep ``gn_project``.
     Also pin when the cuRobo refresh solver is built. Default mode: setup
     passes ``reik_num_seeds`` through and its warmup builds the solver, so it
-    exists when the first refresh starts, instead of being built (and its CUDA
-    graphs captured) by a mid-run fallback. Balance-first runs no cuRobo during
-    Adam: its world has 0 seeds, no refresh solver at any refresh or at the
-    end, and ``ik_refresh_solver`` is the main solver."""
+    exists at every refresh instead of being built by a mid-run fallback; the
+    capture of its CUDA graphs is not checked. Balance-first runs no cuRobo
+    during Adam: its world has 0 seeds, no refresh solver at any refresh or at
+    the end, and ``ik_refresh_solver`` is the main solver."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
     import os
@@ -97,13 +97,14 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         assert world.ik_refresh_solver is world.ik_solver
     else:
         assert calls["_refresh_balanced"] == 0 and calls["gn_project"] >= 1, calls
-        # Setup passes the configured seed count through, and its warmup builds and captures the
-        # refresh solver: it exists when the first refresh starts (the first spied call runs before
-        # any fallback reads the property). Built later, by a GN-miss fallback, its CUDA graphs would
-        # be captured mid-run, where a --motion_plan run has the planner-build thread going and a
-        # concurrent capture fails.
+        # Setup passes the configured seed count through, and the refresh solver exists at every
+        # refresh. The first spied call runs before any fallback reads the property, so warmup built
+        # it, and later refreshes find it still there. Built by a GN-miss fallback instead, its CUDA
+        # graphs would be captured mid-run, where a --motion_plan run has the planner-build thread
+        # going and a concurrent capture fails. This pins the build, not the capture: whether warmup
+        # captured the graphs is not checked here.
         assert world._reik_num_seeds == config.reik_num_seeds
-        assert built_before[0], f"setup did not build the refresh solver (reik_num_seeds={world._reik_num_seeds})"
+        assert all(built_before), f"setup did not build the refresh solver (reik_num_seeds={world._reik_num_seeds})"
 
 
 @needs_cuda
