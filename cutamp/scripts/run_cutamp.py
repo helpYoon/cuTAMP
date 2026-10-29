@@ -140,7 +140,7 @@ def entrypoint():
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
         help="LBFGS iteration budget for the warm refresh/fallback solver "
              "(multiple of 20; 0 = cuRobo default 100; no effect with --reik_balance_first "
-             "beyond validation, which still requires the multiple of 20).",
+             "beyond validation, which still requires a non-negative multiple of 20).",
     )
     parser.add_argument(
         "--soft_cost",
