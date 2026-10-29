@@ -3,7 +3,6 @@
 import gc
 import os
 import sys
-import traceback
 
 import pytest
 import torch
@@ -48,11 +47,11 @@ def _free_cuda_between_tests():
     TAMPWorld stacks (several GiB each); without reclaiming between tests,
     two heavy tests in one process OOM a 24 GiB card. Gated on reserved
     memory so the dozens of CPU/light tests skip the gc.collect() tax. A
-    failed test's frames, which pytest keeps in ``sys.last_traceback``, are
-    cleared first: they hold its locals."""
+    failed test's exception, which pytest keeps in ``sys.last_*``, is
+    dropped first: its traceback holds the test's locals."""
     yield
     if torch.cuda.is_available() and torch.cuda.memory_reserved() > (1 << 30):
-        traceback.clear_frames(getattr(sys, "last_traceback", None))
+        sys.last_type = sys.last_value = sys.last_traceback = None
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -70,8 +69,10 @@ def blocks_t1_plan():
     teardown before it drops the cached value, and the module's last test
     still holds the yielded object until after teardown. The autouse
     ``_free_cuda_between_tests`` runs before module teardown, so it can't.
-    A failed test's frames in ``sys.last_traceback`` hold its locals until
-    the next test's call phase, so the teardown clears them first.
+    A failed test's exception in ``sys.last_*`` holds its locals until the
+    next test's call phase, so the teardown drops it first. Clearing the
+    traceback's frames is not enough: on CPython 3.10, the ``f_locals``
+    snapshot pytest reads to render a failure outlives ``frame.clear()``.
     """
     import numpy as np
     from cutamp.config import TAMPConfiguration
@@ -92,7 +93,7 @@ def blocks_t1_plan():
     del world, skeleton, particles  # the list holds the only references
     yield plan
     plan.clear()
-    traceback.clear_frames(getattr(sys, "last_traceback", None))
+    sys.last_type = sys.last_value = sys.last_traceback = None
     gc.collect()
     torch.cuda.empty_cache()
 
