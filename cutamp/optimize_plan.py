@@ -181,10 +181,11 @@ class _StepBody:
 def _clear_step_autograd(cost_fn: CostFunction, params: List[torch.Tensor]) -> None:
     """Drop the autograd state a step leaves behind: ``cost_fn``'s CoM
     penalties cache, which holds the last forward's tensors and their graph
-    (P9, ruling 6), and every param's ``.grad`` (P10). Before G_step's
-    warm-ups, that graph would carry an eager step's AccumulateGrad nodes
-    into the capture; after the release, the cache and the grads hold blocks
-    of G_step's pool."""
+    (P9, ruling 6), and every param's ``.grad`` (P10). Right after G_step's
+    release, both hold blocks of its pool. Before its warm-ups, the cache
+    clear is ruling 6's belt and braces: every ``CostFunction`` call resets
+    the cache on entry, so the graph alive when the capture starts is the
+    last warm-up's either way."""
     cost_fn._com_polygon_penalties_cache = None
     for p in params:
         p.grad = None
