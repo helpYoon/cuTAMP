@@ -11,8 +11,12 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     """Run cutamp_demo with --coupled_reik for a few Adam steps. Assert no
     exception, and that each mode refreshes through its own path: balance-first
     through ``_refresh_balanced``, default through the per-dep ``gn_project``.
-    Setup builds the cuRobo refresh solver in default mode only: balance-first
-    runs no cuRobo during Adam, so its world has none."""
+    Also pin when the cuRobo refresh solver is built. Default mode: setup
+    passes ``reik_num_seeds`` through and its warmup builds the solver, so it
+    exists when the first refresh starts, instead of being built (and its CUDA
+    graphs captured) by a mid-run fallback. Balance-first runs no cuRobo during
+    Adam: its world has 0 seeds, no refresh solver at any refresh or at the
+    end, and ``ik_refresh_solver`` is the main solver."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
     import os
@@ -23,6 +27,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
 
     calls = {"_refresh_balanced": 0, "gn_project": 0}
     worlds = []  # the TAMPWorld every refresh ran on
+    built_before = []  # per call: did that world already have its refresh solver when the call started?
     # Where the world sits in each call: _refresh_balanced(particles, ik_deps, world, gate, step)
     # and gn_project(world, q_full, world_from_ee, arm).
     world_arg = {"_refresh_balanced": 2, "gn_project": 0}
@@ -32,7 +37,9 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
 
         def counted(*args, **kwargs):
             calls[name] += 1
-            worlds.append(args[world_arg[name]])
+            world = args[world_arg[name]]
+            worlds.append(world)
+            built_before.append(world._ik_refresh_solver is not None)
             return original(*args, **kwargs)
 
         monkeypatch.setattr(optimize_plan, name, counted)
@@ -71,6 +78,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     # Balance-first records reach opt_metrics only through the post-loop flush().
     records = opt_metrics.get("reik_refresh")
     assert records, "no reik_refresh records"
+    assert worlds, f"no refresh reached the spies: {calls}"
     world = worlds[0]
     assert all(w is world for w in worlds)
     if reik_balance_first:
@@ -80,15 +88,22 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         # Drift needs a previous target: every record but the first refresh's has it.
         first = min(r["step"] for r in records)
         assert all(("pos_drift_mean" in r) == (r["step"] != first) for r in records)
-        # Nothing calls a refresh solver in this mode, so setup builds and captures none; a later
-        # access returns the main solver instead of starting a lazy, mid-run capture.
+        # Nothing calls a refresh solver in this mode, so setup builds and captures none: no refresh
+        # saw one, the run ended without one, and an access returns the main solver instead of
+        # starting a lazy, mid-run capture.
         assert world._reik_num_seeds == 0
+        assert not any(built_before)
         assert world._ik_refresh_solver is None
         assert world.ik_refresh_solver is world.ik_solver
     else:
         assert calls["_refresh_balanced"] == 0 and calls["gn_project"] >= 1, calls
-        # With coupled_reik and the default 4 seeds, warmup builds and captures the refresh solver.
-        assert world._ik_refresh_solver is not None
+        # Setup passes the configured seed count through, and its warmup builds and captures the
+        # refresh solver: it exists when the first refresh starts (the first spied call runs before
+        # any fallback reads the property). Built later, by a GN-miss fallback, its CUDA graphs would
+        # be captured mid-run, where a --motion_plan run has the planner-build thread going and a
+        # concurrent capture fails.
+        assert world._reik_num_seeds == config.reik_num_seeds
+        assert built_before[0], f"setup did not build the refresh solver (reik_num_seeds={world._reik_num_seeds})"
 
 
 @needs_cuda
