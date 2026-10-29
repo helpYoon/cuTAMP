@@ -14,8 +14,8 @@ import torch
 
 from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
-    SpyVis, clone_particles, install_step_replay_spy, make_optimizer, make_plan_info, needs_cuda, repair_cuda_rng,
-    run_optimizer,
+    SpyVis, clone_particles, install_refresh_spy, install_step_replay_spy, make_optimizer, make_plan_info, needs_cuda,
+    repair_cuda_rng, run_optimizer,
 )
 from cutamp.tests.test_step_lockstep import _site_ptrs
 
@@ -125,16 +125,41 @@ def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):            # Review F
 
 
 @needs_cuda
+@pytest.mark.parametrize("reik_interval, num_opt_steps, capture_step", [(5, 50, 4), (1, 12, 0)])
+def test_refresh_graph_lockstep(blocks_t1_plan, monkeypatch, reik_interval, num_opt_steps, capture_step):
+    from cutamp.optimize_plan import _QueuedRefresh, _ReikDriftGate
+    world, skeleton, base = blocks_t1_plan
+    config = _graph_config(num_opt_steps=num_opt_steps, reik_interval=reik_interval)
+    eager = install_refresh_spy(monkeypatch)
+    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
+    assert m["refresh_capture_step"] == capture_step and m["refresh_capture_s"] > 0
+    steps = list(range(capture_step + reik_interval, num_opt_steps, reik_interval))
+    assert [s for s, _ in eager] == steps            # 9..49 = refreshes 2-10; 1..11 (Review Focus 5)
+    # flush() turns the replays' slots into the records eager packs give, but for solve_s
+    q_names = tuple(r["conf"] for r in m["reik_refresh"] if r["step"] == capture_step)
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record(); e1.record()
+    ref = _ReikDriftGate(len(q_names), 0.0, 0.0)
+    ref._queued = [_QueuedRefresh(s, q_names, 64, p, e0, e1) for s, p in eager]
+    ref.flush()
+    strip = lambda rs: [{k: v for k, v in r.items() if k != "solve_s"} for r in rs]
+    assert strip(ref.stats) == strip([r for r in m["reik_refresh"] if r["step"] in set(steps)])
+
+
+@needs_cuda
 def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch, record_property):
     import cutamp.optimize_plan as optimize_plan
 
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=20)
     replays = install_step_replay_spy(monkeypatch)
+    eager = install_refresh_spy(monkeypatch)
     busy = itertools.count()
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
                          visualizer=SpyVis(config), planner_busy=lambda: next(busy) < 7)
     assert m["capture_step"] == 7 and replays == [list(range(13))]
+    # Design 4.6: refresh #1 (step 4) runs eagerly with no G_step yet, so G_refresh waits for refresh #2.
+    assert m["refresh_capture_step"] == 9 and [s for s, _ in eager] == [14, 19]
     assert next(busy) == 8                           # consulted once per step, until the capture
     # Ruling 6 / design open question 1: report, don't assert, whether the deferred capture
     # also succeeds without the penalties-cache clear. The clear stays either way.
@@ -171,7 +196,8 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):  # Review
     for call in range(2):
         m, _ = run_optimizer(plan_info, config, optimizer=opt)
         assert m["capture_step"] == 0 and m["capture_s"] > 0
-        assert Counter(n for n, _, _ in released) == {"G_step": call + 1}   # once per graph per call
+        assert m["refresh_capture_step"] == 4
+        assert Counter(n for n, _, _ in released) == {"G_step": call + 1, "G_refresh": call + 1}  # once per call each
         assert all(v.grad is None for v in plan_info["particles"].values())
         gc.collect()
         torch.cuda.synchronize()
@@ -203,6 +229,7 @@ def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):     # Review F
     assert [m[k] for k in keys] == [None] * 4 and released == []
     m, _, _ = run(num_opt_steps=3)                                     # ends before refresh #1
     assert m["capture_step"] == 0 and released == ["G_step"]
+    assert m["refresh_capture_step"] is None
     m, timer, parts = run(num_opt_steps=50, early_stop_patience=1)     # early stop
     assert m.get("early_stopped_at") is not None and not timer.has_timer("optimization_step")
     assert len(released) == 1 + sum(m[k] is not None for k in ("capture_step", "refresh_capture_step"))

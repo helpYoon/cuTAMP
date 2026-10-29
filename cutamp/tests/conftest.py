@@ -291,6 +291,39 @@ def install_step_replay_spy(monkeypatch) -> list:
     return replays
 
 
+def install_refresh_spy(monkeypatch) -> list:
+    """Wrap ``_StaticRefresh.__call__`` so every G_refresh replay checks itself
+    bitwise against an eager ``_refresh_balanced`` on clones of the particles
+    (:func:`clone_particles`), through a fresh gate whose refs are clones of
+    the static refs. The eager refresh runs first, as the step spy's twin
+    does: it shares the gate site and ``kinematics_jac`` with the graph. Then
+    the replay, and :func:`assert_bitwise` on the covered confs, the slot and
+    the refs, and on every other particle, which must be as it was. Returns
+    the list each replay appends ``(step, packed)`` to: its step, and a clone
+    of the eager refresh's packed stats."""
+    from cutamp.optimize_plan import _ReikDriftGate, _refresh_balanced, _StaticRefresh
+
+    orig, eager = _StaticRefresh.__call__, []
+
+    def spy(self, step):
+        clones, before = clone_particles(self.particles), clone_particles(self.particles)
+        g2 = _ReikDriftGate(len(self.q_names), self.gate.pos_tol, self.gate.rot_tol)
+        g2.refs = [r.clone() for r in self.refs]
+        _refresh_balanced(clones, self.ik_deps, self.world, g2, step)
+        orig(self, step)
+        where = f"G_refresh replay at step {step}"
+        assert_bitwise({"q": {n: self.particles[n] for n in self.q_names}, "slot": self.slot, "refs": list(self.refs)},
+                       {"q": {n: clones[n] for n in self.q_names}, "slot": g2._queued[-1].packed, "refs": g2.refs},
+                       where)
+        others = [n for n in self.particles if n not in self.q_names]
+        assert_bitwise({n: self.particles[n] for n in others}, {n: before[n] for n in others},
+                       f"{where}: a particle outside the covered confs")
+        eager.append((step, g2._queued[-1].packed.clone()))
+
+    monkeypatch.setattr(_StaticRefresh, "__call__", spy)
+    return eager
+
+
 def repair_cuda_rng() -> None:
     """One trivial capture that succeeds, after one that failed: a failed
     capture leaves torch's CUDA RNG unusable until a later capture succeeds

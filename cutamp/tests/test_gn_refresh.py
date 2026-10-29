@@ -379,6 +379,30 @@ def test_balanced_refresh_is_sync_free():
     misses = (~(pose_ok & com_ok)).view(4, 8).sum(-1).tolist()
     assert [(r["conf"], r["gn_fail"]) for r in gate.stats[-4:]] == list(zip(names, misses))
 
+    # The same refresh replayed as G_refresh: one graph launch, and no kernel launch, host sync
+    # or host copy. Count API names, not memcpy activities: the graph's own memcpy nodes may
+    # show up as activities.
+    from cutamp.optimize_plan import _StaticRefresh
+    refresh = _StaticRefresh(particles, deps, world, gate)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **sync_events) as prof:
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            refresh(19)
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+    names = [e.name for e in prof.events()]
+    assert names.count("cudaGraphLaunch") == 1
+    assert not [n for n in names if n.startswith(("cudaLaunch", "cuLaunch"))]
+    assert [n for n in names if "Synchronize" in n] == ["cudaDeviceSynchronize"]
+    assert not [n for n in names if "DtoH" in n or "HtoD" in n]
+    assert sum("EventRecord" in n for n in names) == 2 and names.count("cudaMemcpyAsync") == 1  # the slot clone
+    if sync_events:
+        assert [n for n in names if n.endswith(" Sync")] == ["Context Sync"]
+    gate.flush()
+    assert [r["step"] for r in gate.stats[-4:]] == [19] * 4 and all("pos_drift_mean" in r for r in gate.stats[-4:])
+    refresh.release()
+
 
 @needs_cuda
 def test_balanced_refresh_on_each_dep_layout():

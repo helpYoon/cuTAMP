@@ -256,7 +256,8 @@ class _BestSnapshot:
 
 class _QueuedRefresh(NamedTuple):
     """One balance-first refresh's stats, queued by
-    ``_ReikDriftGate.log_batch`` until ``flush()``."""
+    ``_ReikDriftGate.log_batch`` or a G_refresh replay
+    (``_StaticRefresh.__call__``) until ``flush()``."""
     step: int
     q_names: Tuple[str, ...]
     batch: int
@@ -328,9 +329,10 @@ class _ReikDriftGate:
         # measure_drift to after the merge or fallback (balance-first records from
         # before the refresh became one batched call used this window too); in
         # balance-first mode, the refresh's CUDA-event span (target build through
-        # write-back) / D, an even split. Per-run sums are meaningful in both; the
-        # windows differ, so don't compare solve_s across modes or with those older
-        # balance-first records.
+        # write-back, and through the stats packing for a G_refresh replay) / D, an
+        # even split. Per-run sums are meaningful in both; the windows differ, so
+        # don't compare solve_s across modes or with those older balance-first
+        # records.
         rec = {
             "step": step, "conf": q_name, "batch": batch,
             "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
@@ -363,22 +365,28 @@ class _ReikDriftGate:
         self._append_record(step, q_name, batch, n_fail, solve_s, drift,
                             gn_fail, gn_fail_pose, gn_fail_com, fallback)
 
-    def log_batch(self, step: int, q_names: List[str], batch: int, ok, pose_ok, com_ok,
-                  pos_drift, rot_drift, start, end) -> None:
-        """Queue one balance-first refresh's records for :meth:`flush`, without
-        a host read.
+    def _pack(self, D: int, batch: int, ok, pose_ok, com_ok, pos_drift, rot_drift) -> torch.Tensor:
+        """One balance-first refresh's stats as a ``[D, k]`` float32 device
+        tensor, device math only: per dep, each mask's miss count, then any
+        drift stats (:meth:`_drift_stats`). ``k = 3``, or ``3 + 3 +
+        len(_BUCKETS) = 11`` with drift.
 
-        ``ok``, ``pose_ok`` and ``com_ok`` are ``[D*B]`` bool over
-        ``D = len(q_names)`` dep-major blocks of ``batch`` rows; the drifts
-        are ``[D*B]``, or ``None`` on the first refresh; ``start`` and ``end``
-        are the refresh's timing events. Each mask's miss count, and any
-        drift stats, go per dep into one ``[D, k]`` float32 device tensor.
+        ``ok``, ``pose_ok`` and ``com_ok`` are ``[D*B]`` bool over ``D``
+        dep-major blocks of ``batch`` rows; the drifts are ``[D*B]``, or
+        ``None`` on the first refresh.
         """
-        D = len(q_names)
         cols = [(~m).view(D, batch).sum(-1) for m in (ok, pose_ok, com_ok)]
         if pos_drift is not None:
             cols += self._drift_stats(pos_drift.view(D, batch), rot_drift.view(D, batch))
-        packed = torch.stack([c.float() for c in cols], dim=-1)
+        return torch.stack([c.float() for c in cols], dim=-1)
+
+    def log_batch(self, step: int, q_names: List[str], batch: int, ok, pose_ok, com_ok,
+                  pos_drift, rot_drift, start, end) -> None:
+        """Queue one balance-first refresh's records for :meth:`flush`, without
+        a host read: its :meth:`_pack` (``D = len(q_names)``) and ``start``
+        and ``end``, the refresh's timing events.
+        """
+        packed = self._pack(len(q_names), batch, ok, pose_ok, com_ok, pos_drift, rot_drift)
         self._queued.append(_QueuedRefresh(step, tuple(q_names), batch, packed, start, end))
 
     def flush(self) -> None:
@@ -402,6 +410,32 @@ class _ReikDriftGate:
                 self._append_record(r.step, q_name, r.batch, gn_fail, solve_s, drift or None,
                                     gn_fail, int(gn_fail_pose), int(gn_fail_com), fallback=False)
         self._queued.clear()
+
+
+def _project_and_write_back(
+    particles: dict, ik_deps: List[IKDep], world: TAMPWorld, world_from_ee: torch.Tensor, gate: _ReikDriftGate,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The balance-first refresh after its targets, shared by
+    :func:`_refresh_balanced` and G_refresh's body (:class:`_StaticRefresh`):
+    :func:`gn_project_balanced` on the covered Confs' dep-major stack toward
+    ``world_from_ee``, the ``[D*B, 4, 4]`` stack of the deps' targets;
+    :func:`gn_gate` on the result, on the ``"gate"`` FK site; then every row
+    written back in place. Returns ``(pose_ok, com_ok)``, ``[D*B]`` bool."""
+    q_names = [dep.q_name for dep in ik_deps]
+    batch = world_from_ee.shape[0] // len(ik_deps)
+    arms = tuple(dep.arm for dep in ik_deps)
+    q = gn_project_balanced(
+        world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms,
+    )
+    pose_ok, com_ok = gn_gate(
+        world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol, kin=world.site_kinematics("gate"),
+    )
+    with torch.no_grad():
+        for name, q_dep in zip(q_names, q.split(batch)):
+            particles[name].copy_(q_dep)
+            # Dropped from the optimizer, so .grad has no consumer.
+            particles[name].grad = None
+    return pose_ok, com_ok
 
 
 def _refresh_balanced(
@@ -437,19 +471,7 @@ def _refresh_balanced(
     first_refresh = pos_drifts[0] is None
     assert all((d is None) == first_refresh for d in pos_drifts), "deps share their first refresh"
 
-    world_from_ee = torch.cat(targets)
-    arms = tuple(dep.arm for dep in ik_deps)
-    q = gn_project_balanced(
-        world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms,
-    )
-    pose_ok, com_ok = gn_gate(
-        world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol, kin=world.site_kinematics("gate"),
-    )
-    with torch.no_grad():
-        for name, q_dep in zip(q_names, q.split(batch)):
-            particles[name].copy_(q_dep)
-            # Dropped from the optimizer, so .grad has no consumer.
-            particles[name].grad = None
+    pose_ok, com_ok = _project_and_write_back(particles, ik_deps, world, torch.cat(targets), gate)
     end.record()
 
     gate.log_batch(
@@ -458,6 +480,80 @@ def _refresh_balanced(
         None if first_refresh else torch.cat(rot_drifts),
         start, end,
     )
+
+
+class _StaticRefresh:
+    """G_refresh (``--cuda_graphs``, design 4.2-4.3): :func:`_refresh_balanced`
+    captured as a CUDA graph, which :meth:`__call__` replays at each later
+    refresh of the optimize call.
+
+    Its static I/O, besides the particles: ``refs`` ``[D, B, 4, 4]``, each
+    dep's target at the last refresh, and ``slot`` ``[D, 11]``, that
+    refresh's :meth:`_ReikDriftGate._pack`. The body measures the drift
+    against ``refs`` and then advances them in place (P5: ``measure_drift``
+    rebinds ``gate.refs[i]``, and a graph keeps reading the old tensor), and
+    packs the stats into ``slot`` (P6: ``log_batch``'s host append would run
+    at capture only). Captured right after an eager refresh, which builds the
+    ``"gate"`` site, sizes that site and ``world.kinematics_jac`` for the
+    ``D*B`` stack, fills gn_refresh's cached constants (a miss is a
+    host-to-device copy, which fails a capture) and sets ``gate.refs``.
+    """
+
+    def __init__(self, particles: dict, ik_deps: List[IKDep], world: TAMPWorld, gate: _ReikDriftGate):
+        assert all(r is not None for r in gate.refs), "G_refresh is captured after an eager refresh sets gate.refs"
+        self.particles, self.ik_deps, self.world, self.gate = particles, ik_deps, world, gate
+        self.refs = torch.stack(gate.refs)
+        self.slot = torch.zeros(len(ik_deps), 3 + 3 + len(gate._BUCKETS), device=self.refs.device)  # _pack's [D, 11]
+        self.q_names = tuple(dep.q_name for dep in ik_deps)
+        self.batch = self.refs.shape[1]
+
+        def warmup() -> None:  # on scratch copies: the body writes the confs and the refs (design 4.3)
+            self.body({k: v.detach().clone() for k, v in particles.items()}, self.refs.detach().clone(),
+                      self.slot.detach().clone())
+
+        # The guard's sites are the ones the body runs, and the eager refresh built both.
+        self.graph = cuda_graphs.capture(
+            "G_refresh", lambda: self.body(particles, self.refs, self.slot), warmup,
+            ptrs=lambda: cuda_graphs.graph_ptrs(
+                [*particles.values(), self.refs, self.slot],
+                [world.site_kinematics("gate"), world.kinematics_jac],
+            ),
+        )
+        self.capture_s = self.graph.capture_s
+
+    def body(self, particles: dict, refs: torch.Tensor, slot: torch.Tensor) -> None:
+        """:func:`_refresh_balanced`'s device work on static I/O, with the same
+        math: the targets; each dep's drift against ``refs[i]``, then
+        ``refs[i]`` advanced in place; the projection and write-back; and the
+        stats packed into ``slot``. Sync-free, so it can be captured."""
+        # Detached: nothing may flow into the Pose / Grasp leaves.
+        targets = [dep.target_fn(particles).detach() for dep in self.ik_deps]
+        drifts = [curobo_pose_error(refs[i], t) for i, t in enumerate(targets)]  # measure_drift's metric
+        for i, t in enumerate(targets):
+            refs[i].copy_(t)
+        pos_drifts, rot_drifts = zip(*drifts)
+        pose_ok, com_ok = _project_and_write_back(particles, self.ik_deps, self.world, torch.cat(targets), self.gate)
+        slot.copy_(self.gate._pack(len(targets), self.batch, pose_ok & com_ok, pose_ok, com_ok,
+                                   torch.cat(pos_drifts), torch.cat(rot_drifts)))
+
+    def __call__(self, step: int) -> None:
+        """Replay G_refresh as the refresh at ``step``, and queue its stats on
+        the gate for ``flush()``, as ``log_batch`` does."""
+        # P7: events recorded inside a capture are invalid, so these time the replay from outside.
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        self.graph.replay()
+        end.record()
+        # P6: the next replay rewrites the slot, so the queue keeps a copy.
+        self.gate._queued.append(_QueuedRefresh(step, self.q_names, self.batch, self.slot.clone(), start, end))
+        for name in self.q_names:
+            self.particles[name].grad = None  # as _project_and_write_back does: a replay runs no Python
+
+    def release(self) -> None:
+        """Release the graph (``CapturedGraph.release``), and drop the static
+        refs and slot."""
+        self.graph.release()
+        self.refs = self.slot = None
 
 
 class ParticleOptimizer:
@@ -828,8 +924,9 @@ class ParticleOptimizer:
             # P13: the no-op Visualizer skips the vis block, and with it the block's syncs.
             keep_vis=type(visualizer) is not Visualizer,
         )
-        # --cuda_graphs (Mode H): G_step replaces the eager step from its capture on.
-        step_graph = None
+        # --cuda_graphs (Mode H): G_step replaces the eager step from its capture on, and
+        # G_refresh the eager refresh.
+        step_graph = refresh_graph = None
         if self.config.cuda_graphs:
             opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
         try:
@@ -895,7 +992,15 @@ class ParticleOptimizer:
                 # Counts from 1 so the first refresh lands at step K-1 (after
                 # the first batch of pose updates), not step 0.
                 if ik_deps and (step + 1) % self.config.reik_interval == 0:
-                    self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
+                    if refresh_graph is not None:
+                        refresh_graph(step)
+                    else:
+                        self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
+                        # G_step exists only once the planner thread has ended, and it stays ended (design 4.6).
+                        if step_graph is not None and self.config.reik_balance_first:
+                            refresh_graph = _StaticRefresh(particles, ik_deps, world, reik_gate)
+                            opt_metrics["refresh_capture_s"] = refresh_graph.capture_s
+                            opt_metrics["refresh_capture_step"] = step
                 timer.stop("optimization_step")
                 pbar.set_description(
                     f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, "
@@ -906,6 +1011,8 @@ class ParticleOptimizer:
             if step_graph is not None:
                 step_graph.release()
                 _clear_step_autograd(cost_fn, body.params)
+            if refresh_graph is not None:
+                refresh_graph.release()
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).

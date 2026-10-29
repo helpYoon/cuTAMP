@@ -77,9 +77,11 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     assert "best_soft_cost_com_feasible" in opt_metrics
     assert opt_metrics["num_satisfying_com_feasible"] <= opt_metrics["num_satisfying_final"]
 
-    # Without --motion_plan there is no planner thread, so G_step is captured at step 0.
+    # Without --motion_plan there is no planner thread, so G_step is captured at step 0, and
+    # G_refresh right after refresh #1 (reik_interval=2, so step 1).
     if cuda_graphs:
         assert opt_metrics["capture_step"] == 0
+        assert opt_metrics["refresh_capture_step"] == 1
     else:
         assert "capture_step" not in opt_metrics
 
