@@ -10,7 +10,7 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Literal, NamedTuple, Tuple, TypedDict
+from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple, TypedDict
 
 import torch
 from torch.optim import Adam
@@ -119,6 +119,52 @@ def _adam_consider_types(config: TAMPConfiguration) -> set:
     ):
         consider.add("cost")
     return consider
+
+
+@dataclass
+class _StepBody:
+    """One in-loop Adam step's device work, which the loop calls once per
+    step: the rollout, costs, satisfying mask and loss; the per-step scalars,
+    stacked; then the backward and the grad masks.
+
+    Returns ``(packed, vis)``. ``packed`` is the detached ``[3]`` float32
+    stack of the satisfying count, the loss and the min cost, with the best
+    satisfying soft cost (``inf`` when none satisfies) as a 4th entry when
+    ``with_soft``. ``vis`` is ``(rollout, cost_dict, costs, satisfying_mask)``
+    for the loop's vis block when ``keep_vis``, else ``None``. ``params`` are
+    the optimizer's tensors, and ``grad_masks`` maps a tensor's ``id`` to its
+    mask, as ``build_grad_masks`` builds them.
+    """
+    particles: dict
+    rollout_fn: RolloutFunction
+    cost_fn: CostFunction
+    cost_reducer: CostReducer
+    get_mask: Callable[..., torch.Tensor]
+    consider_types: set
+    params: List[torch.Tensor]
+    grad_masks: Dict[int, torch.Tensor]
+    with_soft: bool
+    keep_vis: bool
+
+    def __call__(self) -> Tuple[torch.Tensor, Optional[tuple]]:
+        rollout = self.rollout_fn(self.particles)
+        cost_dict = self.cost_fn(rollout, self.particles)
+        costs = self.cost_reducer(cost_dict, consider_types=self.consider_types)
+        satisfying_mask = self.get_mask(cost_dict, verbose=False)
+        loss = costs.mean()
+        # Every per-step scalar in one tensor, so the loop reads them in one
+        # device-to-host copy: each .item() blocks the host until the GPU drains.
+        scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
+        if self.with_soft:
+            soft_costs = self.cost_reducer.soft_costs(cost_dict)
+            scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
+        packed = torch.stack(scalars).detach()
+        # Ruling 7: the backward now runs before the loop's bookkeeping, so
+        # elapsed[s], and a first solution's times, end after step s's backward.
+        # It writes only .grad, which the bookkeeping doesn't read.
+        loss.backward()
+        apply_grad_masks([{"params": self.params}], self.grad_masks)
+        return packed, ((rollout, cost_dict, costs, satisfying_mask) if self.keep_vis else None)
 
 
 class PlanContainer(TypedDict):
@@ -549,6 +595,33 @@ class ParticleOptimizer:
                     fallback=fallback,
                 )
 
+    def _visualize_step(self, visualizer: Visualizer, step: int, vis: tuple, num_satisfying: int,
+                        loss_val: float, indices: torch.Tensor) -> None:
+        """Log one Adam step's state: the best particle's last conf and object
+        poses, the cost dict and the loss. ``vis`` is the step body's
+        ``(rollout, cost_dict, costs, satisfying_mask)``."""
+        rollout, cost_dict, costs, satisfying_mask = vis
+        # Visualize satisfying particles if we have any. Otherwise, just show the best particle so far.
+        if num_satisfying > 0:
+            best_satisfying_idx = costs[satisfying_mask].argmin()
+            best_idx = indices[satisfying_mask][best_satisfying_idx]
+        else:
+            best_idx = costs.argmin()
+
+        # Show last state after rolling out the best particle
+        visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
+        q_last = rollout["confs"][best_idx, -1].tolist()
+
+        # v0.8: configs are full 21-DOF (T1) or single chain DOF (others).
+        # T1RerunRobot maps 21 → 28 URDF actuated joints internally.
+        visualizer.set_joint_positions(q_last)
+        for obj in rollout["obj_to_pose"]:
+            mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]
+            visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
+
+        visualizer.log_cost_dict(cost_dict)
+        visualizer.log_scalar("loss", loss_val)
+
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
         """Optimize particles for the plan skeleton.
 
@@ -695,6 +768,13 @@ class ParticleOptimizer:
         start_time = time.perf_counter()
         time_exceeded = False
         best_snapshot = _BestSnapshot()
+        body = _StepBody(
+            particles, rollout_fn, cost_fn, self.cost_reducer, self.get_satisfying_mask, consider_types,
+            params=[p for g in optimizer.param_groups for p in g["params"]], grad_masks=grad_masks,
+            with_soft=self.config.soft_cost is not None,
+            # P13: the no-op Visualizer skips the vis block, and with it the block's syncs.
+            keep_vis=type(visualizer) is not Visualizer,
+        )
         for step in pbar:
             if self.config.max_loop_dur is not None and timer.elapsed("start_optimization") >= self.config.max_loop_dur:
                 _log.warning(f"Optimization exceeded max time of {self.config.max_loop_dur:.2f}s")
@@ -702,19 +782,8 @@ class ParticleOptimizer:
                 break
             timer.start("optimization_step")
             optimizer.zero_grad()
-
-            rollout = rollout_fn(particles)
-            cost_dict = cost_fn(rollout, particles)
-            costs = self.cost_reducer(cost_dict, consider_types=consider_types)
-            satisfying_mask = self.get_satisfying_mask(cost_dict, verbose=False)
-            loss = costs.mean()
-            # Every per-step scalar in one device-to-host copy: each .item()
-            # blocks the host until the GPU drains.
-            scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-            if self.config.soft_cost is not None:
-                soft_costs = self.cost_reducer.soft_costs(cost_dict)
-                scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
-            num_satisfying, loss_val, min_cost, *best_soft = torch.stack(scalars).tolist()
+            packed, vis = body()
+            num_satisfying, loss_val, min_cost, *best_soft = packed.tolist()  # every scalar in one read
             num_satisfying = int(num_satisfying)
             opt_metrics["num_satisfying"].append(num_satisfying)
 
@@ -751,33 +820,11 @@ class ParticleOptimizer:
                 break
 
             # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
-            if step % vis_every == 0 or step == num_steps - 1:
-                timer.start("visualize_opt_rollout")
-                # Visualize satisfying particles if we have any. Otherwise, just show the best particle so far.
-                if num_satisfying > 0:
-                    best_satisfying_idx = costs[satisfying_mask].argmin()
-                    best_idx = indices[satisfying_mask][best_satisfying_idx]
-                else:
-                    best_idx = costs.argmin()
+            if vis is not None and (step % vis_every == 0 or step == num_steps - 1):
+                with timer.time("visualize_opt_rollout"):
+                    self._visualize_step(visualizer, step, vis, num_satisfying, loss_val, indices)
 
-                # Show last state after rolling out the best particle
-                visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
-                q_last = rollout["confs"][best_idx, -1].tolist()
-
-                # v0.8: configs are full 21-DOF (T1) or single chain DOF (others).
-                # T1RerunRobot maps 21 → 28 URDF actuated joints internally.
-                visualizer.set_joint_positions(q_last)
-                for obj in rollout["obj_to_pose"]:
-                    mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]
-                    visualizer.log_mat4x4(f"world/{obj}", mat4x4_last)
-
-                visualizer.log_cost_dict(cost_dict)
-                visualizer.log_scalar("loss", loss_val)
-                timer.stop("visualize_opt_rollout")
-
-            # Compute gradients and step the optimizer.
-            loss.backward()
-            apply_grad_masks(optimizer.param_groups, grad_masks)
+            # The body already ran the backward and the grad masks.
             optimizer.step()
             # Counts from 1 so the first refresh lands at step K-1 (after
             # the first batch of pose updates), not step 0.
@@ -787,6 +834,7 @@ class ParticleOptimizer:
             pbar.set_description(
                 f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
             )
+            vis = None  # P9: no eager step leaves an autograd graph alive for a later capture
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).

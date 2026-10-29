@@ -4,10 +4,10 @@ HEAD's math is cfa7a46 + B0 (ruling 11): goal_in_xy summed per object in a
 fixed order, frozen here as :func:`_head_per_object_sum`. No oracle may vendor
 ``stable_placement_costs`` or restore ``scatter_add_``.
 
-Every in-loop step runs three more times on clones of its particles: twice as
-the code now runs it, and once under :func:`_head_math`. All three must match
-bitwise at every step, in every case: run to run, and against HEAD, the gate
-for edits that change both arms.
+Every in-loop step, one ``_StepBody`` call, first runs twice more on clones of
+its particles: once under :func:`_head_math`, and once as the code now runs it
+(its twin). The step must match both bitwise, at every step and in every case:
+its twin run to run, and HEAD, the gate for edits that change both arms.
 """
 
 import os
@@ -18,8 +18,9 @@ from unittest import mock
 import pytest
 import torch
 
+from cutamp.config import SUPPORTED_SOFT_COSTS
 from cutamp.tests.conftest import (
-    assert_bitwise, clone_particles, make_plan_info, needs_cuda, run_optimizer, step_outputs,
+    SpyVis, assert_bitwise, clone_particles, make_plan_info, needs_cuda, run_optimizer, step_outputs, twin_body,
 )
 
 
@@ -114,6 +115,60 @@ def _site_ptrs(world) -> dict:
     return ptrs
 
 
+def _install_lockstep(monkeypatch, world) -> List[tuple]:
+    """Wrap ``_StepBody.__call__`` so every in-loop step checks itself bitwise,
+    on clones of its particles: against its twin (:func:`twin_body`), run to
+    run, and against :func:`_head_step` under :func:`_head_math`, given the
+    body's own functions. Each step also checks that the oracle reached every
+    FK call. Returns the list each step appends ``(names, got, ptrs)`` to: the
+    optimized params' particle names, the step's :func:`step_outputs`, and
+    :func:`_site_ptrs` after it."""
+    import cutamp.cost_function as cost_function
+    import cutamp.optimize_plan as optimize_plan
+    from curobo.kinematics import Kinematics
+
+    orig, orig_fk = optimize_plan._StepBody.__call__, Kinematics.compute_kinematics
+    fk_calls, steps = [], []
+
+    def counted_fk(kin, *args, **kwargs):  # every FK call, however the caller got its instance
+        fk_calls.append(kin)
+        return orig_fk(kin, *args, **kwargs)
+
+    def site_fk(fn):
+        """``fn()``, and how many FK calls it made on a site."""
+        fk_calls.clear()
+        out = fn()
+        return out, sum(any(kin is site for site in world._site_kinematics.values()) for kin in fk_calls)
+
+    def lockstep(self):
+        k = len(steps)
+        name_of = {id(t): n for n, t in self.particles.items()}
+        names = [name_of[id(p)] for p in self.params]
+        masks = {name_of[i]: m for i, m in self.grad_masks.items() if i in name_of}
+        with _head_math(world) as shared:
+            assert cost_function._per_object_sum is _head_per_object_sum, f"step {k}"
+            ref, ref_sites = site_fk(lambda: _head_step(
+                clone_particles(self.particles), self.rollout_fn, self.cost_fn, self.cost_reducer, self.get_mask,
+                self.consider_types, self.with_soft, names, masks))
+        # The twin runs before the step: its backward overwrites the sites' grad_out, which the
+        # step's .grad may hold until optimizer.step().
+        twin = twin_body(self)
+        again, twin_sites = site_fk(lambda: step_outputs(*orig(twin), twin.params))
+        (packed, vis), n_sites = site_fk(lambda: orig(self))
+        got = step_outputs(packed, vis, self.params)
+        assert ref_sites == 0 and shared.calls == twin_sites == n_sites > 0, (  # the oracle reached every FK call
+            f"step {k}: the step made {n_sites} site FK calls and its twin {twin_sites}; "
+            f"ref {shared.calls} reset ones, {ref_sites} site ones")
+        assert_bitwise(got, again, f"step {k}: run to run")
+        assert_bitwise(got, ref, f"step {k}")
+        steps.append((names, got, _site_ptrs(world)))
+        return packed, vis
+
+    monkeypatch.setattr(Kinematics, "compute_kinematics", counted_fk)
+    monkeypatch.setattr(optimize_plan._StepBody, "__call__", lockstep)
+    return steps
+
+
 @needs_cuda
 @pytest.mark.parametrize("reik_balance_first,coupled_reik", [(False, True), (True, True), (False, False)])
 def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, coupled_reik):
@@ -121,14 +176,7 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
     # then vs HEAD's one shared instance, bitwise. The sites' buffers never move.
     # Coupled re-IK drops every FK-fed Conf from Adam, so no compared grad comes out
     # of an FK backward; with coupled_reik=False, Adam optimizes them and one does.
-    import cutamp.cost_function as cost_function
-    from curobo.kinematics import Kinematics
     from cutamp.config import TAMPConfiguration
-    from cutamp.constraint_checker import ConstraintChecker
-    from cutamp.cost_reduction import CostReducer
-    from cutamp.optimize_plan import _adam_consider_types
-    from cutamp.rollout import RolloutFunction
-    from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
     from cutamp.t1_domain import Conf
 
     world, skeleton, base = blocks_t1_plan
@@ -137,49 +185,18 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
     config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0,
                                reik_balance_first=reik_balance_first, coupled_reik=coupled_reik,
                                force_adam=not coupled_reik, enable_visualizer=False)
-    orig_fk, fk_calls = Kinematics.compute_kinematics, []
-
-    def counted_fk(kin, *args, **kwargs):  # every FK call, however the caller got its instance
-        fk_calls.append(kin)
-        return orig_fk(kin, *args, **kwargs)
-
-    def site_calls() -> int:
-        return sum(any(kin is site for site in world._site_kinematics.values()) for kin in fk_calls)
-
-    monkeypatch.setattr(Kinematics, "compute_kinematics", counted_fk)
-    plan_info = make_plan_info(world, skeleton, clone_particles(base), config)
-    step_args = (plan_info["cost_fn"], CostReducer(default_constraint_to_mult.copy()),
-                 ConstraintChecker(default_constraint_to_tol.copy()).get_mask,
-                 _adam_consider_types(config), config.soft_cost is not None)
     confs = {v for op in skeleton for v, prm in zip(op.values, op.operator.parameters) if prm.type == Conf}
-    orig, ptrs = RolloutFunction.__call__, []
-
-    def spy(self, p):
-        if torch.is_grad_enabled():  # the in-loop forward: the init and final rollouts run under no_grad
-            k, params = len(ptrs), [n for n, t in p.items() if t.requires_grad]
-            fk_calls.clear()
-            new = _head_step(clone_particles(p), lambda x: orig(self, x), *step_args, params, {})
-            n_site = site_calls()
-            again = _head_step(clone_particles(p), lambda x: orig(self, x), *step_args, params, {})
-            fk_calls.clear()
-            with _head_math(world) as shared:
-                assert cost_function._per_object_sum is _head_per_object_sum, f"step {k}"
-                ref = _head_step(clone_particles(p), lambda x: orig(self, x), *step_args, params, {})
-            assert shared.calls == n_site > 0 and site_calls() == 0, (  # the oracle reached every FK call
-                f"step {k}: new made {n_site} site FK calls; ref {shared.calls} reset ones, {site_calls()} site ones")
-            assert_bitwise(again, new, f"step {k}: run to run")
-            assert_bitwise(new, ref, f"step {k}")
-            if k == 0 and not coupled_reik:  # the gate sees an FK backward
-                assert any(n in confs and g is not None and bool(g.ne(0).any())
-                           for n, g in zip(params, new["grads"])), f"no optimized Conf has a nonzero grad: {params}"
-            ptrs.append(_site_ptrs(world))
-        return orig(self, p)
-
-    monkeypatch.setattr(RolloutFunction, "__call__", spy)
+    steps = _install_lockstep(monkeypatch, world)
     print("blocks_t1_plan:", " | ".join(op.name for op in skeleton),
           f"(PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')})")
-    run_optimizer(plan_info, config)
-    assert len(ptrs) == 50
+    # Not the no-op Visualizer, so the body returns vis and each step compares costs, mask and values too.
+    run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
+    assert len(steps) == 50
+    names, got, _ = steps[0]
+    if not coupled_reik:  # the gate sees an FK backward
+        assert any(n in confs and g is not None and bool(g.ne(0).any()) for n, g in zip(names, got["grads"])), (
+            f"no optimized Conf has a nonzero grad: {names}")
+    ptrs = [p for _, _, p in steps]
     for k, p in enumerate(ptrs):  # a site that is never built fails by name
         want = {"rollout", "retract", "com"} | ({"gate"} if reik_balance_first and k >= 5 else set())
         assert p.keys() - {"config"} == want, f"step {k}: sites {sorted(p.keys() - {'config'})}, want {sorted(want)}"
@@ -187,6 +204,28 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
         assert all(p[site] == ptrs[0][site] for p in ptrs), site
     if reik_balance_first:  # refresh #1, at step 4, builds the gate site
         assert all(p["gate"] == ptrs[5]["gate"] for p in ptrs[5:]), "gate"
+
+
+@needs_cuda
+@pytest.mark.parametrize("sc,balance_first", [
+    (None, True), *((sc, True) for sc in SUPPORTED_SOFT_COSTS),
+    *((sc, False) for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
+])
+def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
+    # The step vs its twin and HEAD, as test_step_lockstep_vs_head checks it, for each soft
+    # cost alone and for none. max_obj_dist, min_obj_dist and align_yaw also run in default
+    # mode: the default soft costs never reach their triu gathers.
+    from cutamp.config import TAMPConfiguration
+
+    world, skeleton, base = blocks_t1_plan
+    config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
+                               reik_balance_first=balance_first, enable_visualizer=False,
+                               soft_cost=None if sc is None else [sc])
+    steps = _install_lockstep(monkeypatch, world)
+    print("blocks_t1_plan:", " | ".join(op.name for op in skeleton),
+          f"(PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')})")
+    run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
+    assert len(steps) == 5
 
 
 @needs_cuda

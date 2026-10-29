@@ -1,5 +1,6 @@
 """Shared pytest fixtures for cuTAMP tests (cuRobo v0.8 single-MotionPlanner)."""
 
+import dataclasses
 import gc
 import os
 import sys
@@ -140,6 +141,48 @@ def run_optimizer(plan_info: dict, config, optimizer=None, visualizer=None, time
         plan_info, timer, visualizer or Visualizer(config, None),
     )
     return opt_metrics, timer
+
+
+class SpyVis:
+    """A duck-typed stand-in for a real visualizer, so the Adam loop runs its
+    vis block. It records ``opt_steps``, each value ``set_time_sequence`` sets
+    on an ``opt_*`` timeline, and ``losses``, each ``log_scalar("loss", v)``.
+    Every other method is a no-op. Not a ``Visualizer`` subclass:
+    ``cutamp/utils/visualizer.py`` imports rerun and cuRobo at module level,
+    and collection must not."""
+
+    def __init__(self, config):
+        self.config = config
+        self.opt_steps, self.losses = [], []
+
+    def set_time_sequence(self, timeline: str, val: int) -> None:
+        if timeline.startswith("opt_"):
+            self.opt_steps.append(val)
+
+    def log_scalar(self, name: str, value: float) -> None:
+        if name == "loss":
+            self.losses.append(value)
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: None
+
+
+def twin_body(body):
+    """A copy of ``body``, a ``_StepBody``, on fresh clones of its particles
+    (:func:`clone_particles`): ``params`` and the ``grad_masks`` keys are
+    remapped to the clones by ``id`` (a key that is no particle's ``id``
+    stays), and every other field, ``keep_vis`` among them, is shared. The twin
+    runs on ``body``'s FK sites, and a site's joint grad is its ``grad_out``,
+    which a ``.grad`` may hold: run the twin before ``body``'s own step, and
+    clone what it returns (:func:`step_outputs`) before the next FK call."""
+    clones = clone_particles(body.particles)
+    clone_of = {id(body.particles[name]): clone for name, clone in clones.items()}
+    return dataclasses.replace(
+        body, particles=clones, params=[clone_of[id(p)] for p in body.params],
+        grad_masks={id(clone_of[i]) if i in clone_of else i: m for i, m in body.grad_masks.items()},
+    )
 
 
 def step_outputs(packed, vis, params) -> dict:
