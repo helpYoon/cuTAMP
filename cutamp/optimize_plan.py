@@ -372,7 +372,9 @@ def _refresh_balanced(
     q = gn_project_balanced(
         world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms,
     )
-    pose_ok, com_ok = gn_gate(world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol)
+    pose_ok, com_ok = gn_gate(
+        world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol, kin=world.site_kinematics("gate"),
+    )
     with torch.no_grad():
         for name, q_dep in zip(q_names, q.split(batch)):
             particles[name].copy_(q_dep)

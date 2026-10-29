@@ -148,21 +148,21 @@ class ComOverBasePolygonCost(BaseCost):
 ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
 
 
-def _fk_state(world, q_batch: torch.Tensor):
-    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through
-    ``world.kinematics``; return its kinematics state. Differentiable
-    through cuRobo's FK chain."""
+def _fk_state(world, q_batch: torch.Tensor, kin=None):
+    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through ``kin``
+    (``None``: ``world.kinematics``); return its kinematics state.
+    Differentiable through cuRobo's FK chain."""
     from curobo.types import JointState
-    kin = world.kinematics
+    kin = world.kinematics if kin is None else kin
     q_batch = q_batch.to(kin.device_cfg.device)
     if q_batch.ndim == 1:
         q_batch = q_batch.unsqueeze(0)
-    js = JointState.from_position(q_batch, joint_names=list(world.kinematics.joint_names))
+    js = JointState.from_position(q_batch, joint_names=list(kin.joint_names))
     return kin.compute_kinematics(kin.get_active_js(js))
 
 
 def _com_and_base_from_state(ks):
-    """``(com_world [B,3], base_T [B,4,4])`` from a ``world.kinematics``
+    """``(com_world [B,3], base_T [B,4,4])`` from a CoM-enabled kinematics
     state: the inputs every COM-polygon helper needs."""
     com_world = ks.robot_com[..., :3].reshape(-1, 3)
     base_T = (
@@ -173,17 +173,17 @@ def _com_and_base_from_state(ks):
     return com_world, base_T
 
 
-def _fk_com_and_base(world, q_batch: torch.Tensor):
-    """FK ``q_batch`` through ``world.kinematics``; return
+def _fk_com_and_base(world, q_batch: torch.Tensor, kin=None):
+    """FK ``q_batch`` through ``kin`` (``None``: ``world.kinematics``); return
     ``(com_world [B,3], base_T [B,4,4])`` — the inputs every COM-polygon
     helper needs. Differentiable through cuRobo's FK chain."""
-    return _com_and_base_from_state(_fk_state(world, q_batch))
+    return _com_and_base_from_state(_fk_state(world, q_batch, kin))
 
 
 def com_polygon_mask_from_state(ks) -> torch.Tensor:
-    """:func:`compute_com_polygon_mask` on a kinematics state that
-    ``world.kinematics`` already computed, so a caller that needs the FK for
-    other checks too runs it once. ``[B]`` bool."""
+    """:func:`compute_com_polygon_mask` on a kinematics state that a CoM-enabled
+    FK already computed, so a caller that needs the FK for other checks too
+    runs it once. ``[B]`` bool."""
     com, base_T = _com_and_base_from_state(ks)
     # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
     # post-IK COM-safe check and ConstraintChecker can never diverge. With the
@@ -267,14 +267,10 @@ def compute_com_polygon_penalties(
     ]
     if not conf_names:
         return {}
-    # One FK for all confs, into fresh buffers. world.kinematics keeps FK
-    # outputs, backward state and returned gradients in one buffer set per
-    # batch shape, so same-shape calls before backward corrupt each other's
-    # gradients (one call per conf left all but the last one wrong).
+    # One FK for all confs, on its own site (TAMPWorld.site_kinematics).
     qs = [particles[name] for name in conf_names]
     q_all = torch.cat(qs)
-    world.kinematics.update_batch_size(q_all.shape[0], 1, reset_buffers=True)
-    com_world, base_T = _fk_com_and_base(world, q_all)
+    com_world, base_T = _fk_com_and_base(world, q_all, world.site_kinematics("com"))
     pen = com_polygon_penalty(
         com_world, base_T, _half_extents(com_world.device, com_world.dtype),
         COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT,

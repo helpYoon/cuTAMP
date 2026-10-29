@@ -42,6 +42,10 @@ from cutamp.utils.shapes import sample_greedy_surface_spheres
 
 _log = logging.getLogger(__name__)
 
+#: The Adam loop's forward-kinematics sites, each on its own Kinematics
+#: (:meth:`TAMPWorld.site_kinematics`).
+FK_SITES = ("rollout", "retract", "com", "gate")
+
 
 class TAMPWorld:
     """A TAMPEnvironment plus T1 kinematics, a Scene, and motion-planner factory.
@@ -95,6 +99,7 @@ class TAMPWorld:
         self._enable_com_aware_ik = enable_com_aware_ik
         self._ik_refresh_solver = None
         self._kinematics_jac = None
+        self._site_kinematics: Dict[str, Kinematics] = {}
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).
         self._obj_to_spheres: Dict[str, torch.Tensor] = {}
@@ -234,6 +239,35 @@ class TAMPWorld:
                 device_cfg=self.device_cfg, compute_jacobian=True,
             )
         return self._kinematics_jac
+
+    def site_kinematics(self, name: str) -> Kinematics:
+        """The dedicated Kinematics of the Adam loop's FK site ``name`` (one of
+        ``FK_SITES``): on ``kinematics``' config and CoM-enabled like it, built
+        lazily, once per name, and never reset. ``kinematics`` stays for the
+        eager users: particle init, ``compute_com_polygon_mask``, the final
+        refresh and the motion checks.
+
+        1. One instance per site: an instance keeps its FK outputs, the state
+           its backward reads and the gradient it returns in one buffer set,
+           so same-shape calls on one instance before backward corrupt each
+           other's gradients.
+        2. Never reset, and that is safe: cuRobo's FK backward overwrites
+           ``grad_out`` row by row, and that is the kernel's only writable
+           pointer (``curobo/_src/curobolib/kernels/kinematics/
+           kinematics_backward_kernel.cuh:138``, ``:153``). No gradient reads
+           what an earlier call left, and the zero-filled gradient inputs the
+           backward falls back on stay zero.
+        3. Fixed buffers: a site's buffers change only with its batch shape, so
+           a CUDA graph can bake them in whatever the call order. A graph that
+           bakes buffers allocated before capture writes freed memory once an
+           eager call reallocates them, as the gate FK in G_refresh, the
+           refresh's graph, would on the shared ``kinematics``.
+        """
+        if name not in FK_SITES:
+            raise ValueError(f"unknown FK site {name!r}: FK_SITES is {FK_SITES}")
+        if name not in self._site_kinematics:
+            self._site_kinematics[name] = Kinematics(self.kinematics.config, compute_com=True)
+        return self._site_kinematics[name]
 
     @property
     def ik_refresh_solver(self) -> InverseKinematics:

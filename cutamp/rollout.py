@@ -123,7 +123,7 @@ class RolloutFunction:
         if confs.shape[1] > 0:
             confs_flat = confs.view(-1, confs.shape[-1])
             js = JointState.from_position(confs_flat)
-            kin_state = self.world.kinematics.compute_kinematics(js)
+            kin_state = self.world.site_kinematics("rollout").compute_kinematics(js)
             ee_pose = kin_state.tool_poses  # ToolPose [B*H, 1, num_links, 3/4]
 
             # Per-timestep ee selection: for each conf, pick that arm's tool frame.

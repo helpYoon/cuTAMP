@@ -468,6 +468,7 @@ def gn_gate(
     arms: str | Sequence[str],
     pos_tol: float,
     rot_tol: float,
+    kin=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge gate for :func:`gn_project_balanced`'s output, from one FK pass.
 
@@ -481,7 +482,7 @@ def gn_gate(
     index is a host-to-device copy.
 
     Args:
-        world: TAMPWorld (uses ``kinematics``, the CoM-enabled FK).
+        world: TAMPWorld (its tool frames, and the default ``kin``).
         q_full: ``[N, dof]`` full-cspace joint positions, contiguous float32
             on the kinematics device: cuRobo's FK raises otherwise.
             ``compute_com_polygon_mask`` moves and copies ``q``; this gate
@@ -491,6 +492,9 @@ def gn_gate(
             :func:`gn_project_balanced`.
         pos_tol: position tolerance (metres).
         rot_tol: rotation tolerance (radians).
+        kin: the CoM-enabled Kinematics to run the FK on; ``None`` means
+            ``world.kinematics``. ``_refresh_balanced`` passes the ``"gate"``
+            site (``TAMPWorld.site_kinematics``).
 
     Returns:
         ``(pose_ok [N] bool, com_ok [N] bool)``.
@@ -498,12 +502,11 @@ def gn_gate(
     from cutamp.com_polygon_cost import com_polygon_mask_from_state
     from cutamp.costs import curobo_pose_error
 
+    kin = world.kinematics if kin is None else kin
     N = q_full.shape[0]
     arms = _dep_arms(arms, N)
     _, is_left = _row_layout(arms, N // len(arms), q_full.shape[1], q_full.device, q_full.dtype)
-    state = world.kinematics.compute_kinematics(
-        JointState.from_position(q_full, joint_names=list(world.kinematics.joint_names))
-    )
+    state = kin.compute_kinematics(JointState.from_position(q_full, joint_names=list(kin.joint_names)))
     pos, quat = _row_tool_pose(
         state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left,
     )

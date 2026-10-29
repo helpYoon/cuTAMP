@@ -307,14 +307,10 @@ class CostFunction:
         # RetractFree: checks world + all movables
         # RetractHolding: checks world + movables excluding held object
         if self.retract_info and self._particles is not None:
-            # One FK for every retract conf, into fresh buffers. world.kinematics
-            # keeps FK outputs, backward state and returned gradients in one
-            # buffer set per batch shape, so separate same-shape calls (or one
-            # matching the rollout's FK shape) corrupt each other's gradients.
+            # One FK for every retract conf, on its own site (TAMPWorld.site_kinematics).
             q_retracts = torch.cat([self._particles[name] for name, _, _ in self.retract_info])
             num_particles = self._particles[self.retract_info[0][0]].shape[0]
-            kin_model = self.world.kinematics
-            kin_model.update_batch_size(q_retracts.shape[0], 1, reset_buffers=True)
+            kin_model = self.world.site_kinematics("retract")
             all_retract_spheres = kin_model.compute_kinematics(JointState.from_position(q_retracts)).robot_spheres
             for (q_retract_name, is_holding, held_obj), retract_spheres in zip(
                 self.retract_info, all_retract_spheres.split(num_particles)  # each (b, h, n, 4)
