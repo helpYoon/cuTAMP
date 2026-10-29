@@ -4,7 +4,8 @@ The refresh stacks every IK dep into one sync-free call, which rests on
 three claims pinned here: the branch-free rotation log map is roma's, bit
 for bit; a dep-major stack steps every row exactly as its dep's own call
 would; and each row's pins and frame follow its own dep's arm, checked on
-the interleaved (left, right, left, right) order a real refresh uses.
+two of the arm orders real blocks_t1 refreshes use: (left, right, left,
+right) and (left, right, right, left).
 """
 import math
 
@@ -88,9 +89,10 @@ def test_balanced_step_moves_no_pinned_column():
     assert torch.all(step[col_mask == 0] == 0)
     assert torch.any(step[col_mask == 1] != 0)  # not vacuous: the free columns move
 
-    # The pins themselves, in a real blocks_t1 refresh's interleaved arm order
-    # (left_q1, right_q1, left_q3, right_q3), against a layout built block by
-    # block: the base and each block's inactive arm pinned, its own arm's frame.
+    # The pins themselves, in two of the arm orders real blocks_t1 refreshes use,
+    # (left_q1, right_q1, left_q3, right_q3) and (left_q1, right_q1, right_q3,
+    # left_q3), each against a layout built block by block: the base and each
+    # block's inactive arm pinned, its own arm's frame.
     layout, is_left = _row_layout(("left", "right", "left", "right"), 3, 21, torch.device("cpu"), torch.float32)
     expected = torch.ones(12, 21)
     expected[:, BASE_INDICES] = 0
@@ -100,3 +102,13 @@ def test_balanced_step_moves_no_pinned_column():
     expected[9:12, LEFT_ARM_INDICES] = 0
     assert torch.equal(layout, expected)
     assert torch.equal(is_left, torch.tensor([True, False, True, False]).repeat_interleave(3))
+
+    layout, is_left = _row_layout(("left", "right", "right", "left"), 3, 21, torch.device("cpu"), torch.float32)
+    expected = torch.ones(12, 21)
+    expected[:, BASE_INDICES] = 0
+    expected[0:3, RIGHT_ARM_INDICES] = 0
+    expected[3:6, LEFT_ARM_INDICES] = 0
+    expected[6:9, LEFT_ARM_INDICES] = 0
+    expected[9:12, RIGHT_ARM_INDICES] = 0
+    assert torch.equal(layout, expected)
+    assert torch.equal(is_left, torch.tensor([True, False, False, True]).repeat_interleave(3))
