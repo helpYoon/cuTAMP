@@ -67,7 +67,7 @@ def sphere_to_sphere_overlap(
 ) -> torch.Tensor:
     """
     Compute the overlap volume between two sets of spheres. Can be used as a collision distance function. If
-    use_aabb_check=True, we compute the overlap only for batches of spheres that have intersecting AABBs.
+    use_aabb_check=True, the overlap is zero for batches of spheres whose AABBs don't intersect.
     """
     if not use_aabb_check:
         return _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance)
@@ -81,10 +81,10 @@ def sphere_to_sphere_overlap(
     min_2, max_2 = aabb_2.unbind(-2)
     intersect = (min_1 <= max_2).all(-1) & (max_1 >= min_2).all(-1)  # [b, *h]
 
-    output = torch.zeros_like(intersect, dtype=torch.float32)  # [b, *h]
-    if intersect.any():
-        # Only compute overlap for intersecting AABBs
-        output[intersect] = _sphere_to_sphere_overlap(spheres_1[intersect], spheres_2[intersect], activation_distance)
+    # Every batch's overlap, kept where the AABBs intersect. Computing only those
+    # batches took host syncs (intersect.any(), and the boolean-mask gathers and
+    # write), which a CUDA graph can't capture.
+    output = torch.where(intersect, _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance), 0.0)
     return output
 
 

@@ -38,11 +38,22 @@ from cutamp.task_planning.costs import TrajectoryLength
 from cutamp.utils.common import transform_spheres
 
 
-@lru_cache
+@lru_cache(maxsize=None)
 def _device_const(values: tuple, device, dtype=None) -> torch.Tensor:
     """``values`` on ``device``, made once: ``torch.tensor`` from a Python
-    sequence is a blocking host-to-device copy. Shared; never mutate."""
+    sequence is a blocking host-to-device copy. Shared; never mutate. Never
+    evicted, since a captured CUDA graph keeps reading its address."""
     return torch.tensor(values, device=device, dtype=dtype)
+
+
+def _pairwise_upper_sum(x: torch.Tensor) -> torch.Tensor:
+    """``[B]``: the sums of ``x`` ``[B, n, n]`` over each strict upper triangle,
+    gathered by index in row-major order, the order cfa7a46's triu boolean-mask
+    gather took, so the sums are the same. The mask's gather syncs on its
+    ``nonzero``; ``triu_indices`` builds the index on the device."""
+    n = x.shape[-1]
+    iu = torch.triu_indices(n, n, 1, device=x.device)
+    return x[:, iu[0], iu[1]].sum(-1)
 
 
 def _per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
@@ -413,8 +424,7 @@ class CostFunction:
                 return last_obj_position[..., :2].norm(dim=-1).sum(dim=-1)
             elif cost_name in ("max_obj_dist", "min_obj_dist"):
                 all_obj_dists = torch.cdist(last_obj_position, last_obj_position, p=2)
-                mask = torch.triu(torch.ones_like(all_obj_dists), diagonal=1) == 1
-                dists_sum = all_obj_dists[mask].view(mask.shape[0], -1).sum(-1)
+                dists_sum = _pairwise_upper_sum(all_obj_dists)
                 return -dists_sum if cost_name == "max_obj_dist" else dists_sum
             else:  # min_y or max_y
                 last_y = last_obj_position[..., 1].sum(dim=-1)
@@ -426,8 +436,7 @@ class CostFunction:
             last_obj_yaw = roma.rotmat_to_euler("XYZ", last_obj_mat3x3)[..., 2]
             yaw_diffs = last_obj_yaw[:, :, None] - last_obj_yaw[:, None, :]
             yaw_diffs = torch.atan2(torch.sin(yaw_diffs), torch.cos(yaw_diffs)).abs()
-            mask = torch.triu(torch.ones_like(yaw_diffs), diagonal=1) == 1
-            return yaw_diffs[mask].view(mask.shape[0], -1).sum(-1)
+            return _pairwise_upper_sum(yaw_diffs)
         
         # Retract close to home — penalize body slice (post-base) deviation
         # from the configured T1 home pose.

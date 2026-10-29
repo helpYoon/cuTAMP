@@ -2,7 +2,9 @@
 
 HEAD's math is cfa7a46 + B0 (ruling 11): goal_in_xy summed per object in a
 fixed order, frozen here as :func:`_head_per_object_sum`. No oracle may vendor
-``stable_placement_costs`` or restore ``scatter_add_``.
+``stable_placement_costs`` or restore ``scatter_add_``. The sync-free edits'
+HEAD forms are frozen here too: :func:`_head_sphere_to_sphere_overlap`,
+:func:`_head_fk_state` and :func:`_head_upper_sum`.
 
 Every in-loop step, one ``_StepBody`` call, first runs twice more on clones of
 its particles: once under :func:`_head_math`, and once as the code now runs it
@@ -19,6 +21,7 @@ import pytest
 import torch
 
 from cutamp.config import SUPPORTED_SOFT_COSTS
+from cutamp.costs import _sphere_to_sphere_overlap, get_aabb_from_spheres
 from cutamp.tests.conftest import (
     SpyVis, assert_bitwise, clone_particles, make_plan_info, needs_cuda, run_optimizer, step_outputs, twin_body,
 )
@@ -55,16 +58,77 @@ def _head_per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tens
     return torch.stack([block.sum(-1) for block in x.split(counts, dim=1)], dim=1)
 
 
+# A verbatim copy of cutamp.costs.sphere_to_sphere_overlap at cfa7a46 (costs.py:61-88):
+# the AABB branch's host-synced form, which P1 replaces with a dense torch.where.
+def _head_sphere_to_sphere_overlap(
+    spheres_1: torch.Tensor,
+    spheres_2: torch.Tensor,
+    activation_distance: float | None = None,
+    use_aabb_check: bool = False,
+) -> torch.Tensor:
+    """
+    Compute the overlap volume between two sets of spheres. Can be used as a collision distance function. If
+    use_aabb_check=True, we compute the overlap only for batches of spheres that have intersecting AABBs.
+    """
+    if not use_aabb_check:
+        return _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance)
+
+    # Compute AABB for each batch of spheres
+    aabb_1 = get_aabb_from_spheres(spheres_1)  # [b, *h, 2, 3]
+    aabb_2 = get_aabb_from_spheres(spheres_2)  # [b, *h, 2, 3]
+
+    # Check intersection
+    min_1, max_1 = aabb_1.unbind(-2)
+    min_2, max_2 = aabb_2.unbind(-2)
+    intersect = (min_1 <= max_2).all(-1) & (max_1 >= min_2).all(-1)  # [b, *h]
+
+    output = torch.zeros_like(intersect, dtype=torch.float32)  # [b, *h]
+    if intersect.any():
+        # Only compute overlap for intersecting AABBs
+        output[intersect] = _sphere_to_sphere_overlap(spheres_1[intersect], spheres_2[intersect], activation_distance)
+    return output
+
+
+# A verbatim copy of cutamp.com_polygon_cost._fk_state as Task 1 (447dae3) committed it:
+# it keeps the identity reorder kin.get_active_js(js), whose index is a host-to-device
+# copy, which P2 drops.
+def _head_fk_state(world, q_batch: torch.Tensor, kin=None):
+    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through ``kin``
+    (``None``: ``world.kinematics``); return its kinematics state.
+    Differentiable through cuRobo's FK chain."""
+    from curobo.types import JointState
+    kin = world.kinematics if kin is None else kin
+    q_batch = q_batch.to(kin.device_cfg.device)
+    if q_batch.ndim == 1:
+        q_batch = q_batch.unsqueeze(0)
+    js = JointState.from_position(q_batch, joint_names=list(kin.joint_names))
+    return kin.compute_kinematics(kin.get_active_js(js))
+
+
+def _head_upper_sum(x: torch.Tensor) -> torch.Tensor:
+    """``[B]``: the sum of ``x`` ``[B, n, n]`` over its strict upper triangle, by
+    cfa7a46's triu boolean-mask gather (cost_function.py:409-410, :422-423),
+    which syncs on its ``nonzero``. P12's ``_pairwise_upper_sum`` replaces it."""
+    return x[torch.triu(torch.ones_like(x), diagonal=1) == 1].view(x.shape[0], -1).sum(-1)
+
+
 @contextmanager
 def _head_math(world):
     """HEAD's math: every FK site on the one shared ``world.kinematics``, and
-    :func:`_head_per_object_sum` for goal_in_xy's sum. The reset before each FK
+    the frozen HEAD functions: :func:`_head_per_object_sum` for goal_in_xy's
+    sum, :func:`_head_sphere_to_sphere_overlap` for the collision costs,
+    :func:`_head_fk_state` for the CoM FK and :func:`_head_upper_sum` for the
+    triu soft costs. Never vendor ``stable_placement_costs`` here, or restore
+    ``scatter_add_`` (ruling 11): B0's sum is HEAD's. The reset before each FK
     call keeps two live calls off one set of buffers, the job HEAD's two resets
     did; which buffers a call uses doesn't change its values. Yields the shared
     :class:`_ResetFK`."""
     shared = _ResetFK(world.kinematics)
     with mock.patch.object(world, "site_kinematics", lambda name: shared), \
-            mock.patch("cutamp.cost_function._per_object_sum", _head_per_object_sum):
+            mock.patch("cutamp.cost_function._per_object_sum", _head_per_object_sum), \
+            mock.patch("cutamp.cost_function.sphere_to_sphere_overlap", _head_sphere_to_sphere_overlap), \
+            mock.patch("cutamp.com_polygon_cost._fk_state", _head_fk_state), \
+            mock.patch("cutamp.cost_function._pairwise_upper_sum", _head_upper_sum):
         yield shared
 
 

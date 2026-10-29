@@ -113,7 +113,7 @@ def _dep_arms(arms: str | Sequence[str], rows: int) -> tuple[str, ...]:
     return arms
 
 
-@lru_cache
+@lru_cache(maxsize=None)
 def _row_layout(arms: tuple[str, ...], rows: int, dof: int, device, dtype):
     """Per-row layout of ``len(arms)`` dep-major blocks of ``rows`` rows each,
     block ``i`` on ``arms[i]``: ``(col_mask [N, dof], is_left [N] bool)`` with
@@ -122,7 +122,8 @@ def _row_layout(arms: tuple[str, ...], rows: int, dof: int, device, dtype):
     The column mask is the IK solver's cspace pin (base + inactive arm
     immobile); ``is_left`` picks each row's tool frame. Made once per layout:
     building it from Python data is a blocking host-to-device copy. Shared;
-    never mutate.
+    never mutate. Never evicted, since a captured CUDA graph keeps reading
+    its addresses.
     """
     if not set(arms) <= {"left", "right"}:
         raise ValueError(f"arms must each be 'left' or 'right', got {arms}")
@@ -137,10 +138,11 @@ def _row_layout(arms: tuple[str, ...], rows: int, dof: int, device, dtype):
     )
 
 
-@lru_cache
+@lru_cache(maxsize=None)
 def _limit_margins(device, dtype):
     """``T1_LIMIT_MARGIN_LOWER/UPPER`` on ``device``, made once (a blocking
-    host-to-device copy otherwise). Shared; never mutate."""
+    host-to-device copy otherwise). Shared; never mutate. Never evicted, since
+    a captured CUDA graph keeps reading their addresses."""
     return (
         torch.tensor(T1_LIMIT_MARGIN_LOWER, device=device, dtype=dtype),
         torch.tensor(T1_LIMIT_MARGIN_UPPER, device=device, dtype=dtype),

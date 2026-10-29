@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import os
 import sys
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -241,6 +242,19 @@ def assert_bitwise(got, want, where: str) -> None:
             fail(path, f"max abs diff n/a: got {kind(g)}, want {kind(w)}")
 
     walk(got, want, "")
+
+
+@contextmanager
+def sync_debug_error():
+    """Raise a ``RuntimeError`` on every synchronizing CUDA call in the block:
+    sync debug mode ``"error"``, set back to ``0`` (off) on the way out. The
+    mode is a prototype that warns on entry, and it misses driver-API waits,
+    which :func:`cupti_sync_events` catches."""
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
 
 
 def cupti_sync_events() -> dict:

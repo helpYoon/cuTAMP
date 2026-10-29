@@ -121,6 +121,16 @@ def _adam_consider_types(config: TAMPConfiguration) -> set:
     return consider
 
 
+def _adam_param_groups(params: List[Tuple[torch.Tensor, bool]], conf_lr: float) -> List[dict]:
+    """Adam param groups for ``(tensor, is_conf)`` pairs, one per learning
+    rate: the non-Confs at the optimizer's ``lr``, then the Confs at
+    ``conf_lr``, each in ``params``' order. An empty group is left out. Adam
+    updates each element as one group per tensor would, in fewer launches."""
+    non_confs = [p for p, is_conf in params if not is_conf]
+    confs = [p for p, is_conf in params if is_conf]
+    return [g for g in ({"params": non_confs}, {"params": confs, "lr": conf_lr}) if g["params"]]
+
+
 @dataclass
 class _StepBody:
     """One in-loop Adam step's device work, which the loop calls once per
@@ -664,7 +674,7 @@ class ParticleOptimizer:
             rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
         ) if ik_deps else None
 
-        param_groups = []
+        pairs = []  # (tensor, is a Conf) per optimized param, for _adam_param_groups
         param_msg = []
         # Initial configurations that we don't optimize
         initial_confs = {"q0", "left_q0", "right_q0"}
@@ -683,17 +693,16 @@ class ParticleOptimizer:
                 val.requires_grad = False
                 continue
             param_msg.append(f"(param: {param} = {tuple(val.shape)})")
-            group = {"params": val}
-            if param_type == Conf:
-                group["lr"] = self.config.conf_lr
-            param_groups.append(group)
+            pairs.append((val, param_type == Conf))
             opt_metrics["opt_params"][param] = {"type": param_type, "shape": list(val.shape)}
             val.requires_grad = True
 
-        if not param_groups:
+        if not pairs:
             raise RuntimeError(f"No parameters to optimize! For plan skeleton: {plan_skeleton}")
 
-        optimizer = Adam(params=param_groups, lr=self.config.lr)
+        # P14: one group per learning rate, not one per param. Adam launches its
+        # foreach kernels once per group, and each element's update is unchanged.
+        optimizer = Adam(params=_adam_param_groups(pairs, self.config.conf_lr), lr=self.config.lr)
 
         # Per-conf gradient mask: hard-zero DOFs that should not move during
         # this operator (e.g., base + inactive arm during arm operations).

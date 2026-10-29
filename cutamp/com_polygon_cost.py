@@ -45,10 +45,11 @@ COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadr
 COM_TOL = 4e-4                       # == COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2 (on-boundary penalty)
 
 
-@lru_cache
+@lru_cache(maxsize=None)
 def _half_extents(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """``COM_HALF_EXTENTS`` on ``device``, made once: ``torch.tensor`` from a
-    Python tuple is a blocking host-to-device copy. Shared; never mutate."""
+    Python tuple is a blocking host-to-device copy. Shared; never mutate.
+    Never evicted, since a captured CUDA graph keeps reading its address."""
     return torch.tensor(COM_HALF_EXTENTS, device=device, dtype=dtype)
 
 
@@ -158,7 +159,9 @@ def _fk_state(world, q_batch: torch.Tensor, kin=None):
     if q_batch.ndim == 1:
         q_batch = q_batch.unsqueeze(0)
     js = JointState.from_position(q_batch, joint_names=list(kin.joint_names))
-    return kin.compute_kinematics(kin.get_active_js(js))
+    # js is in kin's own joint order, so kin.get_active_js(js) would be an identity
+    # reorder, and its index a blocking host-to-device copy (as gn_gate notes).
+    return kin.compute_kinematics(js)
 
 
 def _com_and_base_from_state(ks):
