@@ -122,7 +122,8 @@ def entrypoint():
     parser.add_argument(
         "--reik_num_seeds", type=int, default=_defaults.reik_num_seeds,
         help="Use a dedicated low-seed, warm-started IK solver for re-IK refreshes "
-             "(cost ~linear in seeds; init and final refresh keep 32 seeds). 0 = main solver.",
+             "(cost ~linear in seeds; init and final refresh keep 32 seeds; no effect "
+             "with --reik_balance_first). 0 = main solver.",
     )
     parser.add_argument(
         "--no_reik_gn", dest="reik_gn", action="store_false",
@@ -138,7 +139,7 @@ def entrypoint():
     parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
         help="LBFGS iteration budget for the warm refresh/fallback solver "
-             "(multiple of 20; 0 = cuRobo default 100).",
+             "(multiple of 20; 0 = cuRobo default 100; no effect with --reik_balance_first).",
     )
     parser.add_argument(
         "--soft_cost",

@@ -70,7 +70,8 @@ from cutamp.robots.t1 import (
 )
 
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
-# fallback-rate instrumentation shows a fat non-converged band.
+# fallback-rate (default mode) or gn_fail (balance-first) instrumentation
+# shows a fat non-converged band.
 GN_ITERS = 3
 # Levenberg damping on JJ^T. Units mix metres/radians; at mm/mrad residuals
 # the conditioning effect dominates and the bias is negligible.
@@ -80,7 +81,9 @@ GN_DAMPING = 1e-4
 # (18 cm pose error), UNclamped steps overshoot to 45+ cm while clamped
 # descent converges linearly at ~0.7x error/iter. mm-scale refresh drift
 # never saturates it, so warm-start convergence stays effectively quadratic;
-# corrections big enough to ride the clamp belong to the cuRobo fallback.
+# corrections big enough to ride the clamp belong to the cuRobo fallback in
+# default mode; balance-first resumes them at the next refresh and repairs at
+# the final pre-check refresh.
 GN_STEP_CLAMP = 0.15
 # Balance-first only: a CoM axis outside the support rectangle (or that a step
 # would push out) is driven this far inside the edge, absorbing ~2-4 mm of

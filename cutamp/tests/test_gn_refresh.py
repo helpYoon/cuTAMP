@@ -367,8 +367,7 @@ def test_balanced_refresh_is_sync_free():
     else:
         warnings.warn("no torch profiler _ExperimentalConfig(enable_cuda_sync_events=...): driver-API syncs unchecked")
     assert all(particles[n].grad is None for n in names)
-    # Every row, the far deps' unconverged ones too, in place (Adam state and
-    # grad_masks hold these tensors).
+    # Every row, the far deps' unconverged ones too, written in place.
     assert all(particles[n] is c for n, c in zip(names, confs))
     assert torch.equal(torch.cat(confs), gn_project_balanced(world, before, T, arms))
 

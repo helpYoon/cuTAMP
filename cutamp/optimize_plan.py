@@ -217,9 +217,10 @@ class _ReikDriftGate:
     starved the satisfying pool and the early-stop signal). The third is
     balance-first mode's stall gate, which sent rows failing several
     consecutive refreshes to the cuRobo fallback. Stage 0 (2026-10-28,
-    blocks_t1, 12 seeds per arm at n=64 and n=256) found that never calling
-    cuRobo during Adam (arm E1) matched or beat it (arm E0) on satisfying
-    count and CoM feasibility, so that mode no longer does.
+    blocks_t1, 12 seeds per arm): never calling cuRobo during Adam (E1)
+    matched the stall gate (E0) at n=64 on a 0.5 m surface (final 62.75 vs
+    63.0, p=0.51) and beat it at n=256 on the ground (244.4 vs 238.7,
+    p=0.018), so that mode no longer does.
     """
 
     # Drift histogram bucket edges (metres) recorded per refresh.
@@ -253,10 +254,13 @@ class _ReikDriftGate:
                        gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
         """Append one ``stats`` record. ``drift`` is :meth:`_drift_stats` as
         Python floats, or ``None`` on the first refresh."""
-        # solve_s: in default mode, per-dep wall time from after measure_drift
-        # to after the merge or fallback; in balance-first mode, the refresh's
-        # CUDA-event span (target build through write-back) / D. Per-run sums
-        # are meaningful; per-dep values and cross-mode comparisons are not.
+        # solve_s: in default mode, each dep's own wall time from after
+        # measure_drift to after the merge or fallback (balance-first records from
+        # before the refresh became one batched call used this window too); in
+        # balance-first mode, the refresh's CUDA-event span (target build through
+        # write-back) / D, an even split. Per-run sums are meaningful in both; the
+        # windows differ, so don't compare solve_s across modes or with those older
+        # balance-first records.
         rec = {
             "step": step, "conf": q_name, "batch": batch,
             "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
@@ -347,8 +351,9 @@ def _refresh_balanced(
     Makes no host syncs once gn_refresh's cached constants exist, since the
     Adam loop is host-launch-bound: CUDA events time it, and
     ``gate.log_batch`` keeps the stats on the device until ``gate.flush()``.
-    The ``copy_`` keeps each Conf's tensor identity, which ``grad_masks`` and
-    Adam state depend on.
+    Rows are written in place with ``copy_``, like every particle write;
+    covered Confs are out of the optimizer, so no Adam state or grad mask
+    refers to them.
     """
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
@@ -421,8 +426,9 @@ class ParticleOptimizer:
 
         cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
         so the IK call cannot run under ``torch.no_grad``; only the in-place
-        ``copy_`` is wrapped. The ``copy_`` preserves tensor identity, which
-        ``grad_masks`` and Adam state both depend on.
+        ``copy_`` is wrapped. Rows are written in place with ``copy_``, like
+        every particle write; covered Confs are out of the optimizer, so no
+        Adam state or grad mask refers to them.
         """
         if not ik_deps:
             return
