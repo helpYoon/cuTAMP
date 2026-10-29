@@ -10,7 +10,9 @@ from cutamp.tests.conftest import needs_cuda
 def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_first):
     """Run cutamp_demo with --coupled_reik for a few Adam steps. Assert no
     exception, and that each mode refreshes through its own path: balance-first
-    through ``_refresh_balanced``, default through the per-dep ``gn_project``."""
+    through ``_refresh_balanced``, default through the per-dep ``gn_project``.
+    Setup builds the cuRobo refresh solver in default mode only: balance-first
+    runs no cuRobo during Adam, so its world has none."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
     import os
@@ -20,12 +22,17 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     from cutamp.scripts.run_cutamp import cutamp_demo
 
     calls = {"_refresh_balanced": 0, "gn_project": 0}
+    worlds = []  # the TAMPWorld every refresh ran on
+    # Where the world sits in each call: _refresh_balanced(particles, ik_deps, world, gate, step)
+    # and gn_project(world, q_full, world_from_ee, arm).
+    world_arg = {"_refresh_balanced": 2, "gn_project": 0}
 
     def count_calls(name):
         original = getattr(optimize_plan, name)
 
         def counted(*args, **kwargs):
             calls[name] += 1
+            worlds.append(args[world_arg[name]])
             return original(*args, **kwargs)
 
         monkeypatch.setattr(optimize_plan, name, counted)
@@ -64,6 +71,8 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     # Balance-first records reach opt_metrics only through the post-loop flush().
     records = opt_metrics.get("reik_refresh")
     assert records, "no reik_refresh records"
+    world = worlds[0]
+    assert all(w is world for w in worlds)
     if reik_balance_first:
         assert calls["_refresh_balanced"] >= 1 and calls["gn_project"] == 0, calls
         # No cuRobo during Adam: every GN miss stays a miss.
@@ -71,8 +80,15 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         # Drift needs a previous target: every record but the first refresh's has it.
         first = min(r["step"] for r in records)
         assert all(("pos_drift_mean" in r) == (r["step"] != first) for r in records)
+        # Nothing calls a refresh solver in this mode, so setup builds and captures none; a later
+        # access returns the main solver instead of starting a lazy, mid-run capture.
+        assert world._reik_num_seeds == 0
+        assert world._ik_refresh_solver is None
+        assert world.ik_refresh_solver is world.ik_solver
     else:
         assert calls["_refresh_balanced"] == 0 and calls["gn_project"] >= 1, calls
+        # With coupled_reik and the default 4 seeds, warmup builds and captures the refresh solver.
+        assert world._ik_refresh_solver is not None
 
 
 @needs_cuda

@@ -299,7 +299,8 @@ def setup_cutamp(
             coll_sphere_radius=config.coll_sphere_radius,
             enable_com_aware_ik=config.enable_com_aware_ik,
             ik_max_batch_size=config.num_particles,
-            reik_num_seeds=config.reik_num_seeds,
+            # Balance-first runs no cuRobo during Adam, so it needs no refresh solver.
+            reik_num_seeds=0 if config.reik_balance_first else config.reik_num_seeds,
             reik_lbfgs_iters=config.reik_lbfgs_iters,
         )
         check_tamp_world_not_in_collision(world)
