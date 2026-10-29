@@ -6,10 +6,11 @@ fixed order, frozen here as :func:`_head_per_object_sum`. No oracle may vendor
 
 Every in-loop step runs three more times on clones of its particles: twice as
 the code now runs it, and once under :func:`_head_math`. All three must match
-bitwise at every step, in both modes: run to run, and against HEAD, the gate
+bitwise at every step, in every case: run to run, and against HEAD, the gate
 for edits that change both arms.
 """
 
+import os
 from contextlib import contextmanager
 from typing import Dict, List, Tuple
 from unittest import mock
@@ -23,12 +24,15 @@ from cutamp.tests.conftest import (
 
 
 class _ResetFK:
-    """``kin`` with fresh buffers before every FK call; everything else delegates."""
+    """``kin`` with fresh buffers before every FK call, counted in ``calls``;
+    everything else delegates."""
 
     def __init__(self, kin):
         self._kin = kin
+        self.calls = 0
 
     def compute_kinematics(self, js):
+        self.calls += 1
         self._kin.update_batch_size(js.position.shape[0], 1, reset_buffers=True)
         return self._kin.compute_kinematics(js)
 
@@ -37,7 +41,9 @@ class _ResetFK:
 
 
 # A verbatim copy of cutamp.cost_function._per_object_sum as B0 (4cf62d9) committed it:
-# HEAD's goal_in_xy sum, frozen, so a later edit to production's sum fails "vs HEAD".
+# HEAD's goal_in_xy sum, frozen. The lockstep checks production's sum against it on the
+# run's own inputs, which are sparse; test_frozen_sum_matches_production checks it on
+# dense inputs at the run's layouts and two more, where a reordered sum changes bits.
 def _head_per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
     """``[B, len(counts)]``: the sums of ``x`` ``[B, sum(counts)]`` over consecutive
     column blocks of ``counts[i]`` columns, one fixed-order reduction per block.
@@ -53,11 +59,12 @@ def _head_math(world):
     """HEAD's math: every FK site on the one shared ``world.kinematics``, and
     :func:`_head_per_object_sum` for goal_in_xy's sum. The reset before each FK
     call keeps two live calls off one set of buffers, the job HEAD's two resets
-    did; which buffers a call uses doesn't change its values."""
+    did; which buffers a call uses doesn't change its values. Yields the shared
+    :class:`_ResetFK`."""
     shared = _ResetFK(world.kinematics)
     with mock.patch.object(world, "site_kinematics", lambda name: shared), \
             mock.patch("cutamp.cost_function._per_object_sum", _head_per_object_sum):
-        yield
+        yield shared
 
 
 def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_types, with_soft,
@@ -84,52 +91,117 @@ def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_
     return step_outputs(packed, (rollout, cost_dict, costs, satisfying_mask), [particles[n] for n in params])
 
 
+# The shared kinematics_config tensors the FK kernels take raw pointers to, besides each
+# site's own buffers: the forward's 9, then the 5 more the backward takes (curobo's
+# _src/curobolib/cuda_ops/kinematics.py:156-237, :325-355).
+_FK_CONFIG_TENSORS = (
+    "fixed_transforms", "link_spheres", "link_masses_com", "joint_map_type", "joint_map", "link_map",
+    "tool_frame_map", "link_sphere_idx_map", "joint_offset_map",
+    "link_chain_data", "link_chain_offsets", "joint_links_data", "joint_links_offsets", "joint_affects_endeffector",
+)
+
+
 def _site_ptrs(world) -> dict:
-    """Each built FK site's batch, horizon and buffer pointers."""
-    return {
-        name: (kin._batch, kin._horizon, tuple(0 if b is None else b.data_ptr() for b in kin._buffers.values()))
-        for name, kin in world._site_kinematics.items()
-    }
+    """Each built FK site's batch, horizon and buffer pointers, and under
+    ``"config"`` the pointers of the :data:`_FK_CONFIG_TENSORS` all sites share."""
+    def ptr(t):
+        return 0 if t is None else t.data_ptr()
+
+    cfg = world.kinematics.config.kinematics_config
+    ptrs = {name: (kin._batch, kin._horizon, tuple(map(ptr, kin._buffers.values())))
+            for name, kin in world._site_kinematics.items()}
+    ptrs["config"] = tuple(ptr(getattr(cfg, n)) for n in _FK_CONFIG_TENSORS)
+    return ptrs
 
 
 @needs_cuda
-@pytest.mark.parametrize("reik_balance_first", [False, True])
-def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first):
+@pytest.mark.parametrize("reik_balance_first,coupled_reik", [(False, True), (True, True), (False, False)])
+def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, coupled_reik):
     # Each in-loop step, on clones: the dedicated never-reset FK sites run to run,
     # then vs HEAD's one shared instance, bitwise. The sites' buffers never move.
+    # Coupled re-IK drops every FK-fed Conf from Adam, so no compared grad comes out
+    # of an FK backward; with coupled_reik=False, Adam optimizes them and one does.
+    import cutamp.cost_function as cost_function
+    from curobo.kinematics import Kinematics
     from cutamp.config import TAMPConfiguration
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_reduction import CostReducer
     from cutamp.optimize_plan import _adam_consider_types
     from cutamp.rollout import RolloutFunction
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
+    from cutamp.t1_domain import Conf
 
     world, skeleton, base = blocks_t1_plan
+    # The cases share blocks_t1_plan's world, which keeps every site it builds.
+    monkeypatch.setattr(world, "_site_kinematics", {})
     config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0,
-                               reik_balance_first=reik_balance_first, enable_visualizer=False)
+                               reik_balance_first=reik_balance_first, coupled_reik=coupled_reik,
+                               force_adam=not coupled_reik, enable_visualizer=False)
+    orig_fk, fk_calls = Kinematics.compute_kinematics, []
+
+    def counted_fk(kin, *args, **kwargs):  # every FK call, however the caller got its instance
+        fk_calls.append(kin)
+        return orig_fk(kin, *args, **kwargs)
+
+    def site_calls() -> int:
+        return sum(any(kin is site for site in world._site_kinematics.values()) for kin in fk_calls)
+
+    monkeypatch.setattr(Kinematics, "compute_kinematics", counted_fk)
     plan_info = make_plan_info(world, skeleton, clone_particles(base), config)
     step_args = (plan_info["cost_fn"], CostReducer(default_constraint_to_mult.copy()),
                  ConstraintChecker(default_constraint_to_tol.copy()).get_mask,
                  _adam_consider_types(config), config.soft_cost is not None)
+    confs = {v for op in skeleton for v, prm in zip(op.values, op.operator.parameters) if prm.type == Conf}
     orig, ptrs = RolloutFunction.__call__, []
 
     def spy(self, p):
         if torch.is_grad_enabled():  # the in-loop forward: the init and final rollouts run under no_grad
             k, params = len(ptrs), [n for n, t in p.items() if t.requires_grad]
+            fk_calls.clear()
             new = _head_step(clone_particles(p), lambda x: orig(self, x), *step_args, params, {})
+            n_site = site_calls()
             again = _head_step(clone_particles(p), lambda x: orig(self, x), *step_args, params, {})
-            with _head_math(world):
+            fk_calls.clear()
+            with _head_math(world) as shared:
+                assert cost_function._per_object_sum is _head_per_object_sum, f"step {k}"
                 ref = _head_step(clone_particles(p), lambda x: orig(self, x), *step_args, params, {})
+            assert shared.calls == n_site > 0 and site_calls() == 0, (  # the oracle reached every FK call
+                f"step {k}: new made {n_site} site FK calls; ref {shared.calls} reset ones, {site_calls()} site ones")
             assert_bitwise(again, new, f"step {k}: run to run")
             assert_bitwise(new, ref, f"step {k}")
+            if k == 0 and not coupled_reik:  # the gate sees an FK backward
+                assert any(n in confs and g is not None and bool(g.ne(0).any())
+                           for n, g in zip(params, new["grads"])), f"no optimized Conf has a nonzero grad: {params}"
             ptrs.append(_site_ptrs(world))
         return orig(self, p)
 
     monkeypatch.setattr(RolloutFunction, "__call__", spy)
+    print("blocks_t1_plan:", " | ".join(op.name for op in skeleton),
+          f"(PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')})")
     run_optimizer(plan_info, config)
     assert len(ptrs) == 50
-    for site in ("rollout", "retract", "com"):
+    for k, p in enumerate(ptrs):  # a site that is never built fails by name
+        want = {"rollout", "retract", "com"} | ({"gate"} if reik_balance_first and k >= 5 else set())
+        assert p.keys() - {"config"} == want, f"step {k}: sites {sorted(p.keys() - {'config'})}, want {sorted(want)}"
+    for site in ("rollout", "retract", "com", "config"):
         assert all(p[site] == ptrs[0][site] for p in ptrs), site
     if reik_balance_first:  # refresh #1, at step 4, builds the gate site
-        gates = [p.get("gate") for p in ptrs[5:]]
-        assert gates[0] is not None and gates == [gates[0]] * len(gates)
+        assert all(p["gate"] == ptrs[5]["gate"] for p in ptrs[5:]), "gate"
+
+
+@needs_cuda
+def test_frozen_sum_matches_production(blocks_t1_plan):
+    # Dense inputs at the run's layouts and two more: production's goal_in_xy sum
+    # equals the frozen copy bitwise, forward and grad with respect to x.
+    from cutamp.config import TAMPConfiguration
+    from cutamp.cost_function import CostFunction, _per_object_sum
+
+    world, skeleton, _ = blocks_t1_plan
+    layouts = CostFunction(skeleton, world, TAMPConfiguration(num_particles=64)).surface_to_sphere_counts.values()
+    g = torch.Generator("cuda").manual_seed(0)
+    for counts in [*layouts, (37, 50, 13), (200, 56)]:
+        x = torch.rand(64, sum(counts), device="cuda", generator=g, requires_grad=True)
+        gy = torch.rand(64, len(counts), device="cuda", generator=g)
+        got, want = _per_object_sum(x, counts), _head_per_object_sum(x, counts)
+        assert_bitwise([got, *torch.autograd.grad(got, x, gy)], [want, *torch.autograd.grad(want, x, gy)],
+                       f"counts {counts}")

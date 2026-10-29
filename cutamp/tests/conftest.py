@@ -2,6 +2,8 @@
 
 import gc
 import os
+import sys
+import traceback
 
 import pytest
 import torch
@@ -45,9 +47,12 @@ def _free_cuda_between_tests():
     """Release GPU memory after heavy tests. Integration tests build full
     TAMPWorld stacks (several GiB each); without reclaiming between tests,
     two heavy tests in one process OOM a 24 GiB card. Gated on reserved
-    memory so the dozens of CPU/light tests skip the gc.collect() tax."""
+    memory so the dozens of CPU/light tests skip the gc.collect() tax. A
+    failed test's frames, which pytest keeps in ``sys.last_traceback``, are
+    cleared first: they hold its locals."""
     yield
     if torch.cuda.is_available() and torch.cuda.memory_reserved() > (1 << 30):
+        traceback.clear_frames(getattr(sys, "last_traceback", None))
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -58,25 +63,36 @@ def blocks_t1_plan():
     builds for 64 particles, the first task plan, and its seeded 64-particle
     init. Tests never write to it: they run on ``clone_particles(particles)``.
     A module that uses it must not build a second world (two OOM a 24 GiB card).
+    numpy is seeded over the world build and the init, then restored: it
+    samples the block spheres. The plan follows PYTHONHASHSEED.
 
     A list, so its teardown can free the world: pytest runs a fixture's
     teardown before it drops the cached value, and the module's last test
     still holds the yielded object until after teardown. The autouse
     ``_free_cuda_between_tests`` runs before module teardown, so it can't.
+    A failed test's frames in ``sys.last_traceback`` hold its locals until
+    the next test's call phase, so the teardown clears them first.
     """
+    import numpy as np
     from cutamp.config import TAMPConfiguration
     from cutamp.particle_initialization import ParticleInitializer
     from cutamp.t1_domain import all_t1_operators
     from cutamp.task_planning import task_plan_generator
 
-    world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
-    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
-    torch.manual_seed(0)
-    particles = ParticleInitializer(world, TAMPConfiguration(num_particles=64))(skeleton)
+    rng = np.random.get_state()
+    np.random.seed(0)
+    try:
+        world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
+        skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+        torch.manual_seed(0)
+        particles = ParticleInitializer(world, TAMPConfiguration(num_particles=64))(skeleton)
+    finally:
+        np.random.set_state(rng)
     plan = [world, skeleton, particles]
     del world, skeleton, particles  # the list holds the only references
     yield plan
     plan.clear()
+    traceback.clear_frames(getattr(sys, "last_traceback", None))
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -145,37 +161,40 @@ def step_outputs(packed, vis, params) -> dict:
 
 
 def assert_bitwise(got, want, where: str) -> None:
-    """``got`` equals ``want`` bitwise: ``torch.equal`` on every tensor, through
-    lists, tuples and dicts of tensors and ``None``; ``None`` must meet
-    ``None``. The ``AssertionError`` names ``where``, the first differing path
-    and its max abs diff."""
+    """``got`` equals ``want`` bitwise: the same dtype, shape and device, then
+    ``torch.equal``, on every tensor, through lists, tuples and dicts. Other
+    leaves, ``None`` among them, must have the same type and compare equal.
+    The ``AssertionError`` names ``where``, the first differing path and its
+    max abs diff, ``n/a`` when the dtype, shape, device or structure differs:
+    ``torch.equal`` alone promotes, so it passes f32 against f64 or bool."""
     def fail(path, detail):
         raise AssertionError(f"{where}: {path or 'value'} differs, {detail}")
 
     def kind(x):
         if isinstance(x, torch.Tensor):
-            return f"{x.dtype} {tuple(x.shape)}"
+            return f"{x.dtype} {tuple(x.shape)} on {x.device}"
         if isinstance(x, dict):
             return f"dict with keys {list(x)}"
         if isinstance(x, (list, tuple)):
             return f"{type(x).__name__} of {len(x)}"
         return type(x).__name__
 
+    nodes = (torch.Tensor, dict, list, tuple)
+
     def walk(g, w, path):
         if isinstance(w, torch.Tensor) and isinstance(g, torch.Tensor):
-            if torch.equal(g, w):
-                return
-            if g.shape != w.shape or g.dtype != w.dtype:
+            if g.dtype != w.dtype or g.shape != w.shape or g.device != w.device:
                 fail(path, f"max abs diff n/a: {kind(g)} vs {kind(w)}")
-            fail(path, f"max abs diff {(g.double() - w.double()).abs()[g != w].max().item()}")
+            if not torch.equal(g, w):
+                fail(path, f"max abs diff {(g.double() - w.double()).abs()[g != w].max().item()}")
         elif isinstance(w, dict) and isinstance(g, dict) and g.keys() == w.keys():
             for k in w:
                 walk(g[k], w[k], f"{path}[{k!r}]" if path else str(k))
         elif isinstance(w, (list, tuple)) and type(g) is type(w) and len(g) == len(w):
             for i, (gi, wi) in enumerate(zip(g, w)):
                 walk(gi, wi, f"{path}[{i}]")
-        elif g is not None or w is not None:
-            fail(path, f"got {kind(g)}, want {kind(w)}")
+        elif isinstance(g, nodes) or isinstance(w, nodes) or not (type(g) is type(w) and g == w):
+            fail(path, f"max abs diff n/a: got {kind(g)}, want {kind(w)}")
 
     walk(got, want, "")
 

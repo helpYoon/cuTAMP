@@ -256,7 +256,11 @@ class TAMPWorld:
            pointer (``curobo/_src/curobolib/kernels/kinematics/
            kinematics_backward_kernel.cuh:138``, ``:153``). No gradient reads
            what an earlier call left, and the zero-filled gradient inputs the
-           backward falls back on stay zero.
+           backward falls back on stay zero. The backward returns ``grad_out``
+           itself, so a site's joint gradient, and a ``.grad`` that adopted
+           it, holds only until that site's next backward: clear ``.grad``
+           (``zero_grad(set_to_none=True)``) or clone it before a second
+           backward through the same site.
         3. Fixed buffers: a site's buffers change only with its batch shape, so
            a CUDA graph can bake them in whatever the call order. A graph that
            bakes buffers allocated before capture writes freed memory once an
