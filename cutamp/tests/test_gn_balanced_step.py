@@ -3,8 +3,8 @@
 The refresh stacks every IK dep into one sync-free call, which rests on
 three claims pinned here: the branch-free rotation log map is roma's, bit
 for bit; a dep-major stack steps every row exactly as its dep's own call
-would; and each row's pins and frame follow its own dep's arm, in any arm
-order.
+would; and each row's pins and frame follow its own dep's arm, checked on
+the interleaved (left, right, left, right) order a real refresh uses.
 """
 import math
 

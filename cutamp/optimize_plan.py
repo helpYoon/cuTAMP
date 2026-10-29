@@ -352,8 +352,8 @@ def _refresh_balanced(
     Adam loop is host-launch-bound: CUDA events time it, and
     ``gate.log_batch`` keeps the stats on the device until ``gate.flush()``.
     Rows are written in place with ``copy_``, like every particle write;
-    covered Confs are out of the optimizer, so no Adam state or grad mask
-    refers to them.
+    covered Confs are out of the optimizer, so neither Adam nor
+    ``apply_grad_masks`` (which walks only optimizer params) touches them.
     """
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
@@ -427,8 +427,9 @@ class ParticleOptimizer:
         cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
         so the IK call cannot run under ``torch.no_grad``; only the in-place
         ``copy_`` is wrapped. Rows are written in place with ``copy_``, like
-        every particle write; covered Confs are out of the optimizer, so no
-        Adam state or grad mask refers to them.
+        every particle write; covered Confs are out of the optimizer, so
+        neither Adam nor ``apply_grad_masks`` (which walks only optimizer
+        params) touches them.
         """
         if not ik_deps:
             return
