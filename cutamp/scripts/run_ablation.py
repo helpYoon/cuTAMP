@@ -1,8 +1,10 @@
 """Runner for the standard-cuTAMP 2x2 ablation study.
 
-Sweeps 4 cells x heights x seeds, one sequential GPU run each, writing
+Sweeps the cells x heights x seeds, one sequential GPU run each, writing
 standard experiment dirs plus a resumable manifest. See
 docs/superpowers/specs/2026-08-05-standard-cutamp-baseline-design.md.
+The 2x2 is balance (CoM) x re-IK on the balance-first refresh, plus
+``default_reik``, the full system on the default refresh.
 
 Usage:
     python -m cutamp.scripts.run_ablation --out /tmp/ablation-study
@@ -15,17 +17,20 @@ import subprocess
 import sys
 from pathlib import Path
 
+BALANCE_FIRST = ["--reik_balance_first", "--cuda_graphs"]
 CELLS = {
-    "full": [],
-    "no_com": ["--no_com_all"],
+    "full": BALANCE_FIRST,
+    "default_reik": [],
+    "no_com": ["--no_com_all"] + BALANCE_FIRST,
     "no_reik": ["--no_coupled_reik", "--force_adam", "--soft_in_adam", "always"],
     "standard": ["--no_com_all", "--no_coupled_reik", "--force_adam",
                  "--soft_in_adam", "always"],
 }
 HEIGHTS = [0.0, 0.25, 0.50, 0.65]
-SEEDS = [0, 1, 2, 3, 4]
-BASE_ARGS = ["-n", "512", "--disable_visualizer", "--motion_plan"]
-SMOKE_ARGS = ["-n", "64", "--num_opt_steps", "30", "--disable_visualizer"]
+SEEDS = list(range(10))
+SOFT_ARGS = ["--soft_cost", "joint_limit_margin"]  # one soft-cost setting for every arm
+BASE_ARGS = ["-n", "512", "--disable_visualizer", "--motion_plan"] + SOFT_ARGS
+SMOKE_ARGS = ["-n", "64", "--num_opt_steps", "30", "--disable_visualizer"] + SOFT_ARGS
 
 
 def build_run_plan(heights=HEIGHTS, seeds=SEEDS, smoke=False):

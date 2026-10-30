@@ -99,7 +99,7 @@ def test_skip_non_done_status(tmp_path):
 def test_main_writes_outputs(tmp_path, monkeypatch):
     manifest = [
         _fake_run(tmp_path, c, h, s)
-        for c in ("full", "no_com", "no_reik", "standard")
+        for c in ("full", "default_reik", "no_com", "no_reik", "standard")
         for h in (0.0, 0.5) for s in (0, 1)
     ]
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -195,3 +195,52 @@ def test_compute_deltas_paired_by_height_and_seed():
     agg = aggregate_deltas(rows)
     mean, std = agg[("standard", 0.0)]["num_satisfying_final"]
     assert mean == -15.0 and round(std, 3) == round(statistics.stdev([-40, 10]), 3)
+
+
+def _patch(run, overall=None, refreshes=None):
+    exp = Path(run["experiment_path"])
+    if overall is not None:
+        m = json.loads((exp / "overall_metrics.json").read_text())
+        (exp / "overall_metrics.json").write_text(json.dumps({**m, **overall}))
+    if refreshes is not None:
+        o = json.loads((exp / "optimization" / "opt_0001.json").read_text())
+        o["reik_refresh"] = [{"fallback": f} for f in refreshes]
+        (exp / "optimization" / "opt_0001.json").write_text(json.dumps(o))
+
+
+def test_stable_plan_wilson_and_curobo_calls(tmp_path, monkeypatch):
+    import math
+    import sys
+    from cutamp.scripts import analyze_ablation
+    from cutamp.scripts.analyze_ablation import stable_rates, wilson
+
+    runs = {(c, s): _fake_run(tmp_path, c, 0.0, s) for c in ("full", "default_reik") for s in (0, 1, 2)}
+    _patch(runs["full", 0], {"motion_plan_success": True}, [False, False])  # viol 0.0: balanced
+    _patch(runs["full", 1], {"motion_plan_success": False})                 # no plan
+    # full s2: no motion_plan_success key -> unknown, dropped from n
+    _patch(runs["default_reik", 0], {"motion_plan_success": True}, [True, False, True])  # viol 0.2
+    _patch(runs["default_reik", 1], {"motion_plan_success": True, "traj_com_violation_frac": None})  # audit failed
+    (tmp_path / "manifest.json").write_text(json.dumps(list(runs.values())))
+
+    recs = {(r["cell"], r["seed"]): r for r in load_study(tmp_path / "manifest.json")}
+    assert [recs["full", s]["stable_plan"] for s in (0, 1, 2)] == [1.0, 0.0, None]
+    assert [recs["default_reik", s]["stable_plan"] for s in (0, 1, 2)] == [0.0, None, None]
+    assert recs["full", 0]["reik_curobo_calls"] == 0
+    assert recs["default_reik", 0]["reik_curobo_calls"] == 2
+    assert recs["default_reik", 2]["reik_curobo_calls"] is None  # no refresh records (no re-IK)
+
+    rates = stable_rates(recs.values())
+    assert rates[("full", 0.0)] == rates[("full", "all")] == (1, 2)
+    assert rates[("default_reik", 0.0)] == (0, 1)
+
+    lo, hi = wilson(5, 10)
+    assert math.isclose(lo, 0.2366, abs_tol=1e-4) and math.isclose(hi, 0.7634, abs_tol=1e-4)
+    lo, hi = wilson(0, 10)
+    assert lo == 0.0 and math.isclose(hi, 0.2775, abs_tol=1e-4)
+
+    monkeypatch.setattr(sys, "argv", ["analyze_ablation", "--manifest", str(tmp_path / "manifest.json"),
+                                      "--out", str(tmp_path / "out")])
+    analyze_ablation.main()
+    md = (tmp_path / "out" / "results.md").read_text()
+    assert "## Balanced-plan rate" in md
+    assert "| Full (CoM + balance-first re-IK) | all | 1/2 | 0.50 |" in md

@@ -8,6 +8,7 @@ import argparse
 import csv
 import glob
 import json
+import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -22,12 +23,15 @@ METRICS = [
     "found_solution",
     "loop_s",
     "ms_per_step",
+    "stable_plan",
+    "reik_curobo_calls",
 ]
-CELL_ORDER = ["full", "no_com", "no_reik", "standard"]
+CELL_ORDER = ["full", "default_reik", "no_com", "no_reik", "standard"]
 # Label arms by what they HAVE, not what was removed — "−CoM" reads as
 # "the CoM thing" in figures when it is precisely the arm WITHOUT it.
 CELL_LABEL = {
-    "full": "Full (CoM + re-IK)",
+    "full": "Full (CoM + balance-first re-IK)",
+    "default_reik": "Full, default re-IK",
     "no_com": "re-IK only (no CoM)",
     "no_reik": "CoM only (no re-IK)",
     "standard": "Standard cuTAMP (neither)",
@@ -77,6 +81,14 @@ def load_study(manifest_path):
         overall = {}
         if (exp / "overall_metrics.json").exists():
             overall = json.load(open(exp / "overall_metrics.json"))
+        # A balanced plan: a motion plan whose every audited trajectory frame
+        # keeps the CoM in the polygon. None when the audit is missing.
+        mps, viol = overall.get("motion_plan_success"), overall.get("traj_com_violation_frac")
+        stable_plan = None if mps is None or (mps and viol is None) else float(bool(mps) and viol == 0)
+        # cuRobo calls during Adam: default-mode refreshes whose GN missed rows.
+        # Balance-first logs fallback=False; the final repair isn't logged.
+        refreshes = [r for o in opt_data for r in o.get("reik_refresh", [])]
+        curobo_calls = sum(bool(r.get("fallback")) for r in refreshes) if refreshes else None
         records.append({
             "cell": run["cell"], "height": run["height"], "seed": run["seed"],
             "num_satisfying_final": opt.get("num_satisfying_final"),
@@ -94,8 +106,32 @@ def load_study(manifest_path):
             ),
             "loop_s": loop_s,
             "ms_per_step": ms_per_step,
+            "stable_plan": stable_plan,
+            "reik_curobo_calls": curobo_calls,
         })
     return records
+
+
+def wilson(k, n, z=1.96):
+    """Wilson score interval for ``k`` successes in ``n`` trials (95% at z=1.96)."""
+    if n == 0:
+        return float("nan"), float("nan")
+    p, d = k / n, 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def stable_rates(records):
+    """``{(cell, height or "all"): (k, n)}`` balanced plans over runs with a known outcome."""
+    out = defaultdict(lambda: [0, 0])
+    for r in records:
+        if r.get("stable_plan") is None:
+            continue
+        for key in ((r["cell"], r["height"]), (r["cell"], "all")):
+            out[key][0] += int(r["stable_plan"])
+            out[key][1] += 1
+    return {k: tuple(v) for k, v in out.items()}
 
 
 def aggregate(records):
@@ -177,9 +213,9 @@ def _write_deltas_csv(delta_rows, path):
             w.writerow([row["cell"], row["height"], row["seed"], row["metric"], row["delta"]])
 
 
-def _write_md(agg, delta_agg, path):
-    lines = ["| cell | height | satisfying | CoM-feasible | best soft (CoM-feas.) | margin [m] | motion plan | solved | traj viol. | loop [s] | ms/step |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+def _write_md(agg, delta_agg, path, rates=None):
+    lines = ["| cell | height | satisfying | CoM-feasible | best soft (CoM-feas.) | margin [m] | motion plan | solved | traj viol. | loop [s] | ms/step | cuRobo calls |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for (cell, height), m in sorted(agg.items(), key=lambda kv: (kv[0][1], CELL_ORDER.index(kv[0][0]))):
         def fmt(name, digits=1):
             if name not in m:
@@ -190,8 +226,23 @@ def _write_md(agg, delta_agg, path):
             f"| {CELL_LABEL[cell]} | {height:.2f} | {fmt('num_satisfying_final', 0)} "
             f"| {fmt('num_satisfying_com_feasible', 0)} | {fmt('best_soft_cost_com_feasible')} "
             f"| {fmt('best_com_margin', 3)} | {fmt('motion_plan_success', 2)} | {fmt('found_solution', 2)} "
-            f"| {fmt('traj_com_violation_frac', 3)} | {fmt('loop_s', 0)} | {fmt('ms_per_step', 1)} |"
+            f"| {fmt('traj_com_violation_frac', 3)} | {fmt('loop_s', 0)} | {fmt('ms_per_step', 1)} "
+            f"| {fmt('reik_curobo_calls', 1)} |"
         )
+
+    if rates:
+        lines += [
+            "",
+            "## Balanced-plan rate (motion plan with every trajectory frame CoM-inside; Wilson 95%)",
+            "",
+            "| cell | height | k/n | rate | 95% CI |",
+            "|---|---|---|---|---|",
+        ]
+        order = lambda kv: (CELL_ORDER.index(kv[0][0]), (1, 0) if kv[0][1] == "all" else (0, kv[0][1]))
+        for (cell, height), (k, n) in sorted(rates.items(), key=order):
+            lo, hi = wilson(k, n)
+            h = height if height == "all" else f"{height:.2f}"
+            lines.append(f"| {CELL_LABEL[cell]} | {h} | {k}/{n} | {k / n:.2f} | [{lo:.2f}, {hi:.2f}] |")
 
     lines += [
         "",
@@ -255,7 +306,7 @@ def main():
     delta_agg = aggregate_deltas(delta_rows)
     _write_csv(agg, out / "results.csv")
     _write_deltas_csv(delta_rows, out / "deltas.csv")
-    _write_md(agg, delta_agg, out / "results.md")
+    _write_md(agg, delta_agg, out / "results.md", stable_rates(records))
     _figures(agg, out / "figures")
     print(f"{len(records)} runs -> {out}/results.csv, deltas.csv, results.md, figures/")
 

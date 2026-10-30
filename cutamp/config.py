@@ -126,7 +126,9 @@ class TAMPConfiguration:
     enable_joint_limit_margin: bool = True
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
     # COM, recruiting legs within limits. The post-IK mask stays as the
-    # backstop. Validation: commits 217d4b6 / 5b9ae65.
+    # backstop. Validation: commits 217d4b6 / 5b9ae65. Also gates the re-IK
+    # refresh's CoM terms (balance-first level 1, the GN merge gate, the final
+    # repair's CoM check), so --no_com_all leaves no balance channel in re-IK.
     enable_com_aware_ik: bool = True
     # --- Ablation-study flags (2x2 baseline; docs/superpowers/specs/
     # 2026-08-05-standard-cutamp-baseline-design.md). All default to the

@@ -168,6 +168,13 @@ def test_gn_project_balanced_keeps_com_in_and_closes_pose():
     assert bool(compute_com_polygon_mask(world, q2).all())
     assert bool((pos2 < pos0 - 0.05).all()), f"{pos0.min().item():.3f} -> {pos2.max().item():.3f}"
 
+    # balance=False (the no-CoM ablation) drops level 1: it trades the CoM for
+    # the pose, so it ends closer to the far target and outside the polygon.
+    q3 = gn_project_balanced(world, q0, far, "left", iters=30, balance=False)
+    pos3, _ = _achieved_pose_errors(world, q3, far, "left")
+    assert not bool(compute_com_polygon_mask(world, q3).any())
+    assert bool((pos3 < pos2).all()), f"{pos3.max().item():.3f} vs {pos2.min().item():.3f}"
+
 
 @needs_cuda
 def test_gn_project_balanced_leaves_margin_bands_holding_pose_and_com():
