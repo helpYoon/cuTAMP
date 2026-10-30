@@ -159,8 +159,7 @@ def _fk_state(world, q_batch: torch.Tensor, kin=None):
     if q_batch.ndim == 1:
         q_batch = q_batch.unsqueeze(0)
     js = JointState.from_position(q_batch, joint_names=list(kin.joint_names))
-    # js is in kin's own joint order, so kin.get_active_js(js) would be an identity
-    # reorder, and its index a blocking host-to-device copy (as gn_gate notes).
+    # No kin.get_active_js(js): js is already in kin's order, and the reorder index is a blocking H2D copy.
     return kin.compute_kinematics(js)
 
 

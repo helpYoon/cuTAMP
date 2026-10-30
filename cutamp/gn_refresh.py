@@ -19,13 +19,8 @@ with damped Gauss-Newton on the 6-DOF pose residual:
 
 Cost: ``GN_ITERS`` batched FK+Jacobian kernel calls plus a [B, 6, 6] solve —
 about 2-5 ms per dep at 512 particles. ``gn_project_balanced`` projects all
-of a refresh's deps in one call, as a dep-major stack whose rows each keep
-their own arm's tool frame and cspace pin, and makes no host syncs: the Adam
-loop is host-launch-bound, and one call per dep cost hundreds of syncs per
-refresh. So its active-set rounds always run in full, its solves are the
-``*_ex`` kernels without the error check, its level-3 SPD system goes
-through Cholesky (batched 21x21 f64 LU dispatches to MAGMA, which syncs),
-and its constants are cached on the device.
+of a refresh's deps in one call and makes no host syncs (the Adam loop is
+host-launch-bound), so its solves are the unchecked ``*_ex`` kernels.
 
 What this deliberately does NOT do (the full cuRobo solver covers these at
 particle init, at the final pre-check refresh, and in default mode on the
@@ -50,11 +45,6 @@ per-refresh fallback):
 ``gn_project_balanced`` is the balance-first variant behind
 ``config.reik_balance_first``: CoM-in-polygon is a hard first level, the
 pose is least squares inside it, and joint-limit margins use what is left.
-In that mode no cuRobo call runs during Adam: every row's iterate is written
-back, an unconverged row resumes at the next refresh, and the final
-pre-check refresh is the only cuRobo repair. ``gn_gate`` is its one-FK
-merge gate: the pose and CoM masks from one FK pass, which that mode only
-counts in its refresh stats.
 """
 
 from functools import lru_cache
@@ -70,8 +60,7 @@ from cutamp.robots.t1 import (
 )
 
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
-# fallback-rate (default mode) or gn_fail (balance-first) instrumentation
-# shows a fat non-converged band.
+# fallback-rate or gn_fail instrumentation shows a fat non-converged band.
 GN_ITERS = 3
 # Levenberg damping on JJ^T. Units mix metres/radians; at mm/mrad residuals
 # the conditioning effect dominates and the bias is negligible.
@@ -81,9 +70,7 @@ GN_DAMPING = 1e-4
 # (18 cm pose error), UNclamped steps overshoot to 45+ cm while clamped
 # descent converges linearly at ~0.7x error/iter. mm-scale refresh drift
 # never saturates it, so warm-start convergence stays effectively quadratic;
-# corrections big enough to ride the clamp belong to the cuRobo fallback in
-# default mode; balance-first resumes them at the next refresh and repairs at
-# the final pre-check refresh.
+# corrections big enough to ride the clamp belong to cuRobo or a later refresh.
 GN_STEP_CLAMP = 0.15
 # Balance-first only: a CoM axis outside the support rectangle (or that a step
 # would push out) is driven this far inside the edge, absorbing ~2-4 mm of
@@ -168,11 +155,8 @@ def _setup(world, q_full: torch.Tensor, arms: tuple[str, ...]):
 
 
 def _rotmat_to_rotvec(R: torch.Tensor) -> torch.Tensor:
-    """``roma.rotmat_to_rotvec`` (roma 1.5.4: ``rotmat_to_unitquat``, then
-    shortest-arc ``unitquat_to_rotvec``), bit for bit, without its host syncs:
-    roma splits rows by ``nonzero`` twice, so this builds all four quaternion
-    candidates and gathers each row's ``argmax`` choice, and picks the
-    small/large-angle scale with ``torch.where``."""
+    """``roma.rotmat_to_rotvec`` (roma 1.5.4), bit for bit, without the host syncs
+    of its ``nonzero`` row splits: every candidate is built, then gathered."""
     m = R.reshape(-1, 3, 3)
     diag = m.diagonal(dim1=-2, dim2=-1)
     tr = diag.sum(-1)
@@ -213,8 +197,7 @@ def _row_tool_pose(state, left: str, right: str, is_left):
 
 def _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left):
     """World-frame residual ``[Δpos; rotvec(R* R^T)]`` ``[N, 6]`` and the
-    column-masked tool Jacobian ``[N, 6, dof]``, each row on its own arm's
-    tool frame (``frames``, ``is_left`` and ``col_mask`` from :func:`_setup`)."""
+    column-masked tool Jacobian ``[N, 6, dof]``, each row on its own arm's frame."""
     N = world_from_ee.shape[0]
     (left, left_idx), (right, right_idx) = frames
     pos, quat = _row_tool_pose(state, left, right, is_left)
@@ -309,9 +292,7 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
 
     Active sets, re-solved three times like levels 1-2: a CoM axis this step
     would push past ``inner`` is locked, and a joint it would push past a
-    hard limit is frozen (joints frozen by levels 1-2 stay frozen). The
-    rounds always run in full: a round whose sets didn't change recomputes
-    the same step, and stopping early would need a host read.
+    hard limit is frozen (joints frozen by levels 1-2 stay frozen).
     Float64 because the explicit projector is ill-conditioned (cond(A A^T)
     ~5e5 on place confs): in float32 it leaked ~5e-3 of each step into the
     pose, the damped solve amplified that ~15x, and ~80/512 place confs lost
@@ -326,7 +307,6 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
         sel = (margin_err * free != 0).to(f64)
         m = sel.unsqueeze(-1) * proj                                # [B, dof, dof]
         rhs = sel * (margin_err - step).to(f64)
-        # m m^T + damping I is SPD.
         y = _spd_solve(m @ m.transpose(-1, -2) + GN_MARGIN_DAMPING * eye_dof, rhs.unsqueeze(-1))
         dq3 = (m.transpose(-1, -2) @ y).squeeze(-1).to(q.dtype)
         s3 = _fraction_that_fits(step, dq3) * dq3
@@ -341,11 +321,9 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
 
 
 def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask):
-    """One balance-first step ``[N, dof]`` (levels 1-3, see
-    :func:`gn_project_balanced`), which the caller adds and clamps to the
-    joint limits. ``jac`` and ``jac_com`` arrive column-masked by
-    ``col_mask [N, dof]``, each row's cspace pin. Every op is row-wise, so a
-    row's step doesn't depend on which deps share the call."""
+    """One balance-first step ``[N, dof]``, levels 1-3 of :func:`gn_project_balanced`,
+    on ``jac`` and ``jac_com`` already masked by ``col_mask``. Every op is
+    row-wise, so a row's step doesn't depend on which deps share the call."""
     from cutamp.com_polygon_cost import _half_extents
 
     half = _half_extents(q.device, q.dtype)
@@ -374,9 +352,8 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_
         active = active | pushed_out
         free = free * ~blocked
 
-    # Trust region in priority order: scale dq1 into the box, then add
-    # the largest fraction of dq2 that still fits; level 3 takes what
-    # room is left.
+    # Trust region in priority order: scale dq1 into the box, then add the
+    # largest fraction of dq2 that still fits; level 3 takes what room is left.
     step = _fraction_that_fits(torch.zeros_like(dq1), dq1) * dq1
     step = step + _fraction_that_fits(step, dq2) * dq2
     margin_err = ((band_lo - q).clamp_min(0) - (q - band_hi).clamp_min(0)) * col_mask
@@ -414,21 +391,9 @@ def gn_project_balanced(
     - the CoM Jacobian comes from autograd through cuRobo's FK, so each
       iteration costs about two pose-only iterations.
 
-    Otherwise the contract is :func:`gn_project`'s: convergence is not
-    guaranteed; callers measure the achieved error.
-
-    Args:
-        world: TAMPWorld (uses ``kinematics_jac``, the Jacobian-enabled FK).
-        q_full: ``[N, dof]`` full-cspace joint positions (not modified).
-        world_from_ee: ``[N, 4, 4]`` target tool poses.
-        arms: one arm ("left" / "right") per IK dep, so a refresh projects
-            all its deps in one call. Rows are dep-major blocks of
-            ``N // len(arms)`` rows; block ``i`` targets ``arms[i]``'s tool
-            frame with the other arm and the virtual base locked. A bare
-            ``str`` is one dep. ``ValueError`` if ``N`` doesn't split evenly.
-
-    Returns:
-        ``[N, dof]`` projected joint positions, clamped to joint limits.
+    Otherwise the contract is :func:`gn_project`'s, except that ``arms`` holds
+    one arm per IK dep (a bare ``str`` is one): rows are ``len(arms)`` equal
+    dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and cspace pin.
     """
     from cutamp.com_polygon_cost import _project_com_to_base
 
@@ -472,34 +437,13 @@ def gn_gate(
     rot_tol: float,
     kin=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge gate for :func:`gn_project_balanced`'s output, from one FK pass.
+    """Merge gate for :func:`gn_project_balanced`'s output (same ``arms``), from
+    one FK pass on ``kin`` (default ``world.kinematics``) and with no host syncs.
 
-    ``pose_ok`` holds where the row's ``_achieved_pose_errors``
-    (particle_initialization.py, the checker's metric, on the row's own
-    arm's tool frame) are strictly under both tolerances; ``com_ok`` is
-    ``compute_com_polygon_mask``. These are the masks those helpers give
-    with one FK per dep and one more for the CoM. No host syncs once its
-    cached constants exist: unlike ``compute_com_polygon_mask``, it skips
-    ``get_active_js``, an identity reorder for these joint names whose
-    index is a host-to-device copy.
-
-    Args:
-        world: TAMPWorld (its tool frames, and the default ``kin``).
-        q_full: ``[N, dof]`` full-cspace joint positions, contiguous float32
-            on the kinematics device: cuRobo's FK raises otherwise.
-            ``compute_com_polygon_mask`` moves and copies ``q``; this gate
-            passes it straight through.
-        world_from_ee: ``[N, 4, 4]`` target tool poses.
-        arms: one arm per IK dep, rows in dep-major blocks, as in
-            :func:`gn_project_balanced`.
-        pos_tol: position tolerance (metres).
-        rot_tol: rotation tolerance (radians).
-        kin: the CoM-enabled Kinematics to run the FK on; ``None`` means
-            ``world.kinematics``. ``_refresh_balanced`` passes the ``"gate"``
-            site (``TAMPWorld.site_kinematics``).
-
-    Returns:
-        ``(pose_ok [N] bool, com_ok [N] bool)``.
+    Returns ``(pose_ok [N], com_ok [N])``: ``_achieved_pose_errors`` (the
+    checker's metric, on each row's own arm) strictly under ``pos_tol`` and
+    ``rot_tol``, and ``compute_com_polygon_mask``. ``q_full`` must be
+    contiguous float32 on the kinematics device, as cuRobo's FK requires.
     """
     from cutamp.com_polygon_cost import com_polygon_mask_from_state
     from cutamp.costs import curobo_pose_error
