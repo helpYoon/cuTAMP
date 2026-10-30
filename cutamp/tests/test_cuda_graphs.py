@@ -11,13 +11,15 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
-    SpyVis, clone_particles, install_refresh_spy, install_step_replay_spy, make_optimizer, make_plan_info, needs_cuda,
-    repair_cuda_rng, run_optimizer,
+    SpyVis, clone_particles, cupti_sync_events, install_refresh_spy, install_step_replay_spy, make_optimizer,
+    make_plan_info, needs_cuda, repair_cuda_rng, run_optimizer,
 )
 from cutamp.tests.test_step_lockstep import _site_ptrs
+from cutamp.utils.timer import TorchTimer
 
 
 def test_cuda_graphs_validation():
@@ -234,3 +236,84 @@ def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):     # Review F
     assert m.get("early_stopped_at") is not None and not timer.has_timer("optimization_step")
     assert len(released) == 1 + sum(m[k] is not None for k in ("capture_step", "refresh_capture_step"))
     assert all(v.grad is None for v in parts.values())
+
+
+class _ProfilingTimer(TorchTimer):
+    """A ``TorchTimer`` that profiles the optimization steps in ``steps``, counted by its
+    ``start("optimization_step")`` calls: each from before the timer's start sync to after
+    its stop sync. ``names[step]`` is that step's profiler event names."""
+
+    def __init__(self, steps):
+        super().__init__()
+        self.steps, self.names, self._started, self._prof = set(steps), {}, 0, None
+
+    def start(self, metric: str) -> None:
+        if metric == "optimization_step":
+            if self._started in self.steps:
+                self._prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **cupti_sync_events())
+                self._prof.__enter__()
+            self._started += 1
+        super().start(metric)
+
+    def stop(self, metric: str) -> float:
+        duration = super().stop(metric)
+        if metric == "optimization_step":
+            self.close()
+        return duration
+
+    def close(self) -> None:
+        """Exit the open profile, if any, and keep its step's event names. A step that
+        raises never reaches ``stop``, and its profile would outlive the test."""
+        if self._prof is not None:
+            prof, self._prof = self._prof, None
+            prof.__exit__(None, None, None)
+            self.names[self._started - 1] = [e.name for e in prof.events()]
+
+
+@needs_cuda
+@pytest.mark.parametrize("arm", ["S1", "G"])
+def test_loop_sync_audit(blocks_t1_plan, arm):                        # design 6.4, out of graph
+    # Steps 40-49, each from before the step timer's start sync to after its stop sync. Every
+    # step has the loop's 3 device syncs (timer.py:33, the elapsed sync, timer.py:45), the
+    # profiler's own, and packed.tolist()'s copy and stream sync; a refresh step adds its 2
+    # timing events. A G step is 1 graph launch (2 with the refresh) plus the eager Adam
+    # step's launches: the captured body alone holds 1,029 kernels. Inside the graphs, the
+    # global-mode capture is the audit, since it fails on any sync.
+    world, skeleton, base = blocks_t1_plan
+    config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0, reik_balance_first=True,
+                               cuda_graphs=arm == "G", enable_visualizer=False)
+    timer = _ProfilingTimer(range(40, 50))
+    try:
+        m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, timer=timer)
+    finally:
+        timer.close()
+    assert sorted(timer.names) == list(range(40, 50))
+    # The step where num_satisfying first turns positive adds the first-solution sync.
+    first = next((s for s, k in enumerate(m["num_satisfying"]) if k > 0), None)
+    sync_events = bool(cupti_sync_events())
+    for step, names in sorted(timer.names.items()):
+        if step == first:
+            continue
+        kind = "refresh" if step in (44, 49) else "plain"
+        got = {
+            "Synchronize": Counter(n for n in names if "Synchronize" in n),
+            "DtoH": sum("DtoH" in n for n in names),
+            "HtoD": sum("HtoD" in n for n in names),
+            "EventRecord": sum("EventRecord" in n for n in names),
+            "cudaGraphLaunch": names.count("cudaGraphLaunch"),
+        }
+        want = {
+            "Synchronize": {"cudaDeviceSynchronize": 4, "cudaStreamSynchronize": 1},
+            "DtoH": 1,
+            "HtoD": 0,
+            "EventRecord": 2 if kind == "refresh" else 0,
+            "cudaGraphLaunch": 0 if arm == "S1" else 1 + (kind == "refresh"),
+        }
+        if sync_events:  # CUPTI's sync records also catch driver-API waits
+            got["sync events"] = Counter(n for n in names if n.endswith(" Sync"))
+            want["sync events"] = {"Context Sync": 4, "Stream Sync": 1}
+        launches = sum(n.startswith(("cudaLaunch", "cuLaunch")) for n in names)
+        print(f"sync audit [{arm}] step {step} ({kind}): {launches} kernel launches, {got}")
+        assert got == want, f"{arm} step {step} ({kind})"
+        if arm == "G":
+            assert launches < 100, f"G step {step} ({kind}): {launches} kernel launches, not the eager Adam step's"

@@ -18,6 +18,8 @@ needs_cuda = pytest.mark.skipif(
     _cvd in ("", "-1") or (_cvd is None and not os.path.exists("/dev/nvidia0")),
     reason="Requires a CUDA device.",
 )
+#: Marks a slow live test, which runs only with CUTAMP_SLOW=1.
+needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
 
 def make_blocks_t1_world(**tamp_world_kwargs):
