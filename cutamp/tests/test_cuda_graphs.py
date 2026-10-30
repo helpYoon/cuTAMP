@@ -16,7 +16,7 @@ from torch.profiler import ProfilerActivity, profile
 from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
     SpyVis, clone_particles, cupti_sync_events, install_refresh_spy, install_step_replay_spy, make_optimizer,
-    make_plan_info, needs_cuda, repair_cuda_rng, run_optimizer,
+    make_plan_info, needs_cuda, run_optimizer,
 )
 from cutamp.tests.test_step_lockstep import _site_ptrs
 from cutamp.utils.timer import TorchTimer
@@ -151,9 +151,7 @@ def test_refresh_graph_lockstep(blocks_t1_plan, monkeypatch, reik_interval, num_
 
 
 @needs_cuda
-def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch, record_property):
-    import cutamp.optimize_plan as optimize_plan
-
+def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=20)
     replays = install_step_replay_spy(monkeypatch)
@@ -165,21 +163,6 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch, record
     # Design 4.6: refresh #1 (step 4) runs eagerly with no G_step yet, so G_refresh waits for refresh #2.
     assert m["refresh_capture_step"] == 9 and [s for s, _ in eager] == [14, 19]
     assert next(busy) == 8                           # consulted once per step, until the capture
-    # Ruling 6 / design open question 1: report, don't assert, whether the deferred capture
-    # also succeeds without the penalties-cache clear. The clear stays either way.
-    monkeypatch.setattr(optimize_plan, "_clear_step_autograd",
-                        lambda cost_fn, params: [setattr(p, "grad", None) for p in params])
-    busy2 = itertools.count()
-    try:
-        m2, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
-                              visualizer=SpyVis(config), planner_busy=lambda: next(busy2) < 7)
-        outcome = f"captured at step {m2['capture_step']}"
-    except RuntimeError as e:
-        # A failed capture leaves this process's allocator in capture mode for every later test: a finding, not a pass.
-        outcome = f"capture failed: {e.__cause__!r}"
-        repair_cuda_rng()
-    print("deferred capture without the penalties-cache clear:", outcome)
-    record_property("capture_without_penalties_cache_clear", outcome)
 
 
 @needs_cuda
