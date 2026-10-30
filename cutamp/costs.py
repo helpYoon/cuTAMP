@@ -81,12 +81,9 @@ def sphere_to_sphere_overlap(
     min_2, max_2 = aabb_2.unbind(-2)
     intersect = (min_1 <= max_2).all(-1) & (max_1 >= min_2).all(-1)  # [b, *h]
 
-    # Every batch's overlap, kept where the AABBs intersect. Computing only those
-    # batches took host syncs (intersect.any(), and the boolean-mask gathers and
-    # write), which a CUDA graph can't capture.
-    # A NaN sphere on a non-intersecting row now gets NaN grads: where's backward multiplies by 0.
-    output = torch.where(intersect, _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance), 0.0)
-    return output
+    # Dense, then masked: computing only the intersecting batches needs host syncs a graph can't capture.
+    # A NaN sphere on a non-intersecting batch gets NaN grads: where's zero grad meets its NaN partials.
+    return torch.where(intersect, _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance), 0.0)
 
 
 def curobo_pose_error(

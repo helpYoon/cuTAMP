@@ -20,11 +20,6 @@ SUPPORTED_SOFT_COSTS = (
     "minimize_body_movement", "joint_limit_margin",
 )
 
-# Soft costs cuda_graphs rejects (validate_tamp_config): the step can't be captured
-# with them on. align_yaw's roma.rotmat_to_euler syncs the host inside roma, on
-# rotmat_to_unitquat's nonzero and unitquat_to_euler's boolean-mask writes.
-CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS = ("align_yaw",)
-
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
@@ -200,13 +195,8 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError("cuda_graphs needs reik_balance_first (it captures the balance-first Adam step)")
     if config.cuda_graphs and not config.coupled_reik:
         raise ValueError("cuda_graphs needs coupled_reik (balance-first runs only with coupled re-IK)")
-    if config.cuda_graphs:
-        unsupported = [name for name in (config.soft_cost or []) if name in CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS]
-        if unsupported:
-            raise ValueError(
-                f"cuda_graphs can't capture the soft cost(s) {', '.join(unsupported)}: roma's rotmat_to_unitquat "
-                f"syncs the host on nonzero; run them without cuda_graphs"
-            )
+    if config.cuda_graphs and "align_yaw" in (config.soft_cost or []):
+        raise ValueError("cuda_graphs can't capture align_yaw: roma's rotmat_to_euler syncs the host")
     if config.reik_gn and not config.coupled_reik:
         # GN refresh only runs inside the coupled-reIK loop. Now that reik_gn
         # defaults ON, this combination just means "no refreshes at all" —
