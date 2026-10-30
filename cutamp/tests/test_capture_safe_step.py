@@ -6,7 +6,7 @@ import torch
 from torch.optim import Adam
 from torch.profiler import ProfilerActivity, profile
 
-from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
+from cutamp.config import TAMPConfiguration
 from cutamp.costs import _sphere_to_sphere_overlap, get_aabb_from_spheres
 from cutamp.tests.conftest import (
     SpyVis, clone_particles, make_plan_info, needs_cuda, run_optimizer, sync_debug_error,
@@ -177,9 +177,7 @@ def test_align_yaw_syncs_in_roma(blocks_t1_plan):
     from cutamp.rollout import RolloutFunction
 
     world, skeleton, base = blocks_t1_plan
-    config = TAMPConfiguration(num_particles=64, num_opt_steps=3, early_stop_patience=0, reik_balance_first=True,
-                               enable_visualizer=False,
-                               soft_cost=[s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw"])
+    config = TAMPConfiguration(soft_cost=["align_yaw"])
     # Built first: the constructor's own host-to-device copies would raise first.
     cf = CostFunction(skeleton, world, config)
     with torch.no_grad():

@@ -441,6 +441,7 @@ class _StaticRefresh:
             self.body({k: v.detach().clone() for k, v in particles.items()}, self.refs.detach().clone(),
                       self.slot.detach().clone())
 
+        # Guard every Kinematics the body runs; the eager refresh built both.
         self.graph = cuda_graphs.CapturedGraph(
             "G_refresh", lambda: self.body(particles, self.refs, self.slot), warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
@@ -498,7 +499,8 @@ class ParticleOptimizer:
     ) -> None:
         """Re-solve IK for each ``IKDep`` and write the result into the
         corresponding Conf particle in-place. Failed particles keep their
-        previous q (per-particle masked write).
+        previous q (per-particle masked write), except in a balance-first
+        gated refresh, which writes every row back.
 
         When ``gate`` is given, refreshes run GN-first on
         ``world.ik_refresh_solver`` (a cheap warm-seeded low-seed solver when

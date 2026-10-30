@@ -57,7 +57,8 @@ def _pairwise_upper_sum(x: torch.Tensor) -> torch.Tensor:
 def _per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
     """``[B, len(counts)]``: sums of ``x`` ``[B, sum(counts)]`` over consecutive column blocks of
     ``counts[i]`` columns. A fixed-order reduction, bitwise run to run and under graph replay, unlike
-    ``scatter_add_``'s atomics. ``counts`` are Python ints, so there is no host read."""
+    ``scatter_add_``'s atomics; over 128 columns its split also depends on each row's address mod 16
+    bytes, fixed for a freshly allocated ``x``. ``counts`` are Python ints, so there is no host read."""
     return torch.stack([block.sum(-1) for block in x.split(counts, dim=1)], dim=1)
 
 

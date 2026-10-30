@@ -244,7 +244,9 @@ class TAMPWorld:
         (``kinematics`` stays for the eager callers). An instance reuses one buffer set per batch
         shape, so two same-shape calls on it before backward corrupt each other's gradients. Never
         reset a site: a CUDA graph bakes its buffers, and a reset (or a shared instance's other
-        callers) would reallocate them under the graph. The backward returns that buffer, so a
+        callers) would reallocate them under the graph. That is safe: cuRobo's FK backward
+        (kinematics_backward_kernel.cuh) overwrites ``grad_out`` row by row, its only writable pointer,
+        so no gradient reads what an earlier call left. The backward returns ``grad_out`` itself, so a
         ``.grad`` adopted from it holds only until the site's next backward: clear or clone it."""
         if name not in FK_SITES:
             raise ValueError(f"unknown FK site {name!r}: FK_SITES is {FK_SITES}")
@@ -279,9 +281,10 @@ class TAMPWorld:
         """Warmup the multi-frame IK solver with a multi-frame FK goal.
 
         ``warm_refresh`` also captures the refresh solver's CUDA graphs with
-        the exact call the coupled-reIK fallback makes. It must run before the
-        planner thread starts: a capture concurrent with another thread's CUDA
-        calls fails.
+        the exact call the coupled-reIK fallback makes, when the world has one
+        (``reik_num_seeds > 0``; balance-first builds it with 0). It must run
+        before the planner thread starts: a capture concurrent with another
+        thread's CUDA calls fails.
         """
         ik = self.ik_solver
         max_bs = getattr(ik.config, "max_batch_size", num_particles)

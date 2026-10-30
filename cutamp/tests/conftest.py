@@ -190,6 +190,7 @@ def bitwise_diffs(a, b, raw: bool = True, path: str = "") -> list:
     """Every difference between ``a`` and ``b`` through dicts, lists and tuples, as ``(path, detail)`` pairs.
     ``raw`` compares tensor bits and float bytes (NaN equals the same NaN, -0.0 differs); else ``torch.equal``."""
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        # First: != promotes dtypes and broadcasts shapes, so f32 could pass against f64 and [1] against [N].
         if (a.dtype, a.shape, a.device) != (b.dtype, b.shape, b.device):
             return [(path, f"{a.dtype} {tuple(a.shape)} {a.device} vs {b.dtype} {tuple(b.shape)} {b.device}")]
         if raw:

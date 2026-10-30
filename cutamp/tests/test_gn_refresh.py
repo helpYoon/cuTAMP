@@ -221,6 +221,8 @@ def test_gn_project_balanced_pins_per_row():
     q1 = gn_project_balanced(world, q, T, arms)
     per_dep = torch.cat([gn_project_balanced(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)])
     assert (q1 - per_dep).abs().max().item() <= 1e-5  # bitwise as measured; slack for batch-dependent GPU reductions
+    left_only = gn_project_balanced(world, q[:16], T[:16], arms[:2])  # a stack with no right-arm rows
+    assert (left_only - per_dep[:16]).abs().max().item() <= 1e-5
     assert torch.equal(q1[:, BASE_INDICES], q[:, BASE_INDICES])
     assert torch.equal(q1[:16, RIGHT_ARM_INDICES], q[:16, RIGHT_ARM_INDICES])
     assert torch.equal(q1[16:, LEFT_ARM_INDICES], q[16:, LEFT_ARM_INDICES])

@@ -99,7 +99,7 @@ def _row_layout(arms: tuple[str, ...], n: int, dof: int, device, dtype):
     building it is a host-to-device copy; never mutate or evict it: a captured
     CUDA graph keeps reading its addresses."""
     if not arms or n % len(arms) or not set(arms) <= {"left", "right"}:
-        raise ValueError(f"{n} rows don't split into equal 'left'/'right' dep blocks: {arms}")
+        raise ValueError(f"{n} rows over arms {arms}: need equal dep blocks, each 'left' or 'right'")
     col_mask = torch.ones(len(arms), dof, dtype=dtype)
     col_mask[:, BASE_INDICES] = 0.0
     for i, arm in enumerate(arms):
