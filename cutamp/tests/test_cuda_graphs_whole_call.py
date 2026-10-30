@@ -1,0 +1,138 @@
+"""``--cuda_graphs`` against eager, one whole optimize call at a time (final review M1): in one
+process, a graph-mode call gives the eager call's result bitwise.
+
+The spies in conftest check each replay against an eager body run on the same state just
+before it, so the eager twin shares the FK sites, the cost function and the world with the
+graph. Here nothing eager runs in a graph call: hooks that run the same in both modes record
+what the loop computes, and whole calls are compared, values to values, as raw bytes."""
+
+import itertools
+import random
+import struct
+import sys
+
+import numpy as np
+import torch
+
+from cutamp.config import TAMPConfiguration
+from cutamp.tests.conftest import clone_particles, make_optimizer, make_plan_info, needs_cuda
+
+_TIMING = ("elapsed", "opt_start_to_first_sol")
+_CAPTURE = ("capture_s", "capture_step", "refresh_capture_s", "refresh_capture_step")  # G-only keys
+_INT_VIEW = {torch.float32: torch.int32, torch.float64: torch.int64, torch.float16: torch.int16,
+             torch.bfloat16: torch.int16, torch.bool: torch.uint8}
+
+
+def _snap(particles: dict) -> dict:
+    return {k: v.detach().clone() for k, v in particles.items()}
+
+
+def _diffs(a, b, path: str = "") -> list:
+    """Every difference between ``a`` and ``b`` as raw bytes, through dicts, lists and tuples:
+    ``(path, detail)`` pairs, ``[]`` when equal. Tensors compare their bits, so NaN equals the
+    same NaN and -0.0 differs from 0.0; floats compare their IEEE bytes; other leaves ``==``."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if (a.dtype, a.shape, a.device) != (b.dtype, b.shape, b.device):
+            return [(path, f"{a.dtype} {tuple(a.shape)} {a.device} vs {b.dtype} {tuple(b.shape)} {b.device}")]
+        dt = _INT_VIEW.get(a.dtype, a.dtype)
+        ne = a.detach().contiguous().view(dt) != b.detach().contiguous().view(dt)
+        if not ne.any():
+            return []
+        d = (a.double() - b.double()).abs()[ne].nan_to_num(float("inf")).max().item()
+        return [(path, f"{int(ne.sum())} of {a.numel()} elements differ, max abs diff {d}")]
+    if isinstance(a, dict) and isinstance(b, dict):
+        if list(a) != list(b):
+            return [(path, f"keys {list(a)} vs {list(b)}")]
+        return [d for k in a for d in _diffs(a[k], b[k], f"{path}[{k!r}]")]
+    if isinstance(a, (list, tuple)) and type(a) is type(b) and len(a) == len(b):
+        return [d for i, (x, y) in enumerate(zip(a, b)) for d in _diffs(x, y, f"{path}[{i}]")]
+    if isinstance(a, float) and isinstance(b, float):
+        return [] if struct.pack("<d", a) == struct.pack("<d", b) else [(path, f"{a!r} vs {b!r}")]
+    nodes = (torch.Tensor, dict, list, tuple)
+    if type(a) is type(b) and not isinstance(a, nodes) and a == b:
+        return []
+    return [(path, f"{a!r:.80} vs {b!r:.80}")]
+
+
+def _install_recorder(monkeypatch) -> dict:
+    """Hooks that record one optimize call into ``box["rec"]``, the same in both modes, and run
+    no eager body (a replay bypasses ``_StepBody.__call__``, so no spy there):
+    - ``_BestSnapshot.update``, once per step: the ``packed`` tensor the loop just read, the
+      ``num_satisfying`` and ``min_cost`` it passes, every particle and every param's ``.grad``;
+    - ``_refresh_ik_deps`` with ``gate=None``, the final cuRobo refresh: the particles before
+      and after it;
+    - ``_ik_for_pose``, which balance-first calls only in that refresh: each result's
+      ``solution`` and ``success``."""
+    import cutamp.optimize_plan as op
+    box = {"rec": None}
+    update, refresh, ik = op._BestSnapshot.update, op.ParticleOptimizer._refresh_ik_deps, op._ik_for_pose
+
+    def update_spy(self, step, num_satisfying, min_loss, particles):
+        loop = sys._getframe(1).f_locals  # ParticleOptimizer.__call__'s frame
+        box["rec"]["steps"].append({
+            "packed": loop["packed"].clone(), "num_satisfying": num_satisfying, "min_cost": min_loss,
+            "particles": _snap(particles),
+            "grads": [None if p.grad is None else p.grad.clone() for p in loop["body"].params],
+        })
+        return update(self, step, num_satisfying, min_loss, particles)
+
+    def refresh_spy(self, particles, ik_deps, world, gate=None, step=None):
+        if gate is None:
+            box["rec"]["pre_final"] = _snap(particles)
+        refresh(self, particles, ik_deps, world, gate, step)
+        if gate is None:
+            box["rec"]["post_final"] = _snap(particles)
+
+    def ik_spy(*args, **kwargs):
+        res = ik(*args, **kwargs)
+        box["rec"]["ik"].append((res.solution.clone(), res.success.clone()))
+        return res
+
+    monkeypatch.setattr(op._BestSnapshot, "update", update_spy)
+    monkeypatch.setattr(op.ParticleOptimizer, "_refresh_ik_deps", refresh_spy)
+    monkeypatch.setattr(op, "_ik_for_pose", ik_spy)
+    return box
+
+
+@needs_cuda
+def test_graph_calls_give_the_eager_result(blocks_t1_plan, monkeypatch):
+    from cutamp.utils.timer import TorchTimer
+    from cutamp.utils.visualizer import Visualizer
+    world, skeleton, base = blocks_t1_plan
+    box = _install_recorder(monkeypatch)
+    rng = torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate()
+
+    def call(cuda_graphs, planner_busy=None) -> dict:
+        """One optimize call on a fresh copy of the init, from the same RNG states."""
+        torch.set_rng_state(rng[0])
+        torch.cuda.set_rng_state_all(rng[1])
+        np.random.set_state(rng[2])
+        random.setstate(rng[3])
+        world.ik_solver.reset_seed()  # the IK seed sampler persists across solves
+        config = TAMPConfiguration(num_particles=64, num_opt_steps=100, early_stop_patience=0,
+                                   reik_balance_first=True, coupled_reik=True, cuda_graphs=cuda_graphs,
+                                   enable_visualizer=False)
+        box["rec"] = rec = {"steps": [], "pre_final": None, "post_final": None, "ik": []}
+        info = make_plan_info(world, skeleton, clone_particles(base), config)
+        optimizer = make_optimizer(config, planner_busy=planner_busy)
+        found, m, exceeded = optimizer(info, TorchTimer(), Visualizer(config, None))
+        rec.update(final=_snap(info["particles"]), found=found, exceeded=exceeded,
+                   metrics={k: v for k, v in m.items() if k not in _TIMING + _CAPTURE})
+        rec["metrics"]["reik_refresh"] = [{k: v for k, v in r.items() if k != "solve_s"} for r in m["reik_refresh"]]
+        rec["capture"] = tuple(m.get(k, "absent") for k in ("capture_step", "refresh_capture_step"))
+        return rec
+
+    e1, g1, e2, g2 = call(False), call(True), call(False), call(True)
+    busy = itertools.count()
+    gd = call(True, planner_busy=lambda: next(busy) < 7)    # as test_deferred_capture_after_planner_ends
+    # Each call ran as meant: G1 and G2 capture at step 0 and refresh #1, Gd defers to step 7.
+    assert [c["capture"] for c in (e1, g1, e2, g2, gd)] == [("absent",) * 2, (0, 4), ("absent",) * 2, (0, 4), (7, 9)]
+    assert next(busy) == 8 and all(len(c["steps"]) == 100 for c in (e1, g1, e2, g2, gd))
+    assert _diffs(e1["steps"][0]["particles"], e1["steps"][-1]["particles"])  # the recording isn't vacuous
+    for name, got, want in (("G1 vs E1", g1, e1),       # the claim
+                            ("E2 vs E1", e2, e1),       # the graph call leaves no state behind
+                            ("G2 vs G1", g2, g1),       # a recaptured call gives the same result
+                            ("Gd vs E1", gd, e1)):      # so does a capture deferred to mid-call
+        got, want = ({k: v for k, v in c.items() if k != "capture"} for c in (got, want))
+        diffs = _diffs(got, want)
+        assert not diffs, f"{name}: {len(diffs)} differences, the first {diffs[:5]}"
