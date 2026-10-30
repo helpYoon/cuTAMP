@@ -150,9 +150,8 @@ ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
 
 
 def _fk_state(world, q_batch: torch.Tensor, kin=None):
-    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through ``kin``
-    (``None``: ``world.kinematics``); return its kinematics state.
-    Differentiable through cuRobo's FK chain."""
+    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through ``kin`` (default ``world.kinematics``);
+    return its kinematics state. Differentiable through cuRobo's FK chain."""
     from curobo.types import JointState
     kin = world.kinematics if kin is None else kin
     q_batch = q_batch.to(kin.device_cfg.device)
@@ -176,16 +175,12 @@ def _com_and_base_from_state(ks):
 
 
 def _fk_com_and_base(world, q_batch: torch.Tensor, kin=None):
-    """FK ``q_batch`` through ``kin`` (``None``: ``world.kinematics``); return
-    ``(com_world [B,3], base_T [B,4,4])`` — the inputs every COM-polygon
-    helper needs. Differentiable through cuRobo's FK chain."""
+    """``(com_world [B,3], base_T [B,4,4])`` for ``q_batch``, FK'd by :func:`_fk_state`."""
     return _com_and_base_from_state(_fk_state(world, q_batch, kin))
 
 
 def com_polygon_mask_from_state(ks) -> torch.Tensor:
-    """:func:`compute_com_polygon_mask` on a kinematics state that a CoM-enabled
-    FK already computed, so a caller that needs the FK for other checks too
-    runs it once. ``[B]`` bool."""
+    """``[B]`` bool :func:`compute_com_polygon_mask` on a state a CoM-enabled FK already computed."""
     com, base_T = _com_and_base_from_state(ks)
     # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
     # post-IK COM-safe check and ConstraintChecker can never diverge. With the
@@ -254,8 +249,7 @@ def compute_com_polygon_penalties(
     the ``CostFunction`` instance so the FK runs once per evaluation.
 
     Args:
-        world: TAMPWorld instance. ``world.kinematics`` must
-            be available (cached property — first call builds it).
+        world: TAMPWorld instance; the FK runs on its ``site_kinematics("com")``.
         particles: dict mapping particle name to ``[B, full_dof]``
             tensor. Non-Conf particles (poses, grasps) are skipped.
 

@@ -122,8 +122,7 @@ def entrypoint():
     parser.add_argument(
         "--reik_num_seeds", type=int, default=_defaults.reik_num_seeds,
         help="Use a dedicated low-seed, warm-started IK solver for re-IK refreshes "
-             "(cost ~linear in seeds; init and final refresh keep 32 seeds; no effect "
-             "with --reik_balance_first beyond validation, still >= 0). 0 = main solver.",
+             "(cost ~linear in seeds; init and final refresh keep 32 seeds). 0 = main solver.",
     )
     parser.add_argument(
         "--no_reik_gn", dest="reik_gn", action="store_false",
@@ -138,15 +137,13 @@ def entrypoint():
     )
     parser.add_argument(
         "--cuda_graphs", action="store_true",
-        help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs: the step is captured "
-             "once the motion-planner build has ended, the refresh at the first refresh after that. "
-             "Needs --reik_balance_first and coupled re-IK (no --no_coupled_reik); rejects the align_yaw soft cost.",
+        help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs. "
+             "Needs --reik_balance_first and coupled re-IK; rejects the align_yaw soft cost.",
     )
     parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
         help="LBFGS iteration budget for the warm refresh/fallback solver "
-             "(multiple of 20; 0 = cuRobo default 100; no effect with --reik_balance_first "
-             "beyond validation, which still requires a non-negative multiple of 20).",
+             "(multiple of 20; 0 = cuRobo default 100).",
     )
     parser.add_argument(
         "--soft_cost",

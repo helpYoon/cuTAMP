@@ -18,7 +18,7 @@ from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
-# (200, 56) has a block over 128 columns: the reduction's vectorized path (_per_object_sum's docstring).
+# (200, 56) has a block over 128 columns: the reduction's vectorized path (its split depends on row alignment).
 _CASES = [(counts, b) for counts in ((50, 50), (37, 50, 13), (200, 56)) for b in (64, 256)]
 
 

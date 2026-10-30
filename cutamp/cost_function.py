@@ -47,24 +47,17 @@ def _device_const(values: tuple, device, dtype=None) -> torch.Tensor:
 
 
 def _pairwise_upper_sum(x: torch.Tensor) -> torch.Tensor:
-    """``[B]``: the sums of ``x`` ``[B, n, n]`` over each strict upper triangle,
-    gathered by index in row-major order, the order cfa7a46's triu boolean-mask
-    gather took, so the sums are the same. The mask's gather syncs on its
-    ``nonzero``; ``triu_indices`` builds the index on the device."""
+    """``[B]``: sums of ``x`` ``[B, n, n]`` over each strict upper triangle, in the triu mask's
+    row-major order, so the sums match it. An index gather: the mask would sync on its ``nonzero``."""
     n = x.shape[-1]
     iu = torch.triu_indices(n, n, 1, device=x.device)
     return x[:, iu[0], iu[1]].sum(-1)
 
 
 def _per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
-    """``[B, len(counts)]``: the sums of ``x`` ``[B, sum(counts)]`` over consecutive
-    column blocks of ``counts[i]`` columns, one fixed-order reduction per block.
-    Bitwise run to run and under CUDA-graph replay, which ``scatter_add_`` is not:
-    its CUDA atomics add in a varying order, so its rounding varies. For a block
-    wider than 128 columns, the reduction's split also depends on each row's
-    address mod 16 bytes, which is fixed for a freshly allocated ``x``. The backward
-    gives each column its block's upstream grad, the gather ``scatter_add_``'s
-    backward gives. ``counts`` are Python ints, so there is no host read."""
+    """``[B, len(counts)]``: sums of ``x`` ``[B, sum(counts)]`` over consecutive column blocks of
+    ``counts[i]`` columns. A fixed-order reduction, bitwise run to run and under graph replay, unlike
+    ``scatter_add_``'s atomics. ``counts`` are Python ints, so there is no host read."""
     return torch.stack([block.sum(-1) for block in x.split(counts, dim=1)], dim=1)
 
 
@@ -149,8 +142,6 @@ class CostFunction:
             self.surface_to_target_z[surface] = target_z
 
         self.surface_to_sphere_idx_map = {}
-        # Each placed object's sphere count, in placement order: the column blocks of
-        # stable_placement_costs' torch.cat(surface_spheres, dim=1). Python ints.
         self.surface_to_sphere_counts: Dict[str, Tuple[int, ...]] = {}
         for surface, placements in self.surface_to_placements.items():
             counts = tuple(world.get_collision_spheres(obj).shape[0] for obj, _ in placements)
@@ -256,8 +247,7 @@ class CostFunction:
             spheres = torch.cat(surface_spheres, dim=1)
             spheres_xy = spheres[..., :2]
 
-            # Within goal xy bounds: sum each object's per-sphere distances over its
-            # block of `spheres`, in a fixed order (cfa7a46's scatter_add_ used atomics).
+            # Within goal xy bounds, summed per object in a fixed order (_per_object_sum)
             in_goal_xy = dist_from_bounds_jit(spheres_xy, *self.surface_to_aabb[surface])
             support_vals[f"{surface}_in_xy"] = _per_object_sum(in_goal_xy, self.surface_to_sphere_counts[surface])
 

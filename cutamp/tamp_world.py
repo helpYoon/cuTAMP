@@ -42,8 +42,7 @@ from cutamp.utils.shapes import sample_greedy_surface_spheres
 
 _log = logging.getLogger(__name__)
 
-#: The Adam loop's forward-kinematics sites, each on its own Kinematics
-#: (:meth:`TAMPWorld.site_kinematics`).
+#: The Adam loop's FK sites, each on its own Kinematics (TAMPWorld.site_kinematics).
 FK_SITES = ("rollout", "retract", "com", "gate")
 
 
@@ -241,32 +240,12 @@ class TAMPWorld:
         return self._kinematics_jac
 
     def site_kinematics(self, name: str) -> Kinematics:
-        """The dedicated Kinematics of the Adam loop's FK site ``name`` (one of
-        ``FK_SITES``): on ``kinematics``' config and CoM-enabled like it, built
-        lazily, once per name, and never reset. ``kinematics`` stays for the
-        eager users: particle init, ``compute_com_polygon_mask``, the final
-        refresh and the motion checks.
-
-        1. One instance per site: an instance keeps its FK outputs, the state
-           its backward reads and the gradient it returns in one buffer set,
-           so same-shape calls on one instance before backward corrupt each
-           other's gradients.
-        2. Never reset, and that is safe: cuRobo's FK backward overwrites
-           ``grad_out`` row by row, and that is the kernel's only writable
-           pointer (``curobo/_src/curobolib/kernels/kinematics/
-           kinematics_backward_kernel.cuh:138``, ``:153``). No gradient reads
-           what an earlier call left, and the zero-filled gradient inputs the
-           backward falls back on stay zero. The backward returns ``grad_out``
-           itself, so a site's joint gradient, and a ``.grad`` that adopted
-           it, holds only until that site's next backward: clear ``.grad``
-           (``zero_grad(set_to_none=True)``) or clone it before a second
-           backward through the same site.
-        3. Fixed buffers: a site's buffers change only with its batch shape, so
-           a CUDA graph can bake them in whatever the call order. A graph that
-           bakes buffers allocated before capture writes freed memory once an
-           eager call reallocates them, as the gate FK in G_refresh, the
-           refresh's graph, would on the shared ``kinematics``.
-        """
+        """The Adam loop's FK site ``name``: a dedicated, lazily built, CoM-enabled Kinematics
+        (``kinematics`` stays for the eager callers). An instance reuses one buffer set per batch
+        shape, so two same-shape calls on it before backward corrupt each other's gradients. Never
+        reset a site: a CUDA graph bakes its buffers, and a reset (or a shared instance's other
+        callers) would reallocate them under the graph. The backward returns that buffer, so a
+        ``.grad`` adopted from it holds only until the site's next backward: clear or clone it."""
         if name not in FK_SITES:
             raise ValueError(f"unknown FK site {name!r}: FK_SITES is {FK_SITES}")
         if name not in self._site_kinematics:
@@ -299,12 +278,10 @@ class TAMPWorld:
     def warmup_ik_solver(self, num_particles: int, warm_refresh: bool = False):
         """Warmup the multi-frame IK solver with a multi-frame FK goal.
 
-        When the world has a refresh solver (``reik_num_seeds > 0``),
-        ``warm_refresh`` also captures its CUDA graphs with the exact call the
-        coupled-reIK fallback makes; with 0 seeds (balance-first setup builds
-        its world that way) there is nothing to capture. The capture must run
-        before the planner thread starts: a capture concurrent with another
-        thread's CUDA calls fails.
+        ``warm_refresh`` also captures the refresh solver's CUDA graphs with
+        the exact call the coupled-reIK fallback makes. It must run before the
+        planner thread starts: a capture concurrent with another thread's CUDA
+        calls fails.
         """
         ik = self.ik_solver
         max_bs = getattr(ik.config, "max_batch_size", num_particles)

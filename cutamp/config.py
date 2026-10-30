@@ -73,8 +73,6 @@ class TAMPConfiguration:
     # near-answer, so the 32-seed global search is wasted there). Cost scales
     # ~linearly with seeds. Particle init and the final pre-check refresh
     # always use the full 32-seed solver. 0 = refreshes use the main solver.
-    # No effect with reik_balance_first beyond validation (still >= 0):
-    # balance-first runs no cuRobo during Adam.
     # Default 4 (= current q + 3 random): A/B on blocks_t1 @512 particles
     # showed 407 -> 251 ms/step with best-satisfying / best-soft-cost equal
     # or better than the 32-seed refresh (2026-08-04).
@@ -83,24 +81,19 @@ class TAMPConfiguration:
     # the warm q onto the moved pose target with batched damped GN (~2-5 ms
     # per dep) instead of a cuRobo solve; rows that miss checker tolerance or
     # the CoM polygon fall back to the reik_num_seeds cuRobo solve that
-    # refresh (not in balance-first mode). Init and the final pre-check
-    # refresh always use the full 32-seed solver. Default ON: A/B on blocks_t1
-    # @512 (2026-08-04) vs the cuRobo-only refresh: loop 98.0 -> 63.1 s, best
-    # soft 27.9 -> 21.3, final satisfying 349 vs 341, CoM-in-polygon parity
-    # (worst 499 vs 502).
+    # refresh. Init and the final pre-check refresh always use the full
+    # 32-seed solver. Default ON: A/B on blocks_t1 @512 (2026-08-04) vs the
+    # cuRobo-only refresh: loop 98.0 -> 63.1 s, best soft 27.9 -> 21.3,
+    # final satisfying 349 vs 341, CoM-in-polygon parity (worst 499 vs 502).
     reik_gn: bool = True
     # Balance-first GN refresh (gn_project_balanced, prototype): CoM-in-polygon
     # is GN's first priority and the pose is least squares inside it; every
     # row's iterate is written back, and no cuRobo runs during Adam (the final
     # pre-check refresh still repairs). Needs reik_gn.
     reik_balance_first: bool = False
-    # Replay the balance-first Adam step (G_step) and the balance-first re-IK
-    # refresh (G_refresh) as CUDA graphs (cutamp/cuda_graphs.py). In each
-    # optimize call, G_step is captured once the motion-planner build thread has
-    # ended, and G_refresh at the first refresh after that; both are released at
-    # loop exit. Needs reik_balance_first (default mode stays eager) and
-    # coupled_reik, and rejects CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS. A failed
-    # capture ends the run: there is no switch to eager mid-run.
+    # Replay the balance-first Adam step and re-IK refresh as CUDA graphs
+    # (cutamp/cuda_graphs.py). Needs reik_balance_first and coupled_reik, and
+    # rejects align_yaw. A failed capture ends the run: no switch to eager.
     cuda_graphs: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started
@@ -110,9 +103,7 @@ class TAMPConfiguration:
     # the CoM re-centering inside LBFGS doesn't converge (CoM-in-polygon
     # collapsed to 407/512). Must be a multiple of the LBFGS inner_iters
     # (20, lbfgs_ik.yml). Init and the final pre-check refresh keep the
-    # full 100-iteration schedule. No effect with reik_balance_first beyond
-    # validation (still a non-negative multiple of 20): balance-first runs no
-    # cuRobo during Adam.
+    # full 100-iteration schedule.
     reik_lbfgs_iters: int = 40
 
     ## Task Planning
@@ -208,9 +199,7 @@ def validate_tamp_config(config: TAMPConfiguration):
     if config.cuda_graphs and not config.reik_balance_first:
         raise ValueError("cuda_graphs needs reik_balance_first (it captures the balance-first Adam step)")
     if config.cuda_graphs and not config.coupled_reik:
-        raise ValueError(
-            "cuda_graphs needs coupled_reik (the balance-first step it captures runs only with coupled re-IK)"
-        )
+        raise ValueError("cuda_graphs needs coupled_reik (balance-first runs only with coupled re-IK)")
     if config.cuda_graphs:
         unsupported = [name for name in (config.soft_cost or []) if name in CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS]
         if unsupported:
