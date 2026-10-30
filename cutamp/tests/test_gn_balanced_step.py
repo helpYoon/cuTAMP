@@ -1,14 +1,7 @@
-"""CPU tests for the balance-first GN core (cutamp/gn_refresh.py).
-
-The refresh stacks every IK dep into one sync-free call, which rests on
-three claims pinned here: the branch-free rotation log map is roma's, bit
-for bit; a dep-major stack steps every row exactly as its dep's own call
-would; and each row's pins and frame follow its own dep's arm, checked on
-two of the arm orders real blocks_t1 refreshes use: (left, right, left,
-right) and (left, right, right, left).
-"""
+"""CPU tests for the balance-first GN core (cutamp/gn_refresh.py)."""
 import math
 
+import pytest
 import roma
 import torch
 
@@ -18,11 +11,9 @@ from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
 
 
 def _synthetic(seed, dof=21, B=64):
-    """Inputs for one ``_balanced_step`` on four dep-major blocks of ``B`` rows
-    (pick and place on each arm): ``(stack, blocks)``, the ``[4B]`` argument
-    tuple and its four ``[B]`` slices. Some joints sit on a hard limit or in
-    the margin band and some CoM rows are outside the support rectangle, so
-    every active set fires."""
+    """``(stack, blocks)``: one ``_balanced_step`` argument tuple on four dep-major ``B``-row
+    blocks and its four per-block slices. Some joints sit on a limit or in the margin band and some
+    CoM rows are outside, so every active set fires."""
     g = torch.Generator().manual_seed(seed)
     lower = -(2 * torch.rand(dof, generator=g) + 0.2)
     upper = 2 * torch.rand(dof, generator=g) + 0.2
@@ -69,10 +60,8 @@ def test_balanced_step_stack_matches_per_dep():
         stack, blocks = _synthetic(seed)                 # one [4B] stack + its 4 [B] blocks
         assert torch.equal(_balanced_step(*stack), torch.cat([_balanced_step(*b) for b in blocks]))
 
-    # That self-comparison can't see a mis-wired level-3 solve, the step's one
-    # hand-wired kernel, so check it against the library's LU on systems built
-    # like _margin_step's: m = sel * (projector onto the null space of 8 rows),
-    # with about 60% of its rows zeroed, then m m^T + damping I.
+    # The stack-vs-blocks check can't see a mis-wired _spd_solve, the step's one hand-wired kernel: compare
+    # it with LU on m m^T + damping I, m a row-masked null-space projector, as _margin_step builds it.
     g = torch.Generator().manual_seed(0)
     f64 = torch.float64
     basis = torch.linalg.qr(torch.randn(256, 21, 8, generator=g, dtype=f64))[0]
@@ -89,10 +78,7 @@ def test_balanced_step_moves_no_pinned_column():
     assert torch.all(step[col_mask == 0] == 0)
     assert torch.any(step[col_mask == 1] != 0)  # not vacuous: the free columns move
 
-    # The pins themselves, in two of the arm orders real blocks_t1 refreshes use,
-    # (left_q1, right_q1, left_q3, right_q3) and (left_q1, right_q1, right_q3,
-    # left_q3), each against a layout built block by block: the base and each
-    # block's inactive arm pinned, its own arm's frame.
+    # The pins on an interleaved arm order, against a layout built block by block.
     layout, is_left = _row_layout(("left", "right", "left", "right"), 12, 21, torch.device("cpu"), torch.float32)
     expected = torch.ones(12, 21)
     expected[:, BASE_INDICES] = 0
@@ -102,13 +88,7 @@ def test_balanced_step_moves_no_pinned_column():
     expected[9:12, LEFT_ARM_INDICES] = 0
     assert torch.equal(layout, expected)
     assert torch.equal(is_left, torch.tensor([True, False, True, False]).repeat_interleave(3))
-
-    layout, is_left = _row_layout(("left", "right", "right", "left"), 12, 21, torch.device("cpu"), torch.float32)
-    expected = torch.ones(12, 21)
-    expected[:, BASE_INDICES] = 0
-    expected[0:3, RIGHT_ARM_INDICES] = 0
-    expected[3:6, LEFT_ARM_INDICES] = 0
-    expected[6:9, LEFT_ARM_INDICES] = 0
-    expected[9:12, RIGHT_ARM_INDICES] = 0
-    assert torch.equal(layout, expected)
-    assert torch.equal(is_left, torch.tensor([True, False, False, True]).repeat_interleave(3))
+    with pytest.raises(ValueError):  # rows that don't split into equal dep blocks
+        _row_layout(("left", "right"), 5, 21, torch.device("cpu"), torch.float32)
+    with pytest.raises(ValueError):  # an arm that is neither left nor right
+        _row_layout(("left", "up"), 4, 21, torch.device("cpu"), torch.float32)

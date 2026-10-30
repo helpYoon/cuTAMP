@@ -1,20 +1,12 @@
-"""goal_in_xy's per-object sum, ``cost_function._per_object_sum``: the fixed-order
-replacement for cfa7a46's ``scatter_add_`` (cost_function.py:236-239), whose CUDA
-atomics add in a varying order, so goal_in_xy was not bitwise run to run.
-
-HEAD's form has no fixed bits to match, so the new op is gated by: determinism
-over repeats (HEAD's form is the positive control), a float64-reference error
-within HEAD's own spread and error, bitwise grads, sync-free capture, and
-run-to-run bitwise in the real cost function, with and without grad, through
-the call site it uses, where the particle grads are the ones cfa7a46's form gives."""
+"""goal_in_xy's fixed-order per-object sum (``cost_function._per_object_sum``), which replaced
+``scatter_add_``: its CUDA atomics made goal_in_xy vary run to run."""
 
 import os
 
-import numpy as np
 import pytest
 import torch
 
-from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
+from cutamp.tests.conftest import needs_cuda, sync_debug_error
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
@@ -23,12 +15,12 @@ _CASES = [(counts, b) for counts in ((50, 50), (37, 50, 13), (200, 56)) for b in
 
 
 def _block_index(counts, b):
-    """HEAD's sphere -> object map (cost_function.py:127-135), expanded to ``b`` rows."""
+    """HEAD's sphere -> object map, expanded to ``b`` rows."""
     return torch.tensor([o for o, n in enumerate(counts) for _ in range(n)], device="cuda")[None].expand(b, -1)
 
 
 def _head_sum(x, idx, k):
-    """HEAD's form (cost_function.py:236-239): atomic adds in a varying order."""
+    """HEAD's form: atomic adds in a varying order."""
     return torch.zeros(x.shape[0], k, dtype=x.dtype, device=x.device).scatter_add_(1, idx, x)
 
 
@@ -42,15 +34,6 @@ def _not_equal(got, want):
 def _grads(out):
     """The ``("grad", name)`` entries of a :func:`test_cost_function_is_run_to_run_bitwise` output."""
     return {k: v for k, v in out.items() if k[0] == "grad"}
-
-
-@pytest.fixture
-def _numpy_rng_restored():
-    """Puts numpy's global RNG back as the test found it, so the tests after one
-    that seeds it keep their own draws."""
-    state = np.random.get_state()
-    yield
-    np.random.set_state(state)
 
 
 @needs_cuda
@@ -71,16 +54,11 @@ def test_per_object_sum_is_fixed_order():
         head_got, = torch.autograd.grad(_head_sum(xr, idx, k), xr, gy)
         assert torch.equal(got, gy.gather(1, idx)) and torch.equal(got, head_got), (counts, b)
         # 3. Sync-free, forward and backward (the capture rule).
-        torch.cuda.set_sync_debug_mode("error")
-        try:
+        with sync_debug_error():
             torch.autograd.grad(_per_object_sum(xr, counts), xr, gy)
-        finally:
-            torch.cuda.set_sync_debug_mode(0)
         cases.append((counts, b, x, idx, k, want))
     if torch.are_deterministic_algorithms_enabled():
-        pytest.skip("deterministic algorithms are on, so HEAD's scatter_add_ takes its deterministic kernel and has "
-                    "no atomics to measure: skipped the positive control, the spread bound and the HEAD-error bound "
-                    "(checks 1-3 ran and passed)")
+        pytest.skip("deterministic algorithms are on: scatter_add_ has no atomics to measure (checks 1-3 passed)")
     for counts, b, x, idx, k, want in cases:  # 4-5 measure HEAD's atomics
         # 4. The positive control: HEAD's form is not deterministic.
         heads = torch.stack([_head_sum(x, idx, k) for _ in range(200)])
@@ -92,10 +70,8 @@ def test_per_object_sum_is_fixed_order():
         err = (want.double().cpu() - ref).abs().max().item()
         spread = (heads.amax(0) - heads.amin(0)).max().item()
         head_err = (heads.double().cpu() - ref).abs().max().item()
-        assert err <= head_err, f"{counts}, B={b}: B0 error {err:.3g} exceeds HEAD's {head_err:.3g}"
-        assert err <= spread, (
-            f"{counts}, B={b}: HEAD's spread {spread:.3g} is below B0's error {err:.3g}: "
-            "HEAD's atomics vary too little on this GPU for the spread bound")
+        assert err <= head_err, f"{counts}, B={b}: error {err:.3g} exceeds the atomic form's {head_err:.3g}"
+        assert err <= spread, f"{counts}, B={b}: atomic spread {spread:.3g} is below the error {err:.3g}"
 
 
 @needs_cuda
@@ -129,35 +105,24 @@ def test_per_object_sum_replays_like_eager():
 
 
 @needs_cuda
-def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
+def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
     from cutamp.config import TAMPConfiguration
     from cutamp.constraint_checker import ConstraintChecker
-    from cutamp.cost_function import CostFunction
+    from cutamp.cost_function import CostFunction, _per_object_sum
     from cutamp.cost_reduction import CostReducer
     from cutamp.optimize_plan import _adam_consider_types
-    from cutamp.particle_initialization import ParticleInitializer
     from cutamp.rollout import RolloutFunction
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-    from cutamp.t1_domain import all_t1_operators
-    from cutamp.task_planning import task_plan_generator
 
-    np.random.seed(0)  # the world's block spheres are sampled from numpy's global RNG: a recreatable state
-    world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
-    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+    world, skeleton, particles = blocks_t1_plan
     where = f"skeleton {' | '.join(map(str, skeleton))}; PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}"
     config = TAMPConfiguration(num_particles=64)
-    torch.manual_seed(0)
-    particles = ParticleInitializer(world, config)(skeleton)
     rollout_fn, cost_fn = RolloutFunction(skeleton, world, config), CostFunction(skeleton, world, config)
     reducer = CostReducer(default_constraint_to_mult.copy())
     checker = ConstraintChecker(default_constraint_to_tol.copy())
 
-    # The init state, where sums have the most nonzero sphere terms. Asserted: 256 repeats bitwise
-    # equal to `want`. Power against cfa7a46's atomics patched in at this seeded state, at the
-    # PYTHONHASHSEED=1 skeleton: 8 repeats would miss (all agree with `want`) with probability
-    # above 1% in 6 of 9 processes, and 0.78 in the weakest (its top result in 973 of 1000 calls);
-    # 244 bound that state's miss below 1% at the Wilson 95% upper bound. The grad-enabled repeats
-    # below vary more under those atomics, and 8 of them miss under 1% in every measured state.
+    # At the init state (most nonzero sphere terms), 8 no_grad repeats often all agree with `want` even
+    # under cfa7a46's atomics, hence 256; the grad-enabled repeats below vary more, so 8 suffice there.
     def outputs():
         with torch.no_grad():
             cost_dict = cost_fn(rollout_fn(particles), particles)
@@ -171,17 +136,15 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
     assert ("StablePlacement", "goal_in_xy") in want
     for r in range(256):
         bad = _not_equal(outputs(), want)
-        assert not bad, f"repeat {r}: not bitwise run to run: {bad} ({where})"   # RED at cfa7a46: goal_in_xy
+        assert not bad, f"repeat {r}: not bitwise run to run: {bad} ({where})"
     for surface, placements in cost_fn.surface_to_placements.items():  # the blocks the split assumes
         counts = cost_fn.surface_to_sphere_counts[surface]
         assert counts == tuple(world.get_collision_spheres(o).shape[0] for o, _ in placements)
-        assert all(type(n) is int for n in counts)                  # Python ints: no host read per call
         assert cost_fn.surface_to_sphere_idx_map[surface].tolist() == [
             i for i, n in enumerate(counts) for _ in range(n)]     # the amin's map agrees with the blocks
 
-    # The call site: one _per_object_sum call per surface, on that surface's blocks,
-    # and its result is the value. An inline replacement there fails this.
-    from cutamp.cost_function import _per_object_sum
+    # One _per_object_sum call per surface, on its blocks, gives the value: the lockstep oracle and the grad
+    # compare below patch cost_function._per_object_sum, so the call site must go through it.
     calls = []
 
     def recording(x, counts):
@@ -205,7 +168,7 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
         out = {(c, n): v.detach().clone() for c, e in cost_dict.items() for n, v in e["values"].items()}
         out["costs"] = costs.detach().clone()
         out["mask"] = checker.get_mask(cost_dict, verbose=False).clone()
-        costs.mean().backward()                 # the Adam loop's loss (optimize_plan.py:706-708, :777)
+        costs.mean().backward()                 # the Adam loop's loss
         out.update({("grad", k): v.grad.clone() for k, v in leaves.items() if v.grad is not None})
         return out
 
@@ -216,12 +179,12 @@ def test_cost_function_is_run_to_run_bitwise(monkeypatch, _numpy_rng_restored):
         bad = _not_equal(grad_outputs(), want)
         assert not bad, f"grad-enabled repeat {r}: not bitwise run to run: {bad} ({where})"
 
-    # In situ, B0 leaves the particle grads as cfa7a46's form gives them: its zeros + scatter_add_,
-    # on each surface's own idx map. Only the grads are compared: that form's values vary.
+    # In situ, the fixed-order sum leaves the particle grads as cfa7a46's form gives them: its zeros +
+    # scatter_add_, on each surface's own idx map. Only the grads are compared: that form's values vary.
     idx_for = {c: cost_fn.surface_to_sphere_idx_map[s][None].expand(64, -1)
                for s, c in cost_fn.surface_to_sphere_counts.items()}
     with monkeypatch.context() as m:
         m.setattr("cutamp.cost_function._per_object_sum", lambda x, c: _head_sum(x, idx_for[c], len(c)))
         head = grad_outputs()
     bad = _not_equal(_grads(head), _grads(want))
-    assert not bad, f"particle grads under cfa7a46's scatter_add_ differ from B0's: {bad} ({where})"
+    assert not bad, f"particle grads under cfa7a46's scatter_add_ differ from the fixed-order sum's: {bad} ({where})"

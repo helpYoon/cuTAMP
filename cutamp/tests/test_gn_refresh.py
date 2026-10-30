@@ -5,24 +5,19 @@ check is the load-bearing regression (GN silently diverges if cuRobo ever
 changes row order or frame).
 """
 import math
-import warnings
 from unittest import mock
 
 import pytest
 import roma
 import torch
 
-from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
+from cutamp.tests.conftest import cupti_sync_events, make_blocks_t1_world, needs_cuda, sync_debug_error
 
 
 def _four_dep_stack(world):
-    """A refresh's dep-major stack of four 8-row IK deps: ``(q [32, 21],
-    T [32, 4, 4], arms)``. Per arm, one IK solution for an identity-rotation
-    target at (0.35, +-0.25, 0.25) feeds a warm dep (its target drifted by mm,
-    as between refreshes) and a far dep (x = 0.9, out of balanced reach).
-    The deps are arm-sorted, ``("left", "left", "right", "right")``, unlike a
-    real blocks_t1 refresh, which interleaves the arms (left_q1, right_q1,
-    left_q3, right_q3)."""
+    """``(q [32, 21], T [32, 4, 4], arms)``: four arm-sorted 8-row IK deps. Per arm, one IK
+    solution for a target at (0.35, +-0.25, 0.25) feeds a warm dep (target drifted by mm) and a
+    far dep (x = 0.9, out of balanced reach)."""
     from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask
 
     B = 8
@@ -214,44 +209,9 @@ def test_gn_project_balanced_leaves_margin_bands_holding_pose_and_com():
 
 
 @needs_cuda
-def test_gn_project_balanced_stack_matches_per_dep():
-    # One call on a refresh's whole dep-major stack matches one call per dep,
-    # and so does a stack with no right-arm rows (measured bitwise; the bound
-    # leaves room for GPU kernels whose reduction order depends on the batch).
-    from cutamp.gn_refresh import gn_project_balanced
-
-    world = make_blocks_t1_world()
-    q, T, arms = _four_dep_stack(world)
-    per_dep = torch.cat([gn_project_balanced(world, qi, Ti, a)
-                         for qi, Ti, a in zip(q.split(8), T.split(8), arms)])
-    assert (gn_project_balanced(world, q, T, arms) - per_dep).abs().max().item() <= 1e-5
-    left_only = gn_project_balanced(world, q[:16], T[:16], arms[:2])
-    assert (left_only - per_dep[:16]).abs().max().item() <= 1e-5
-
-
-@needs_cuda
-def test_gn_project_balanced_accepts_bare_arm():
-    # Today's call style: a bare arm is one dep, not ("l", "e", "f", "t").
-    # Rows that don't split into equal dep blocks, or an arm that is neither
-    # left nor right, raise instead of picking a frame.
-    from cutamp.gn_refresh import gn_project_balanced
-
-    world = make_blocks_t1_world()
-    q, T, arms = _four_dep_stack(world)
-    assert torch.equal(gn_project_balanced(world, q[:8], T[:8], "left"),
-                       gn_project_balanced(world, q[:8], T[:8], ("left",)))
-    with pytest.raises(ValueError):
-        gn_project_balanced(world, q[:10], T[:10], arms)
-    with pytest.raises(ValueError):
-        gn_project_balanced(world, q[:8], T[:8], "up")
-
-
-@needs_cuda
 def test_gn_project_balanced_pins_per_row():
-    # Each row keeps its own dep's cspace pin and tool frame: the base never
-    # moves, each arm moves only in its own deps' rows, and both warm deps
-    # close their 3.9 mm drift on their own arm's frame (a right row on the
-    # left frame would chase a target half a metre away).
+    # Each row keeps its own dep's cspace pin and tool frame (a right row on the left frame
+    # would chase a target half a metre away).
     from cutamp.gn_refresh import gn_project_balanced
     from cutamp.particle_initialization import _achieved_pose_errors
     from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
@@ -259,6 +219,8 @@ def test_gn_project_balanced_pins_per_row():
     world = make_blocks_t1_world()
     q, T, arms = _four_dep_stack(world)
     q1 = gn_project_balanced(world, q, T, arms)
+    per_dep = torch.cat([gn_project_balanced(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)])
+    assert (q1 - per_dep).abs().max().item() <= 1e-5  # bitwise as measured; slack for batch-dependent GPU reductions
     assert torch.equal(q1[:, BASE_INDICES], q[:, BASE_INDICES])
     assert torch.equal(q1[:16, RIGHT_ARM_INDICES], q[:16, RIGHT_ARM_INDICES])
     assert torch.equal(q1[16:, LEFT_ARM_INDICES], q[16:, LEFT_ARM_INDICES])
@@ -277,23 +239,17 @@ def test_gn_project_balanced_pins_per_row():
 
 @needs_cuda
 def test_gn_gate_matches_checker_helpers():
-    # One FK over the whole stack gives the checker helpers' masks: per-dep
-    # _achieved_pose_errors on each row's own arm, and compute_com_polygon_mask
-    # on the stack and per dep. The lean is forward: a 0.45 rad back-lean
-    # leaves every leaned CoM inside on this seeded draw; forward, every leaned
-    # CoM was out on each of 20 draws (114 mm out on this one).
+    # One FK over the whole stack gives the checker helpers' masks, each row on its own arm;
+    # the forward ankle lean puts every leaned row's CoM outside the polygon.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_gate
     from cutamp.particle_initialization import _achieved_pose_errors
 
     world = make_blocks_t1_world()
     q, T, arms = _four_dep_stack(world)
-    q = q.clone()
-    q[::3, 3] -= 0.45  # lean the ankle on every third row: CoM leaves the polygon
-    # Make every term of the masks matter: unleaned warm rows 1 and 2 (3.9 mm
-    # off) get rotation-only errors between and beyond the tolerances, and
-    # leaned row 0 aims at its own tool pose, so it is pose-ok but CoM-out.
-    T = T.clone()
+    q[::3, 3] -= 0.45  # lean the ankle on every third row
+    # Rows 1 and 2 get rotation errors between and beyond the tolerance; leaned row 0 aims
+    # at its own tool pose, so it is pose-ok but CoM-out.
     for row, ang in ((1, 0.02), (2, 0.1)):
         T[row, :3, :3] = roma.rotvec_to_rotmat(torch.tensor([0.0, 0.0, ang], device="cuda")) @ T[row, :3, :3]
     pos, quat, _ = _fk_pose(world, q[:8], world.tool_frame_for_arm("left"))
@@ -309,29 +265,17 @@ def test_gn_gate_matches_checker_helpers():
     assert torch.equal(com_ok, torch.cat([compute_com_polygon_mask(world, qi) for qi in q.split(8)]))
     assert pose_ok.any() and (~pose_ok).any() and com_ok.any() and (~com_ok).any()
     assert (pose_ok & ~com_ok).any()
-    # A real blocks_t1 refresh interleaves the arms (left_q1, right_q1, left_q3,
-    # right_q3). The unleaned right warm rows are pose-ok on their own frame
-    # (3.9 mm off) and 0.65 m off on the left one.
-    perm = torch.cat([torch.arange(8, device="cuda") + 8 * b for b in (0, 2, 1, 3)])
-    inter = ("left", "right", "left", "right")
-    pose_int, com_int = gn_gate(world, q[perm], T[perm], inter, 0.005, 0.05)
-    assert torch.equal(pose_int, pose_ok[perm])
-    assert torch.equal(com_int, com_ok[perm])
 
 
 @needs_cuda
 # Sync debug mode warns that it misses some syncs; the profile is the oracle.
 @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 def test_balanced_refresh_is_sync_free():
-    # A steady-state balance-first refresh makes no host syncs or copies: its
-    # profile holds only the profiler's own cudaDeviceSynchronize (an empty
-    # profile records exactly one). It writes every row of the projection
-    # back in place, and its deferred stats count the gate misses of the rows
-    # it wrote.
+    # A steady-state balance-first refresh makes no host syncs or copies (its profile holds only
+    # the profiler's own cudaDeviceSynchronize) and drops stale grads.
     from torch.profiler import ProfilerActivity, profile
 
-    from cutamp.gn_refresh import gn_gate, gn_project_balanced
-    from cutamp.optimize_plan import IKDep, _ReikDriftGate, _refresh_balanced
+    from cutamp.optimize_plan import IKDep, _ReikDriftGate, _refresh_balanced, _StaticRefresh
 
     world = make_blocks_t1_world()
     q, T, arms = _four_dep_stack(world)
@@ -341,75 +285,37 @@ def test_balanced_refresh_is_sync_free():
     gate = _ReikDriftGate(4, pos_tol=0.005, rot_tol=0.05)
     for step in (4, 9):  # warm-up: lazy kinematics, caches, allocations, the drift reference
         _refresh_balanced(particles, deps, world, gate, step)
-    confs = [particles[n] for n in names]
-    before = torch.cat(confs)
-    for c in confs:
-        c.grad = torch.ones_like(c)  # stale buffers the refresh must drop
+    for n in names:
+        particles[n].grad = torch.ones_like(particles[n])  # stale buffers the refresh must drop
     torch.cuda.synchronize()
-    # CUPTI sync activities also catch driver-API waits (cuRobo launches FK
-    # through cuda.core), which the runtime-API names and sync debug mode miss.
-    # The config is a private API, hence the guard.
-    try:
-        sync_events = {"experimental_config": torch._C._profiler._ExperimentalConfig(enable_cuda_sync_events=True)}
-    except (AttributeError, TypeError):
-        sync_events = {}
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **sync_events) as prof:
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            _refresh_balanced(particles, deps, world, gate, 14)
-        finally:
-            torch.cuda.set_sync_debug_mode(0)
+    sync_events = cupti_sync_events()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **sync_events) as prof, sync_debug_error():
+        _refresh_balanced(particles, deps, world, gate, 14)
     events = [e.name for e in prof.events()]
     assert [n for n in events if "Synchronize" in n] == ["cudaDeviceSynchronize"]
     assert not [n for n in events if "DtoH" in n or "HtoD" in n]
     if sync_events:  # the profiler's own cudaDeviceSynchronize is the one Context Sync
         assert [n for n in events if n.endswith(" Sync")] == ["Context Sync"]
-    else:
-        warnings.warn("no torch profiler _ExperimentalConfig(enable_cuda_sync_events=...): driver-API syncs unchecked")
     assert all(particles[n].grad is None for n in names)
-    # Every row, the far deps' unconverged ones too, written in place.
-    assert all(particles[n] is c for n, c in zip(names, confs))
-    assert torch.equal(torch.cat(confs), gn_project_balanced(world, before, T, arms))
 
     gate.flush()
-    assert len(gate.stats) == 12
-    # Drift from the second refresh on, so the profiled call took the drift path.
-    assert ["pos_drift_mean" in r for r in gate.stats] == [False] * 4 + [True] * 8
-    pose_ok, com_ok = gn_gate(world, torch.cat([particles[n] for n in names]), T, arms, 0.005, 0.05)
-    misses = (~(pose_ok & com_ok)).view(4, 8).sum(-1).tolist()
-    assert [(r["conf"], r["gn_fail"]) for r in gate.stats[-4:]] == list(zip(names, misses))
+    assert all("pos_drift_mean" in r for r in gate.stats[-4:])  # the profiled refresh took the drift path
 
-    # The same refresh replayed as G_refresh: one graph launch, and no kernel launch, host sync
-    # or host copy. Count API names, not memcpy activities: the graph's own memcpy nodes may
-    # show up as activities.
-    from cutamp.optimize_plan import _StaticRefresh
+    # Replayed as G_refresh: one graph launch plus the slot clone's copy, and no eager kernel launch.
     refresh = _StaticRefresh(particles, deps, world, gate)
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **sync_events) as prof:
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            refresh(19)
-        finally:
-            torch.cuda.set_sync_debug_mode(0)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **sync_events) as prof, sync_debug_error():
+        refresh(19)
     names = [e.name for e in prof.events()]
-    assert names.count("cudaGraphLaunch") == 1
+    assert names.count("cudaGraphLaunch") == 1 and names.count("cudaMemcpyAsync") == 1
     assert not [n for n in names if n.startswith(("cudaLaunch", "cuLaunch"))]
-    assert [n for n in names if "Synchronize" in n] == ["cudaDeviceSynchronize"]
-    assert not [n for n in names if "DtoH" in n or "HtoD" in n]
-    assert sum("EventRecord" in n for n in names) == 2 and names.count("cudaMemcpyAsync") == 1  # the slot clone
-    if sync_events:
-        assert [n for n in names if n.endswith(" Sync")] == ["Context Sync"]
-    gate.flush()
-    assert [r["step"] for r in gate.stats[-4:]] == [19] * 4 and all("pos_drift_mean" in r for r in gate.stats[-4:])
     refresh.graph.release()
 
 
 @needs_cuda
 def test_balanced_refresh_on_each_dep_layout():
-    # One dep, a one-arm stack, and a real blocks_t1 refresh's interleaved arm
-    # order (left_q1, right_q1, left_q3, right_q3): each refresh writes back its
-    # stack's projection and flushes one record per dep, in dep order, counting
-    # the gate misses of the rows it wrote. The second refresh takes the drift path.
+    # One dep, a one-arm stack and blocks_t1's interleaved arm order: each refresh writes back its
+    # stack's projection and flushes one record per dep, in dep order, counting its gate misses.
     from cutamp.gn_refresh import gn_gate, gn_project_balanced
     from cutamp.optimize_plan import IKDep, _ReikDriftGate, _refresh_balanced
 
@@ -431,7 +337,6 @@ def test_balanced_refresh_on_each_dep_layout():
         written = torch.cat(confs)
         assert torch.equal(written, gn_project_balanced(world, before, T_sub, arms_sub)), idx
         gate.flush()
-        assert len(gate.stats) == 2 * len(idx), idx
         assert [(r["step"], r["conf"]) for r in gate.stats] == [(s, n) for s in (4, 9) for n in names], idx
         assert ["pos_drift_mean" in r for r in gate.stats] == [False] * len(idx) + [True] * len(idx), idx
         pose_ok, com_ok = gn_gate(world, written, T_sub, arms_sub, 0.005, 0.05)

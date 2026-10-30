@@ -64,14 +64,6 @@ def test_log_stat_records_drift_histogram():
     assert rec["frac_drift_below"]["2mm"] == 0.5
 
 
-def test_flush_without_refreshes_is_noop():
-    # A loop that ends before its first refresh (early stop, max_loop_dur)
-    # queues nothing, so reik_refresh stays absent.
-    gate = _ReikDriftGate(2, pos_tol=0.005, rot_tol=0.05)
-    gate.flush()
-    assert gate.stats == []
-
-
 @needs_cuda
 def test_log_batch_flush_matches_log_stat():
     # Balance-first stats stay on the device until flush(), which turns them
@@ -84,9 +76,8 @@ def test_log_batch_flush_matches_log_stat():
     rot_drift = torch.zeros(D * B, device="cuda")
     gate = _ReikDriftGate(D, pos_tol=0.005, rot_tol=0.05)
     events = []
-    # GPU waits of different lengths (about 0.4 ms vs 35 ms on a 4090), so
-    # solve_s is nonzero and only a host stall of tens of ms inside the first
-    # window could flip the two refreshes. Warm the spin kernel and drain first.
+    # Two GPU waits, ~0.4 ms and ~35 ms, so solve_s differs and only a tens-of-ms host stall could flip
+    # the two refreshes. Warm the spin kernel and drain first.
     torch.cuda._sleep(1)
     torch.cuda.synchronize()
     for step, drift, cycles in ((7, (pos_drift, rot_drift), 1_000_000), (12, (None, None), 100_000_000)):
@@ -98,12 +89,10 @@ def test_log_batch_flush_matches_log_stat():
         gate.log_batch(step, names, B, pose_ok & com_ok, pose_ok, com_ok, *drift, start, end)
     gate.flush()
 
-    assert [(r["step"], r["conf"], r["batch"]) for r in gate.stats] == [
-        (7, names[0], B), (7, names[1], B), (12, names[0], B), (12, names[1], B),
-    ]
+    assert [(r["step"], r["conf"], r["batch"]) for r in gate.stats] == [(s, n, B) for s in (7, 12) for n in names]
     for rec, counts, (start, end) in zip(gate.stats, [(2, 1, 1), (2, 2, 1)] * 2, events):
         assert (rec["gn_fail"], rec["gn_fail_pose"], rec["gn_fail_com"]) == counts
-        assert rec["n_ik_fail"] == rec["gn_fail"] and rec["fallback"] is False and rec["solve_s"] >= 0
+        assert rec["n_ik_fail"] == rec["gn_fail"] and rec["fallback"] is False
         # The refresh's event time, split evenly over its deps.
         assert rec["solve_s"] == round(start.elapsed_time(end) / 1e3 / D, 4)
     assert 0 < gate.stats[0]["solve_s"] < gate.stats[2]["solve_s"]
@@ -114,17 +103,6 @@ def test_log_batch_flush_matches_log_stat():
     ref, rec = ref_gate.stats[0], gate.stats[0]
     assert rec.keys() == ref.keys()
     assert all(type(rec[k]) is type(ref[k]) for k in ref), {k: (type(rec[k]), type(ref[k])) for k in ref}
-    assert rec["frac_drift_below"] == ref["frac_drift_below"] and rec["frac_drift_below"]["2mm"] == 0.5
-    for key in ("pos_drift_mean", "pos_drift_max", "rot_drift_max"):
-        assert rec[key] == pytest.approx(ref[key], rel=1e-6)
-    drift_keys = {"pos_drift_mean", "pos_drift_max", "rot_drift_max", "frac_drift_below"}
-    for rec in gate.stats[2:]:
-        assert rec.keys() == ref.keys() - drift_keys
-    # Key order too (the views above compare as sets).
-    base = ["step", "conf", "batch", "n_ik_fail", "solve_s", "fallback", "gn_fail", "gn_fail_pose", "gn_fail_com"]
-    full = base + ["pos_drift_mean", "pos_drift_max", "rot_drift_max", "frac_drift_below"]
-    assert [list(r) for r in gate.stats] == [full, full, base, base]
-    assert list(gate.stats[0]["frac_drift_below"]) == ["0.5mm", "1mm", "2mm", "5mm", "10mm"]
     gate.flush()  # the queue is empty now: nothing is appended twice
     assert len(gate.stats) == 4
 

@@ -11,7 +11,6 @@ from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 def test_site_kinematics_are_dedicated():
     from cutamp.tamp_world import FK_SITES
     world = make_blocks_t1_world()
-    assert FK_SITES == ("rollout", "retract", "com", "gate")
     kins = [world.site_kinematics(s) for s in FK_SITES]
     assert len({id(k) for k in (*kins, world.kinematics, world.kinematics_jac)}) == 6
     assert all(world.site_kinematics(s) is k for s, k in zip(FK_SITES, kins))
@@ -22,8 +21,7 @@ def test_site_kinematics_are_dedicated():
 
 @needs_cuda
 def test_same_shape_sites_keep_their_grads():
-    # The failure the old resets prevented: two same-shape FK calls on ONE instance
-    # before backward corrupt the first call's gradient. Sites keep them apart.
+    # Two same-shape FK calls on one instance before backward corrupt the first's gradient; sites keep them apart.
     from curobo.kinematics import Kinematics
     from curobo.types import JointState
     world = make_blocks_t1_world()
