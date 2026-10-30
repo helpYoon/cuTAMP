@@ -108,10 +108,12 @@ def main():
     ap.add_argument("--out", required=True, help="study output dir (manifest lives here)")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny pilot: 64 particles, 30 steps, 1 height, 1 seed, no motion plan")
+    ap.add_argument("--heights", type=float, nargs="+", help="override the heights")
+    ap.add_argument("--seeds", type=int, nargs="+", help="override the seeds")
     a = ap.parse_args()
     plan = build_run_plan(
-        heights=[0.0] if a.smoke else HEIGHTS,
-        seeds=[0] if a.smoke else SEEDS,
+        heights=a.heights or ([0.0] if a.smoke else HEIGHTS),
+        seeds=a.seeds or ([0] if a.smoke else SEEDS),
         smoke=a.smoke,
     )
     manifest = run_study(plan, a.out)
