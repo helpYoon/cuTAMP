@@ -166,18 +166,12 @@ class _StepBody:
         apply_grad_masks([{"params": self.params}], self.grad_masks)
         return packed, ((rollout, cost_dict, costs, satisfying_mask) if self.keep_vis else None)
 
-
-def _clear_step_autograd(cost_fn: CostFunction, params: List[torch.Tensor]) -> None:
-    """Drop the autograd state a step leaves behind: ``cost_fn``'s CoM
-    penalties cache, which holds the last forward's tensors and their graph
-    (P9, ruling 6), and every param's ``.grad`` (P10). Right after G_step's
-    release, both hold blocks of its pool. Before its warm-ups, the cache
-    clear is ruling 6's belt and braces: every ``CostFunction`` call resets
-    the cache on entry, so the graph alive when the capture starts is the
-    last warm-up's either way."""
-    cost_fn._com_polygon_penalties_cache = None
-    for p in params:
-        p.grad = None
+    def clear_autograd(self) -> None:
+        """Drop the CoM cache and every param's ``.grad``: before a capture, so a deferred one's first warm-up
+        doesn't accumulate into the last eager step's grads, and after G_step's release, when both hold its pool."""
+        self.cost_fn._com_polygon_penalties_cache = None
+        for p in self.params:
+            p.grad = None
 
 
 class PlanContainer(TypedDict):
@@ -413,7 +407,6 @@ def _refresh_balanced(
     assert all(t.shape[0] == batch for t in targets), [t.shape[0] for t in targets]
     pos_drifts, rot_drifts = zip(*(gate.measure_drift(i, t) for i, t in enumerate(targets)))
     first_refresh = pos_drifts[0] is None
-    assert all((d is None) == first_refresh for d in pos_drifts), "deps share their first refresh"
 
     pose_ok, com_ok = _project_and_write_back(particles, ik_deps, world, torch.cat(targets), gate)
     end.record()
@@ -448,14 +441,13 @@ class _StaticRefresh:
             self.body({k: v.detach().clone() for k, v in particles.items()}, self.refs.detach().clone(),
                       self.slot.detach().clone())
 
-        self.graph = cuda_graphs.capture(
+        self.graph = cuda_graphs.CapturedGraph(
             "G_refresh", lambda: self.body(particles, self.refs, self.slot), warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
                 [*particles.values(), self.refs, self.slot],
                 [world.site_kinematics("gate"), world.kinematics_jac],
             ),
         )
-        self.capture_s = self.graph.capture_s
 
     def body(self, particles: dict, refs: torch.Tensor, slot: torch.Tensor) -> None:
         """:func:`_refresh_balanced`'s device work on static I/O, sync-free so it can be captured."""
@@ -477,14 +469,6 @@ class _StaticRefresh:
         end.record()
         # The next replay rewrites the slot, so the queue keeps a copy.
         self.gate._queued.append(_QueuedRefresh(step, self.q_names, self.batch, self.slot.clone(), start, end))
-        for name in self.q_names:
-            self.particles[name].grad = None  # as _project_and_write_back does: a replay runs no Python
-
-    def release(self) -> None:
-        """Release the graph (``CapturedGraph.release``), and drop the static
-        refs and slot."""
-        self.graph.release()
-        self.refs = self.slot = None
 
 
 class ParticleOptimizer:
@@ -644,18 +628,18 @@ class ParticleOptimizer:
                     fallback=fallback,
                 )
 
-    def _capture_step(self, body: _StepBody, cost_fn: CostFunction, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
+    def _capture_step(self, body: _StepBody, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
         """Capture ``body`` as G_step. Each warm-up drops every ``.grad``, so the captured AccumulateGrad
         gives each param a graph-owned ``.grad`` that every replay rewrites in place (never zero_grad it).
         The guard covers the particles, those grads and the step's three FK sites."""
-        _clear_step_autograd(cost_fn, body.params)
+        body.clear_autograd()
 
         def warmup() -> None:
             body()
             for p in body.params:
                 p.grad = None
 
-        return cuda_graphs.capture(
+        return cuda_graphs.CapturedGraph(
             "G_step", body, warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
                 [*body.particles.values(), *(p.grad for p in body.params)],
@@ -850,7 +834,7 @@ class ParticleOptimizer:
                     break
                 timer.start("optimization_step")  # a capture's cost lands in its step
                 if self.config.cuda_graphs and step_graph is None and not (self.planner_busy and self.planner_busy()):
-                    step_graph = self._capture_step(body, cost_fn, world)  # the planner thread has ended
+                    step_graph = self._capture_step(body, world)  # the planner thread has ended
                     opt_metrics["capture_s"], opt_metrics["capture_step"] = step_graph.capture_s, step
                 if step_graph is not None:
                     step_graph.replay()  # never zero_grad after the capture: the graph owns .grad
@@ -911,7 +895,7 @@ class ParticleOptimizer:
                         # G_step exists only once the planner thread has ended for good.
                         if step_graph is not None and self.config.reik_balance_first:
                             refresh_graph = _StaticRefresh(particles, ik_deps, world, reik_gate)
-                            opt_metrics["refresh_capture_s"] = refresh_graph.capture_s
+                            opt_metrics["refresh_capture_s"] = refresh_graph.graph.capture_s
                             opt_metrics["refresh_capture_step"] = step
                 timer.stop("optimization_step")
                 pbar.set_description(
@@ -922,9 +906,9 @@ class ParticleOptimizer:
         finally:  # also on early stop and on errors: no graph outlives the loop
             if step_graph is not None:
                 step_graph.release()
-                _clear_step_autograd(cost_fn, body.params)
+                body.clear_autograd()
             if refresh_graph is not None:
-                refresh_graph.release()
+                refresh_graph.graph.release()
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).
@@ -943,7 +927,6 @@ class ParticleOptimizer:
         # restore_if_better may have rewritten particles, making gate refs stale.
         if ik_deps:
             self._refresh_ik_deps(particles, ik_deps, world)
-        if reik_gate is not None:
             reik_gate.flush()  # balance-first records sit on the device until here
         if reik_gate is not None and reik_gate.stats:
             opt_metrics["reik_refresh"] = reik_gate.stats

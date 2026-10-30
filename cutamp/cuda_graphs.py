@@ -31,17 +31,35 @@ def graph_ptrs(tensors: Iterable[Optional[torch.Tensor]], kins: Iterable[Kinemat
 
 class CapturedGraph:
     """A captured graph and its guard: ``outputs`` are the static tensors ``body`` returned in the capture,
-    which every replay rewrites in place; ``ptrs`` reads the guard tuple (:func:`graph_ptrs`)."""
+    which every replay rewrites in place; ``ptrs`` reads the guard tuple (:func:`graph_ptrs`).
 
-    def __init__(self, name: str, cuda_graph: torch.cuda.CUDAGraph, outputs: Any, body: Callable[[], Any],
-                 ptrs: Callable[[], tuple], capture_s: float):
-        self.name = name
-        self.cuda_graph = cuda_graph
-        self.outputs = outputs
-        self.body = body
-        self.ptrs = ptrs
-        self.capture_s = capture_s
-        self.captured_ptrs = ptrs()
+    The capture goes into its own private pool, after three ``warmup`` calls on :func:`side_stream` that fill
+    lazy caches, compile kernels and size buffers (``warmup`` must leave no state the capture would bake in).
+    ``"global"`` mode fails the capture on another thread's unsafe CUDA call. A failed capture leaves the side
+    stream current, so the constructor restores the caller's and raises; there is no eager fallback: the
+    failure leaves torch's CUDA RNG unusable until a capture succeeds and the caching allocator in capture
+    mode until the process exits.
+    """
+
+    def __init__(self, name: str, body: Callable[[], Any], warmup: Callable[[], None], ptrs: Callable[[], tuple]):
+        side = side_stream()
+        t0 = time.perf_counter()
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                warmup()
+        cur.wait_stream(side)
+        self.cuda_graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(self.cuda_graph, stream=side, capture_error_mode="global"):
+                self.outputs = body()
+        except Exception as e:
+            torch.cuda.set_stream(cur)
+            raise RuntimeError(f"CUDA graph capture of {name} failed; rerun without --cuda_graphs") from e
+        torch.cuda.synchronize()
+        self.capture_s = time.perf_counter() - t0
+        self.name, self.body, self.ptrs, self.captured_ptrs = name, body, ptrs, ptrs()
 
     def replay(self) -> None:
         """Replay on the current stream once the guard holds: a moved address would touch freed memory."""
@@ -58,31 +76,3 @@ class CapturedGraph:
         graph = weakref.ref(self.cuda_graph)
         self.cuda_graph = self.outputs = self.body = self.ptrs = None
         assert graph() is None, f"{self.name}: its CUDAGraph outlived release()"
-
-
-def capture(name: str, body: Callable[[], Any], warmup: Callable[[], None], ptrs: Callable[[], tuple],
-            warmups: int = 3) -> CapturedGraph:
-    """Capture ``body`` as the CUDA graph ``name``, into its own private pool, after three ``warmup`` calls
-    on :func:`side_stream` that fill lazy caches, compile kernels and size buffers (``warmup`` must leave
-    no state the capture would bake in). ``"global"`` mode fails the capture on another thread's unsafe
-    CUDA call. A failed capture leaves the side stream current, so this restores the caller's and raises;
-    there is no eager fallback: the failure leaves torch's CUDA RNG unusable until a capture succeeds and
-    the caching allocator in capture mode until the process exits.
-    """
-    side = side_stream()
-    t0 = time.perf_counter()
-    cur = torch.cuda.current_stream()
-    side.wait_stream(cur)
-    with torch.cuda.stream(side):
-        for _ in range(warmups):
-            warmup()
-    cur.wait_stream(side)
-    cuda_graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(cuda_graph, stream=side, capture_error_mode="global"):
-            outputs = body()
-    except Exception as e:
-        torch.cuda.set_stream(cur)
-        raise RuntimeError(f"CUDA graph capture of {name} failed; rerun without --cuda_graphs") from e
-    torch.cuda.synchronize()
-    return CapturedGraph(name, cuda_graph, outputs, body, ptrs, time.perf_counter() - t0)

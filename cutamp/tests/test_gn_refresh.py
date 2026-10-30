@@ -401,7 +401,7 @@ def test_balanced_refresh_is_sync_free():
         assert [n for n in names if n.endswith(" Sync")] == ["Context Sync"]
     gate.flush()
     assert [r["step"] for r in gate.stats[-4:]] == [19] * 4 and all("pos_drift_mean" in r for r in gate.stats[-4:])
-    refresh.release()
+    refresh.graph.release()
 
 
 @needs_cuda

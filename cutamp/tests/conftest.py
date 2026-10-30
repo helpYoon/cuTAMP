@@ -330,7 +330,7 @@ def repair_cuda_rng() -> None:
     """One trivial capture that succeeds, after one that failed: a failed
     capture leaves torch's CUDA RNG unusable until a later capture succeeds
     (design 4.8). It repairs only the RNG, not the allocator, which stays in
-    capture mode until the process exits (``cutamp.cuda_graphs.capture``), so
+    capture mode until the process exits (``cutamp.cuda_graphs.CapturedGraph``), so
     a test that makes a capture fail runs that capture in a child process."""
     with torch.cuda.graph(torch.cuda.CUDAGraph()):
         torch.zeros(1, device="cuda") + 1

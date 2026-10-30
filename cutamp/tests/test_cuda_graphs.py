@@ -51,11 +51,11 @@ import os
 import pytest
 import torch
 import cutamp
-from cutamp.cuda_graphs import capture
+from cutamp.cuda_graphs import CapturedGraph
 from cutamp.tests.conftest import repair_cuda_rng
 assert os.path.realpath(cutamp.__file__).startswith(os.getcwd() + os.sep), cutamp.__file__
 with pytest.raises(RuntimeError, match="--cuda_graphs"):
-    capture("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
+    CapturedGraph("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
 assert torch.cuda.current_stream() == torch.cuda.default_stream()
 repair_cuda_rng()
 assert torch.rand(4, device="cuda").isfinite().all()
@@ -65,7 +65,7 @@ assert torch.rand(4, device="cuda").isfinite().all()
 @needs_cuda
 def test_failed_capture_restores_default_stream():
     # A failed capture leaves its process's allocator in capture mode until the process exits
-    # (cuda_graphs.capture), so it runs in a child. No flock there: the child runs inside this
+    # (cuda_graphs.CapturedGraph), so it runs in a child. No flock there: the child runs inside this
     # process's GPU lock, and a second flock on the same file would deadlock.
     child = subprocess.run([sys.executable, "-c", _FAILED_CAPTURE_CHILD], cwd=Path(__file__).resolve().parents[2],
                            capture_output=True, text=True, timeout=120)
@@ -75,7 +75,7 @@ def test_failed_capture_restores_default_stream():
 @needs_cuda
 def test_guard_trips_on_resize():
     from curobo.types import JointState
-    from cutamp.cuda_graphs import capture, graph_ptrs
+    from cutamp.cuda_graphs import CapturedGraph, graph_ptrs
     from cutamp.robots.t1 import get_t1_kinematics
     kin = get_t1_kinematics()
     q = (0.1 * torch.randn(4, len(kin.joint_names), device="cuda")).requires_grad_()
@@ -89,7 +89,7 @@ def test_guard_trips_on_resize():
 
     for breaker in ("resize", "drop grad"):
         q.grad = None
-        g = capture("toy", body, warmup, ptrs=lambda: graph_ptrs([q, q.grad], [kin]))
+        g = CapturedGraph("toy", body, warmup, ptrs=lambda: graph_ptrs([q, q.grad], [kin]))
         g.replay()
         if breaker == "resize":
             kin.update_batch_size(8, 1)
