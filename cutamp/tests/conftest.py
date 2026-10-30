@@ -3,6 +3,7 @@
 import dataclasses
 import gc
 import os
+import struct
 import sys
 import weakref
 from contextlib import contextmanager
@@ -181,43 +182,43 @@ def step_outputs(packed, vis, params) -> dict:
     return out
 
 
-def assert_bitwise(got, want, where: str) -> None:
-    """``got`` equals ``want`` bitwise: the same dtype, shape and device, then
-    ``torch.equal``, on every tensor, through lists, tuples and dicts. Other
-    leaves, ``None`` among them, must have the same type and compare equal.
-    The ``AssertionError`` names ``where``, the first differing path and its
-    max abs diff, ``n/a`` when the dtype, shape, device or structure differs:
-    ``torch.equal`` alone promotes, so it passes f32 against f64 or bool."""
-    def fail(path, detail):
-        raise AssertionError(f"{where}: {path or 'value'} differs, {detail}")
+_INT_VIEW = {torch.float32: torch.int32, torch.float64: torch.int64, torch.float16: torch.int16,
+             torch.bfloat16: torch.int16, torch.bool: torch.uint8}
 
-    def kind(x):
-        if isinstance(x, torch.Tensor):
-            return f"{x.dtype} {tuple(x.shape)} on {x.device}"
-        if isinstance(x, dict):
-            return f"dict with keys {list(x)}"
-        if isinstance(x, (list, tuple)):
-            return f"{type(x).__name__} of {len(x)}"
-        return type(x).__name__
 
+def bitwise_diffs(a, b, raw: bool = True, path: str = "") -> list:
+    """Every difference between ``a`` and ``b`` through dicts, lists and tuples, as ``(path, detail)`` pairs.
+    ``raw`` compares tensor bits and float bytes (NaN equals the same NaN, -0.0 differs); else ``torch.equal``."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if (a.dtype, a.shape, a.device) != (b.dtype, b.shape, b.device):
+            return [(path, f"{a.dtype} {tuple(a.shape)} {a.device} vs {b.dtype} {tuple(b.shape)} {b.device}")]
+        if raw:
+            dt = _INT_VIEW.get(a.dtype, a.dtype)
+            ne = a.detach().contiguous().view(dt) != b.detach().contiguous().view(dt)
+        else:
+            ne = a.detach() != b.detach()
+        if not ne.any():
+            return []
+        d = (a.double() - b.double()).abs()[ne].nan_to_num(float("inf")).max().item()
+        return [(path, f"{int(ne.sum())} of {a.numel()} elements differ, max abs diff {d}")]
+    if isinstance(a, dict) and isinstance(b, dict):
+        if list(a) != list(b):
+            return [(path, f"keys {list(a)} vs {list(b)}")]
+        return [d for k in a for d in bitwise_diffs(a[k], b[k], raw, f"{path}[{k!r}]")]
+    if isinstance(a, (list, tuple)) and type(a) is type(b) and len(a) == len(b):
+        return [d for i, (x, y) in enumerate(zip(a, b)) for d in bitwise_diffs(x, y, raw, f"{path}[{i}]")]
+    if raw and isinstance(a, float) and isinstance(b, float):
+        return [] if struct.pack("<d", a) == struct.pack("<d", b) else [(path, f"{a!r} vs {b!r}")]
     nodes = (torch.Tensor, dict, list, tuple)
+    if type(a) is type(b) and not isinstance(a, nodes) and a == b:
+        return []
+    return [(path, f"{a!r:.80} vs {b!r:.80}")]
 
-    def walk(g, w, path):
-        if isinstance(w, torch.Tensor) and isinstance(g, torch.Tensor):
-            if g.dtype != w.dtype or g.shape != w.shape or g.device != w.device:
-                fail(path, f"max abs diff n/a: {kind(g)} vs {kind(w)}")
-            if not torch.equal(g, w):
-                fail(path, f"max abs diff {(g.double() - w.double()).abs()[g != w].max().item()}")
-        elif isinstance(w, dict) and isinstance(g, dict) and g.keys() == w.keys():
-            for k in w:
-                walk(g[k], w[k], f"{path}[{k!r}]" if path else str(k))
-        elif isinstance(w, (list, tuple)) and type(g) is type(w) and len(g) == len(w):
-            for i, (gi, wi) in enumerate(zip(g, w)):
-                walk(gi, wi, f"{path}[{i}]")
-        elif isinstance(g, nodes) or isinstance(w, nodes) or not (type(g) is type(w) and g == w):
-            fail(path, f"max abs diff n/a: got {kind(g)}, want {kind(w)}")
 
-    walk(got, want, "")
+def assert_bitwise(got, want, where: str, raw: bool = False) -> None:
+    """``got`` has no :func:`bitwise_diffs` from ``want``; the message names ``where`` and the first differences."""
+    diffs = bitwise_diffs(got, want, raw)
+    assert not diffs, f"{where}: {len(diffs)} differences, the first {diffs[:5]}"
 
 
 @contextmanager

@@ -3,46 +3,18 @@ call, and the recorded calls must match as raw bytes."""
 
 import itertools
 import random
-import struct
 import sys
 
 import numpy as np
 import torch
 
-from cutamp.tests.conftest import clone_particles, make_optimizer, make_plan_info, needs_cuda
+from cutamp.tests.conftest import (
+    assert_bitwise, bitwise_diffs, clone_particles, make_optimizer, make_plan_info, needs_cuda,
+)
 from cutamp.tests.test_cuda_graphs import _graph_config
 
 _TIMING = ("elapsed", "opt_start_to_first_sol")
 _CAPTURE = ("capture_s", "capture_step", "refresh_capture_s", "refresh_capture_step")  # G-only keys
-_INT_VIEW = {torch.float32: torch.int32, torch.float64: torch.int64, torch.float16: torch.int16,
-             torch.bfloat16: torch.int16, torch.bool: torch.uint8}
-
-
-def _diffs(a, b, path: str = "") -> list:
-    """Every difference between ``a`` and ``b`` as raw bytes, through dicts, lists and tuples:
-    ``(path, detail)`` pairs, ``[]`` when equal. Tensors compare their bits, so NaN equals the
-    same NaN and -0.0 differs from 0.0; floats compare their IEEE bytes; other leaves ``==``."""
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if (a.dtype, a.shape, a.device) != (b.dtype, b.shape, b.device):
-            return [(path, f"{a.dtype} {tuple(a.shape)} {a.device} vs {b.dtype} {tuple(b.shape)} {b.device}")]
-        dt = _INT_VIEW.get(a.dtype, a.dtype)
-        ne = a.detach().contiguous().view(dt) != b.detach().contiguous().view(dt)
-        if not ne.any():
-            return []
-        d = (a.double() - b.double()).abs()[ne].nan_to_num(float("inf")).max().item()
-        return [(path, f"{int(ne.sum())} of {a.numel()} elements differ, max abs diff {d}")]
-    if isinstance(a, dict) and isinstance(b, dict):
-        if list(a) != list(b):
-            return [(path, f"keys {list(a)} vs {list(b)}")]
-        return [d for k in a for d in _diffs(a[k], b[k], f"{path}[{k!r}]")]
-    if isinstance(a, (list, tuple)) and type(a) is type(b) and len(a) == len(b):
-        return [d for i, (x, y) in enumerate(zip(a, b)) for d in _diffs(x, y, f"{path}[{i}]")]
-    if isinstance(a, float) and isinstance(b, float):
-        return [] if struct.pack("<d", a) == struct.pack("<d", b) else [(path, f"{a!r} vs {b!r}")]
-    nodes = (torch.Tensor, dict, list, tuple)
-    if type(a) is type(b) and not isinstance(a, nodes) and a == b:
-        return []
-    return [(path, f"{a!r:.80} vs {b!r:.80}")]
 
 
 def _install_recorder(monkeypatch) -> dict:
@@ -112,11 +84,9 @@ def test_graph_calls_give_the_eager_result(blocks_t1_plan, monkeypatch):
     gd = call(True, planner_busy=lambda: next(busy) < 7)    # as test_deferred_capture_after_planner_ends
     assert [c["capture"] for c in (e1, g1, e2, g2, gd)] == [("absent",) * 2, (0, 4), ("absent",) * 2, (0, 4), (7, 9)]
     assert next(busy) == 8 and all(len(c["steps"]) == 100 for c in (e1, g1, e2, g2, gd))
-    assert _diffs(e1["steps"][0]["particles"], e1["steps"][-1]["particles"])  # the recording isn't vacuous
+    assert bitwise_diffs(e1["steps"][0]["particles"], e1["steps"][-1]["particles"])  # the recording isn't vacuous
     for name, got, want in (("G1 vs E1", g1, e1),       # the claim
                             ("E2 vs E1", e2, e1),       # the graph call leaves no state behind
                             ("G2 vs G1", g2, g1),       # a recaptured call gives the same result
                             ("Gd vs E1", gd, e1)):      # so does a capture deferred to mid-call
-        got, want = ({k: v for k, v in c.items() if k != "capture"} for c in (got, want))
-        diffs = _diffs(got, want)
-        assert not diffs, f"{name}: {len(diffs)} differences, the first {diffs[:5]}"
+        assert_bitwise(*({k: v for k, v in c.items() if k != "capture"} for c in (got, want)), name, raw=True)
