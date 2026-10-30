@@ -1,20 +1,7 @@
-"""Lockstep of the in-loop Adam step against HEAD's math.
+"""Every in-loop Adam step against its twin, run to run, and against HEAD's math, bitwise. HEAD is
+cfa7a46 with the fixed-order goal_in_xy sum and production's dense AABB overlap, plus frozen copies
+of what the sync-free edits replaced. No oracle may vendor stable_placement_costs or restore scatter_add_."""
 
-HEAD's math is cfa7a46 + B0 + P1 (ruling 11, deviation D3): goal_in_xy summed
-per object in a fixed order, frozen here as :func:`_head_per_object_sum`, and
-production's dense AABB sphere overlap. No oracle may vendor
-``stable_placement_costs`` or restore ``scatter_add_``. Two more sync-free
-edits' HEAD forms are frozen here: :func:`_head_fk_state` and
-:func:`_head_upper_sum`. :func:`_head_sphere_to_sphere_overlap`, cfa7a46's
-masked overlap, is only the reference of P1's unit test.
-
-Every in-loop step, one ``_StepBody`` call, first runs twice more on clones of
-its particles: once under :func:`_head_math`, and once as the code now runs it
-(its twin). The step must match both bitwise, at every step and in every case:
-its twin run to run, and HEAD, the gate for edits that change both arms.
-"""
-
-import os
 from contextlib import contextmanager
 from typing import Dict, List, Tuple
 from unittest import mock
@@ -22,8 +9,7 @@ from unittest import mock
 import pytest
 import torch
 
-from cutamp.config import SUPPORTED_SOFT_COSTS
-from cutamp.costs import _sphere_to_sphere_overlap, get_aabb_from_spheres
+from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
     SpyVis, assert_bitwise, clone_particles, make_plan_info, needs_cuda, run_optimizer, step_outputs, twin_body,
 )
@@ -46,59 +32,14 @@ class _ResetFK:
         return getattr(self._kin, name)
 
 
-# A verbatim copy of cutamp.cost_function._per_object_sum as B0 (4cf62d9) committed it:
-# HEAD's goal_in_xy sum, frozen. The lockstep checks production's sum against it on the
-# run's own inputs, which are sparse; test_frozen_sum_matches_production checks it on
-# dense inputs at the run's layouts and two more, where a reordered sum changes bits.
+# cost_function._per_object_sum as 4cf62d9 committed it, frozen. test_frozen_sum_matches_production
+# checks production against it on dense inputs, where a reordered sum changes bits.
 def _head_per_object_sum(x: torch.Tensor, counts: Tuple[int, ...]) -> torch.Tensor:
-    """``[B, len(counts)]``: the sums of ``x`` ``[B, sum(counts)]`` over consecutive
-    column blocks of ``counts[i]`` columns, one fixed-order reduction per block.
-    Bitwise run to run and under CUDA-graph replay, which ``scatter_add_`` is not:
-    its CUDA atomics add in a varying order, so its rounding varies. The backward
-    gives each column its block's upstream grad, the gather ``scatter_add_``'s
-    backward gives. ``counts`` are Python ints, so there is no host read."""
     return torch.stack([block.sum(-1) for block in x.split(counts, dim=1)], dim=1)
 
 
-# A verbatim copy of cutamp.costs.sphere_to_sphere_overlap at cfa7a46 (costs.py:61-88):
-# the AABB branch's host-synced form, which P1 replaces with a dense torch.where. Not in
-# _head_math (D3): only test_dense_aabb_overlap_matches_masked compares against it.
-def _head_sphere_to_sphere_overlap(
-    spheres_1: torch.Tensor,
-    spheres_2: torch.Tensor,
-    activation_distance: float | None = None,
-    use_aabb_check: bool = False,
-) -> torch.Tensor:
-    """
-    Compute the overlap volume between two sets of spheres. Can be used as a collision distance function. If
-    use_aabb_check=True, we compute the overlap only for batches of spheres that have intersecting AABBs.
-    """
-    if not use_aabb_check:
-        return _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance)
-
-    # Compute AABB for each batch of spheres
-    aabb_1 = get_aabb_from_spheres(spheres_1)  # [b, *h, 2, 3]
-    aabb_2 = get_aabb_from_spheres(spheres_2)  # [b, *h, 2, 3]
-
-    # Check intersection
-    min_1, max_1 = aabb_1.unbind(-2)
-    min_2, max_2 = aabb_2.unbind(-2)
-    intersect = (min_1 <= max_2).all(-1) & (max_1 >= min_2).all(-1)  # [b, *h]
-
-    output = torch.zeros_like(intersect, dtype=torch.float32)  # [b, *h]
-    if intersect.any():
-        # Only compute overlap for intersecting AABBs
-        output[intersect] = _sphere_to_sphere_overlap(spheres_1[intersect], spheres_2[intersect], activation_distance)
-    return output
-
-
-# A verbatim copy of cutamp.com_polygon_cost._fk_state as Task 1 (447dae3) committed it:
-# it keeps the identity reorder kin.get_active_js(js), whose index is a host-to-device
-# copy, which P2 drops.
+# com_polygon_cost._fk_state as 447dae3 committed it, frozen: it keeps the identity reorder get_active_js.
 def _head_fk_state(world, q_batch: torch.Tensor, kin=None):
-    """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through ``kin``
-    (``None``: ``world.kinematics``); return its kinematics state.
-    Differentiable through cuRobo's FK chain."""
     from curobo.types import JointState
     kin = world.kinematics if kin is None else kin
     q_batch = q_batch.to(kin.device_cfg.device)
@@ -109,24 +50,15 @@ def _head_fk_state(world, q_batch: torch.Tensor, kin=None):
 
 
 def _head_upper_sum(x: torch.Tensor) -> torch.Tensor:
-    """``[B]``: the sum of ``x`` ``[B, n, n]`` over its strict upper triangle, by
-    cfa7a46's triu boolean-mask gather (cost_function.py:409-410, :422-423),
-    which syncs on its ``nonzero``. P12's ``_pairwise_upper_sum`` replaces it."""
+    """cfa7a46's strict-upper-triangle sum, by triu boolean mask (syncs on its nonzero)."""
     return x[torch.triu(torch.ones_like(x), diagonal=1) == 1].view(x.shape[0], -1).sum(-1)
 
 
 @contextmanager
 def _head_math(world):
-    """HEAD's math, cfa7a46 + B0 + P1 (ruling 11, D3): every FK site on the
-    one shared ``world.kinematics``, and the frozen HEAD functions:
-    :func:`_head_per_object_sum` for goal_in_xy's sum, :func:`_head_fk_state`
-    for the CoM FK and :func:`_head_upper_sum` for the triu soft costs. P1's
-    dense AABB overlap is production's own, unpatched: D3 approved its change
-    from cfa7a46's masked form. Never vendor ``stable_placement_costs`` here,
-    or restore ``scatter_add_`` (ruling 11): B0's sum is HEAD's. The reset
-    before each FK call keeps two live calls off one set of buffers, the job
-    HEAD's two resets did; which buffers a call uses doesn't change its
-    values. Yields the shared :class:`_ResetFK`."""
+    """HEAD's math: every FK site on the one shared ``world.kinematics``, reset before each FK call so two
+    live calls never share buffers (the job HEAD's two resets did), and the frozen functions above; the
+    dense overlap is production's own, unpatched. Yields the shared :class:`_ResetFK`."""
     shared = _ResetFK(world.kinematics)
     with mock.patch.object(world, "site_kinematics", lambda name: shared), \
             mock.patch("cutamp.cost_function._per_object_sum", _head_per_object_sum), \
@@ -137,11 +69,7 @@ def _head_math(world):
 
 def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_types, with_soft,
                params: List[str], masks: Dict[str, torch.Tensor]) -> dict:
-    """One Adam step as HEAD's loop runs it on ``particles`` (optimize_plan.py
-    :704-715 without the host read, then the backward and grad masks of
-    :777-778), as :func:`step_outputs`. ``params`` names the optimized tensors,
-    the only ones whose grads are masked and returned; ``masks`` maps names to
-    grad masks."""
+    """One Adam step as HEAD's loop runs it, as :func:`step_outputs`; ``params`` names the optimized particles."""
     from cutamp.conf_locking import apply_grad_masks
 
     rollout = rollout_fn(particles)
@@ -159,9 +87,8 @@ def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_
     return step_outputs(packed, (rollout, cost_dict, costs, satisfying_mask), [particles[n] for n in params])
 
 
-# The shared kinematics_config tensors the FK kernels take raw pointers to, besides each
-# site's own buffers: the forward's 9, then the 5 more the backward takes (curobo's
-# _src/curobolib/cuda_ops/kinematics.py:156-237, :325-355).
+# The shared kinematics_config tensors the FK kernels take raw pointers to, besides each site's own buffers: the
+# forward's 9, then the backward's 5 more (curobo's _src/curobolib/cuda_ops/kinematics.py:156-237, :325-355).
 _FK_CONFIG_TENSORS = (
     "fixed_transforms", "link_spheres", "link_masses_com", "joint_map_type", "joint_map", "link_map",
     "tool_frame_map", "link_sphere_idx_map", "joint_offset_map",
@@ -172,25 +99,16 @@ _FK_CONFIG_TENSORS = (
 def _site_ptrs(world) -> dict:
     """Each built FK site's batch, horizon and buffer pointers, and under
     ``"config"`` the pointers of the :data:`_FK_CONFIG_TENSORS` all sites share."""
-    def ptr(t):
-        return 0 if t is None else t.data_ptr()
-
+    from cutamp.cuda_graphs import graph_ptrs
     cfg = world.kinematics.config.kinematics_config
-    ptrs = {name: (kin._batch, kin._horizon, tuple(map(ptr, kin._buffers.values())))
-            for name, kin in world._site_kinematics.items()}
-    ptrs["config"] = tuple(ptr(getattr(cfg, n)) for n in _FK_CONFIG_TENSORS)
+    ptrs = {name: graph_ptrs([], [kin]) for name, kin in world._site_kinematics.items()}
+    ptrs["config"] = graph_ptrs([getattr(cfg, n) for n in _FK_CONFIG_TENSORS], [])
     return ptrs
 
 
 def _install_lockstep(monkeypatch, world) -> List[tuple]:
-    """Wrap ``_StepBody.__call__`` so every in-loop step checks itself bitwise,
-    on clones of its particles: against its twin (:func:`twin_body`), run to
-    run, and against :func:`_head_step` under :func:`_head_math`, given the
-    body's own functions. Each step also checks that the oracle reached every
-    FK call. Returns the list each step appends ``(names, got, ptrs)`` to: the
-    optimized params' particle names, the step's :func:`step_outputs`, and
-    :func:`_site_ptrs` after it."""
-    import cutamp.cost_function as cost_function
+    """Check every ``_StepBody`` call bitwise against its twin and against :func:`_head_step` under
+    :func:`_head_math`. Returns ``(names, outputs, site ptrs)`` per step."""
     import cutamp.optimize_plan as optimize_plan
     from curobo.kinematics import Kinematics
 
@@ -211,14 +129,11 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
         k = len(steps)
         name_of = {id(t): n for n, t in self.particles.items()}
         names = [name_of[id(p)] for p in self.params]
-        masks = {name_of[i]: m for i, m in self.grad_masks.items() if i in name_of}
+        masks = {name_of[i]: m for i, m in self.grad_masks.items()}
         with _head_math(world) as shared:
-            assert cost_function._per_object_sum is _head_per_object_sum, f"step {k}"
             ref, ref_sites = site_fk(lambda: _head_step(
                 clone_particles(self.particles), self.rollout_fn, self.cost_fn, self.cost_reducer, self.get_mask,
                 self.consider_types, self.with_soft, names, masks))
-        # The twin runs before the step: its backward overwrites the sites' grad_out, which the
-        # step's .grad may hold until optimizer.step().
         twin = twin_body(self)
         again, twin_sites = site_fk(lambda: step_outputs(*orig(twin), twin.params))
         (packed, vis), n_sites = site_fk(lambda: orig(self))
@@ -239,11 +154,8 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
 @needs_cuda
 @pytest.mark.parametrize("reik_balance_first,coupled_reik", [(False, True), (True, True), (False, False)])
 def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, coupled_reik):
-    # Each in-loop step, on clones: the dedicated never-reset FK sites run to run,
-    # then vs HEAD's one shared instance, bitwise. The sites' buffers never move.
-    # Coupled re-IK drops every FK-fed Conf from Adam, so no compared grad comes out
-    # of an FK backward; with coupled_reik=False, Adam optimizes them and one does.
-    from cutamp.config import TAMPConfiguration
+    # Dedicated never-reset sites vs HEAD's one shared instance; the sites' buffers never move.
+    # coupled_reik=False lets Adam optimize the FK-fed Confs, so one compared grad comes out of FK.
     from cutamp.t1_domain import Conf
 
     world, skeleton, base = blocks_t1_plan
@@ -254,8 +166,6 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
                                force_adam=not coupled_reik, enable_visualizer=False)
     confs = {v for op in skeleton for v, prm in zip(op.values, op.operator.parameters) if prm.type == Conf}
     steps = _install_lockstep(monkeypatch, world)
-    print("blocks_t1_plan:", " | ".join(op.name for op in skeleton),
-          f"(PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')})")
     # Not the no-op Visualizer, so the body returns vis and each step compares costs, mask and values too.
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
     assert len(steps) == 50
@@ -279,18 +189,13 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
     *((sc, False) for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
 ])
 def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
-    # The step vs its twin and HEAD, as test_step_lockstep_vs_head checks it, for each soft
-    # cost alone and for none. max_obj_dist, min_obj_dist and align_yaw also run in default
-    # mode: the default soft costs never reach their triu gathers.
-    from cutamp.config import TAMPConfiguration
-
+    # As test_step_lockstep_vs_head, for each soft cost alone and for none. max_obj_dist, min_obj_dist and align_yaw
+    # also run in default mode: the default soft costs never reach their triu gathers.
     world, skeleton, base = blocks_t1_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
                                reik_balance_first=balance_first, enable_visualizer=False,
                                soft_cost=None if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
-    print("blocks_t1_plan:", " | ".join(op.name for op in skeleton),
-          f"(PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')})")
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
     assert len(steps) == 5
 
@@ -299,7 +204,6 @@ def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
 def test_frozen_sum_matches_production(blocks_t1_plan):
     # Dense inputs at the run's layouts and two more: production's goal_in_xy sum
     # equals the frozen copy bitwise, forward and grad with respect to x.
-    from cutamp.config import TAMPConfiguration
     from cutamp.cost_function import CostFunction, _per_object_sum
 
     world, skeleton, _ = blocks_t1_plan

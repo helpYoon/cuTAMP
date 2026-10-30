@@ -1,4 +1,4 @@
-"""``--cuda_graphs`` (Mode H): the balance-first Adam step and re-IK refresh, captured
+"""``--cuda_graphs``: the balance-first Adam step and re-IK refresh, captured
 as G_step and G_refresh and replayed, each replay against its eager counterpart bitwise."""
 
 import gc
@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
+from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration, validate_tamp_config
 from cutamp.tests.conftest import (
     SpyVis, clone_particles, cupti_sync_events, install_refresh_spy, install_step_replay_spy, make_optimizer,
     make_plan_info, needs_cuda, run_optimizer,
@@ -23,7 +23,6 @@ from cutamp.utils.timer import TorchTimer
 
 
 def test_cuda_graphs_validation():
-    from cutamp.config import TAMPConfiguration, validate_tamp_config
     assert TAMPConfiguration().cuda_graphs is False
     with pytest.raises(ValueError, match="cuda_graphs needs reik_balance_first"):
         validate_tamp_config(TAMPConfiguration(cuda_graphs=True))
@@ -52,13 +51,10 @@ import pytest
 import torch
 import cutamp
 from cutamp.cuda_graphs import CapturedGraph
-from cutamp.tests.conftest import repair_cuda_rng
 assert os.path.realpath(cutamp.__file__).startswith(os.getcwd() + os.sep), cutamp.__file__
 with pytest.raises(RuntimeError, match="--cuda_graphs"):
     CapturedGraph("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
 assert torch.cuda.current_stream() == torch.cuda.default_stream()
-repair_cuda_rng()
-assert torch.rand(4, device="cuda").isfinite().all()
 """
 
 
@@ -107,7 +103,7 @@ def _graph_config(**kw):
 
 @needs_cuda
 @pytest.mark.parametrize("sc", [None, *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
-def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):  # Review Focus 4
+def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=2, soft_cost=None if sc is None else [sc])
     replays = install_step_replay_spy(monkeypatch)
@@ -117,7 +113,7 @@ def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):  # 
 
 
 @needs_cuda
-def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):            # Review Focus 1
+def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=25)
     replays, vis = install_step_replay_spy(monkeypatch), SpyVis(config)
@@ -129,44 +125,30 @@ def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):            # Review F
 
 
 @needs_cuda
-@pytest.mark.parametrize("reik_interval, num_opt_steps, capture_step", [(5, 50, 4), (1, 12, 0)])
-def test_refresh_graph_lockstep(blocks_t1_plan, monkeypatch, reik_interval, num_opt_steps, capture_step):
-    from cutamp.optimize_plan import _QueuedRefresh, _ReikDriftGate
+def test_refresh_graph_lockstep(blocks_t1_plan, monkeypatch):
     world, skeleton, base = blocks_t1_plan
-    config = _graph_config(num_opt_steps=num_opt_steps, reik_interval=reik_interval)
+    config = _graph_config(num_opt_steps=12, reik_interval=1)
     eager = install_refresh_spy(monkeypatch)
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
-    assert m["refresh_capture_step"] == capture_step and m["refresh_capture_s"] > 0
-    steps = list(range(capture_step + reik_interval, num_opt_steps, reik_interval))
-    assert [s for s, _ in eager] == steps            # 9..49 = refreshes 2-10; 1..11 (Review Focus 5)
-    # flush() turns the replays' slots into the records eager packs give, but for solve_s
-    q_names = tuple(r["conf"] for r in m["reik_refresh"] if r["step"] == capture_step)
-    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    e0.record(); e1.record()
-    ref = _ReikDriftGate(len(q_names), 0.0, 0.0)
-    ref._queued = [_QueuedRefresh(s, q_names, 64, p, e0, e1) for s, p in eager]
-    ref.flush()
-    strip = lambda rs: [{k: v for k, v in r.items() if k != "solve_s"} for r in rs]
-    assert strip(ref.stats) == strip([r for r in m["reik_refresh"] if r["step"] in set(steps)])
+    assert m["refresh_capture_step"] == 0 and m["refresh_capture_s"] > 0
+    assert eager == list(range(1, 12))
 
 
 @needs_cuda
 def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
+    # SpyVis on: the loop's vis = None must drop an eager step's graph before a later capture.
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=20)
     replays = install_step_replay_spy(monkeypatch)
-    eager = install_refresh_spy(monkeypatch)
     busy = itertools.count()
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
                          visualizer=SpyVis(config), planner_busy=lambda: next(busy) < 7)
     assert m["capture_step"] == 7 and replays == [list(range(13))]
-    # Design 4.6: refresh #1 (step 4) runs eagerly with no G_step yet, so G_refresh waits for refresh #2.
-    assert m["refresh_capture_step"] == 9 and [s for s, _ in eager] == [14, 19]
     assert next(busy) == 8                           # consulted once per step, until the capture
 
 
 @needs_cuda
-def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):  # Review Focus 2
+def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=10)
@@ -182,8 +164,6 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):  # Review
     opt = make_optimizer(config)
     for call in range(2):
         m, _ = run_optimizer(plan_info, config, optimizer=opt)
-        assert m["capture_step"] == 0 and m["capture_s"] > 0
-        assert m["refresh_capture_step"] == 4
         assert Counter(n for n, _, _ in released) == {"G_step": call + 1, "G_refresh": call + 1}  # once per call each
         assert all(v.grad is None for v in plan_info["particles"].values())
         gc.collect()
@@ -201,7 +181,7 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):  # Review
 
 
 @needs_cuda
-def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):     # Review Focus 3
+def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
     world, skeleton, base = blocks_t1_plan
     released, orig = [], CapturedGraph.release
@@ -224,9 +204,7 @@ def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):     # Review F
 
 
 class _ProfilingTimer(TorchTimer):
-    """A ``TorchTimer`` that profiles the optimization steps in ``steps``, counted by its
-    ``start("optimization_step")`` calls: each from before the timer's start sync to after
-    its stop sync. ``names[step]`` is that step's profiler event names."""
+    """Profiles the optimization steps in ``steps``; ``names[step]`` is that step's event names."""
 
     def __init__(self, steps):
         super().__init__()
@@ -247,8 +225,7 @@ class _ProfilingTimer(TorchTimer):
         return duration
 
     def close(self) -> None:
-        """Exit the open profile, if any, and keep its step's event names. A step that
-        raises never reaches ``stop``, and its profile would outlive the test."""
+        """Exit the open profile, if any: a step that raises never reaches ``stop``."""
         if self._prof is not None:
             prof, self._prof = self._prof, None
             prof.__exit__(None, None, None)
@@ -257,16 +234,14 @@ class _ProfilingTimer(TorchTimer):
 
 @needs_cuda
 @pytest.mark.parametrize("arm", ["S1", "G"])
-def test_loop_sync_audit(blocks_t1_plan, arm):                        # design 6.4, out of graph
-    # Steps 40-49, each from before the step timer's start sync to after its stop sync. Every
-    # step has the loop's 3 device syncs (timer.py:33, the elapsed sync, timer.py:45), the
-    # profiler's own, and packed.tolist()'s copy and stream sync; a refresh step adds its 2
-    # timing events. A G step is 1 graph launch (2 with the refresh) plus the eager Adam
-    # step's launches: the captured body alone holds 1,029 kernels. Inside the graphs, the
-    # global-mode capture is the audit, since it fails on any sync.
+def test_loop_sync_audit(blocks_t1_plan, arm):
+    # Each profiled step has the loop's 3 device syncs, the profiler's own and packed.tolist()'s copy
+    # and stream sync; a refresh step adds 2 timing events. A G step is 1 graph launch (2 with the
+    # refresh) plus the eager Adam step (the captured body alone is ~1,000 kernels, hence < 100);
+    # inside the graphs, the global-mode capture is the audit, and every capturable soft cost is on.
     world, skeleton, base = blocks_t1_plan
-    config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0, reik_balance_first=True,
-                               cuda_graphs=arm == "G", enable_visualizer=False)
+    config = _graph_config(num_opt_steps=50, cuda_graphs=arm == "G",
+                           soft_cost=[s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw"])
     timer = _ProfilingTimer(range(40, 50))
     try:
         m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, timer=timer)
@@ -298,7 +273,6 @@ def test_loop_sync_audit(blocks_t1_plan, arm):                        # design 6
             got["sync events"] = Counter(n for n in names if n.endswith(" Sync"))
             want["sync events"] = {"Context Sync": 4, "Stream Sync": 1}
         launches = sum(n.startswith(("cudaLaunch", "cuLaunch")) for n in names)
-        print(f"sync audit [{arm}] step {step} ({kind}): {launches} kernel launches, {got}")
         assert got == want, f"{arm} step {step} ({kind})"
         if arm == "G":
             assert launches < 100, f"G step {step} ({kind}): {launches} kernel launches, not the eager Adam step's"

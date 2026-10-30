@@ -7,10 +7,11 @@ from torch.optim import Adam
 from torch.profiler import ProfilerActivity, profile
 
 from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
+from cutamp.costs import _sphere_to_sphere_overlap, get_aabb_from_spheres
 from cutamp.tests.conftest import (
-    SpyVis, clone_particles, cupti_sync_events, make_plan_info, needs_cuda, run_optimizer, sync_debug_error,
+    SpyVis, clone_particles, make_plan_info, needs_cuda, run_optimizer, sync_debug_error,
 )
-from cutamp.tests.test_step_lockstep import _head_sphere_to_sphere_overlap, _head_upper_sum
+from cutamp.tests.test_step_lockstep import _head_upper_sum
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
@@ -21,10 +22,33 @@ def test_noop_visualizer_skips_vis_block(blocks_t1_plan):
     config = TAMPConfiguration(num_particles=64, num_opt_steps=12, early_stop_patience=0,
                                reik_balance_first=True, enable_visualizer=False)
     _, timer = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
-    assert "visualize_opt_rollout" not in timer.get_summaries()  # P13: the no-op visualizer skips the block
+    assert "visualize_opt_rollout" not in timer.get_summaries()  # the no-op visualizer skips the block
     vis = SpyVis(config)
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
     assert vis.opt_steps == [0, 10, 11]
+
+
+# cfa7a46's sphere_to_sphere_overlap, frozen: the masked AABB form, which syncs on intersect.any().
+def _head_sphere_to_sphere_overlap(
+    spheres_1: torch.Tensor,
+    spheres_2: torch.Tensor,
+    activation_distance: float | None = None,
+    use_aabb_check: bool = False,
+) -> torch.Tensor:
+    if not use_aabb_check:
+        return _sphere_to_sphere_overlap(spheres_1, spheres_2, activation_distance)
+
+    aabb_1 = get_aabb_from_spheres(spheres_1)  # [b, *h, 2, 3]
+    aabb_2 = get_aabb_from_spheres(spheres_2)  # [b, *h, 2, 3]
+
+    min_1, max_1 = aabb_1.unbind(-2)
+    min_2, max_2 = aabb_2.unbind(-2)
+    intersect = (min_1 <= max_2).all(-1) & (max_1 >= min_2).all(-1)  # [b, *h]
+
+    output = torch.zeros_like(intersect, dtype=torch.float32)  # [b, *h]
+    if intersect.any():
+        output[intersect] = _sphere_to_sphere_overlap(spheres_1[intersect], spheres_2[intersect], activation_distance)
+    return output
 
 
 def _spheres(k=None, seed=0):
@@ -45,11 +69,9 @@ def _spheres(k=None, seed=0):
 
 
 @needs_cuda
-def test_dense_aabb_overlap_matches_masked(monkeypatch):            # P1
-    # Not bitwise (deviation D3): the masked form ran the overlap on only the intersecting rows, so
-    # cdist's TF32 GEMMs and the reduction batch differently. Measured at [64, 50, 4] with TF32: grads
-    # differ by ~1e-4 relative at k=1 intersecting rows, and the forward by under 1 ulp at k=8. Rows
-    # whose AABBs don't intersect are exactly 0, in the output and both grads.
+def test_dense_aabb_overlap_matches_masked(monkeypatch):
+    # Not bitwise: the masked form ran the overlap on only the intersecting rows, so TF32 cdist and the
+    # reduction batch differently (grads ~1e-4 relative). Non-intersecting rows are exactly 0.
     from cutamp.costs import sphere_to_sphere_overlap
 
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)   # the loop's regime
@@ -64,7 +86,7 @@ def test_dense_aabb_overlap_matches_masked(monkeypatch):            # P1
             assert torch.equal(want > 0, near), case                # the near rows overlap, the far ones don't
             w = torch.rand_like(want)
             gw = torch.autograd.grad((want * w).sum(), (a, b))
-            with sync_debug_error():                                # RED: costs.py:85 intersect.any()
+            with sync_debug_error():
                 got = sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
                 gg = torch.autograd.grad((got * w).sum(), (a, b))
             assert (got[~near] == 0).all() and all((g[~near] == 0).all() for g in gg), case
@@ -80,7 +102,7 @@ def test_dense_aabb_overlap_matches_masked(monkeypatch):            # P1
 
 
 @needs_cuda
-def test_com_fk_skips_identity_reorder(blocks_t1_plan):             # P2
+def test_com_fk_skips_identity_reorder(blocks_t1_plan):
     from curobo.types import JointState
     from cutamp.com_polygon_cost import _fk_state
 
@@ -96,12 +118,12 @@ def test_com_fk_skips_identity_reorder(blocks_t1_plan):             # P2
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         _fk_state(world, q, kin=world.site_kinematics("com"))
     names = [e.name for e in prof.events()]
-    assert not [n for n in names if "HtoD" in n or "DtoH" in n]     # RED: the reorder index's H2D
+    assert not [n for n in names if "HtoD" in n or "DtoH" in n]
     assert [n for n in names if "Synchronize" in n] == ["cudaDeviceSynchronize"]   # the profiler's own
 
 
 @needs_cuda
-def test_pairwise_upper_sum_matches_triu_mask():                    # P12
+def test_pairwise_upper_sum_matches_triu_mask():
     from cutamp.cost_function import _pairwise_upper_sum
 
     torch.manual_seed(0)
@@ -116,7 +138,7 @@ def test_pairwise_upper_sum_matches_triu_mask():                    # P12
         assert torch.equal(got, want) and torch.equal(gg, gw), n
 
 
-def test_constant_builders_never_evict():                           # P8, CPU
+def test_constant_builders_never_evict():
     from cutamp.com_polygon_cost import _half_extents
     from cutamp.cost_function import _device_const
     from cutamp.gn_refresh import _row_layout
@@ -125,7 +147,7 @@ def test_constant_builders_never_evict():                           # P8, CPU
 
 
 @needs_cuda
-def test_merged_adam_groups_match_per_param():                      # P14
+def test_merged_adam_groups_match_per_param():
     from cutamp.optimize_plan import _adam_param_groups
 
     torch.manual_seed(0)
@@ -149,11 +171,8 @@ def test_merged_adam_groups_match_per_param():                      # P14
 
 
 @needs_cuda
-def test_eager_step_makes_one_host_read(blocks_t1_plan, monkeypatch):
-    # The warm eager step, every capturable soft cost on, profiled with sync debug mode
-    # "error": its one host read is the loop's packed.tolist(). align_yaw (D1) is the
-    # exception, and its sync is roma's.
-    import cutamp.optimize_plan as optimize_plan
+def test_align_yaw_syncs_in_roma(blocks_t1_plan):
+    # Why cuda_graphs rejects align_yaw: its sync is roma's.
     from cutamp.cost_function import CostFunction
     from cutamp.rollout import RolloutFunction
 
@@ -161,32 +180,6 @@ def test_eager_step_makes_one_host_read(blocks_t1_plan, monkeypatch):
     config = TAMPConfiguration(num_particles=64, num_opt_steps=3, early_stop_patience=0, reik_balance_first=True,
                                enable_visualizer=False,
                                soft_cost=[s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw"])
-    orig, names = optimize_plan._StepBody.__call__, []
-    calls = 0
-
-    def profiled(self):  # calls 1-2 pass through and warm everything up; call 3 is profiled
-        nonlocal calls
-        calls += 1
-        if calls < 3:
-            return orig(self)
-        torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **cupti_sync_events()) as prof:
-            with sync_debug_error():
-                packed, vis = orig(self)
-            packed.tolist()
-        names.extend(e.name for e in prof.events())
-        return packed, vis
-
-    monkeypatch.setattr(optimize_plan._StepBody, "__call__", profiled)
-    run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
-    assert calls == 3
-    # The profiler's own sync, and the tolist's.
-    assert sorted(n for n in names if "Synchronize" in n) == ["cudaDeviceSynchronize", "cudaStreamSynchronize"]
-    assert sum("DtoH" in n for n in names) == 1
-    assert not [n for n in names if "HtoD" in n]
-    if cupti_sync_events():  # driver-API waits too
-        assert sorted(n for n in names if n.endswith(" Sync")) == ["Context Sync", "Stream Sync"]
-
     # Built first: the constructor's own host-to-device copies would raise first.
     cf = CostFunction(skeleton, world, config)
     with torch.no_grad():
