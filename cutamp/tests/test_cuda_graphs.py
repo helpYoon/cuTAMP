@@ -27,6 +27,8 @@ def test_cuda_graphs_validation():
     assert TAMPConfiguration().cuda_graphs is False
     with pytest.raises(ValueError, match="cuda_graphs needs reik_balance_first"):
         validate_tamp_config(TAMPConfiguration(cuda_graphs=True))
+    with pytest.raises(ValueError, match="cuda_graphs needs coupled_reik"):
+        validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True, coupled_reik=False))
     with pytest.raises(ValueError, match="align_yaw"):
         validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True, soft_cost=["align_yaw"]))
     validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True))

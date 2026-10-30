@@ -140,7 +140,7 @@ def entrypoint():
         "--cuda_graphs", action="store_true",
         help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs: the step is captured "
              "once the motion-planner build has ended, the refresh at the first refresh after that. "
-             "Needs --reik_balance_first; rejects the align_yaw soft cost.",
+             "Needs --reik_balance_first and coupled re-IK (no --no_coupled_reik); rejects the align_yaw soft cost.",
     )
     parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,

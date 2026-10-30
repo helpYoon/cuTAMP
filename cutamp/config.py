@@ -98,9 +98,9 @@ class TAMPConfiguration:
     # refresh (G_refresh) as CUDA graphs (cutamp/cuda_graphs.py). In each
     # optimize call, G_step is captured once the motion-planner build thread has
     # ended, and G_refresh at the first refresh after that; both are released at
-    # loop exit. Needs reik_balance_first (default mode stays eager) and rejects
-    # CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS. A failed capture ends the run: there is
-    # no switch to eager mid-run.
+    # loop exit. Needs reik_balance_first (default mode stays eager) and
+    # coupled_reik, and rejects CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS. A failed
+    # capture ends the run: there is no switch to eager mid-run.
     cuda_graphs: bool = False
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started
@@ -207,6 +207,10 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError("reik_balance_first needs reik_gn (it replaces the GN refresh step)")
     if config.cuda_graphs and not config.reik_balance_first:
         raise ValueError("cuda_graphs needs reik_balance_first (it captures the balance-first Adam step)")
+    if config.cuda_graphs and not config.coupled_reik:
+        raise ValueError(
+            "cuda_graphs needs coupled_reik (the balance-first step it captures runs only with coupled re-IK)"
+        )
     if config.cuda_graphs:
         unsupported = [name for name in (config.soft_cost or []) if name in CUDA_GRAPHS_UNSUPPORTED_SOFT_COSTS]
         if unsupported:
