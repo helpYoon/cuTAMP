@@ -91,48 +91,23 @@ GN_MARGIN_DAMPING = 1e-2
 GN_MARGIN_STEP = 0.03
 
 
-def _dep_arms(arms: str | Sequence[str], rows: int) -> tuple[str, ...]:
-    """``arms`` as one arm per IK dep (a bare ``str`` is one dep).
-    ``ValueError`` if ``rows`` doesn't split into that many equal dep blocks."""
-    arms = (arms,) if isinstance(arms, str) else tuple(arms)
-    if not arms or rows % len(arms):
-        raise ValueError(f"{rows} rows don't split into {len(arms)} equal dep blocks")
-    return arms
-
-
 @lru_cache(maxsize=None)
-def _row_layout(arms: tuple[str, ...], rows: int, dof: int, device, dtype):
-    """Per-row layout of ``len(arms)`` dep-major blocks of ``rows`` rows each,
-    block ``i`` on ``arms[i]``: ``(col_mask [N, dof], is_left [N] bool)`` with
-    ``N = len(arms) * rows``.
-
-    The column mask is the IK solver's cspace pin (base + inactive arm
-    immobile); ``is_left`` picks each row's tool frame. Made once per layout:
-    building it from Python data is a blocking host-to-device copy. Shared;
-    never mutate. Never evicted, since a captured CUDA graph keeps reading
-    its addresses.
-    """
-    if not set(arms) <= {"left", "right"}:
-        raise ValueError(f"arms must each be 'left' or 'right', got {arms}")
+def _row_layout(arms: tuple[str, ...], n: int, dof: int, device, dtype):
+    """``(col_mask [n, dof], is_left [n])`` for ``n`` rows in ``len(arms)`` equal
+    dep-major blocks, block ``i`` on ``arms[i]``: the IK solver's cspace pin
+    (base + inactive arm immobile) and each row's tool frame. Cached, since
+    building it is a host-to-device copy; never mutate or evict it: a captured
+    CUDA graph keeps reading its addresses."""
+    if not arms or n % len(arms) or not set(arms) <= {"left", "right"}:
+        raise ValueError(f"{n} rows don't split into equal 'left'/'right' dep blocks: {arms}")
     col_mask = torch.ones(len(arms), dof, dtype=dtype)
     col_mask[:, BASE_INDICES] = 0.0
     for i, arm in enumerate(arms):
         col_mask[i, RIGHT_ARM_INDICES if arm == "left" else LEFT_ARM_INDICES] = 0.0
     is_left = torch.tensor([arm == "left" for arm in arms])
     return (
-        col_mask.repeat_interleave(rows, dim=0).to(device),
-        is_left.repeat_interleave(rows).to(device),
-    )
-
-
-@lru_cache(maxsize=None)
-def _limit_margins(device, dtype):
-    """``T1_LIMIT_MARGIN_LOWER/UPPER`` on ``device``, made once (a blocking
-    host-to-device copy otherwise). Shared; never mutate. Never evicted, since
-    a captured CUDA graph keeps reading their addresses."""
-    return (
-        torch.tensor(T1_LIMIT_MARGIN_LOWER, device=device, dtype=dtype),
-        torch.tensor(T1_LIMIT_MARGIN_UPPER, device=device, dtype=dtype),
+        col_mask.repeat_interleave(n // len(arms), dim=0).to(device),
+        is_left.repeat_interleave(n // len(arms)).to(device),
     )
 
 
@@ -150,7 +125,7 @@ def _setup(world, q_full: torch.Tensor, arms: tuple[str, ...]):
     limits = world.kinematics.get_joint_limits().position
     lower = limits[0].to(q.device, q.dtype)
     upper = limits[1].to(q.device, q.dtype)
-    col_mask, is_left = _row_layout(arms, q.shape[0] // len(arms), q.shape[1], q.device, q.dtype)
+    col_mask, is_left = _row_layout(arms, q.shape[0], q.shape[1], q.device, q.dtype)
     return kin, frames, joint_names, q, lower, upper, col_mask, is_left
 
 
@@ -198,7 +173,6 @@ def _row_tool_pose(state, left: str, right: str, is_left):
 def _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left):
     """World-frame residual ``[Δpos; rotvec(R* R^T)]`` ``[N, 6]`` and the
     column-masked tool Jacobian ``[N, 6, dof]``, each row on its own arm's frame."""
-    N = world_from_ee.shape[0]
     (left, left_idx), (right, right_idx) = frames
     pos, quat = _row_tool_pose(state, left, right, is_left)
     # cuRobo quaternions are wxyz; roma expects xyzw.
@@ -208,7 +182,7 @@ def _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
     # Rows 0-2 linear, 3-5 angular, world frame (finite-diff verified;
     # see test_gn_refresh.py).
     jacs = state.tool_jacobians[:, 0]
-    jac = torch.where(is_left.view(N, 1, 1), jacs[:, left_idx], jacs[:, right_idx])
+    jac = torch.where(is_left.view(-1, 1, 1), jacs[:, left_idx], jacs[:, right_idx])
     return torch.cat([r_pos, r_rot], dim=-1), jac * col_mask.unsqueeze(1)
 
 
@@ -396,13 +370,13 @@ def gn_project_balanced(
     dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and cspace pin.
     """
     from cutamp.com_polygon_cost import _project_com_to_base
+    from cutamp.cost_function import _device_const
 
     N = q_full.shape[0]
-    arms = _dep_arms(arms, N)
+    arms = (arms,) if isinstance(arms, str) else tuple(arms)
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
-    margin_lower, margin_upper = _limit_margins(q.device, q.dtype)
-    band_lo = lower + margin_lower
-    band_hi = upper - margin_upper
+    band_lo = lower + _device_const(T1_LIMIT_MARGIN_LOWER, q.device, q.dtype)
+    band_hi = upper - _device_const(T1_LIMIT_MARGIN_UPPER, q.device, q.dtype)
 
     for _ in range(iters):
         q_g = q.detach().requires_grad_(True)
@@ -445,17 +419,13 @@ def gn_gate(
     ``rot_tol``, and ``compute_com_polygon_mask``. ``q_full`` must be
     contiguous float32 on the kinematics device, as cuRobo's FK requires.
     """
-    from cutamp.com_polygon_cost import com_polygon_mask_from_state
+    from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
     from cutamp.costs import curobo_pose_error
 
-    kin = world.kinematics if kin is None else kin
-    N = q_full.shape[0]
-    arms = _dep_arms(arms, N)
-    _, is_left = _row_layout(arms, N // len(arms), q_full.shape[1], q_full.device, q_full.dtype)
-    state = kin.compute_kinematics(JointState.from_position(q_full, joint_names=list(kin.joint_names)))
-    pos, quat = _row_tool_pose(
-        state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left,
-    )
+    arms = (arms,) if isinstance(arms, str) else tuple(arms)
+    _, is_left = _row_layout(arms, q_full.shape[0], q_full.shape[1], q_full.device, q_full.dtype)
+    state = _fk_state(world, q_full, kin)
+    pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
     ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
     pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
     return (pos_err < pos_tol) & (rot_err < rot_tol), com_polygon_mask_from_state(state)

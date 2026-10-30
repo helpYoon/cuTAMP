@@ -30,7 +30,7 @@ def _synthetic(seed, dof=21, B=64):
     margin[BASE_INDICES] = 0.0
     shared = (lower, upper, lower + margin, upper - margin)
     half = torch.tensor(COM_HALF_EXTENTS)
-    col_mask, _ = _row_layout(("left", "left", "right", "right"), B, dof, torch.device("cpu"), torch.float32)
+    col_mask, _ = _row_layout(("left", "left", "right", "right"), 4 * B, dof, torch.device("cpu"), torch.float32)
 
     deps = []
     for c in col_mask.split(B):
@@ -93,7 +93,7 @@ def test_balanced_step_moves_no_pinned_column():
     # (left_q1, right_q1, left_q3, right_q3) and (left_q1, right_q1, right_q3,
     # left_q3), each against a layout built block by block: the base and each
     # block's inactive arm pinned, its own arm's frame.
-    layout, is_left = _row_layout(("left", "right", "left", "right"), 3, 21, torch.device("cpu"), torch.float32)
+    layout, is_left = _row_layout(("left", "right", "left", "right"), 12, 21, torch.device("cpu"), torch.float32)
     expected = torch.ones(12, 21)
     expected[:, BASE_INDICES] = 0
     expected[0:3, RIGHT_ARM_INDICES] = 0
@@ -103,7 +103,7 @@ def test_balanced_step_moves_no_pinned_column():
     assert torch.equal(layout, expected)
     assert torch.equal(is_left, torch.tensor([True, False, True, False]).repeat_interleave(3))
 
-    layout, is_left = _row_layout(("left", "right", "right", "left"), 3, 21, torch.device("cpu"), torch.float32)
+    layout, is_left = _row_layout(("left", "right", "right", "left"), 12, 21, torch.device("cpu"), torch.float32)
     expected = torch.ones(12, 21)
     expected[:, BASE_INDICES] = 0
     expected[0:3, RIGHT_ARM_INDICES] = 0
