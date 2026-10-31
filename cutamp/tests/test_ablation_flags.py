@@ -112,6 +112,3 @@ def test_adam_consider_types_soft_gate():
     assert _adam_consider_types(
         TAMPConfiguration(coupled_reik=False, soft_in_adam="always")
     ) == {"constraint", "cost"}
-    assert _adam_consider_types(
-        TAMPConfiguration(optimize_soft_costs=False, soft_in_adam="always")
-    ) == {"constraint"}

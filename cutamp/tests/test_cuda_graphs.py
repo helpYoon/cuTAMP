@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration, validate_tamp_config
+from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration, uses_cuda_graphs, validate_tamp_config
 from cutamp.tests.conftest import (
     SpyVis, clone_particles, cupti_sync_events, install_refresh_spy, install_step_replay_spy, make_optimizer,
     make_plan_info, needs_cuda, run_optimizer,
@@ -22,40 +22,25 @@ from cutamp.tests.test_step_lockstep import _site_ptrs
 from cutamp.utils.timer import TorchTimer
 
 
-def test_cuda_graphs_validation():
-    assert TAMPConfiguration().cuda_graphs is False
-    with pytest.raises(ValueError, match="cuda_graphs needs reik_balance_first"):
-        validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=False))
-    with pytest.raises(ValueError, match="cuda_graphs needs coupled_reik"):
-        validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True, coupled_reik=False))
-    with pytest.raises(ValueError, match="align_yaw"):
-        validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True, soft_cost=["align_yaw"]))
-    validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True))
-    validate_tamp_config(TAMPConfiguration(soft_cost=["align_yaw"]))  # eager mode keeps align_yaw
+def test_uses_cuda_graphs():
+    # On by default; runs the graphs can't capture stay eager and still validate.
+    assert uses_cuda_graphs(TAMPConfiguration())
+    for kw in ({"cuda_graphs": False}, {"reik_balance_first": False}, {"coupled_reik": False},
+               {"soft_cost": ["align_yaw"]}):
+        validate_tamp_config(TAMPConfiguration(**kw))
+        assert not uses_cuda_graphs(TAMPConfiguration(**kw)), kw
 
 
-def test_cli_passes_cuda_graphs(monkeypatch):
+def test_cli_defaults_on(monkeypatch):
+    # --reik_balance_first and --cuda_graphs restate the defaults; each --no_ flag turns its own off.
     import cutamp.scripts.run_cutamp as rc
     seen = []
     monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
-    for argv, want in ((["--reik_balance_first", "--cuda_graphs"], True), (["--reik_balance_first"], False)):
+    for argv, balance_first, graphs in (([], True, True), (["--reik_balance_first", "--cuda_graphs"], True, True),
+                                        (["--no_reik_balance_first"], False, True), (["--no_cuda_graphs"], True, False)):
         monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
         rc.entrypoint()
-        assert seen[-1].cuda_graphs is want
-
-
-def test_cli_balance_first_defaults_on(monkeypatch):
-    import cutamp.scripts.run_cutamp as rc
-    seen = []
-    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
-    for argv, want in (([], True), (["--reik_balance_first"], True),
-                       (["--no_reik_balance_first"], False), (["--no_reik_gn"], False)):
-        monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
-        rc.entrypoint()
-        assert seen[-1].reik_balance_first is want, argv
-    monkeypatch.setattr(sys, "argv", ["run_cutamp", "--reik_balance_first", "--no_reik_gn"])
-    with pytest.raises(ValueError, match="reik_balance_first needs reik_gn"):
-        rc.entrypoint()
+        assert (seen[-1].reik_balance_first, seen[-1].cuda_graphs) == (balance_first, graphs), argv
 
 
 # The failing capture's process: cwd is this tree's root, so ``-c`` imports this tree's cutamp.
@@ -66,7 +51,7 @@ import torch
 import cutamp
 from cutamp.cuda_graphs import CapturedGraph
 assert os.path.realpath(cutamp.__file__).startswith(os.getcwd() + os.sep), cutamp.__file__
-with pytest.raises(RuntimeError, match="--cuda_graphs"):
+with pytest.raises(RuntimeError, match="--no_cuda_graphs"):
     CapturedGraph("bad", body=lambda: torch.ones(1, device="cuda").sum().item(), warmup=lambda: None, ptrs=tuple)
 assert torch.cuda.current_stream() == torch.cuda.default_stream()
 """

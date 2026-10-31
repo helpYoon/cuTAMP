@@ -23,13 +23,13 @@ of a refresh's deps in one call and makes no host syncs (the Adam loop is
 host-launch-bound), so its solves are the unchecked ``*_ex`` kernels.
 
 What this deliberately does NOT do (the full cuRobo solver covers these at
-particle init, at the final pre-check refresh, and in default mode on the
+particle init, at the final pre-check refresh, and in pose-only mode on the
 per-refresh fallback):
 
 - no self/world-collision vetting inside the update (the rollout's hard
   constraints still score every conf every step, so violations surface in
   the satisfying mask rather than silently passing),
-- no CoM residual in ``gn_project`` — its default-mode CALLER must AND
+- no CoM residual in ``gn_project`` — its pose-only-mode CALLER must AND
   ``compute_com_polygon_mask`` into its merge gate so out-of-polygon rows
   route to the CoM-aware cuRobo fallback (a pose-only gate demonstrably
   locks in CoM decay: GN keeps pose converged while the conf drifts out of
@@ -38,7 +38,7 @@ per-refresh fallback):
   runtime win, quality parity), but that version's CoM Jacobian had its x
   row overwritten by the y row (see the clone in ``gn_project_balanced``),
   so the rejection says nothing about a correct CoM row,
-- no basin hopping (strictly local; in default mode, rows that don't
+- no basin hopping (strictly local; in pose-only mode, rows that don't
   converge to checker tolerance are handed to the cuRobo fallback by the
   caller).
 

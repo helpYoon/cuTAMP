@@ -22,7 +22,7 @@ from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
 )
-from cutamp.config import TAMPConfiguration
+from cutamp.config import TAMPConfiguration, uses_cuda_graphs
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
@@ -115,9 +115,7 @@ def _adam_consider_types(config: TAMPConfiguration) -> set:
     them trainable ("auto") or unconditionally ("always" — the ablation's
     upstream-faithful attempt; historically destroys 21-DOF configs)."""
     consider = {"constraint"}
-    if config.optimize_soft_costs and (
-        config.coupled_reik or config.soft_in_adam == "always"
-    ):
+    if config.coupled_reik or config.soft_in_adam == "always":
         consider.add("cost")
     return consider
 
@@ -299,7 +297,7 @@ class _ReikDriftGate:
                        gn_fail=None, gn_fail_pose=None, gn_fail_com=None, fallback=None):
         """Append one ``stats`` record. ``drift`` is :meth:`_drift_stats` as
         Python floats, or ``None`` on the first refresh."""
-        # solve_s: default mode, each dep's wall time; balance-first, the refresh's CUDA-event span (a G_refresh
+        # solve_s: pose-only mode, each dep's wall time; balance-first, the refresh's CUDA-event span (a G_refresh
         # replay's also covers the stats packing) split evenly over its deps. Per-run sums hold in all, but don't
         # compare solve_s across modes.
         rec = {
@@ -312,8 +310,7 @@ class _ReikDriftGate:
             # GN refresh: rows the projection missed, split by which merge-gate
             # criterion failed (a row can fail both). "n_ik_fail" counts rows still
             # failing after GN + fallback (balance-first has no fallback, so it equals
-            # gn_fail); in cuRobo mode it counts solver success-flag failures. Presence
-            # of "gn_fail" marks which semantic a record uses.
+            # gn_fail).
             rec["gn_fail"] = gn_fail
             rec["gn_fail_pose"] = gn_fail_pose
             rec["gn_fail_com"] = gn_fail_com
@@ -502,12 +499,13 @@ class ParticleOptimizer:
         previous q (per-particle masked write), except in a balance-first
         gated refresh, which writes every row back.
 
-        When ``gate`` is given, refreshes run GN-first on
-        ``world.ik_refresh_solver`` (a cheap warm-seeded low-seed solver when
-        ``reik_num_seeds > 0``) and record per-dep drift/timing stats; in
+        When ``gate`` is given, refreshes run GN first, with a cuRobo fallback
+        on ``world.ik_refresh_solver`` (a cheap warm-seeded low-seed solver when
+        ``reik_num_seeds > 0``), and record per-dep drift/timing stats; in
         balance-first mode a gated refresh is :func:`_refresh_balanced` instead.
-        ``gate=None`` refreshes everything on the full-strength main solver —
-        used for the final pre-check refresh.
+        ``gate=None`` repairs the rows that miss checker tolerance or the CoM
+        polygon on the full-strength main solver — used for the final
+        pre-check refresh.
 
         cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
         so the IK call cannot run under ``torch.no_grad``; only the in-place
@@ -528,7 +526,7 @@ class ParticleOptimizer:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             n_gn_fail = n_gn_fail_pose = n_gn_fail_com = fallback = None
-            if gate is not None and self.config.reik_gn:
+            if gate is not None:
                 from cutamp.com_polygon_cost import compute_com_polygon_mask
                 # Gauss-Newton projection from the warm q (see gn_refresh.py).
                 # Merge only rows that converged to checker tolerance
@@ -577,45 +575,36 @@ class ParticleOptimizer:
                         particles[dep.q_name].grad = None
                     n_fail = int((~(ok | take)).sum().item())
             else:
-                # cuRobo solve. Low-seed refresh solver + warm seed only when
-                # gated; with reik_num_seeds=0 this path is byte-identical to
-                # the ungated one (ik_refresh_solver falls back to ik_solver).
-                # Full batch always: cuRobo pads sub-capacity batches
+                # Final pre-check refresh: REPAIR-ONLY, on the full-strength
+                # main solver. Measure which rows actually fail the checker's
+                # kinematic tolerance or the CoM gate and only overwrite those
+                # — a blanket success-masked overwrite perturbs already-good
+                # rows' soft costs (measured best_soft 18.6 -> 22.8 on one
+                # run). Full batch always: cuRobo pads sub-capacity batches
                 # internally, so subsets save nothing.
-                ok_now = None
-                if gate is None:
-                    # Final pre-check refresh: REPAIR-ONLY. Measure which rows
-                    # actually fail the checker's kinematic tolerance or the
-                    # CoM gate and only overwrite those — a blanket
-                    # success-masked overwrite perturbs already-good rows'
-                    # soft costs (measured best_soft 18.6 -> 22.8 on one run).
-                    from cutamp.com_polygon_cost import compute_com_polygon_mask
-                    pos_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err")
-                    rot_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err")
-                    with torch.no_grad():
-                        pos_err, rot_err = _achieved_pose_errors(
-                            world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
-                        )
-                        ok_now = (
-                            (pos_err < pos_tol)
-                            & (rot_err < rot_tol)
-                            & compute_com_polygon_mask(world, particles[dep.q_name])
-                        )
-                    if bool(ok_now.all()):
-                        continue  # nothing to repair for this dep
-                cheap = gate is not None and world.ik_refresh_solver is not world.ik_solver
+                from cutamp.com_polygon_cost import compute_com_polygon_mask
+                pos_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err")
+                rot_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err")
+                with torch.no_grad():
+                    pos_err, rot_err = _achieved_pose_errors(
+                        world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
+                    )
+                    ok_now = (
+                        (pos_err < pos_tol)
+                        & (rot_err < rot_tol)
+                        & compute_com_polygon_mask(world, particles[dep.q_name])
+                    )
+                if bool(ok_now.all()):
+                    continue  # nothing to repair for this dep
                 ik_result = _ik_for_pose(
                     world, world_from_ee, dep.arm,
                     current_state_q=particles[dep.q_name].detach(),
-                    ik=world.ik_refresh_solver if cheap else None,
-                    seed_from_current=cheap,
                 )
                 new_q = _ik_solution_to_full_q(ik_result, world).detach()
                 success = _ik_success_mask(ik_result)
                 n_fail = int((~success).sum().item())
-                if ok_now is not None:
-                    # Repair-only merge: already-good rows keep their q.
-                    success = success & ~ok_now
+                # Repair-only merge: already-good rows keep their q.
+                success = success & ~ok_now
                 with torch.no_grad():
                     merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
@@ -825,7 +814,8 @@ class ParticleOptimizer:
             keep_vis=type(visualizer) is not Visualizer,
         )
         step_graph = refresh_graph = None
-        if self.config.cuda_graphs:
+        use_graphs = uses_cuda_graphs(self.config)
+        if use_graphs:
             opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
         try:
             for step in pbar:
@@ -835,7 +825,7 @@ class ParticleOptimizer:
                     time_exceeded = True
                     break
                 timer.start("optimization_step")  # a capture's cost lands in its step
-                if self.config.cuda_graphs and step_graph is None and not (self.planner_busy and self.planner_busy()):
+                if use_graphs and step_graph is None and not (self.planner_busy and self.planner_busy()):
                     step_graph = self._capture_step(body, world)  # the planner thread has ended
                     opt_metrics["capture_s"], opt_metrics["capture_step"] = step_graph.capture_s, step
                 if step_graph is not None:
@@ -895,7 +885,7 @@ class ParticleOptimizer:
                     else:
                         self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
                         # G_step exists only once the planner thread has ended for good.
-                        if step_graph is not None and self.config.reik_balance_first:
+                        if step_graph is not None:
                             refresh_graph = _StaticRefresh(particles, ik_deps, world, reik_gate)
                             opt_metrics["refresh_capture_s"] = refresh_graph.graph.capture_s
                             opt_metrics["refresh_capture_step"] = step
@@ -950,7 +940,7 @@ class ParticleOptimizer:
         opt_metrics["num_satisfying_final"] = num_satisfying
 
         # Get the best costs from the satisfying particles. Note cost itself includes soft and hard (i.e., constraints)
-        # costs if config.optimize_soft_costs is True, while it only includes hard costs otherwise.
+        # costs when the soft costs join the Adam loss (_adam_consider_types), and only hard costs otherwise.
         best_cost = costs[satisfying_mask].min().item() if num_satisfying > 0 else None
         best_soft_cost = soft_costs[satisfying_mask].min().item() if num_satisfying > 0 else None
         best_hard_cost = hard_costs[satisfying_mask].min().item() if num_satisfying > 0 else None

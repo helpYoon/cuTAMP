@@ -163,7 +163,7 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
     monkeypatch.setattr(world, "_site_kinematics", {})
     config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0,
                                reik_balance_first=reik_balance_first, coupled_reik=coupled_reik,
-                               force_adam=not coupled_reik, enable_visualizer=False)
+                               force_adam=not coupled_reik, cuda_graphs=False, enable_visualizer=False)
     confs = {v for op in skeleton for v, prm in zip(op.values, op.operator.parameters) if prm.type == Conf}
     steps = _install_lockstep(monkeypatch, world)
     # Not the no-op Visualizer, so the body returns vis and each step compares costs, mask and values too.
@@ -190,10 +190,10 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
 ])
 def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
     # As test_step_lockstep_vs_head, for each soft cost alone and for none. max_obj_dist, min_obj_dist and align_yaw
-    # also run in default mode: the default soft costs never reach their triu gathers.
+    # also run in pose-only mode: the default soft costs never reach their triu gathers.
     world, skeleton, base = blocks_t1_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
-                               reik_balance_first=balance_first, enable_visualizer=False,
+                               reik_balance_first=balance_first, cuda_graphs=False, enable_visualizer=False,
                                soft_cost=None if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))

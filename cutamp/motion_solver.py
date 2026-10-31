@@ -300,7 +300,6 @@ def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
         # a place grazed the block just released by up to 0.2 mm.
         collision_activation_distance=0.0025,
         enable_com_polygon=config.enable_com_polygon,
-        enable_joint_limit_margin=config.enable_joint_limit_margin,
     )
 
 

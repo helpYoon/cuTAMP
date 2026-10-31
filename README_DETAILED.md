@@ -182,7 +182,7 @@ cutamp-demo -h
 
 ```bash
 # Minimize the distance between the objects for 10 seconds
-# (soft-cost optimization is on by default; use --no_optimize_soft_costs to disable)
+# (soft costs are always optimized under coupled re-IK, the default)
 cutamp-demo --env blocks_t1 --soft_cost min_obj_dist --max_duration 10
 
 # Maximize the distance between the objects for 10 seconds

@@ -48,10 +48,10 @@ class TAMPConfiguration:
     max_loop_dur: Optional[float] = None
 
     ## Soft Costs
-    # Default ON: validated as a trio with coupled_reik + place_close_to_base
-    # (commit 0c94674) — don't toggle one without considering the others.
-    # joint_limit_margin (added 2026-06-11) is independent of that trio.
-    optimize_soft_costs: bool = True
+    # place_close_to_base is validated with coupled_reik (commit 0c94674,
+    # with soft-cost optimization, then a switch, on) — don't change one
+    # without considering the other. joint_limit_margin (added 2026-06-11)
+    # is independent of that pair.
     # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
     soft_cost: Optional[List[str]] = field(
         default_factory=lambda: ["place_close_to_base", "joint_limit_margin"]
@@ -74,29 +74,23 @@ class TAMPConfiguration:
     # showed 407 -> 251 ms/step with best-satisfying / best-soft-cost equal
     # or better than the 32-seed refresh (2026-08-04).
     reik_num_seeds: int = 4
-    # Gauss-Newton refresh (cutamp/gn_refresh.py): periodic refreshes project
-    # the warm q onto the moved pose target with batched damped GN (~2-5 ms
-    # per dep) instead of a cuRobo solve; rows that miss checker tolerance or
-    # the CoM polygon fall back to the reik_num_seeds cuRobo solve that
-    # refresh (not in balance-first mode). Init and the final pre-check
-    # refresh always use the full 32-seed solver. Default ON: A/B on blocks_t1
-    # @512 (2026-08-04) vs the cuRobo-only refresh: loop 98.0 -> 63.1 s, best
-    # soft 27.9 -> 21.3, final satisfying 349 vs 341, CoM-in-polygon parity
-    # (worst 499 vs 502).
-    reik_gn: bool = True
     # Balance-first GN refresh (gn_project_balanced): CoM-in-polygon is GN's
     # first priority, the pose is least squares inside it, and joint-limit
     # margins use what is left; every row's iterate is written back, and no
     # cuRobo runs during Adam (the final pre-check refresh still repairs).
-    # Needs reik_gn. Default ON (2026-10-30): it is the only path that keeps
-    # covered Confs out of the joint_limit_margin bands (they are out of
-    # Adam, so the soft cost never moves them) — check_plan_margins failed
-    # 7/10 runs without it, 0/10 with it (n=64, seeds 0-4).
+    # Default ON (2026-10-30): it is the only path that keeps covered Confs
+    # out of the joint_limit_margin bands (they are out of Adam, so the soft
+    # cost never moves them) — check_plan_margins failed 7/10 runs without
+    # it, 0/10 with it (n=64, seeds 0-4). False = pose-only GN with the
+    # reik_num_seeds cuRobo fallback for rows that miss checker tolerance or
+    # the CoM polygon (the paper's default-refresh arm).
     reik_balance_first: bool = True
     # Replay the balance-first Adam step and re-IK refresh as CUDA graphs
-    # (cutamp/cuda_graphs.py). Needs reik_balance_first and coupled_reik, and
-    # rejects align_yaw. A failed capture ends the run: no switch to eager.
-    cuda_graphs: bool = False
+    # (cutamp/cuda_graphs.py). Only runs that use them can capture them (see
+    # uses_cuda_graphs); the rest stay eager. Default ON (2026-10-31): 3.5x
+    # faster steps at n=64, 2.1x at 256, replays bitwise equal to eager. A
+    # failed capture ends the run: no switch to eager.
+    cuda_graphs: bool = True
     # LBFGS iteration budget for the refresh/fallback solver (0 = cuRobo's
     # default 100, sized for cold global solves). The fallback is warm-started
     # repair work. Default 40: full A/B (2026-08-04, blocks_t1 @512, two runs
@@ -124,10 +118,6 @@ class TAMPConfiguration:
     ## Trajectories and cuRobo
     # Pass through to MotionPlanner's COM-over-base-polygon soft cost.
     enable_com_polygon: bool = True
-    # Pass through to MotionPlanner's joint-limit margin trajopt cost
-    # (trajectory insurance; endpoint configs are handled by the
-    # "joint_limit_margin" soft cost). Margins: robots/t1.py.
-    enable_joint_limit_margin: bool = True
     # CoM-aware seed-IK residual (cuRobo fork): IK natively trades hand-pose vs
     # COM, recruiting legs within limits. The post-IK mask stays as the
     # backstop. Validation: commits 217d4b6 / 5b9ae65.
@@ -168,6 +158,16 @@ class TAMPConfiguration:
     experiment_root: str = "/tmp/cutamp-experiments"
 
 
+def uses_cuda_graphs(config: TAMPConfiguration) -> bool:
+    """Whether this run captures CUDA graphs: they record the balance-first
+    Adam step and refresh, so they need coupled re-IK and balance-first, and
+    align_yaw can't be captured (roma's rotmat_to_euler syncs the host)."""
+    return (
+        config.cuda_graphs and config.coupled_reik and config.reik_balance_first
+        and "align_yaw" not in (config.soft_cost or [])
+    )
+
+
 def validate_tamp_config(config: TAMPConfiguration):
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
@@ -196,22 +196,10 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(
             f"soft_in_adam must be 'auto' or 'always', not {config.soft_in_adam!r}"
         )
-    if config.reik_balance_first and not config.reik_gn:
-        raise ValueError("reik_balance_first needs reik_gn (it replaces the GN refresh step)")
-    if config.cuda_graphs and not config.reik_balance_first:
-        raise ValueError("cuda_graphs needs reik_balance_first (it captures the balance-first Adam step)")
-    if config.cuda_graphs and not config.coupled_reik:
-        raise ValueError("cuda_graphs needs coupled_reik (balance-first runs only with coupled re-IK)")
-    if config.cuda_graphs and "align_yaw" in (config.soft_cost or []):
-        raise ValueError("cuda_graphs can't capture align_yaw: roma's rotmat_to_euler syncs the host")
-    if config.reik_gn and not config.coupled_reik:
-        # GN refresh only runs inside the coupled-reIK loop. Now that reik_gn
-        # defaults ON, this combination just means "no refreshes at all" —
-        # warn (don't raise) so --no_coupled_reik keeps working, but a
-        # benchmark comparing GN on/off knows the flag was inert.
+    if config.cuda_graphs and not uses_cuda_graphs(config):
         import logging
-        logging.getLogger(__name__).warning(
-            "reik_gn has no effect without coupled_reik (no re-IK refreshes run)"
+        logging.getLogger(__name__).info(
+            "CUDA graphs off for this run: they need coupled_reik and reik_balance_first, and not align_yaw"
         )
     for name in (config.soft_cost or []):
         if name not in SUPPORTED_SOFT_COSTS:

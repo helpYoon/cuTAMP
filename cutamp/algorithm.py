@@ -166,10 +166,7 @@ def sample_plan_skeleton(
 
     # Best cost initially
     with timer.time("compute_best_cost"):
-        consider_types = {"constraint"}
-        if config.optimize_soft_costs:
-            consider_types.add("cost")
-        costs = cost_reducer(cost_dict, consider_types=consider_types)
+        costs = cost_reducer(cost_dict, consider_types={"constraint", "cost"})
         if satisfying_mask.any():
             best_cost = costs[satisfying_mask].min().item()
             best_soft_cost = cost_reducer.soft_costs(cost_dict)[satisfying_mask].min().item()
@@ -337,7 +334,7 @@ def run_cutamp(
     # (curobo/_src/util/warp.py): warp's stream registry is unlocked, and a
     # fresh wrapper per launch from two threads corrupts the heap. solve_curobo
     # joins via get_planner; its warmup timer then measures only the residual wait.
-    # --cuda_graphs captures only after this thread ends (planner_busy): a capture fails on another thread's CUDA work.
+    # CUDA graphs capture only after this thread ends (planner_busy): a capture fails on another thread's CUDA work.
     get_planner = None
     planner_busy = None
     if config.curobo_plan:

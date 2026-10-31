@@ -1,4 +1,4 @@
-"""Capture and replay of the Adam loop's CUDA graphs (``--cuda_graphs``), after cuRobo's ``GraphExecutor``
+"""Capture and replay of the Adam loop's CUDA graphs (on by default; ``--no_cuda_graphs`` turns them off), after cuRobo's ``GraphExecutor``
 (``curobo/_src/util/cuda_graph_util.py``). A graph bakes in every device address it touches, so
 :class:`CapturedGraph` checks before each replay that none has moved."""
 
@@ -56,7 +56,7 @@ class CapturedGraph:
                 self.outputs = body()
         except Exception as e:
             torch.cuda.set_stream(cur)
-            raise RuntimeError(f"CUDA graph capture of {name} failed; rerun without --cuda_graphs") from e
+            raise RuntimeError(f"CUDA graph capture of {name} failed; rerun with --no_cuda_graphs") from e
         torch.cuda.synchronize()
         self.capture_s = time.perf_counter() - t0
         self.name, self.body, self.ptrs, self.captured_ptrs = name, body, ptrs, ptrs()

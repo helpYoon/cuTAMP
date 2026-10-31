@@ -105,11 +105,6 @@ def entrypoint():
 
     # Soft costs
     parser.add_argument(
-        "--no_optimize_soft_costs", dest="optimize_soft_costs", action="store_false",
-        help="Disable soft-cost optimization (default: on, with place_close_to_base).",
-    )
-    parser.set_defaults(optimize_soft_costs=_defaults.optimize_soft_costs)
-    parser.add_argument(
         "--no_coupled_reik", dest="coupled_reik", action="store_false",
         help="Disable re-IK-coupled Adam (default: on). Coupled mode is required for "
              "pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
@@ -119,40 +114,29 @@ def entrypoint():
         "--reik_interval", type=int, default=_defaults.reik_interval,
         help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
     )
+    # --reik_balance_first and --cuda_graphs only restate the defaults; the
+    # paper's reproduction commands pass them.
     parser.add_argument(
-        "--reik_num_seeds", type=int, default=_defaults.reik_num_seeds,
-        help="Use a dedicated low-seed, warm-started IK solver for re-IK refreshes "
-             "(cost ~linear in seeds; init and final refresh keep 32 seeds; only used with "
-             "--no_reik_balance_first). 0 = main solver.",
-    )
-    parser.add_argument(
-        "--no_reik_gn", dest="reik_gn", action="store_false",
-        help="Disable the Gauss-Newton re-IK refresh (default: on); refreshes then run "
-             "the warm cuRobo solve for every dep. Also turns off balance-first, which needs GN.",
-    )
-    parser.set_defaults(reik_gn=_defaults.reik_gn)
-    # Default None: on unless --no_reik_gn, which it needs; explicit
-    # --reik_balance_first --no_reik_gn still fails validation.
-    parser.add_argument(
-        "--reik_balance_first", dest="reik_balance_first", action="store_const", const=True,
+        "--reik_balance_first", dest="reik_balance_first", action="store_true",
         help="Balance-first GN refresh (CoM in polygon, then pose, then joint-limit margins), "
-             "persistent iterates, no cuRobo during Adam (default: on unless --no_reik_gn).",
+             "persistent iterates, no cuRobo during Adam. On by default.",
     )
     parser.add_argument(
-        "--no_reik_balance_first", dest="reik_balance_first", action="store_const", const=False,
+        "--no_reik_balance_first", dest="reik_balance_first", action="store_false",
         help="Use the pose-only GN refresh with cuRobo fallbacks instead; joint-limit margins "
              "are then not enforced on covered Confs.",
     )
+    parser.set_defaults(reik_balance_first=_defaults.reik_balance_first)
     parser.add_argument(
-        "--cuda_graphs", action="store_true",
-        help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs. "
-             "Needs balance-first (the default) and coupled re-IK; rejects the align_yaw soft cost.",
+        "--cuda_graphs", dest="cuda_graphs", action="store_true",
+        help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs. On by default; "
+             "runs without coupled re-IK or balance-first, or with align_yaw, stay eager.",
     )
     parser.add_argument(
-        "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
-        help="LBFGS iteration budget for the warm refresh/fallback solver "
-             "(multiple of 20; 0 = cuRobo default 100; only used with --no_reik_balance_first).",
+        "--no_cuda_graphs", dest="cuda_graphs", action="store_false",
+        help="Run the Adam step and re-IK refresh eagerly.",
     )
+    parser.set_defaults(cuda_graphs=_defaults.cuda_graphs)
     parser.add_argument(
         "--soft_cost",
         nargs="*",
@@ -198,17 +182,6 @@ def entrypoint():
              "configurations from tipping over the wheelbase.",
     )
     parser.set_defaults(enable_com_polygon=_defaults.enable_com_polygon)
-    parser.add_argument(
-        "--no_enable_joint_limit_margin",
-        dest="enable_joint_limit_margin",
-        action="store_false",
-        help="Disable the joint-limit margin trajopt cost on the motion planner. "
-             "By default the cost is enabled (1e5 weight, 0.1 rad band; zero on "
-             "the home-side bounds) and keeps the trajectory interior away from "
-             "joint position limits. The endpoint-side soft cost is controlled "
-             "separately via --soft_cost.",
-    )
-    parser.set_defaults(enable_joint_limit_margin=_defaults.enable_joint_limit_margin)
     parser.add_argument(
         "--no_enable_com_aware_ik",
         dest="enable_com_aware_ik",
@@ -288,22 +261,14 @@ def entrypoint():
         lr=args.lr,
         conf_lr=args.conf_lr,
         max_loop_dur=args.max_duration,
-        optimize_soft_costs=args.optimize_soft_costs,
         coupled_reik=args.coupled_reik,
         reik_interval=args.reik_interval,
-        reik_num_seeds=args.reik_num_seeds,
-        reik_gn=args.reik_gn,
-        reik_balance_first=(
-            _defaults.reik_balance_first and args.reik_gn
-            if args.reik_balance_first is None else args.reik_balance_first
-        ),
+        reik_balance_first=args.reik_balance_first,
         cuda_graphs=args.cuda_graphs,
-        reik_lbfgs_iters=args.reik_lbfgs_iters,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
         curobo_plan=args.motion_plan,
         enable_com_polygon=args.enable_com_polygon and not args.no_com_all,
-        enable_joint_limit_margin=args.enable_joint_limit_margin,
         enable_com_aware_ik=args.enable_com_aware_ik and not args.no_com_all,
         enable_com_init_gate=not args.no_com_all,
         enable_com_hard_constraint=not args.no_com_all,

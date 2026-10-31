@@ -9,7 +9,7 @@ from cutamp.tests.conftest import needs_cuda
 @pytest.mark.parametrize(("reik_balance_first", "cuda_graphs"), [(False, False), (True, False), (True, True)])
 def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_first, cuda_graphs):
     """Run cutamp_demo with --coupled_reik for a few Adam steps in each refresh mode: no
-    exception, each mode refreshes through its own path, and only default mode builds a cuRobo
+    exception, each mode refreshes through its own path, and only pose-only mode builds a cuRobo
     refresh solver (at setup, never mid-run)."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
@@ -40,7 +40,6 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
         reik_interval=2,
         reik_balance_first=reik_balance_first,
         cuda_graphs=cuda_graphs,
-        optimize_soft_costs=True,
         soft_cost=["place_close_to_base"],
         enable_visualizer=False,
         curobo_plan=False,  # skip motion plan to keep test fast

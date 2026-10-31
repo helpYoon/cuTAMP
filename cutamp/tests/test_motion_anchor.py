@@ -82,11 +82,11 @@ def _generate_plan_segments(seed: int):
         num_opt_steps=50,
         curobo_plan=True,
         enable_com_polygon=True,
-        # Pin the soft-cost trio OFF: these tests assert segment schema +
-        # arrival COM-in-hull, which the CoM-aware IK + hard gate guarantee
-        # regardless; running the default coupled-reik optimization here only
-        # doubles runtime (trio coverage lives in test_coupled_reik_smoke).
-        optimize_soft_costs=False,
+        # Pin coupled re-IK OFF, which keeps the soft costs out of Adam: these
+        # tests assert segment schema + arrival COM-in-hull, which the CoM-aware
+        # IK + hard gate guarantee regardless; running the default coupled-reik
+        # optimization here only doubles runtime (coverage of that lives in
+        # test_coupled_reik_smoke).
         coupled_reik=False,
         enable_visualizer=False,
         enable_experiment_logging=False,

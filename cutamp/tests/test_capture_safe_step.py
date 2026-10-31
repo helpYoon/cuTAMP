@@ -17,10 +17,11 @@ pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a 
 
 
 @needs_cuda
-def test_noop_visualizer_skips_vis_block(blocks_t1_plan):
+@pytest.mark.parametrize("cuda_graphs", [False, True])
+def test_noop_visualizer_skips_vis_block(blocks_t1_plan, cuda_graphs):
     world, skeleton, base = blocks_t1_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=12, early_stop_patience=0,
-                               reik_balance_first=True, enable_visualizer=False)
+                               reik_balance_first=True, cuda_graphs=cuda_graphs, enable_visualizer=False)
     _, timer = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
     assert "visualize_opt_rollout" not in timer.get_summaries()  # the no-op visualizer skips the block
     vis = SpyVis(config)
@@ -172,7 +173,7 @@ def test_merged_adam_groups_match_per_param():
 
 @needs_cuda
 def test_align_yaw_syncs_in_roma(blocks_t1_plan):
-    # Why cuda_graphs rejects align_yaw: its sync is roma's.
+    # Why align_yaw runs stay eager under cuda_graphs: its sync is roma's.
     from cutamp.cost_function import CostFunction
     from cutamp.rollout import RolloutFunction
 
