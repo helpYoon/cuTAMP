@@ -84,11 +84,15 @@ class TAMPConfiguration:
     # soft 27.9 -> 21.3, final satisfying 349 vs 341, CoM-in-polygon parity
     # (worst 499 vs 502).
     reik_gn: bool = True
-    # Balance-first GN refresh (gn_project_balanced, prototype): CoM-in-polygon
-    # is GN's first priority and the pose is least squares inside it; every
-    # row's iterate is written back, and no cuRobo runs during Adam (the final
-    # pre-check refresh still repairs). Needs reik_gn.
-    reik_balance_first: bool = False
+    # Balance-first GN refresh (gn_project_balanced): CoM-in-polygon is GN's
+    # first priority, the pose is least squares inside it, and joint-limit
+    # margins use what is left; every row's iterate is written back, and no
+    # cuRobo runs during Adam (the final pre-check refresh still repairs).
+    # Needs reik_gn. Default ON (2026-10-30): it is the only path that keeps
+    # covered Confs out of the joint_limit_margin bands (they are out of
+    # Adam, so the soft cost never moves them) — check_plan_margins failed
+    # 7/10 runs without it, 0/10 with it (n=64, seeds 0-4).
+    reik_balance_first: bool = True
     # Replay the balance-first Adam step and re-IK refresh as CUDA graphs
     # (cutamp/cuda_graphs.py). Needs reik_balance_first and coupled_reik, and
     # rejects align_yaw. A failed capture ends the run: no switch to eager.

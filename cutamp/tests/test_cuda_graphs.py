@@ -25,7 +25,7 @@ from cutamp.utils.timer import TorchTimer
 def test_cuda_graphs_validation():
     assert TAMPConfiguration().cuda_graphs is False
     with pytest.raises(ValueError, match="cuda_graphs needs reik_balance_first"):
-        validate_tamp_config(TAMPConfiguration(cuda_graphs=True))
+        validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=False))
     with pytest.raises(ValueError, match="cuda_graphs needs coupled_reik"):
         validate_tamp_config(TAMPConfiguration(cuda_graphs=True, reik_balance_first=True, coupled_reik=False))
     with pytest.raises(ValueError, match="align_yaw"):
@@ -42,6 +42,20 @@ def test_cli_passes_cuda_graphs(monkeypatch):
         monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
         rc.entrypoint()
         assert seen[-1].cuda_graphs is want
+
+
+def test_cli_balance_first_defaults_on(monkeypatch):
+    import cutamp.scripts.run_cutamp as rc
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
+    for argv, want in (([], True), (["--reik_balance_first"], True),
+                       (["--no_reik_balance_first"], False), (["--no_reik_gn"], False)):
+        monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
+        rc.entrypoint()
+        assert seen[-1].reik_balance_first is want, argv
+    monkeypatch.setattr(sys, "argv", ["run_cutamp", "--reik_balance_first", "--no_reik_gn"])
+    with pytest.raises(ValueError, match="reik_balance_first needs reik_gn"):
+        rc.entrypoint()
 
 
 # The failing capture's process: cwd is this tree's root, so ``-c`` imports this tree's cutamp.

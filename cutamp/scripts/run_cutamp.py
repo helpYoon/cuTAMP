@@ -122,30 +122,36 @@ def entrypoint():
     parser.add_argument(
         "--reik_num_seeds", type=int, default=_defaults.reik_num_seeds,
         help="Use a dedicated low-seed, warm-started IK solver for re-IK refreshes "
-             "(cost ~linear in seeds; init and final refresh keep 32 seeds; no effect "
-             "with --reik_balance_first beyond validation). 0 = main solver.",
+             "(cost ~linear in seeds; init and final refresh keep 32 seeds; only used with "
+             "--no_reik_balance_first). 0 = main solver.",
     )
     parser.add_argument(
         "--no_reik_gn", dest="reik_gn", action="store_false",
         help="Disable the Gauss-Newton re-IK refresh (default: on); refreshes then run "
-             "the warm cuRobo solve for every dep.",
+             "the warm cuRobo solve for every dep. Also turns off balance-first, which needs GN.",
     )
     parser.set_defaults(reik_gn=_defaults.reik_gn)
+    # Default None: on unless --no_reik_gn, which it needs; explicit
+    # --reik_balance_first --no_reik_gn still fails validation.
     parser.add_argument(
-        "--reik_balance_first", action="store_true",
-        help="Prototype: balance-first GN refresh (CoM in polygon before pose), persistent "
-             "iterates, no cuRobo during Adam.",
+        "--reik_balance_first", dest="reik_balance_first", action="store_const", const=True,
+        help="Balance-first GN refresh (CoM in polygon, then pose, then joint-limit margins), "
+             "persistent iterates, no cuRobo during Adam (default: on unless --no_reik_gn).",
+    )
+    parser.add_argument(
+        "--no_reik_balance_first", dest="reik_balance_first", action="store_const", const=False,
+        help="Use the pose-only GN refresh with cuRobo fallbacks instead; joint-limit margins "
+             "are then not enforced on covered Confs.",
     )
     parser.add_argument(
         "--cuda_graphs", action="store_true",
         help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs. "
-             "Needs --reik_balance_first and coupled re-IK; rejects the align_yaw soft cost.",
+             "Needs balance-first (the default) and coupled re-IK; rejects the align_yaw soft cost.",
     )
     parser.add_argument(
         "--reik_lbfgs_iters", type=int, default=_defaults.reik_lbfgs_iters,
         help="LBFGS iteration budget for the warm refresh/fallback solver "
-             "(multiple of 20; 0 = cuRobo default 100; no effect with --reik_balance_first "
-             "beyond validation).",
+             "(multiple of 20; 0 = cuRobo default 100; only used with --no_reik_balance_first).",
     )
     parser.add_argument(
         "--soft_cost",
@@ -287,7 +293,10 @@ def entrypoint():
         reik_interval=args.reik_interval,
         reik_num_seeds=args.reik_num_seeds,
         reik_gn=args.reik_gn,
-        reik_balance_first=args.reik_balance_first,
+        reik_balance_first=(
+            _defaults.reik_balance_first and args.reik_gn
+            if args.reik_balance_first is None else args.reik_balance_first
+        ),
         cuda_graphs=args.cuda_graphs,
         reik_lbfgs_iters=args.reik_lbfgs_iters,
         soft_cost=args.soft_cost,
