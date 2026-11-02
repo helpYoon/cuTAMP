@@ -94,10 +94,11 @@ GN_MARGIN_STEP = 0.03
 @lru_cache(maxsize=None)
 def _row_layout(arms: tuple[str, ...], n: int, dof: int, device, dtype):
     """``(col_mask [n, dof], is_left [n])`` for ``n`` rows in ``len(arms)`` equal
-    dep-major blocks, block ``i`` on ``arms[i]``: the IK solver's cspace pin
-    (base + inactive arm immobile) and each row's tool frame. Cached, since
-    building it is a host-to-device copy; never mutate or evict it: a captured
-    CUDA graph keeps reading its addresses."""
+    dep-major blocks, block ``i`` on ``arms[i]``: the columns GN may move (the base
+    and the inactive arm stay frozen, so that hand rides with the trunk; known-bugs
+    B15) and each row's tool frame. Cached, since building it is a host-to-device
+    copy; never mutate or evict it: a captured CUDA graph keeps reading its
+    addresses."""
     if not arms or n % len(arms) or not set(arms) <= {"left", "right"}:
         raise ValueError(f"{n} rows over arms {arms}: need equal dep blocks, each 'left' or 'right'")
     col_mask = torch.ones(len(arms), dof, dtype=dtype)
@@ -199,8 +200,8 @@ def gn_project(
         world: TAMPWorld (uses ``kinematics_jac``, the Jacobian-enabled FK).
         q_full: ``[B, dof]`` full-cspace joint positions (not modified).
         world_from_ee: ``[B, 4, 4]`` target tool poses.
-        arm: "left" / "right" — the OTHER arm and the virtual base are locked,
-            mirroring the IK solver's cspace pin.
+        arm: "left" / "right" — the OTHER arm and the virtual base are locked.
+            (cuRobo IK instead holds the other hand in the world; known-bugs B15.)
 
     Returns:
         ``[B, dof]`` projected joint positions, clamped to joint limits.
@@ -368,7 +369,7 @@ def gn_project_balanced(
 
     Otherwise the contract is :func:`gn_project`'s, except that ``arms`` holds
     one arm per IK dep (a bare ``str`` is one): rows are ``len(arms)`` equal
-    dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and cspace pin.
+    dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and frozen columns.
 
     ``balance=False`` (the no-CoM ablation, ``config.enable_com_aware_ik``
     off) drops level 1: a zero CoM and CoM Jacobian leave both CoM active

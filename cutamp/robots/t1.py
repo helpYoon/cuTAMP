@@ -15,7 +15,8 @@ The head (2 DOF) and grippers (4+4 DOF) are construction-time lock_joints in
 ``right_base_link``; multi-tool-frame planning uses ``GoalToolPose``.
 
 Inactive-arm pinning (during a Pick/Place/Retract that uses one arm) is
-handled at planning time in ``cutamp/t1_state.py``.
+handled at planning time in ``cutamp/t1_state.py``, and is a no-op as
+configured (see ``T1State.pin_for_arm_action``).
 """
 
 import copy
@@ -366,12 +367,10 @@ def get_t1_ik_solver(
 
     Always built with both tool frames from ``t1_planar_base.yml``. During
     particle-init IK calls the inactive *hand* is held at its home world
-    pose by the multi-frame goal (``_build_multi_frame_goal``), as in the
-    motion planner, so the inactive arm's joints counter-rotate as the body
-    bends (about 1 rad per approach in blocks_t1; known-bugs B15). The
-    cspace pin beside it is a soft regulariser in cuRobo's optimizer only;
-    with CoM-aware IK on, the optimizer sees only the problems the seed LM
-    fails.
+    pose by the multi-frame goal (``_build_multi_frame_goal``), so the
+    inactive arm's joints counter-rotate as the body bends (about 1 rad per
+    approach in blocks_t1; known-bugs B15). The cspace pin written beside it
+    is a no-op as configured (``cspace_target_weight`` is 0).
 
     The 3 base DOFs (``base_j_x``, ``base_j_y``, ``base_j_yaw``) are pinned
     at 0 — IK cannot drift the base during particle init. Legs / torso /

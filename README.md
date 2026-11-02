@@ -104,7 +104,7 @@ graph TD
     end
 
     subgraph Pinning [Cspace pinning per operator]
-        ArmOp["pin_for_arm_action(active_arm)<br/>→ inactive arm pinned to start;<br/>active arm + body free"]
+        ArmOp["pin_for_arm_action(active_arm)<br/>→ inactive arm's cspace weights<br/>(a no-op: cspace_target_weight is 0)"]
     end
 
     subgraph Tools [Tool frames]
@@ -184,7 +184,8 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner,
   kinematics, current joint state, and per-arm `arm_holding` /
   `arm_grasp_transform`. Cspace pinning lives here:
-  - `pin_for_arm_action(arm)` — pin inactive arm; body + active arm free.
+  - `pin_for_arm_action(arm)` — write the inactive arm's cspace pin weights
+    (a no-op as configured: `cspace_target_weight` is 0).
   - `unpin()` — restore original weights.
   - `compute_held_obj_poses(arm, plan)` — per-timestep `world_from_obj` for a
     held object along a planner trajectory.
@@ -478,11 +479,16 @@ commands above use PyTorch's default allocator.
    IK / motion-planner construction time for arm operators (so the base
    doesn't drift while reaching).
 
-3. **Cspace pinning replaces per-arm planners** — `pin_for_arm_action`
-   writes the inactive arm's per-DOF `cspace_target_dof_weight` into every
-   rollout of the planner and its internal IK solver; particle-init and
-   refresh IK apply the same pin (with the multi-frame goal), and the
-   optimizer masks the inactive arm's gradients. Restored by `unpin()`.
+3. **Inactive-arm handling** — `pin_for_arm_action` writes the inactive
+   arm's per-DOF `cspace_target_dof_weight` into every rollout of the planner
+   and its internal IK solver, and particle-init and refresh IK apply the same
+   pin. Restored by `unpin()`. The pin is a no-op as configured: cuRobo scales
+   those weights by `cspace_target_weight`, which is 0 in every IK and trajopt
+   config used. What holds the inactive hand is IK's multi-frame goal, which
+   targets that frame where it is, at the confs IK solves. The optimizer's
+   gradient masks and the GN refresh keep the inactive arm's joints fixed, so
+   that hand rides with the trunk when they move the body, and `plan_cspace`
+   holds nothing between confs. Both arms stay in the collision checks.
 
 4. **Both arms tracked through every trajectory** — body joints are unlocked
    during single-arm planning, so an inactive arm holding a block will still

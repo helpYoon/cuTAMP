@@ -51,8 +51,8 @@ class IKDep:
 
     ``target_fn(particles)`` rebuilds ``world_from_ee`` from the current
     particle state. ``q_name`` is the Conf to overwrite (in-place) with the
-    IK solution. ``arm`` selects the active tool frame and the inactive-arm
-    cspace pin (matching ``_ik_for_pose``'s contract).
+    IK solution. ``arm`` selects the active tool frame, and so which arm is
+    inactive (matching ``_ik_for_pose``'s contract).
     """
     q_name: str
     arm: Literal["left", "right"]

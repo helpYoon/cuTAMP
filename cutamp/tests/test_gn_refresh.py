@@ -217,7 +217,7 @@ def test_gn_project_balanced_leaves_margin_bands_holding_pose_and_com():
 
 @needs_cuda
 def test_gn_project_balanced_pins_per_row():
-    # Each row keeps its own dep's cspace pin and tool frame (a right row on the left frame
+    # Each row keeps its own dep's frozen columns and tool frame (a right row on the left frame
     # would chase a target half a metre away).
     from cutamp.gn_refresh import gn_project_balanced
     from cutamp.particle_initialization import _achieved_pose_errors

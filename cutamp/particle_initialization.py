@@ -67,8 +67,7 @@ def _build_multi_frame_goal(
     The active frame gets ``target_pose``; every inactive frame gets its
     current FK pose at ``current_state``. This satisfies cuRobo IK's
     ``reorder_links`` requirement that the goal cover every kinematics
-    tool frame, while keeping the inactive frames at their "stay put"
-    pose so they don't drag the trajopt away from the cspace pin.
+    tool frame, and holds each inactive hand where it is in the world.
     """
     all_frames: List[str] = list(host.kinematics.tool_frames)
     poses: Dict[str, Pose] = {active_tool_frame: target_pose}
@@ -91,18 +90,18 @@ def _ik_for_pose(
 ):
     """Solve IK for a batch of EE poses, targeting the active arm's tool frame.
 
-    Uses the same multi-frame-goal + cspace-pin pattern the motion planner
-    applies during arm operators: the inactive frame is targeted at its
-    current FK pose, and ``cspace_target_dof_weight`` pulls its joints toward
-    their current values in cuRobo's optimizer (with CoM-aware IK on, only for
-    the problems the seed LM fails). The pose target wins over that soft pull,
+    The multi-frame goal targets the inactive frame at its current FK pose,
     so the inactive hand stays put in the world while its arm's joints
     counter-rotate as the body bends (about 1 rad per approach in blocks_t1).
-    Without either, IK leaves the inactive arm unconstrained and it drifts to
-    arbitrary joint values, polluting downstream particle optimization.
+    Without it, IK leaves the inactive arm unconstrained and it drifts to
+    arbitrary joint values, polluting downstream particle optimization. This
+    goal is the only hold on the inactive hand (known-bugs B15): the cspace
+    pin below is a no-op as configured (``T1State.pin_for_arm_action``), the
+    GN refreshes keep the inactive arm's joints fixed while they move the
+    body, and the motion planner holds nothing between confs.
 
     ``current_state_q`` (full-cspace ``[B, len(world.kinematics.joint_names)]``)
-    anchors the cspace pin and inactive-frame goal at a non-home pose. Note
+    anchors the inactive-frame goal at a non-home pose. Note
     cuRobo's seed manager IGNORES ``current_state`` for seeding — pass
     ``seed_from_current=True`` to additionally inject it as an explicit
     optimization seed (true warm start; remaining seeds stay random). Used
@@ -134,9 +133,9 @@ def _ik_for_pose(
     snapshot = snapshot_cspace_target_dof_weight([ik])
     try:
         if arm is not None:
-            # Weight the inactive arm's DOFs toward their current values: a soft
-            # regulariser only. The inactive frame's target in ``goal`` wins, so
-            # those joints still move to keep that hand still in the world.
+            # Pin the inactive arm's DOFs to their current values: a no-op as
+            # configured (``cspace_target_weight`` is 0). The inactive frame's
+            # target in ``goal`` is what holds that hand in the world.
             write_cspace_target_dof_weight(
                 [ik], build_pin_weights(
                     ik, RIGHT_ARM_JOINT_NAMES if arm == "left" else LEFT_ARM_JOINT_NAMES,

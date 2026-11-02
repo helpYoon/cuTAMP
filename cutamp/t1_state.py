@@ -1,15 +1,13 @@
 """T1State — single-MotionPlanner state container for the T1 humanoid.
 
-Cspace pinning protocols (TrajOpt-side only — see ``pin_for_arm_action``):
+Cspace pinning protocol (see ``pin_for_arm_action``):
 
 * ``pin_for_arm_action(active_arm)``: pin the inactive arm's cspace target
-  weights (mostly informational for IK; trajopt's
-  ``cspace_target_weight`` is 0). The inactive wrist is held in place by
-  cuRobo's native world-frame ``tool_pose`` cost via the multi-frame goal
-  built by ``cutamp/particle_initialization._build_multi_frame_goal`` — that goal
-  sets the inactive frame's target pose to its FK at the segment's
-  starting state, and the criterion stays ENABLED so trajopt drives the
-  inactive wrist back to that world position throughout the trajectory.
+  weights on the planner and its internal IK solver. As configured this is a
+  no-op: cuRobo scales those weights by ``cspace_target_weight``, which is 0
+  in every IK and trajopt config the planner loads. Nothing else holds the
+  inactive hand during a segment either, since the motion solver plans with
+  ``plan_cspace`` between particle confs (known-bugs B15).
 
 Restore via ``unpin()``.
 """
@@ -68,16 +66,13 @@ class T1State:
     def pin_for_arm_action(self, active_arm: Literal["left", "right"]) -> None:
         """Pin the inactive arm's cspace target weight.
 
-        The multi-frame goal holds the inactive *wrist* in the world, not this
-        pin: cuRobo's native world-frame ``tool_pose`` cost stays ENABLED, and
-        ``_build_multi_frame_goal`` sets the inactive frame's target pose to
-        its FK at the segment's start state. The cspace weight write here is
-        largely informational for trajopt (whose ``cspace_target_weight``
-        defaults to 0); on the planner's internal IK seed solver, where it is
-        nonzero, it is a soft regulariser that loses to the wrist target. The
-        arm's joints still move between segment endpoints, which come from
-        particle init, where that hand is held in the world too (about 1 rad
-        per approach in blocks_t1; known-bugs B15).
+        A no-op as configured: the cspace cost multiplies these per-DOF weights
+        by ``cspace_target_weight``, which is 0 in ``lbfgs_ik.yml`` and
+        ``lbfgs_bspline_trajopt.yml`` and defaults to 0 for the particle
+        configs; a config that set it would make this pin act. Nothing holds
+        the inactive hand in the world during a segment: ``plan_cspace``
+        constrains only the endpoint confs, and that hand moves between them
+        (median 17 mm on picks, 42 mm on places in blocks_t1; known-bugs B15).
 
         Idempotency: caller must ``unpin()`` before a second pin.
         """
