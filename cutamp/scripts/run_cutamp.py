@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 """
-PYTORCH_ALLOC_CONF=expandable_segments:True     /home/yoonwoo/miniconda3/envs/tamp/bin/python -m cutamp.scripts.run_cutamp     -n 64 --num_opt_steps 50  --surface_height 0.50 --soft_cost place_close_to_base joint_limit_margin minimize_body_movement  --motion_plan --save_plan data/motion_plan.pkl
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True     /home/yoonwoo/miniconda3/envs/tamp/bin/python -m cutamp.scripts.run_cutamp     -n 64 --num_opt_steps 50  --surface_height 0.50 --soft_cost place_close_to_base joint_limit_margin minimize_body_movement  --motion_plan --save_plan data/motion_plan.pkl
 """
 
 import logging
