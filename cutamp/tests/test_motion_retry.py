@@ -54,6 +54,16 @@ def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
     assert alg._com_margin(None, particle) == pytest.approx(0.1)
 
 
+def test_planned_metrics_describe_the_planned_particle(monkeypatch):
+    # After a retry the plan comes from candidates[rank], not rank 0 (known-bugs N3). A world the CoM summary
+    # didn't run for records no margin.
+    monkeypatch.setattr(alg, "compute_com_margin", lambda world, q: q[:, 0])
+    candidates = [{"left_q0": torch.tensor([0.3, 0.0])}, {"left_q0": torch.tensor([0.1, 0.0])}]
+    assert alg._planned_metrics(None, {"best_com_margin": 0.3}, candidates, 1) == {
+        "motion_plan_rank": 1, "planned_com_margin": pytest.approx(0.1)}
+    assert alg._planned_metrics(None, {"best_com_margin": None}, candidates, 1) == {"motion_plan_rank": 1}
+
+
 @needs_cuda
 def test_reset_puts_placed_blocks_back():
     # A Place moves the block's collision obstacle to the placement. If that

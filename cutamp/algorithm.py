@@ -271,6 +271,15 @@ def _com_margin(world: TAMPWorld, particle: dict) -> float:
     )
 
 
+def _planned_metrics(world: TAMPWorld, metrics: dict, candidates: List[dict], rank: int) -> dict:
+    """The planned particle's rank and CoM margin. ``best_com_margin`` is rank 0's; after a retry the plan comes
+    from another particle (known-bugs N3)."""
+    out = {"motion_plan_rank": rank}
+    if metrics.get("best_com_margin") is not None:  # the CoM summary ran for this world
+        out["planned_com_margin"] = _com_margin(world, candidates[rank])
+    return out
+
+
 def setup_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
@@ -476,10 +485,7 @@ def run_cutamp(
                 if skip_plan or curobo_plan is None:
                     continue
                 overall_metrics.update(traj_audit)
-                # best_com_margin is rank 0's; after a retry the plan comes from another particle (known-bugs N3).
-                overall_metrics["motion_plan_rank"] = rank
-                if metrics.get("best_com_margin") is not None:  # the CoM summary ran for this world
-                    overall_metrics["planned_com_margin"] = _com_margin(world, candidates[rank])
+                overall_metrics.update(_planned_metrics(world, metrics, candidates, rank))
             found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
