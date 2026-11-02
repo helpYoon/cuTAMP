@@ -306,6 +306,13 @@ def test_com_polygon_penalty_single_edge_equals_tol():
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
+def test_com_tol_is_the_on_boundary_penalty():
+    # The gate's tolerance is the barrier's on-boundary value, derived from its constants so a new margin or
+    # weight moves both (known-bugs N5). Pinned at 4e-4: the derivation must leave results bit-identical.
+    from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, COM_TOL
+    assert COM_TOL == COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN ** 2 == 4e-4
+
+
 def test_com_polygon_penalty_deep_inside_is_zero():
     # Barrier-only: deep-inside COM scores exactly 0 (the hard-gate path
     # relies on this).
