@@ -76,6 +76,8 @@ def test_dense_aabb_overlap_matches_masked(monkeypatch):
     from cutamp.costs import sphere_to_sphere_overlap
 
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)   # the loop's regime
+    # Own generator: the global one's state depends on the tests run before, and some weights fail rtol.
+    gen = torch.Generator(device="cuda").manual_seed(0)
     for k in (None, 1, 2, 5):
         s1, s2, near = _spheres(k)
         if k is None:
@@ -85,7 +87,7 @@ def test_dense_aabb_overlap_matches_masked(monkeypatch):
             a, b = s1.clone().requires_grad_(), s2.clone().requires_grad_()
             want = _head_sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
             assert torch.equal(want > 0, near), case                # the near rows overlap, the far ones don't
-            w = torch.rand_like(want)
+            w = torch.rand(want.shape, device=want.device, generator=gen)
             gw = torch.autograd.grad((want * w).sum(), (a, b))
             with sync_debug_error():
                 got = sphere_to_sphere_overlap(a, b, act, use_aabb_check=True)
