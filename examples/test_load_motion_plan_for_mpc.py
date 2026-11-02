@@ -64,6 +64,17 @@ def test_outputs_do_not_alias_source_segment():
     assert np.all(seg["position"]["right_arm"] == 0.0)
 
 
+def test_waist_is_negated_trunk_yaw():
+    # The simplified model reverses the Waist joint (Waist -> Trunk), so real Waist = -Waist_Yaw.
+    seg = _fake_segment()
+    for block in (seg["position"], seg["velocity"], seg["acceleration"]):
+        block["trunk_yaw"] = np.full(seg["T"], 0.3)
+    cmd = mpc.segment_to_mpc_commands(seg)
+    for key in ("joint_commands", "joint_velocities", "joint_accelerations"):
+        np.testing.assert_allclose(cmd[key]["Waist"], -0.3)
+    assert np.all(seg["position"]["trunk_yaw"] == 0.3)  # the source is not negated in place
+
+
 import pickle
 import pytest
 

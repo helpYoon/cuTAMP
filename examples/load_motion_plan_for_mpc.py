@@ -53,12 +53,17 @@ except ImportError:  # support running this file outside the cuTAMP env
 
 JOINT_MAP = {
     "trunk_pitch": ["Left_Hip_Pitch",   "Right_Hip_Pitch"],    # broadcast
-    "trunk_yaw":   ["Waist"],
+    "trunk_yaw":   ["Waist"],                                  # negated, see JOINT_SIGN
     "ankle_pitch": ["Left_Ankle_Pitch", "Right_Ankle_Pitch"],  # broadcast
     "knee_pitch":  ["Left_Knee_Pitch",  "Right_Knee_Pitch"],   # broadcast
     "left_arm":    list(LEFT_ARM_JOINT_NAMES),
     "right_arm":   list(RIGHT_ARM_JOINT_NAMES),
 }
+
+# Sign from sim value to real joint value; fields not listed are +1. The sim
+# Waist_Yaw joint is reversed (parent Waist, child Trunk) with the same +z axis,
+# so real Waist = -Waist_Yaw.
+JOINT_SIGN = {"trunk_yaw": -1.0}
 
 # Real-robot leg joints NOT commanded by this plan. The MPC's balance
 # controller is expected to choose values for these (typically near 0
@@ -117,15 +122,16 @@ def segment_to_mpc_commands(seg: Dict[str, Any]) -> Dict[str, Any]:
     joint_commands: Dict[str, np.ndarray] = {}
     joint_velocities: Dict[str, np.ndarray] = {}
     joint_accelerations: Dict[str, np.ndarray] = {}
-    # .copy() per assignment so mutation of one broadcast target doesn't
-    # silently mutate the other (Left_Hip_Pitch and Right_Hip_Pitch share
-    # the same source array; MPC asymmetric trim would otherwise apply
-    # both biases to both joints).
+    # A fresh array per assignment (the sign multiply allocates) so mutation
+    # of one broadcast target doesn't silently mutate the other
+    # (Left_Hip_Pitch and Right_Hip_Pitch share the same source array; MPC
+    # asymmetric trim would otherwise apply both biases to both joints).
     for sim_field in ("trunk_pitch", "trunk_yaw", "ankle_pitch", "knee_pitch"):
+        s = JOINT_SIGN.get(sim_field, 1.0)
         for rn in JOINT_MAP[sim_field]:
-            joint_commands[rn] = P[sim_field].copy()
-            joint_velocities[rn] = V[sim_field].copy()
-            joint_accelerations[rn] = A[sim_field].copy()
+            joint_commands[rn] = s * P[sim_field]
+            joint_velocities[rn] = s * V[sim_field]
+            joint_accelerations[rn] = s * A[sim_field]
     for sim_field in ("left_arm", "right_arm"):
         for i, rn in enumerate(JOINT_MAP[sim_field]):
             joint_commands[rn] = P[sim_field][:, i].copy()
