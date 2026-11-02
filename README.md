@@ -415,7 +415,7 @@ python -m cutamp.scripts.run_cutamp --motion_plan -n 64
 # Save the processed plan (schema v3) for the MPC consumer, then read it back
 # and check its joint-limit margins (margins need balance-first: with
 # --no_reik_balance_first the check fails on 5 of 10 runs at -n 64, seeds 0-9,
-# each on Torso_Pitch's lower side)
+# --soft_cost joint_limit_margin, each on Torso_Pitch's lower side)
 python -m cutamp.scripts.run_cutamp --motion_plan -n 64 \
     --save_plan data/motion_plan.pkl
 python examples/load_motion_plan_for_mpc.py data/motion_plan.pkl
