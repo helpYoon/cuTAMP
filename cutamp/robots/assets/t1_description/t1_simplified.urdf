@@ -199,9 +199,11 @@
   </link>
 
   <!-- ==================== WAIST YAW (revolute) ==================== -->
-  <!-- Torso yaw between Waist and Trunk. Axis matches the real T1's Waist
-       joint (actual_robot.urdf, axis="0 0 1"); Z-axis sign convention is the
-       same in both URDFs (no flip needed for yaw). Limits tightened
+  <!-- Torso yaw between Waist and Trunk. Its axis is +z like the real T1's
+       Waist joint (t1.urdf, axis="0 0 1"), but parent and child are swapped
+       (see below), so the SIGN FLIPS: the same posture has real
+       Waist = -Waist_Yaw (FK: Waist_Yaw = +0.3 yaws the Trunk +0.3 about the
+       pelvis; t1.urdf's Waist = +0.3 yaws it -0.3). Limits tightened
        2026-06-11 to [-1.47, 1.47] from the real [-1.57, 1.57] (0.1 rad
        safety inset each side). -->
   <joint name="Waist_Yaw" type="revolute">

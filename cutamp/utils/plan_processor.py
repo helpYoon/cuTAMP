@@ -417,7 +417,7 @@ def process_motion_plan(
             "left_arm": list(LEFT_ARM_JOINT_NAMES),
             "right_arm": list(RIGHT_ARM_JOINT_NAMES),
             "trunk_pitch": "Torso_Pitch (broadcast to BOTH Left_Hip_Pitch + Right_Hip_Pitch on real)",
-            "trunk_yaw": "Waist_Yaw (= real Waist joint)",
+            "trunk_yaw": "Waist_Yaw; real Waist = -Waist_Yaw (the joint is reversed, axis kept +z)",
             "left_hand": LEFT_TOOL_FRAME,
             "right_hand": RIGHT_TOOL_FRAME,
         },
