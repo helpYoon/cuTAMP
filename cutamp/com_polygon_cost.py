@@ -36,9 +36,15 @@ from curobo._src.cost.cost_base_cfg import BaseCostCfg
 
 # --- Single source of truth for the COM-over-base-polygon geometry ---
 # Two-foot support hull per actual_robot.urdf: 22.3 cm foot length (X, fore/aft)
-# × 31.2 cm stance width (Y, lateral). The cost, the post-IK mask, the per-conf
-# penalties helper, the ComPolygon tolerance, and the planner/IK cost cfgs all
-# reference these so they cannot drift apart.
+# × 31.2 cm stance width (Y, lateral), centred on mobile_base_link (the ankle
+# axis). The real soles span x [-0.1015, +0.1215] (t1.urdf foot boxes), so the
+# box sits 1 cm behind them. That is kept on purpose: with t1_simplified's 20 kg
+# base box, the real CoM moves about 1.36x as far as this model's, so the front
+# edge already admits a real CoM about 3 cm past the toe. Don't move it forward
+# (known-bugs B4/B5, docs/superpowers/reports/2026-11-01-known-bugs.md).
+# The cost, the post-IK mask, the per-conf penalties helper, the ComPolygon
+# tolerance, and the planner/IK cost cfgs all reference these so they cannot
+# drift apart.
 COM_HALF_EXTENTS = (0.1115, 0.156)   # (X, Y) half-extents in mobile_base_link frame, meters
 COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
