@@ -132,8 +132,9 @@ def test_all_segment_arrivals_com_in_hull(seed):
     # A full plan generates (no RuntimeError from solve_curobo), produces
     # segments, and EVERY segment's ARRIVAL (last frame) — pick, place,
     # retract — is COM-in-hull, since each is a cspace-anchored conf or
-    # retract-home. (Pre-fix, place arrivals leaked out.) Seed 1 exercises
-    # the pick branch anchoring added in Task 3.
+    # retract-home. (Pre-fix, place arrivals leaked out.) Both seeds exercise
+    # the pick and the place anchoring: each plan calls _plan_arm_to_conf once
+    # per LeftPick, RightPick, LeftPlace and RightPlace (measured 2026-11-01).
     from cutamp.robots.t1 import t1_home
     from cutamp.com_polygon_cost import compute_com_polygon_penalties, COM_TOL
 

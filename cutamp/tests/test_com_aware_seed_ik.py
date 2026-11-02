@@ -167,9 +167,12 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
         quat = ks.tool_poses.quaternion.view(1, len(model.tool_frames), 4)[:, base_idx, :]
         return com_support_penalty(com, pos, quat, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, 0.0).sum()
 
-    # A leaning config so the penalty is active: Torso_Pitch forward.
+    # A forward lean so the penalty is active: Torso_Pitch -1.2 with ankle_pitch -0.15 (all else 0)
+    # puts the CoM at x 0.158, past the 0.1115 edge (measured). A deep bow alone (Torso_Pitch -1.5)
+    # barely moves the CoM's x with the torso: d penalty / d Torso_Pitch is only -0.0008 there.
     q0 = torch.zeros(1, model.get_dof(), device=device)
-    q0[0, names.index("Torso_Pitch")] = -1.5
+    q0[0, names.index("Torso_Pitch")] = -1.2
+    q0[0, names.index("ankle_pitch")] = -0.15
 
     q = q0.clone().requires_grad_(True)
     penalty_at(q).backward()

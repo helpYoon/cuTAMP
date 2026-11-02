@@ -201,11 +201,15 @@ class TestTrajoptCost:
 
     @needs_cuda
     def test_planner_keeps_ankle_under_upper_limit(self):
-        # Seed-1 LeftPlace conf, the worst seed-1 case: with a zero ankle-upper
-        # band the COM-polygon cost pushed the ankle +5.7 mrad past its 0 rad
-        # limit late in the path, and cuRobo rejected the plan
-        # (T1_TRAJOPT_ANKLE_UPPER_MARGIN). Movables are disabled and nothing is
-        # attached: only the cost balance is under test.
+        # Seed-1 LeftPlace conf, the worst seed-1 case on the doubled CoM: with a
+        # zero ankle-upper band the COM-polygon cost pushed the ankle +5.7 mrad
+        # past its 0 rad limit late in the path, and cuRobo rejected the plan
+        # (T1_TRAJOPT_ANKLE_UPPER_MARGIN). On the corrected CoM the band no
+        # longer binds on seed 1: with a zero band this conf and all eight
+        # arrivals of a fresh seed-1 plan reach home with the ankle at most
+        # 0.0 rad, its home value (measured 2026-11-01). The band stays as a
+        # guard. Movables are disabled and nothing is attached: only the cost
+        # balance is under test.
         from cutamp.motion_solver import _planner_js_from_full
         from cutamp.tests.conftest import make_blocks_t1_world
 

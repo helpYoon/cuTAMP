@@ -150,7 +150,7 @@ def test_compute_com_polygon_penalties_is_differentiable():
     that makes the hard ComPolygon constraint actually usable as an
     Adam gradient source (the prior (~mask).float() lost this)."""
     import torch
-    from cutamp.com_polygon_cost import compute_com_polygon_penalties
+    from cutamp.com_polygon_cost import COM_TOL, compute_com_polygon_penalties
 
     world = make_blocks_t1_world()
     full_names = list(world.kinematics.joint_names)
@@ -158,10 +158,13 @@ def test_compute_com_polygon_penalties_is_differentiable():
     home = world.q_init.detach().clone()
 
     # Use a configuration with the COM outside the support polygon so the
-    # penalty is non-zero and the gradient is non-trivially non-zero.
-    # Torso_Pitch=-1.5 shifts com_base[x] to ~0.1146 > half_extents[x]=0.1115.
+    # penalty is non-zero and the gradient is non-trivially non-zero. A pure
+    # bow tops out near com_base[x] = 0.0995 (Torso_Pitch -1.6), inside
+    # half_extents[x] = 0.1115, so lean at the ankle too: Torso_Pitch -1.2
+    # with ankle_pitch -0.15 puts com_base[x] at 0.1369 (measured).
     leaning = home.clone()
-    leaning[name_to_idx["Torso_Pitch"]] = -1.5
+    leaning[name_to_idx["Torso_Pitch"]] = -1.2
+    leaning[name_to_idx["ankle_pitch"]] = -0.15
 
     B = 4
     q = leaning.unsqueeze(0).expand(B, -1).contiguous().clone().requires_grad_(True)
@@ -172,6 +175,7 @@ def test_compute_com_polygon_penalties_is_differentiable():
     p = pens["left_q1"]
     assert p.shape == (B,), f"Expected shape ({B},), got {p.shape}"
     assert p.requires_grad, "Penalty tensor must carry an autograd connection."
+    assert float(p[0]) > COM_TOL, f"premise: the lean must put the COM outside; penalty {float(p[0]):.6f}"
 
     # Backward through the sum; q.grad must be populated and non-trivial.
     p.sum().backward()
