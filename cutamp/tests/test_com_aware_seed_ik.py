@@ -192,8 +192,9 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
     assert abs(grad[names.index("Torso_Pitch")].item()) > 1e-3
 
 
-def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
-    """IK a forward-reach grid for the left arm; return (q_full[B,21], success[B], result)."""
+def _forward_reach_solutions(world, n_fwd=4, n_lat=3, unreachable=False):
+    """IK a forward-reach grid for the left arm; return (q_full[B,21], success[B], result).
+    ``unreachable`` appends a pose 3 m ahead, which no IK stage can solve."""
     from cutamp.particle_initialization import (
         _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask,
     )
@@ -205,6 +206,8 @@ def _forward_reach_solutions(world, n_fwd=4, n_lat=3):
             # Absolute world-Y on purpose: left tool home Y is ~+0.3, so
             # sweeping Y in [-0.05, 0.15] creates demanding cross-body reaches.
             m = hm.clone(); m[0, 3] += float(f); m[1, 3] = float(lat); Ts.append(m)
+    if unreachable:
+        m = hm.clone(); m[0, 3] += 3.0; Ts.append(m)
     res = _ik_for_pose(world, torch.stack(Ts, 0), "left")
     return _ik_solution_to_full_q(res, world), _ik_success_mask(res), res
 
@@ -233,8 +236,8 @@ def test_centering_ab_legs_within_limits_pose_preserved():
 
     # (1) centering: with the center pull on (T1_COM_IK_CENTER_WEIGHT=1e-3)
     # the COM must be actively pulled toward center, not just kept in-band.
-    # Sweep showed ~30x reduction; assert a conservative 2x to absorb solver
-    # nondeterminism.
+    # The 48-pose sweep grid gives 2.8x (0.88 vs 2.49 cm); assert 2x to absorb
+    # solver nondeterminism.
     assert float(absx_on.mean()) < 0.5 * float(absx_off.mean()), \
         f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
 
@@ -261,6 +264,25 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     knee_delta = float((q_on[s_on][:, idx["knee_pitch"]]).abs().max())
     print(f"recruitment: max knee_pitch={knee_delta:.3f} rad; "
           f"absx on/off mean {float(absx_on.mean()):.4f}/{float(absx_off.mean()):.4f}")
+
+
+@needs_cuda
+def test_unsolved_problem_keeps_the_others_centred():
+    # N7: cuRobo's IK kept the seed LM's (CoM-aware) solutions only when every problem in the batch
+    # succeeded; otherwise its CoM-blind optimizer re-solved them all. A pose no stage can reach
+    # forces that path every time, and the reachable problems must stay centred.
+    import gc
+    world_off = _world(enable_com_aware_ik=False)
+    q_off, s_off, _ = _forward_reach_solutions(world_off)
+    absx_off = _com_abs_x(world_off, q_off)[s_off]
+    del world_off; gc.collect(); torch.cuda.empty_cache()
+    world_on = _world(enable_com_aware_ik=True)
+    q_on, s_on, _ = _forward_reach_solutions(world_on, unreachable=True)
+    assert not bool(s_on[-1]), "premise: the pose 3 m ahead must fail"
+    assert int(s_on[:-1].sum()) > 0, "CoM-aware IK produced no successful solutions"
+    absx_on = _com_abs_x(world_on, q_on[:-1])[s_on[:-1]]
+    assert float(absx_on.mean()) < 0.5 * float(absx_off.mean()), \
+        f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
 
 
 @needs_cuda

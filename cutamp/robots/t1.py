@@ -101,15 +101,18 @@ T1_CONFIG_PATH = T1_ASSETS_DIR / "t1_planar_base.yml"
 # Seed-IK CoM residual weights. Constraints that bound them:
 # - Pose/joint-limit weights in the seed-IK solver are O(1); the planner's
 #   5e5 rollout weight is NOT transferable here.
-# - Too-strong CoM terms degrade seed convergence, which silently triggers
-#   the CoM-blind MPPI->LBFGS fallback (centering regresses; >= 3e-3 on the
-#   center term even produced an out-of-hull solution).
-# Values are sweep-validated; grids and per-value metrics: commits 473ec51
-# (support weight) and 5b9ae65 (center weight).
+# - The fork re-solves the problems the seed LM fails with cuRobo's CoM-blind
+#   optimizer, so terms strong enough to hurt seed convergence lose centring
+#   on those problems (before known-bugs N7, one failure re-solved them all).
+# Sweeps: commits 473ec51 (support weight) and 5b9ae65 (center weight). The
+# known-bugs Task 6 re-check (corrected CoM, N7 fixed) solves the 48-pose grid
+# in every cell of 0.3-3 x 3e-4-3e-3, so these stay; (1.0, 3e-3) centres to
+# 0.11 cm at a similar pose error but is untried end to end.
 T1_COM_IK_WEIGHT = 1.0
 
 # Pull-to-center term: cw * sum((com/half)^2), active everywhere (not just
-# the edge band); 1e-3 is the sweep knee (~30x centering, zero fallbacks).
+# the edge band). On the 48-pose grid: mean |CoM x| 0.88 cm, against 2.49 cm
+# with the CoM residual off (2.8x).
 T1_COM_IK_CENTER_WEIGHT = 1e-3
 
 # =============================================================================
