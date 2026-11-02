@@ -49,10 +49,11 @@ def _total_opt_steps(opt_data):
     configured budget (``optimize_plan.py`` stamps it before the loop) —
     dividing by it would systematically understate ms/step whenever
     ``early_stop_patience`` fires, which it does in every real study run.
-    A file lacking ``elapsed`` counts as a single step so the metric
-    degrades gracefully instead of silently dropping the file.
+    A file with ``elapsed=[]`` (a skeleton started after the
+    ``--max_duration`` budget) or none ran no step, so it adds none, as it
+    adds no time to ``loop_s`` (known-bugs N6).
     """
-    return sum(len(o["elapsed"]) if o.get("elapsed") else 1 for o in opt_data)
+    return sum(len(o.get("elapsed") or []) for o in opt_data)
 
 
 def load_study(manifest_path):

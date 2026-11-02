@@ -174,6 +174,22 @@ def test_loop_s_sums_across_opt_files(tmp_path):
     assert records[0]["ms_per_step"] == 1000.0 * 15.0 / 6
 
 
+def test_skeleton_started_after_the_budget_adds_no_step(tmp_path):
+    # With --max_duration, a skeleton started after the budget writes elapsed=[]: it ran no step, so it must
+    # not count as one in ms/step (known-bugs N6).
+    exp = tmp_path / "ablation_full_h000_s0"
+    (exp / "optimization").mkdir(parents=True)
+    for i, elapsed in enumerate([[0.0, 1.0, 3.0], []], start=1):
+        (exp / "optimization" / f"opt_{i:04d}.json").write_text(json.dumps({"elapsed": elapsed}))
+    manifest = [{"cell": "full", "height": 0.0, "seed": 0,
+                 "experiment_id": exp.name, "status": "done",
+                 "experiment_path": str(exp)}]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    record = load_study(tmp_path / "manifest.json")[0]
+    assert record["loop_s"] == 3.0
+    assert record["ms_per_step"] == 1000.0 * 3.0 / 3
+
+
 def test_compute_deltas_paired_by_height_and_seed():
     records = [
         {"cell": "full", "height": 0.0, "seed": 0, "num_satisfying_final": 100, "loop_s": 10.0},
