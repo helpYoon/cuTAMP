@@ -85,9 +85,10 @@ class TAMPWorld:
         self._q_init = q_init
 
         # Single multi-frame IK solver. Both tool frames are configured
-        # (matches the planner). Particle init applies the same per-DOF
-        # cspace pin the planner uses to keep the inactive arm at home,
-        # so a "single-arm Pick" doesn't drift the other arm.
+        # (matches the planner). Particle init holds the inactive hand at its
+        # home world pose, so a "single-arm Pick" doesn't move the other hand;
+        # that arm's joints still counter-rotate as the body bends (the
+        # per-DOF cspace pin is only a soft regulariser).
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
             enable_com_aware_ik=enable_com_aware_ik,

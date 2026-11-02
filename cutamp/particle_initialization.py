@@ -130,7 +130,9 @@ def _ik_for_pose(
     snapshot = snapshot_cspace_target_dof_weight([ik])
     try:
         if arm is not None:
-            # Pin the inactive arm's DOFs at their current values.
+            # Weight the inactive arm's DOFs toward their current values: a soft
+            # regulariser only. The inactive frame's target in ``goal`` wins, so
+            # those joints still move to keep that hand still in the world.
             write_cspace_target_dof_weight(
                 [ik], build_pin_weights(
                     ik, RIGHT_ARM_JOINT_NAMES if arm == "left" else LEFT_ARM_JOINT_NAMES,

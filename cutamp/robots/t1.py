@@ -361,10 +361,12 @@ def get_t1_ik_solver(
 ) -> InverseKinematics:
     """InverseKinematics solver for T1 with the mobile base locked.
 
-    Always built with both tool frames from ``t1_planar_base.yml``. The
-    inactive arm during particle-init IK calls is held at home via the
-    same cspace-pin + multi-frame-goal mechanism the motion planner uses
-    (``T1State.pin_for_arm_action`` + ``_build_multi_frame_goal``).
+    Always built with both tool frames from ``t1_planar_base.yml``. During
+    particle-init IK calls the inactive *hand* is held at its home world
+    pose by the multi-frame goal (``_build_multi_frame_goal``), as in the
+    motion planner. The cspace pin beside it is a soft regulariser that
+    loses to that target, so the inactive arm's joints counter-rotate as the
+    body bends (about 1.1 rad per approach, mostly Wrist_Yaw; known-bugs B15).
 
     The 3 base DOFs (``base_j_x``, ``base_j_y``, ``base_j_yaw``) are pinned
     at 0 — IK cannot drift the base during particle init. Legs / torso /
