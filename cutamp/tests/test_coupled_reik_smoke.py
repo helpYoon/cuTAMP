@@ -60,6 +60,10 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     assert "best_com_margin" in opt_metrics
     assert "best_soft_cost_com_feasible" in opt_metrics
     assert opt_metrics["num_satisfying_com_feasible"] <= opt_metrics["num_satisfying_final"]
+    # What Adam added over the IK init (step 0's count), and whether the reported particles are a
+    # restored snapshot. Gain 0 with a restore means the run reports its IK init (known-bugs B13).
+    assert opt_metrics["adam_gain"] == opt_metrics["best_num_satisfying"] - opt_metrics["num_satisfying"][0]
+    assert isinstance(opt_metrics["restored"], bool)
 
     # Without --motion_plan there is no planner thread, so G_step is captured at step 0, and
     # G_refresh right after refresh #1 (reik_interval=2, so step 1).

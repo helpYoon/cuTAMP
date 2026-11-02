@@ -244,3 +244,25 @@ def test_stable_plan_wilson_and_curobo_calls(tmp_path, monkeypatch):
     md = (tmp_path / "out" / "results.md").read_text()
     assert "## Balanced-plan rate" in md
     assert "| Full (CoM + balance-first re-IK) | all | 1/2 | 0.50 |" in md
+
+
+def test_restored_init_reaches_the_table(tmp_path):
+    # Without re-IK, Adam empties the satisfying set and _BestSnapshot puts the step-0 IK init back
+    # (known-bugs B13). adam_gain and restored must carry that into the table; runs that predate
+    # the fields show a dash.
+    from cutamp.scripts.analyze_ablation import _write_md
+
+    runs = [_fake_run(tmp_path, "no_reik", 0.0, s) for s in (0, 1)] + [_fake_run(tmp_path, "full", 0.0, 0)]
+    for run in runs[:2]:
+        f = Path(run["experiment_path"]) / "optimization" / "opt_0001.json"
+        f.write_text(json.dumps({**json.loads(f.read_text()), "adam_gain": 0, "restored": True}))
+    (tmp_path / "manifest.json").write_text(json.dumps(runs))
+
+    recs = load_study(tmp_path / "manifest.json")
+    assert [(r["adam_gain"], r["restored"]) for r in recs] == [(0, 1.0), (0, 1.0), (None, None)]
+    agg = aggregate(recs)
+    assert agg[("no_reik", 0.0)]["restored"] == (1.0, 0.0)
+    _write_md(agg, {}, tmp_path / "results.md")
+    rows = {line.split(" | ")[0]: line for line in (tmp_path / "results.md").read_text().splitlines()}
+    assert rows["| CoM only (no re-IK)"].endswith("| 0 ± 0 | 1.00 ± 0.00 |")
+    assert rows["| Full (CoM + balance-first re-IK)"].endswith("| — | — |")

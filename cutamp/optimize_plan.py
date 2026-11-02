@@ -776,6 +776,9 @@ class ParticleOptimizer:
         # initializations.
         # When coupled_reik is on, run Adam even if init satisfied, since
         # the goal is to actively move Pose particles for the soft cost.
+        # --force_adam runs it without re-IK too; there it loses the init's
+        # satisfying particles within a few steps, and the best-seen restore
+        # below hands the init back (recorded as adam_gain and restored).
         with torch.no_grad():
             init_rollout = rollout_fn(particles)
             init_cost_dict = cost_fn(init_rollout, particles)
@@ -906,15 +909,21 @@ class ParticleOptimizer:
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).
-        if not skip_adam and best_snapshot.restore_if_better(
+        restored = not skip_adam and best_snapshot.restore_if_better(
             particles, opt_metrics["num_satisfying"][-1] if opt_metrics["num_satisfying"] else 0
-        ):
+        )
+        if restored:
             _log.info(
                 f"Restored best-seen particles: {best_snapshot.best_sat} satisfying "
                 f"(step {best_snapshot.best_step}) over final "
                 f"{opt_metrics['num_satisfying'][-1]}"
             )
         opt_metrics["best_num_satisfying"] = best_snapshot.best_sat
+        # What Adam added over the IK init (None if no step ran: best_sat stays -1), and whether the
+        # reported particles are a restored snapshot. Without re-IK, Adam empties the satisfying set
+        # at every lr tried, so those arms report gain 0 with a restore: the IK init (known-bugs B13).
+        opt_metrics["adam_gain"] = best_snapshot.best_sat - init_num if best_snapshot.best_sat >= 0 else None
+        opt_metrics["restored"] = restored
 
         # Final re-IK before downstream satisfaction checks: Adam may have
         # moved poses since the last periodic refresh. Always FULL (no gate):

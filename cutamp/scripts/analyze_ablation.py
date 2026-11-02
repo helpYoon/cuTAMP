@@ -25,6 +25,8 @@ METRICS = [
     "ms_per_step",
     "stable_plan",
     "reik_curobo_calls",
+    "adam_gain",
+    "restored",
 ]
 CELL_ORDER = ["full", "default_reik", "no_com", "no_reik", "standard"]
 # Label arms by what they HAVE, not what was removed — "−CoM" reads as
@@ -108,6 +110,10 @@ def load_study(manifest_path):
             "ms_per_step": ms_per_step,
             "stable_plan": stable_plan,
             "reik_curobo_calls": curobo_calls,
+            # Adam's best count over the IK init, and whether the reported particles are a
+            # restored snapshot: gain 0 with restored 1 means the run reports its IK init.
+            "adam_gain": opt.get("adam_gain"),
+            "restored": None if opt.get("restored") is None else float(opt["restored"]),
         })
     return records
 
@@ -214,8 +220,8 @@ def _write_deltas_csv(delta_rows, path):
 
 
 def _write_md(agg, delta_agg, path, rates=None):
-    lines = ["| cell | height | satisfying | CoM-feasible | best soft (CoM-feas.) | margin [m] | motion plan | solved | traj viol. | loop [s] | ms/step | cuRobo calls |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| cell | height | satisfying | CoM-feasible | best soft (CoM-feas.) | margin [m] | motion plan | solved | traj viol. | loop [s] | ms/step | cuRobo calls | Adam gain | restored |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for (cell, height), m in sorted(agg.items(), key=lambda kv: (kv[0][1], CELL_ORDER.index(kv[0][0]))):
         def fmt(name, digits=1):
             if name not in m:
@@ -227,7 +233,7 @@ def _write_md(agg, delta_agg, path, rates=None):
             f"| {fmt('num_satisfying_com_feasible', 0)} | {fmt('best_soft_cost_com_feasible')} "
             f"| {fmt('best_com_margin', 3)} | {fmt('motion_plan_success', 2)} | {fmt('found_solution', 2)} "
             f"| {fmt('traj_com_violation_frac', 3)} | {fmt('loop_s', 0)} | {fmt('ms_per_step', 1)} "
-            f"| {fmt('reik_curobo_calls', 1)} |"
+            f"| {fmt('reik_curobo_calls', 1)} | {fmt('adam_gain', 0)} | {fmt('restored', 2)} |"
         )
 
     if rates:
