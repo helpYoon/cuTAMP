@@ -919,10 +919,13 @@ class ParticleOptimizer:
                 f"{opt_metrics['num_satisfying'][-1]}"
             )
         opt_metrics["best_num_satisfying"] = best_snapshot.best_sat
-        # What Adam added over the IK init (None if no step ran: best_sat stays -1), and whether the
-        # reported particles are a restored snapshot. Without re-IK, Adam empties the satisfying set
-        # at every lr tried, so those arms report gain 0 with a restore: the IK init (known-bugs B13).
-        opt_metrics["adam_gain"] = best_snapshot.best_sat - init_num if best_snapshot.best_sat >= 0 else None
+        # What Adam added over step 0, which measures the untouched IK init (None if no step ran:
+        # best_sat stays -1), and whether the reported particles are a restored snapshot. Without
+        # re-IK, Adam empties the satisfying set at every lr tried, so those arms report gain 0
+        # with a restore: the IK init (known-bugs B13).
+        opt_metrics["adam_gain"] = (
+            best_snapshot.best_sat - opt_metrics["num_satisfying"][0] if best_snapshot.best_sat >= 0 else None
+        )
         opt_metrics["restored"] = restored
 
         # Final re-IK before downstream satisfaction checks: Adam may have
