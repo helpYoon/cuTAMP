@@ -129,11 +129,11 @@ _ATTACH_LINK_FOR_ARM = {
 }
 
 
-def _plan_dt(result, default=0.05):
-    """Extract the trajectory dt from a v0.8 planner result, falling back to
-    ``default`` when no joint-space solution / dt is available."""
-    js = getattr(result, "js_solution", None)
-    return float(js.dt.item()) if js is not None and js.dt is not None else default
+def _plan_dt(planner) -> float:
+    """The time step between the positions of ``get_interpolated_plan()``: cuRobo's
+    ``interpolation_dt``. Not ``js_solution.dt``, the optimizer's step (0.0145-0.0246 s),
+    which labelled plans 1.02-1.54x too fast."""
+    return float(planner.trajopt_solver.config.interpolation_dt)
 
 
 def _last_timestep_js(plan, planner=None) -> JointState:
@@ -378,7 +378,7 @@ def solve_curobo(
                 if not _cspace_plan_succeeded(result):
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
                 plan = _interp_plan(result)
-                dt = _plan_dt(result)
+                dt = _plan_dt(planner)
 
                 accum_plans.append({
                     "plan": plan, "dt": dt, "arm": arm,
@@ -409,7 +409,7 @@ def solve_curobo(
                 # inverse(obj_from_grasp) since the gripper is at the intended
                 # grasp pose.
                 grasp_plan = _interp_plan(grasp_result)
-                dt = _plan_dt(grasp_result)
+                dt = _plan_dt(planner)
                 accum_plans.append({
                     "plan": grasp_plan, "dt": dt, "arm": arm,
                     "held_objs": state.compute_all_held_obj_poses(grasp_plan),
@@ -443,7 +443,7 @@ def solve_curobo(
                     )
 
                 plan = _interp_plan(place_result)
-                dt = _plan_dt(place_result)
+                dt = _plan_dt(planner)
 
                 accum_plans.append({
                     "plan": plan, "dt": dt, "arm": arm,

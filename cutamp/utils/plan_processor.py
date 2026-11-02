@@ -17,7 +17,10 @@ Output schema per segment::
 
     {
         "arm": "left" | "right" | None,
-        "dt": float,
+        "dt": float,     # seconds between samples: cuRobo's interpolation_dt (0.025).
+                         # Pickles written before the 2026-11-01 fix "label v3 segments
+                         # with interpolation_dt" carry the optimizer's dt instead, which
+                         # plays them 1.02-1.54x too fast (median 1.34x).
         "T": int,
         "position": {
             "trunk_xyz":             [T, 3],     # WORLD, sim t1_simplified.urdf Trunk pose
