@@ -96,9 +96,9 @@ def _ik_for_pose(
     Without it, IK leaves the inactive arm unconstrained and it drifts to
     arbitrary joint values, polluting downstream particle optimization. This
     goal is the only hold on the inactive hand (known-bugs B15): the cspace
-    pin below is a no-op as configured (``T1State.pin_for_arm_action``), the
-    GN refreshes keep the inactive arm's joints fixed while they move the
-    body, and the motion planner holds nothing between confs.
+    pin below is a no-op (``T1State.pin_for_arm_action``), the GN refreshes
+    keep the inactive arm's joints fixed while they move the body, and the
+    motion planner holds nothing between confs.
 
     ``current_state_q`` (full-cspace ``[B, len(world.kinematics.joint_names)]``)
     anchors the inactive-frame goal at a non-home pose. Note
@@ -133,9 +133,10 @@ def _ik_for_pose(
     snapshot = snapshot_cspace_target_dof_weight([ik])
     try:
         if arm is not None:
-            # Pin the inactive arm's DOFs to their current values: a no-op as
-            # configured (``cspace_target_weight`` is 0). The inactive frame's
-            # target in ``goal`` is what holds that hand in the world.
+            # Weight the inactive arm's DOFs in cuRobo's cspace target term: a
+            # no-op (``cspace_target_weight`` is 0, and that term's target is a
+            # zero joint vector, not these joints' current values). The inactive
+            # frame's target in ``goal`` is what holds that hand in the world.
             write_cspace_target_dof_weight(
                 [ik], build_pin_weights(
                     ik, RIGHT_ARM_JOINT_NAMES if arm == "left" else LEFT_ARM_JOINT_NAMES,

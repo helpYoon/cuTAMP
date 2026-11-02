@@ -11,8 +11,8 @@
 
 Per plan-skeleton operator (T1):
   - Arm ops (Pick/Place/Move/Retract): ``pin_for_arm_action(arm)`` pins the
-    inactive arm's cspace weights, a no-op as configured. The base is locked
-    at construction; nothing holds the inactive hand between confs.
+    inactive arm's cspace weights, a no-op. The base is locked at
+    construction; nothing holds the inactive hand between confs.
   - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
     we plan to the gate-approved particle conf with the grasp-object /
     placement-surface obstacle temporarily disabled.
@@ -359,10 +359,12 @@ def solve_curobo(
         arm = metadata.arm
 
         # Pin protocol: arm ops pin the inactive arm's cspace weights (the base
-        # is locked at construction). The pin is a no-op as configured and
-        # plan_cspace holds nothing between endpoint confs, so the inactive hand
-        # is not held along the segment; both arms stay in the collision checks
-        # (T1State.pin_for_arm_action).
+        # is locked at construction). The pin is a no-op and plan_cspace holds
+        # nothing between endpoint confs, so the inactive hand is not held
+        # along the segment (T1State.pin_for_arm_action). Both arms stay in the
+        # collision checks, except against the obstacle a pick or place
+        # segment disables for the whole robot (the grasped block, or the
+        # support surface; _plan_arm_to_conf).
         if arm is not None:
             state.pin_for_arm_action(arm)
 

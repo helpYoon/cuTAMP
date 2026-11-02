@@ -85,13 +85,13 @@ class TAMPWorld:
         self._q_init = q_init
 
         # Single multi-frame IK solver. Both tool frames are configured
-        # (matches the planner). Particle init holds the inactive hand at its
-        # home world pose, so that arm's joints counter-rotate as the body
-        # bends (the per-DOF cspace pin is a no-op as configured). A conf whose
-        # IK fails starts at home instead (_store_ik_q). The balance-first
-        # refresh then moves the body with the inactive arm's joints fixed, so
-        # that hand rides with the trunk, most at those home confs (known-bugs
-        # B15).
+        # (matches the planner). Particle init holds the inactive hand where
+        # the IK's start conf puts it (home, or a CoM-gate retry's perturbed
+        # seed), so that arm's joints counter-rotate as the body bends (the
+        # per-DOF cspace pin is a no-op). A conf whose IK fails starts at home
+        # instead (_store_ik_q). The balance-first refresh then moves the body
+        # with the inactive arm's joints fixed, so that hand rides with the
+        # trunk, most at those home confs (known-bugs B15).
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
             enable_com_aware_ik=enable_com_aware_ik,

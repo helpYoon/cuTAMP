@@ -3,11 +3,10 @@
 Cspace pinning protocol (see ``pin_for_arm_action``):
 
 * ``pin_for_arm_action(active_arm)``: pin the inactive arm's cspace target
-  weights on the planner and its internal IK solver. As configured this is a
-  no-op: cuRobo scales those weights by ``cspace_target_weight``, which is 0
-  in every IK and trajopt config the planner loads. Nothing else holds the
-  inactive hand during a segment either, since the motion solver plans with
-  ``plan_cspace`` between particle confs (known-bugs B15).
+  weights on the planner and its internal IK solver. This is a no-op (see
+  there), and nothing else holds the inactive hand during a segment either,
+  since the motion solver plans with ``plan_cspace`` between particle confs
+  (known-bugs B15).
 
 Restore via ``unpin()``.
 """
@@ -66,13 +65,17 @@ class T1State:
     def pin_for_arm_action(self, active_arm: Literal["left", "right"]) -> None:
         """Pin the inactive arm's cspace target weight.
 
-        A no-op as configured: the cspace cost multiplies these per-DOF weights
-        by ``cspace_target_weight``, which is 0 in ``lbfgs_ik.yml`` and
-        ``lbfgs_bspline_trajopt.yml`` and defaults to 0 for the particle
-        configs; a config that set it would make this pin act. Nothing holds
+        A no-op. The cspace cost multiplies these per-DOF weights by
+        ``cspace_target_weight``, which is 0 in ``lbfgs_ik.yml`` and
+        ``lbfgs_bspline_trajopt.yml``, the planner's only optimizer configs.
+        A nonzero value would not change that: cuRobo zeroes the live weight
+        when it builds the cost, and only ``enable_joint_position_tracking()``,
+        which nothing here calls, restores it. Even then the term would pull
+        these joints toward 0 rad, not hold them, since its target is the goal
+        joint state and neither IK nor ``plan_cspace`` passes one. Nothing holds
         the inactive hand in the world during a segment: ``plan_cspace``
         constrains only the endpoint confs, and that hand moves between them
-        (median 17 mm on picks, 42 mm on places in blocks_t1; known-bugs B15).
+        (known-bugs B15).
 
         Idempotency: caller must ``unpin()`` before a second pin.
         """
