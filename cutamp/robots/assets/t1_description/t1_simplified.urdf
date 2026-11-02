@@ -228,18 +228,15 @@
        the Trunk.STL origin convention, IDENTICAL to t1.urdf (whose Trunk
        visual is also -0.0625 X), so the rendered geometry matches the MPC
        model exactly.
-       The inertial origin (X = -0.06986) is INTENTIONALLY left as-inherited;
-       do NOT "correct" it. When building this simplified model only the
-       kinematic axes were changed (for the inverted leg chain) — the
-       mass/inertia model is preserved deliberately because it ties into the
-       MPC walking/tracking dynamics. It therefore differs from t1.urdf's
-       Trunk inertial (-0.00736 X) by design; that difference feeds cuRobo's
-       planning-side compute_com (CoM-over-base cost / CoM-aware IK) only, and
-       does NOT affect the saved Trunk POSE (the kinematic frame is correct,
-       per the Waist_Yaw note above). -->
+       The inertial origin is t1.urdf's (X = -0.00736), which is where the
+       mesh's volume centroid sits in the Trunk frame. fd5d64c shifted it by
+       the mesh's -0.0625 a second time (to -0.06986), moving the robot CoM
+       1.6 cm back; the user chose this correction on 2026-11-01. No MPC
+       tracker loads this file, so the inertial feeds only the planner's CoM
+       (CoM-over-base cost, CoM-aware IK), not the saved Trunk POSE. -->
   <link name="Trunk">
     <inertial>
-      <origin xyz="-0.0698634598906924 -1.42058017623659E-06 0.105062332707657" rpy="0 0 0" />
+      <origin xyz="-0.0073634598906924 -1.42058017623659E-06 0.105062332707657" rpy="0 0 0" />
       <mass value="11.7" />
       <inertia ixx="0.0915287235057927" ixy="-4.25369739206781E-07" ixz="0.000646360369011163"
                iyy="0.076778716903413" iyz="5.82340020271393E-07" izz="0.0556171053368987" />
