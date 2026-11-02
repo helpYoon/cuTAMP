@@ -39,9 +39,10 @@ def sample_greedy_surface_spheres(
     mesh = obj.get_trimesh_mesh()
     obj.pose = og_pose
 
-    # Sample surface
+    # Sample surface. The fixed seed makes the spheres part of the task's geometry: unseeded, trimesh draws from
+    # numpy's global RNG, which nothing seeds, so every process planned against different spheres (known-bugs N4).
     n_samples = max(n_spheres, n_samples)
-    n_pts = trimesh.sample.sample_surface(mesh, n_samples)[0]
+    n_pts = trimesh.sample.sample_surface(mesh, n_samples, seed=0)[0]
     cloud = trimesh.PointCloud(n_pts)
 
     # Build neighbor graph

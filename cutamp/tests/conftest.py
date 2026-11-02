@@ -64,21 +64,15 @@ def blocks_t1_plan():
     plan (which follows PYTHONHASHSEED) and its seeded init. Read-only: tests run on ``clone_particles(particles)``,
     and a module using it must not build a second world (two OOM a 24 GiB card). A list, so teardown can free the
     world while pytest still holds the yielded object."""
-    import numpy as np
     from cutamp.config import TAMPConfiguration
     from cutamp.particle_initialization import ParticleInitializer
     from cutamp.t1_domain import all_t1_operators
     from cutamp.task_planning import task_plan_generator
 
-    rng = np.random.get_state()  # numpy samples the block spheres
-    np.random.seed(0)
-    try:
-        world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
-        skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
-        torch.manual_seed(0)
-        particles = ParticleInitializer(world, TAMPConfiguration(num_particles=64))(skeleton)
-    finally:
-        np.random.set_state(rng)
+    world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
+    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+    torch.manual_seed(0)
+    particles = ParticleInitializer(world, TAMPConfiguration(num_particles=64))(skeleton)
     plan = [world, skeleton, particles]
     del world, skeleton, particles  # the list holds the only references
     yield plan

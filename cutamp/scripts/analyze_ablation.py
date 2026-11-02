@@ -166,6 +166,12 @@ def compute_deltas(records):
     metric both records have. Pairing on the shared seed controls for
     per-seed variance, unlike comparing independent cell means.
 
+    That holds only for runs made with known-bugs N4's fix. Before it, the
+    blocks' collision spheres came from numpy's unseeded global RNG, so
+    same-seed runs planned against different geometry and diverged within a
+    few steps. G1's seeds are therefore unpaired: its deltas carry the same
+    run-to-run spread as differences of independent runs.
+
     Returns a flat list of dict rows: cell, height, seed, metric, delta.
     """
     by_key = {(r["cell"], r["height"], r["seed"]): r for r in records}
@@ -253,7 +259,7 @@ def _write_md(agg, delta_agg, path, rates=None):
 
     lines += [
         "",
-        "## Per-seed deltas vs. `full` (cell − full, paired by height + seed)",
+        "## Per-seed deltas vs. `full` (cell − full, matched by height + seed; paired only for runs with known-bugs N4's fix, so not for G1)",
         "",
         "| cell | height | metric | delta mean | delta std |",
         "|---|---|---|---|---|",
