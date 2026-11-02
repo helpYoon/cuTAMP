@@ -93,8 +93,12 @@ def _ik_for_pose(
 
     Uses the same multi-frame-goal + cspace-pin pattern the motion planner
     applies during arm operators: the inactive frame is targeted at its
-    current FK pose, and its joints are pinned via ``cspace_target_dof_weight``.
-    Without this, IK leaves the inactive arm unconstrained and it drifts to
+    current FK pose, and ``cspace_target_dof_weight`` pulls its joints toward
+    their current values in cuRobo's optimizer (with CoM-aware IK on, only for
+    the problems the seed LM fails). The pose target wins over that soft pull,
+    so the inactive hand stays put in the world while its arm's joints
+    counter-rotate as the body bends (about 1 rad per approach in blocks_t1).
+    Without either, IK leaves the inactive arm unconstrained and it drifts to
     arbitrary joint values, polluting downstream particle optimization.
 
     ``current_state_q`` (full-cspace ``[B, len(world.kinematics.joint_names)]``)

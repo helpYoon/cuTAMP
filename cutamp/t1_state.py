@@ -68,16 +68,16 @@ class T1State:
     def pin_for_arm_action(self, active_arm: Literal["left", "right"]) -> None:
         """Pin the inactive arm's cspace target weight.
 
-        This holds the inactive *wrist* in the world, not the arm's joints.
-        The wrist is held by cuRobo's native world-frame ``tool_pose`` cost —
-        its criterion stays ENABLED and the multi-frame goal built by
+        The multi-frame goal holds the inactive *wrist* in the world, not this
+        pin: cuRobo's native world-frame ``tool_pose`` cost stays ENABLED, and
         ``_build_multi_frame_goal`` sets the inactive frame's target pose to
         its FK at the segment's start state. The cspace weight write here is
         largely informational for trajopt (whose ``cspace_target_weight``
         defaults to 0); on the planner's internal IK seed solver, where it is
         nonzero, it is a soft regulariser that loses to the wrist target. The
-        arm's joints still move between segment endpoints (about 1.1 rad per
-        approach in blocks_t1, mostly Wrist_Yaw; known-bugs B15).
+        arm's joints still move between segment endpoints, which come from
+        particle init, where that hand is held in the world too (about 1 rad
+        per approach in blocks_t1; known-bugs B15).
 
         Idempotency: caller must ``unpin()`` before a second pin.
         """

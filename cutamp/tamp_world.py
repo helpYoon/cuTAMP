@@ -88,7 +88,10 @@ class TAMPWorld:
         # (matches the planner). Particle init holds the inactive hand at its
         # home world pose, so a "single-arm Pick" doesn't move the other hand;
         # that arm's joints still counter-rotate as the body bends (the
-        # per-DOF cspace pin is only a soft regulariser).
+        # per-DOF cspace pin is only a soft regulariser). A conf whose IK fails
+        # starts at home instead (_store_ik_q), and the balance-first refresh
+        # keeps the inactive arm's joints, so there that hand rides with the
+        # trunk.
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
             enable_com_aware_ik=enable_com_aware_ik,

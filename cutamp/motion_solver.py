@@ -357,7 +357,9 @@ def solve_curobo(
         metadata = ground_op.operator.metadata
         arm = metadata.arm
 
-        # Pin protocol: arm ops lock base+inactive arm.
+        # Pin protocol: arm ops pin the inactive arm's cspace weights (the base
+        # is locked at construction); the multi-frame goal holds the inactive
+        # hand in the world, not the arm's joints (T1State.pin_for_arm_action).
         if arm is not None:
             state.pin_for_arm_action(arm)
 
