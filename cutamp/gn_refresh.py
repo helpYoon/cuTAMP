@@ -340,6 +340,7 @@ def gn_project_balanced(
     world_from_ee: torch.Tensor,
     arms: str | Sequence[str],
     iters: int = GN_ITERS,
+    balance: bool = True,
 ) -> torch.Tensor:
     """Balance-first variant of :func:`gn_project` (``config.reik_balance_first``).
 
@@ -368,6 +369,10 @@ def gn_project_balanced(
     Otherwise the contract is :func:`gn_project`'s, except that ``arms`` holds
     one arm per IK dep (a bare ``str`` is one): rows are ``len(arms)`` equal
     dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and cspace pin.
+
+    ``balance=False`` (the no-CoM ablation, ``config.enable_com_aware_ik``
+    off) drops level 1: a zero CoM and CoM Jacobian leave both CoM active
+    sets empty, so the step is levels 2-3 alone, with no CoM autograd.
     """
     from cutamp.com_polygon_cost import _project_com_to_base
     from cutamp.cost_function import _device_const
@@ -379,22 +384,28 @@ def gn_project_balanced(
     band_hi = upper - _device_const(T1_LIMIT_MARGIN_UPPER, q.device, q.dtype)
 
     for _ in range(iters):
-        q_g = q.detach().requires_grad_(True)
-        with torch.enable_grad():
-            state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
-            with torch.no_grad():  # base joints are pinned, so the base pose is constant
-                base_T = (
-                    state.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
-                    .get_matrix().reshape(N, 4, 4)
-                )
-            com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
-            # Clone: cuRobo's backward writes into a reused buffer, so without
-            # it the second grad call overwrites the x row with the y row.
-            jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
-            jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g)[0]
+        if balance:
+            q_g = q.detach().requires_grad_(True)
+            with torch.enable_grad():
+                state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
+                with torch.no_grad():  # base joints are pinned, so the base pose is constant
+                    base_T = (
+                        state.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
+                        .get_matrix().reshape(N, 4, 4)
+                    )
+                com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
+                # Clone: cuRobo's backward writes into a reused buffer, so without
+                # it the second grad call overwrites the x row with the y row.
+                jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
+                jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g)[0]
+            with torch.no_grad():
+                jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
+                com = com_g.detach()
+        else:
+            with torch.no_grad():
+                state = kin.compute_kinematics(JointState.from_position(q, joint_names=joint_names))
+            com, jac_com = q.new_zeros(N, 2), q.new_zeros(N, 2, q.shape[-1])
         with torch.no_grad():
-            jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
-            com = com_g.detach()
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
             step = _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask)
             q = (q + step).clamp(lower, upper)

@@ -269,9 +269,10 @@ class _ReikDriftGate:
     # Drift histogram bucket edges (metres) recorded per refresh.
     _BUCKETS = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
 
-    def __init__(self, num_deps: int, pos_tol: float, rot_tol: float):
+    def __init__(self, num_deps: int, pos_tol: float, rot_tol: float, balance: bool = True):
         self.pos_tol = pos_tol
         self.rot_tol = rot_tol
+        self.balance = balance  # config.enable_com_aware_ik: does the refresh see the CoM
         self.refs = [None] * num_deps  # [B, 4, 4] target at previous refresh; stale once G_refresh is captured
         self.stats: List[dict] = []
         self._queued: List[_QueuedRefresh] = []  # refreshes awaiting flush()
@@ -370,6 +371,7 @@ def _project_and_write_back(
     arms = tuple(dep.arm for dep in ik_deps)
     q = gn_project_balanced(
         world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms,
+        balance=gate.balance,
     )
     pose_ok, com_ok = gn_gate(
         world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol, kin=world.site_kinematics("gate"),
@@ -545,7 +547,8 @@ class ParticleOptimizer:
                     )
                     pose_ok = (pos_err < gate.pos_tol) & (rot_err < gate.rot_tol)
                     com_ok = compute_com_polygon_mask(world, q_gn)
-                    ok = pose_ok & com_ok
+                    # No-CoM ablation: gate on pose alone (com_ok still feeds the stats).
+                    ok = pose_ok & com_ok if self.config.enable_com_aware_ik else pose_ok
                     merged = torch.where(ok.view(-1, 1), q_gn, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
                     particles[dep.q_name].grad = None
@@ -589,11 +592,9 @@ class ParticleOptimizer:
                     pos_err, rot_err = _achieved_pose_errors(
                         world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
                     )
-                    ok_now = (
-                        (pos_err < pos_tol)
-                        & (rot_err < rot_tol)
-                        & compute_com_polygon_mask(world, particles[dep.q_name])
-                    )
+                    ok_now = (pos_err < pos_tol) & (rot_err < rot_tol)
+                    if self.config.enable_com_aware_ik:  # off in the no-CoM ablation
+                        ok_now &= compute_com_polygon_mask(world, particles[dep.q_name])
                 if bool(ok_now.all()):
                     continue  # nothing to repair for this dep
                 ik_result = _ik_for_pose(
@@ -703,6 +704,7 @@ class ParticleOptimizer:
             len(ik_deps),
             pos_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err"),
             rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
+            balance=self.config.enable_com_aware_ik,
         ) if ik_deps else None
 
         pairs = []  # (tensor, is a Conf) per optimized param, for _adam_param_groups

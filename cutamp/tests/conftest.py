@@ -269,7 +269,7 @@ def install_refresh_spy(monkeypatch) -> list:
 
     def spy(self, step):
         clones, before = clone_particles(self.particles), clone_particles(self.particles)
-        g2 = _ReikDriftGate(len(self.q_names), self.gate.pos_tol, self.gate.rot_tol)
+        g2 = _ReikDriftGate(len(self.q_names), self.gate.pos_tol, self.gate.rot_tol, balance=self.gate.balance)
         g2.refs = [r.clone() for r in self.refs]
         _refresh_balanced(clones, self.ik_deps, self.world, g2, step)
         orig(self, step)

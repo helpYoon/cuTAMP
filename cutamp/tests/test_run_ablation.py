@@ -8,8 +8,10 @@ from cutamp.scripts.run_ablation import CELLS, build_run_plan, run_study
 
 
 def test_cells_match_spec():
-    assert set(CELLS) == {"full", "no_com", "no_reik", "standard"}
-    assert CELLS["full"] == []
+    assert set(CELLS) == {"full", "default_reik", "no_com", "no_reik", "standard"}
+    assert CELLS["default_reik"] == []
+    for cell in ("full", "no_com"):
+        assert "--reik_balance_first" in CELLS[cell] and "--cuda_graphs" in CELLS[cell]
     assert "--no_com_all" in CELLS["no_com"]
     for cell in ("no_reik", "standard"):
         assert "--no_coupled_reik" in CELLS[cell]
@@ -20,7 +22,7 @@ def test_cells_match_spec():
 
 def test_build_run_plan_grid_and_ids():
     plan = build_run_plan(heights=[0.0, 0.5], seeds=[0, 1])
-    assert len(plan) == 4 * 2 * 2
+    assert len(plan) == len(CELLS) * 2 * 2
     ids = [r["experiment_id"] for r in plan]
     assert len(set(ids)) == len(ids)  # unique
     r = plan[0]
@@ -35,7 +37,7 @@ def test_run_study_is_resumable(tmp_path):
         return 0
     plan = build_run_plan(heights=[0.0], seeds=[0])
     run_study(plan, out_dir=tmp_path, execute=fake_exec)
-    assert len(calls) == 4
+    assert len(calls) == len(CELLS)
     manifest = json.load(open(tmp_path / "manifest.json"))
     assert all(r["status"] == "done" for r in manifest)
     # Second invocation: nothing re-runs.
@@ -54,13 +56,13 @@ def test_run_study_retries_failed_runs(tmp_path):
 
     plan = build_run_plan(heights=[0.0], seeds=[0])
     run_study(plan, out_dir=tmp_path, execute=failing_exec)
-    assert len(calls) == 4
+    assert len(calls) == len(CELLS)
     manifest = json.load(open(tmp_path / "manifest.json"))
 
-    # Three done, one failed
+    # All but no_com done, no_com failed
     done_runs = [r for r in manifest if r["status"] == "done"]
     failed_runs = [r for r in manifest if r["status"].startswith("failed")]
-    assert len(done_runs) == 3
+    assert len(done_runs) == len(CELLS) - 1
     assert len(failed_runs) == 1
     assert failed_runs[0]["experiment_id"] == "ablation_no_com_h000_s0"
     assert failed_runs[0]["status"] == "failed(42)"
@@ -79,7 +81,7 @@ def test_run_study_retries_failed_runs(tmp_path):
 
     manifest = json.load(open(tmp_path / "manifest.json"))
     assert all(r["status"] == "done" for r in manifest)
-    assert len(manifest) == 4
+    assert len(manifest) == len(CELLS)
 
 
 def test_experiment_root_defaults_under_out_dir(tmp_path):
