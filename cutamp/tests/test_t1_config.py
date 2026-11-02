@@ -4,6 +4,10 @@ Verifies the YAML loads, has 21 active cspace joints (3 base + 2 leg + 2 torso +
 7 left arm + 7 right arm), declares both tool frames, and locks 10 head/gripper
 joints.
 """
+import xml.etree.ElementTree as ET
+
+import torch
+import yaml
 
 from cutamp.robots.t1 import (
     BASE_DOF,
@@ -14,6 +18,7 @@ from cutamp.robots.t1 import (
     LEFT_TOOL_FRAME,
     RIGHT_ARM_INDICES,
     RIGHT_TOOL_FRAME,
+    T1_ASSETS_DIR,
     TOOL_FRAMES,
     URDF_DOF,
 )
@@ -82,3 +87,24 @@ def test_dof_constants():
     assert URDF_DOF == 28
     assert CUROBO_DOF == 21
     assert BASE_DOF == 3
+
+
+def _joint_xyz(urdf, name):
+    return [float(v) for v in ET.parse(urdf).find(f"joint[@name='{name}']/origin").get("xyz").split()]
+
+
+def test_leg_spheres_cover_both_real_legs():
+    # The planning model has one midline leg, but the real legs stand at y = +-0.106 (t1.urdf's hip
+    # pitch joints). Each leg link's spheres must hold both real leg axes, from the link origin to the
+    # next joint (ankle to knee, knee to hip), with 2 cm to spare.
+    spheres = yaml.safe_load(open(T1_ASSETS_DIR / "t1_spheres.yml"))["collision_spheres"]
+    leg_y = _joint_xyz(T1_ASSETS_DIR / "t1.urdf", "Left_Hip_Pitch")[1]
+    simplified = T1_ASSETS_DIR / "t1_simplified.urdf"
+    t = torch.linspace(0, 1, 50)[:, None]
+    for link, joint in (("shank_link", "knee_pitch"), ("thigh_link", "Torso_Pitch")):
+        c = torch.tensor([s["center"] for s in spheres[link]])
+        r = torch.tensor([s["radius"] for s in spheres[link]])
+        for y in (leg_y, -leg_y):
+            axis = t * torch.tensor(_joint_xyz(simplified, joint)) + torch.tensor([0.0, y, 0.0])
+            spare = (r - torch.cdist(axis, c)).max(dim=1).values
+            assert spare.min() >= 0.02, f"{link}, leg at y {y:+.3f}: {spare.min():.3f} m to spare"

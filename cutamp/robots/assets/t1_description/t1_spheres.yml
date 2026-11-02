@@ -144,24 +144,43 @@ collision_spheres:
     radius: 0.055
   - center: [-0.095, -0.095, 0.021]
     radius: 0.055
+  # One column per real leg, at t1.urdf's hip pitch y = +-0.106; the midline
+  # leg links stand in for both. The thigh columns lean to the hip, which sits
+  # 0.014 ahead of the knee (Torso_Pitch origin).
   shank_link:
-  - center: [0.0, 0.0, 0.04]
-    radius: 0.055
-  - center: [0.0, 0.0, 0.12]
-    radius: 0.055
-  - center: [0.0, 0.0, 0.20]
-    radius: 0.055
-  - center: [0.0, 0.0, 0.27]
-    radius: 0.055
+  - center: [0.0, 0.106, 0.04]
+    radius: 0.065
+  - center: [0.0, 0.106, 0.12]
+    radius: 0.065
+  - center: [0.0, 0.106, 0.20]
+    radius: 0.065
+  - center: [0.0, 0.106, 0.27]
+    radius: 0.065
+  - center: [0.0, -0.106, 0.04]
+    radius: 0.065
+  - center: [0.0, -0.106, 0.12]
+    radius: 0.065
+  - center: [0.0, -0.106, 0.20]
+    radius: 0.065
+  - center: [0.0, -0.106, 0.27]
+    radius: 0.065
   thigh_link:
-  - center: [0.0, 0.0, 0.03]
-    radius: 0.055
-  - center: [0.0, 0.0, 0.09]
-    radius: 0.055
-  - center: [0.0, 0.0, 0.15]
-    radius: 0.055
-  - center: [0.0, 0.0, 0.21]
-    radius: 0.055
+  - center: [0.0018, 0.106, 0.03]
+    radius: 0.065
+  - center: [0.0053, 0.106, 0.09]
+    radius: 0.065
+  - center: [0.0089, 0.106, 0.15]
+    radius: 0.065
+  - center: [0.0125, 0.106, 0.21]
+    radius: 0.065
+  - center: [0.0018, -0.106, 0.03]
+    radius: 0.065
+  - center: [0.0053, -0.106, 0.09]
+    radius: 0.065
+  - center: [0.0089, -0.106, 0.15]
+    radius: 0.065
+  - center: [0.0125, -0.106, 0.21]
+    radius: 0.065
   Waist:
   - center: [0.0, 0.0, 0.0]
     radius: 0.0933
