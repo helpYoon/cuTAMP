@@ -4,7 +4,9 @@ Sweeps the cells x heights x seeds, one sequential GPU run each, writing
 standard experiment dirs plus a resumable manifest. See
 docs/superpowers/specs/2026-08-05-standard-cutamp-baseline-design.md.
 The 2x2 is balance (CoM) x re-IK on the balance-first refresh, plus
-``default_reik``, the full system on the default refresh.
+``default_reik``, the full system on the default refresh. Balance-first
+and CUDA graphs are run_cutamp's defaults, so ``default_reik`` turns both
+off explicitly; with no flags it would be a second ``full`` arm.
 
 Usage:
     python -m cutamp.scripts.run_ablation --out /tmp/ablation-study
@@ -20,7 +22,7 @@ from pathlib import Path
 BALANCE_FIRST = ["--reik_balance_first", "--cuda_graphs"]
 CELLS = {
     "full": BALANCE_FIRST,
-    "default_reik": [],
+    "default_reik": ["--no_reik_balance_first", "--no_cuda_graphs"],
     "no_com": ["--no_com_all"] + BALANCE_FIRST,
     "no_reik": ["--no_coupled_reik", "--force_adam", "--soft_in_adam", "always"],
     "standard": ["--no_com_all", "--no_coupled_reik", "--force_adam",

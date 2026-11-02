@@ -7,9 +7,26 @@ from cutamp.scripts import run_ablation
 from cutamp.scripts.run_ablation import CELLS, build_run_plan, run_study
 
 
+def test_cells_run_their_refresh(monkeypatch):
+    # Each run's argv through run_cutamp's own CLI defaults (balance-first and graphs on): only
+    # full and no_com may run the balance-first refresh, and default_reik keeps the default one.
+    import sys
+
+    import cutamp.scripts.run_cutamp as rc
+    from cutamp.config import uses_cuda_graphs
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
+    want = {"full": (True, True), "default_reik": (False, False), "no_com": (True, True)}
+    for run in build_run_plan(heights=[0.0], seeds=[0]):
+        if run["cell"] in want:
+            monkeypatch.setattr(sys, "argv", ["run_cutamp", *run["args"]])
+            rc.entrypoint()
+            c = seen[-1]
+            assert c.coupled_reik and (c.reik_balance_first, uses_cuda_graphs(c)) == want[run["cell"]], run["cell"]
+
+
 def test_cells_match_spec():
     assert set(CELLS) == {"full", "default_reik", "no_com", "no_reik", "standard"}
-    assert CELLS["default_reik"] == []
     for cell in ("full", "no_com"):
         assert "--reik_balance_first" in CELLS[cell] and "--cuda_graphs" in CELLS[cell]
     assert "--no_com_all" in CELLS["no_com"]
