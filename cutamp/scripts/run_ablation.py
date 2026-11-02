@@ -31,7 +31,7 @@ CELLS = {
 HEIGHTS = [0.0, 0.25, 0.50, 0.65]
 SEEDS = list(range(10))
 SOFT_ARGS = ["--soft_cost", "joint_limit_margin"]  # one soft-cost setting for every arm
-BASE_ARGS = ["-n", "512", "--disable_visualizer", "--motion_plan"] + SOFT_ARGS
+BASE_ARGS = ["-n", "512", "--disable_visualizer", "--motion_plan", "--save_plan", "auto"] + SOFT_ARGS
 SMOKE_ARGS = ["-n", "64", "--num_opt_steps", "30", "--disable_visualizer"] + SOFT_ARGS
 
 
