@@ -50,6 +50,24 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
     assert fp.n == 1  # no repeat: the same start and goal plan the same way
 
 
+def test_audit_counts_each_junction_frame_once(monkeypatch):
+    # Each segment is planned from the previous one's last frame, so its frame 0 repeats that frame. The audit
+    # counted every junction twice: 7 extra frames in an 8-segment blocks_t1 plan (known-bugs N3).
+    from types import SimpleNamespace
+    from curobo.types import JointState
+    import cutamp.com_polygon_cost as cpc
+
+    monkeypatch.setattr(cpc, "compute_com_polygon_mask", lambda world, q: q[:, 0] < 1.0)  # a >= 1: outside
+    names = ["a", "b"]
+
+    def segment(*a):
+        return {"plan": JointState.from_position(torch.tensor([[x, 0.0] for x in a]), joint_names=names)}
+
+    plans = [segment(0.0, 0.0, 1.0), segment(1.0, 0.0, 0.0), segment(0.0, 0.0, 0.0)]  # outside only at a junction
+    world = SimpleNamespace(kinematics=SimpleNamespace(joint_names=names))
+    assert ms._audit_traj_com(world, None, plans) == {"traj_com_violation_frac": 1 / 7, "traj_com_frames": 7}
+
+
 def _generate_plan_segments(seed: int):
     """Run the full cuTAMP pipeline once for blocks_t1 and return
     ``(world, segments, overall_metrics)``: a TAMPWorld for COM checks, the

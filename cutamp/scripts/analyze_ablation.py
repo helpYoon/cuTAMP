@@ -97,7 +97,9 @@ def load_study(manifest_path):
             "num_satisfying_final": opt.get("num_satisfying_final"),
             "num_satisfying_com_feasible": opt.get("num_satisfying_com_feasible"),
             "best_soft_cost_com_feasible": opt.get("best_soft_cost_com_feasible"),
-            "best_com_margin": opt.get("best_com_margin"),
+            # The planned particle's margin. Runs before known-bugs N3 (G1) only have rank 0's, which a
+            # motion-plan retry didn't plan.
+            "best_com_margin": overall.get("planned_com_margin", opt.get("best_com_margin")),
             "traj_com_violation_frac": overall.get("traj_com_violation_frac"),
             "motion_plan_success": (
                 float(overall["motion_plan_success"])

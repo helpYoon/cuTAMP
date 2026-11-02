@@ -262,6 +262,15 @@ def test_stable_plan_wilson_and_curobo_calls(tmp_path, monkeypatch):
     assert "| Full (CoM + balance-first re-IK) | all | 1/2 | 0.50 |" in md
 
 
+def test_margin_is_the_planned_particles(tmp_path):
+    # After a motion-plan retry, best_com_margin describes rank 0, which wasn't planned. The table takes the
+    # planned particle's planned_com_margin, and best_com_margin for runs that predate it (known-bugs N3).
+    runs = [_fake_run(tmp_path, "full", 0.0, s) for s in (0, 1)]
+    _patch(runs[0], {"planned_com_margin": 0.03})
+    (tmp_path / "manifest.json").write_text(json.dumps(runs))
+    assert [r["best_com_margin"] for r in load_study(tmp_path / "manifest.json")] == [0.03, 0.05]
+
+
 def test_restored_init_reaches_the_table(tmp_path):
     # Without re-IK, Adam empties the satisfying set and _BestSnapshot puts the step-0 IK init back
     # (known-bugs B13). adam_gain and restored must carry that into the table; runs that predate

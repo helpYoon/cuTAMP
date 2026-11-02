@@ -35,13 +35,23 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
 
     monkeypatch.setattr(alg, "solve_curobo", fake_solve_curobo)
     candidates = [cand(0, 0), cand(0, 1), cand(1, 0), cand(1, 0), cand(1, 1)]
-    plan, _, skip, attempts = alg._motion_plan_with_retries(
+    plan, _, skip, attempts, rank = alg._motion_plan_with_retries(
         {"plan_skeleton": skeleton}, candidates, None, None, None, None,
     )
     # (0, 1) repeats (0, 0) through the failing pick; the second (1, 0) repeats
     # the first through the failing place; (1, 1) differs at the place, so it runs.
     assert planned == [(0, 0), (1, 0), (1, 1)]
-    assert (plan, skip, attempts) == ("PLAN", False, 3)
+    # rank names the planned particle, which attempts can't once candidates are skipped (known-bugs N3)
+    assert (plan, skip, attempts, rank) == ("PLAN", False, 3, 4)
+
+
+def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
+    # planned_com_margin: the planned particle's margin, computed as optimize_plan computes best_com_margin
+    # for rank 0, which a retry didn't plan (known-bugs N3). Grasps and placements aren't confs.
+    monkeypatch.setattr(alg, "compute_com_margin", lambda world, q: q[:, 0])
+    particle = {"left_q0": torch.tensor([0.3, 0.0]), "left_q1": torch.tensor([0.1, 0.0]),
+                "right_q3": torch.tensor([0.2, 0.0]), "grasp1": torch.tensor([-1.0, 0.0, 0.0, 0.0])}
+    assert alg._com_margin(None, particle) == pytest.approx(0.1)
 
 
 @needs_cuda

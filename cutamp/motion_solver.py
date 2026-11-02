@@ -533,8 +533,12 @@ def solve_curobo(
             )
         cur_t += pos.shape[0] * dt
 
-    # Measure-only trajectory CoM audit (recorded in every ablation arm).
-    #
+    return accum_plans, _audit_traj_com(world, planner, accum_plans)
+
+
+def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
+    """Measure-only trajectory CoM audit (recorded in every ablation arm): the plan's frame count,
+    ``traj_com_frames``, and the fraction of them whose CoM leaves the polygon, ``traj_com_violation_frac``."""
     # Deviates from the task brief's illustrative snippet in two respects:
     #
     # 1. accum_plans entries carry trajectories in different DOF forms
@@ -545,7 +549,7 @@ def solve_curobo(
     #    base joints). Unconditionally calling get_full_js (as the brief's
     #    snippet does) raises ``ValueError: lock_joints is also listed in
     #    js.joint_names`` on the latter case. Mirror the same conditional
-    #    the playback loop just above already uses for this exact DOF-form
+    #    solve_curobo's playback loop already uses for this exact DOF-form
     #    ambiguity: only augment with get_full_js when the trajectory is
     #    short the locked joints; a plain reorder (index-select) handles
     #    the already-fully-articulated case. That loop also defends against
@@ -565,9 +569,11 @@ def solve_curobo(
     try:
         total_frames, violation_frames = 0, 0
         with torch.no_grad():
-            for entry in accum_plans:
+            for i, entry in enumerate(accum_plans):
                 plan_js = entry["plan"]
-                pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
+                # A later segment's frame 0 is the previous one's last (it is planned from last_js): count it
+                # once, not once per segment (known-bugs N3).
+                pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])[1 if i else 0:]
                 src_names = getattr(plan_js, "joint_names", None)
                 if src_names is None:
                     src_names = (
@@ -584,11 +590,10 @@ def solve_curobo(
                 ok = compute_com_polygon_mask(world, full)
                 total_frames += int(ok.numel())
                 violation_frames += int((~ok).sum().item())
-        audit = {
+        return {
             "traj_com_violation_frac": (violation_frames / total_frames) if total_frames else 0.0,
             "traj_com_frames": total_frames,
         }
     except Exception as e:
         _log.warning(f"Trajectory CoM audit failed (measure-only, ignoring): {e}")
-        audit = {}
-    return accum_plans, audit
+        return {}

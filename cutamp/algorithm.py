@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from curobo.types import DeviceCfg as TensorDeviceType
 
+from cutamp.com_polygon_cost import compute_com_margin
 from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
@@ -200,7 +201,7 @@ def _motion_plan_with_retries(
     timer: TorchTimer,
     visualizer,
     get_planner=None,
-) -> Tuple[Optional[dict], Optional[dict], bool, int]:
+) -> Tuple[Optional[dict], Optional[dict], bool, int, Optional[int]]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
@@ -211,7 +212,7 @@ def _motion_plan_with_retries(
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
 
-    Returns ``(curobo_plan, audit, skip_plan, attempts)``:
+    Returns ``(curobo_plan, audit, skip_plan, attempts, rank)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
         failed.
       - ``audit``: the measure-only trajectory CoM audit dict from
@@ -219,6 +220,8 @@ def _motion_plan_with_retries(
       - ``skip_plan``: ``True`` if a ``NotImplementedError`` was raised — the
         caller should skip this plan_skeleton entirely and move on.
       - ``attempts``: number of candidates actually planned (skips excluded).
+      - ``rank``: the index in ``candidates`` of the planned particle, or
+        ``None`` if none was planned.
     """
     skeleton = plan_info["plan_skeleton"]
     last_err, tried, failed = None, 0, []
@@ -236,12 +239,12 @@ def _motion_plan_with_retries(
                 _log.warning(
                     f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
                 )
-            return curobo_plan, audit, False, tried
+            return curobo_plan, audit, False, tried, rank
         except NotImplementedError as e:
             _log.warning(
                 f"Motion planning not supported for this plan: {e}. Trying next plan..."
             )
-            return None, None, True, tried
+            return None, None, True, tried, None
         except RuntimeError as e:
             _log.warning(
                 f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
@@ -257,7 +260,15 @@ def _motion_plan_with_retries(
         f"Exhausted {len(candidates)} particle retries ({tried} planned); giving up on this plan. "
         f"Last error: {last_err}"
     )
-    return None, None, False, tried
+    return None, None, False, tried, None
+
+
+def _com_margin(world: TAMPWorld, particle: dict) -> float:
+    """One particle's CoM margin: the min over its confs, as optimize_plan computes ``best_com_margin``."""
+    return min(
+        compute_com_margin(world, v.unsqueeze(0)).item()
+        for k, v in particle.items() if k.startswith(("left_q", "right_q", "q")) and v.ndim == 1
+    )
 
 
 def setup_cutamp(
@@ -456,7 +467,7 @@ def run_cutamp(
                     plan_info, config, constraint_checker, cost_reducer,
                     n=config.motion_plan_max_retries,
                 )
-                curobo_plan, traj_audit, skip_plan, attempts = _motion_plan_with_retries(
+                curobo_plan, traj_audit, skip_plan, attempts, rank = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
                     get_planner=get_planner,
                 )
@@ -465,6 +476,10 @@ def run_cutamp(
                 if skip_plan or curobo_plan is None:
                     continue
                 overall_metrics.update(traj_audit)
+                # best_com_margin is rank 0's; after a retry the plan comes from another particle (known-bugs N3).
+                overall_metrics["motion_plan_rank"] = rank
+                if metrics.get("best_com_margin") is not None:  # the CoM summary ran for this world
+                    overall_metrics["planned_com_margin"] = _com_margin(world, candidates[rank])
             found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
