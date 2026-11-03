@@ -6,20 +6,34 @@ The full README with installation instructions, examples, and detailed
 documentation can be found in [README_DETAILED.md](README_DETAILED.md).
 
 > **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
-> `curobo/` tree (the `compute_com` plumbing, the CoM-aware seed-IK
-> residual, a thread-safety fix for warp stream wrappers, and a seed-IK LM
-> fix — 9 Python source files, no kernel changes; the earlier batched-COM kernel
-> fix was dropped
+> `curobo/` tree (the `compute_com` plumbing; the CoM-aware seed-IK
+> residual, whose solution is kept for each problem the seed IK solved, so
+> the CoM-blind optimizer replaces only the failed ones; the URDF parser's
+> link-CoM and link-mass fixes; a thread-safety fix for warp stream
+> wrappers; and a seed-IK LM fix — 10 Python source files, no kernel
+> changes; the earlier batched-COM kernel fix was dropped
 > when the base moved to NVlabs PR #678, which fixes it upstream). The edits
 > live on the `main` branch of the cuRobo fork (helpYoon/curobo) — a plain
-> NVlabs checkout without them breaks cuTAMP. Grep `cuTAMP` under
+> NVlabs checkout without them breaks cuTAMP, and its parser puts each
+> link's CoM at R p + p instead of p (twice the offset for an unrotated
+> inertial frame). Grep `cuTAMP` under
 > `curobo/curobo/_src/` for the tagged ones (6 files tagged `cuTAMP fork`,
 > plus `robot_state_transition[_cfg].py` tagged `cuTAMP local addition`);
-> the ninth, `solver/seed_ik/seed_iteration_state_manager.py`, is untagged
-> (it keeps the current objective when an LM step is rejected).
+> two are untagged: `solver/seed_ik/seed_iteration_state_manager.py` (it
+> keeps the current objective when an LM step is rejected) and
+> `robot/parser/parser_urdf.py` (a link's CoM is its inertial origin's
+> translation, and a massless link weighs 0, not 0.01 kg).
+> `git -C curobo diff ac5f931 main` (ac5f931 is the NVlabs base) lists them all.
 > Without the `util/warp.py` fix, the background motion-planner build
 > thread can crash the process with heap corruption
 > (`malloc(): unaligned tcache chunk detected`).
+>
+> Set `SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0` for every command: the fork's
+> tags break setuptools_scm's version lookup, so without it `import curobo`
+> fails with an `AssertionError`. Only `python -m …` and
+> `pytest cutamp/tests/` run from the repo root get by without it (the
+> `curobo/` checkout there shadows the package); `python examples/…`,
+> `pytest examples/` and `cutamp-demo` fail even there.
 
 ## How it works (end-to-end)
 
@@ -32,7 +46,7 @@ until one satisfies every hard constraint, then motion-planning the result.
 graph LR
     A["Task planning<br/>(t1_domain → skeletons)"] --> B["Particle init<br/>(IK-seeded candidates)"]
     B --> C["Optimize<br/>(coupled-Adam:<br/>hard constraints + soft costs)"]
-    C --> D["Motion plan<br/>(single planner,<br/>per-operator cspace pinning)"]
+    C --> D["Motion plan<br/>(single planner,<br/>CoM/ZMP gate per segment)"]
     D --> E["Playback / save<br/>(Rerun · pickle for MPC)"]
 ```
 
@@ -43,12 +57,13 @@ graph LR
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
    / configs (`samplers.py`) and runs cuRobo IK — with CoM-aware seed-IK — for
-   each pick / place conf, re-solving particles whose COM leaves the support
-   polygon. Retract confs start at `t1_home`.
+   each pick / place conf, re-solving particles whose CoM leaves the keyframe
+   rectangle (`COM_HALF_EXTENTS`). Retract confs start at `t1_home`.
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
-   (kinematic, motion, collision, stable-placement, the `ComPolygon`
-   COM-in-hull gate) plus soft costs. Pose-class soft costs use **re-IK-coupled
+   (kinematic, motion, collision, stable-placement, and the `ComPolygon`
+   gate: every conf's CoM inside `COM_HALF_EXTENTS`, the real soles shrunk
+   2 cm and another 5 mm for the arrival's deceleration) plus soft costs. Pose-class soft costs use **re-IK-coupled
    Adam** — outer Adam moves poses while dependent confs are re-projected every
    `reik_interval` steps by balance-first Gauss-Newton (`gn_refresh.py`: CoM
    in the support polygon first, then the pose, then joint-limit margins), with
@@ -62,12 +77,20 @@ graph LR
    best satisfying particles (up to `motion_plan_max_retries`, first success
    wins) through `motion_solver.py`: one 21-DOF `MotionPlanner`, built on a
    background thread while the optimizer runs, re-pinned per operator
-   (`pin_for_arm_action`), and planned to each particle conf with `plan_cspace`.
+   (`pin_for_arm_action`, a no-op), and planned to each particle conf with
+   `plan_cspace`. When `enable_com_polygon` is on (the default), each segment
+   then passes `_balance_gate`: every frame's CoM and multibody ZMP
+   (`com_zmp_in_support`) must stay inside `SUPPORT_HALF_EXTENTS`, the real
+   soles shrunk 2 cm. A CoM outside fails the candidate and the next one is
+   tried; a ZMP outside slows the segment down uniformly (`_retime`, up to
+   `RETIME_MAX` = 4×), and a ZMP still outside at 4× fails the candidate too.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the processed plan
    (schema v3, `utils/plan_processor.py`) for the downstream MPC consumer
    ([`examples/load_motion_plan_for_mpc.py`](examples/load_motion_plan_for_mpc.py)
-   shows how to read it).
+   shows how to read it). A segment the gate slowed down also carries
+   `planner_timing`, the same segment at the motion planner's own timing
+   (`None` otherwise).
 
 `run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
 the shared `TAMPWorld`.
@@ -90,9 +113,11 @@ The mobile base is added as a virtual chain via `extra_links`
 (`world → base_j_x → base_j_y → base_j_yaw → mobile_base_link`) and locked at
 IK / motion-planner construction time, leaving an 18-DOF active cspace for arm
 operators. Two tool frames (`left_base_link`, `right_base_link`) are exposed
-on the same kinematics; per-arm IK uses `GoalToolPose` to target one frame at
-a time. `mobile_base_link` is a third tool frame, there only so the CoM costs
-can read the base pose.
+on the same kinematics; per-arm IK builds one `GoalToolPose` over every tool
+frame (`_build_multi_frame_goal`): the active frame gets the target, and the
+others stay at their FK pose at the IK's start conf, which is what holds the
+idle hand. `mobile_base_link` is a third tool frame, there only so the CoM
+costs can read the base pose.
 
 ```mermaid
 graph TD
@@ -121,9 +146,10 @@ graph TD
 
 There is no per-arm "shared joint" propagation — the body joints are
 genuinely shared in one cspace, so trajopt updates them coherently. The
-inactive arm's tool moves through world during single-arm planning because
-the body translates; the visualizer tracks both arms' held objects through
-every trajectory (see `T1State.compute_all_held_obj_poses`).
+inactive arm's tool moves through world during single-arm planning: the legs
+and torso carry it, and `plan_cspace` holds nothing between the endpoint
+confs (the pin is a no-op). The visualizer tracks both arms' held objects
+through every trajectory (see `T1State.compute_all_held_obj_poses`).
 
 ## Layout
 
@@ -131,7 +157,13 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 
 - **[`assets/t1_description/`](cutamp/robots/assets/t1_description/)**:
   - `t1_simplified.urdf` — URDF the planner loads (adds the `world` link the
-    planar-base chain attaches to). `t1.urdf` is the on-robot model the MPC
+    planar-base chain attaches to). Its masses are the real T1's, lumped for
+    double support: the base carries both feet and ankle crosses, the shank
+    both shanks, the thigh both legs' Hip_Pitch, Hip_Roll and Hip_Yaw links,
+    and the arms and hands take
+    `t1.urdf`'s. Its base origin is the sole plane, and its x, y CoM matches
+    `t1.urdf`'s within 0.5 mm (grippers aside; `test_robot_com.py`).
+    `t1.urdf` is the on-robot model the MPC
     uses, kept for reference (not loaded); its Trunk frame matches the
     planner's, so saved Trunk poses need no compensation.
   - `t1_planar_base.yml` — single cuRobo robot config: kinematics, cspace,
@@ -155,16 +187,22 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   - cuRobo loaders: `get_t1_kinematics` (always `compute_com=True`;
     `compute_jacobian=True` for the GN refresh), `get_t1_ik_solver(scene)` (a single
     multi-tool-frame IK over both arms; with `enable_com_aware_ik=True`, the
-    default, its seed-IK LM stage carries a CoM-over-support-rectangle
-    residual — a cuRobo fork edit — weighted by `T1_COM_IK_WEIGHT` and the
+    default, its seed-IK LM stage carries a CoM residual — a cuRobo fork
+    edit — over the largest base-centred box inside `COM_HALF_EXTENTS`
+    (the fork's box has no centre, so it falls 2 cm short at the toe),
+    weighted by `T1_COM_IK_WEIGHT` and the
     pull-to-center `T1_COM_IK_CENTER_WEIGHT`; `num_seeds` / `lbfgs_iters` /
-    `use_cuda_graph` configure the re-IK refresh solver), and `get_t1_motion_planner`
+    `use_cuda_graph` configure the re-IK refresh solver), `get_t1_motion_planner`
     (the single planner with the base lock, the COM-over-polygon rollout
-    soft cost, and the joint-limit-margin trajopt cost applied).
+    soft cost, and the joint-limit-margin trajopt cost applied), and
+    `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
+    masses and CoMs and the URDF's inertias, for the balance gate's
+    multibody ZMP).
   - Joint-name + index constants: `JOINT_NAMES_FULL`, `BASE_INDICES`,
     `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`,
-    `t1_home`, and the per-joint, per-side joint-limit bands
-    `T1_LIMIT_MARGIN_LOWER` / `T1_LIMIT_MARGIN_UPPER`.
+    `t1_home`, the per-joint, per-side joint-limit bands
+    `T1_LIMIT_MARGIN_LOWER` / `T1_LIMIT_MARGIN_UPPER`, and the planner's
+    ankle-pitch upper band `T1_TRAJOPT_ANKLE_UPPER_MARGIN` (0.02 rad).
   - `T1RerunRobot` for visualization: maps a 21-DOF cspace vector into the
     URDF's 28 joints (the planar base becomes a root transform), splices in
     head + per-arm gripper state. Playback reprojects the planner's 18-DOF
@@ -178,11 +216,13 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   `InverseKinematics` solver, and a `MotionPlanner` factory. `q_init` is one
   21-DOF tensor. Built lazily: `ik_refresh_solver` (the low-seed, warm-started
   IK for re-IK refreshes when `reik_num_seeds > 0`), `kinematics_jac` (the
-  Jacobian twin for the GN refresh), and one `site_kinematics(name)` per
+  Jacobian twin for the GN refresh), `bodies` (`get_t1_bodies`: a second
+  `Kinematics` whose tool frames are every massive link, for the balance
+  gate's multibody ZMP), and one `site_kinematics(name)` per
   Adam-loop FK site in `FK_SITES`.
 
-- [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner,
-  kinematics, current joint state, and per-arm `arm_holding` /
+- [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner, the
+  per-tool-frame `tool_from_ee`, and per-arm `arm_holding` /
   `arm_grasp_transform`. Cspace pinning lives here:
   - `pin_for_arm_action(arm)` — write the inactive arm's cspace pin weights
     (a no-op: `cspace_target_weight` is 0).
@@ -193,9 +233,11 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
     arm currently holding (visualization needs both because the inactive
     arm's tool still translates with the body).
 
-- [`_curobo_internals.py`](cutamp/_curobo_internals.py) — every cuRobo
-  private-API workaround in one file (with `# TODO: file upstream issue`
-  markers): `get_attachment_manager`, `cspace_plan_succeeded`,
+- [`_curobo_internals.py`](cutamp/_curobo_internals.py) — the cuRobo
+  private-API helpers shared across modules, in one file (with `# TODO: file
+  upstream issue` markers; one-off workarounds stay beside their callers:
+  `motion_solver._attach_object` / `_detach_object`,
+  `particle_initialization._achieved_pose_errors`): `get_attachment_manager`, `cspace_plan_succeeded`,
   `iter_rollouts`, the cspace target-weight `write…` / `snapshot…` /
   `restore…` trio (hosts-iterable), `build_pin_weights`, and
   `add_extra_cost` (custom-cost dispatch; effective for the planner's
@@ -203,26 +245,43 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   residual lives inside the seed-IK fork instead).
 
 - [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
-  truth for the COM-over-support-rectangle geometry (`COM_HALF_EXTENTS`,
-  `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT`, `COM_TOL`) and its consumers:
-  `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
+  truth for the balance geometry: the real soles (`SOLE_HALF_EXTENTS`,
+  centred at `COM_CENTER`, 1 cm ahead of the ankle axis), the trajectory
+  gate's `SUPPORT_HALF_EXTENTS` (the soles shrunk by `COM_SAFETY_MARGIN` =
+  2 cm), the keyframes' `COM_HALF_EXTENTS` (a further `COM_DYNAMIC_RESERVE`
+  = 5 mm in), `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT` and `COM_TOL`. Its
+  consumers: `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
   `ComOverBasePolygonCost` (the planner rollout cost),
-  `compute_com_polygon_mask` / `compute_com_polygon_penalties` (the
-  hard `ComPolygon` gate + post-IK COM-safe retry), and `compute_com_margin`
-  (the static stability margin the ablation records).
+  `compute_com_polygon_penalties` (the hard `ComPolygon` constraint),
+  `compute_com_polygon_mask` (the post-IK COM-safe retry and the re-IK
+  merge and repair checks), `compute_com_margin` (the static stability
+  margin the ablation records), and for the trajectory gate
+  `com_zmp_in_support` (each frame's CoM and multibody ZMP), `retime_factor`
+  (the slowdown that brings the ZMP inside) and `compute_support_mask` (the
+  audit's mask on `SUPPORT_HALF_EXTENTS`).
 
 - [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) — hinge² penalty on
   the `T1_LIMIT_MARGIN_*` bands, used twice: `joint_limit_margin_soft_cost`
   (the `joint_limit_margin` soft cost over segment-endpoint confs) and
-  `JointLimitMarginCost` (the planner's trajopt cost, between endpoints).
+  `JointLimitMarginCost` (the planner's trajopt cost, between endpoints,
+  with `T1_TRAJOPT_ANKLE_UPPER_MARGIN` on the ankle-pitch upper side, which
+  the endpoint bands leave at 0).
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
   through the single planner (`build_motion_planner`). Per-operator: pin the
-  cspace, plan to the particle's conf with `plan_cspace`, append a
-  trajectory entry to `accum_plans` (with `held_objs` for both arms), then
-  attach/detach via the AttachmentManager. Playback walks `accum_plans` and
-  hands each entry to the visualizer; a measure-only audit of every frame's
-  COM (`traj_com_violation_frac`) goes into the run metrics.
+  cspace, plan to the particle's conf with `plan_cspace`, then (when
+  `enable_com_polygon` is on) pass `_balance_gate`: every frame's CoM and
+  multibody ZMP must stay inside `SUPPORT_HALF_EXTENTS`; a ZMP excursion
+  slows the segment uniformly (`_retime`, a C² cubic spline, up to
+  `RETIME_MAX` = 4×), and a CoM excursion or a ZMP still out at 4× raises and
+  fails the candidate. Each segment is appended to `accum_plans` (with
+  `held_objs` for both arms; a slowed one also keeps `planner_timing`, the
+  same spline at the planner's own timing), then the object is
+  attached/detached via the AttachmentManager. Playback walks `accum_plans` and
+  hands each entry to the visualizer. The run metrics get the gate's
+  `retime_max`, `traj_com_min_margin` and `traj_zmp_min_margin`, plus
+  `plan_duration_s` and the measure-only audit `traj_com_violation_frac` /
+  `traj_com_frames` against the gate's rectangle.
 
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
   particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc.
@@ -230,9 +289,10 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   (`_ik_for_pose_no_gate` when `enable_com_init_gate` is off).
   `_build_multi_frame_goal` builds the
   `GoalToolPose` covering every tool frame for single-arm actions: the
-  active frame gets the target pose, while inactive frames keep their
-  ENABLED pose criteria targeting their FK poses at the segment's start
-  state.
+  active frame gets the target pose, while each inactive frame keeps its
+  ENABLED pose criteria, targeting its FK pose at the IK's start conf: home
+  in particle init, a perturbed home seed in the CoM-safe retries, or the
+  current particle in a re-IK refresh.
 
 - [`samplers.py`](cutamp/samplers.py) — grasp / placement / yaw samplers
   (`grasp_4dof_sampler`, `place_4dof_sampler`,
@@ -259,15 +319,19 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
   refresh solver, used only when balance-first is off); `cuda_graphs=True`
   (`uses_cuda_graphs`: runs without coupled re-IK or balance-first, or with
   `align_yaw`, stay eager); `early_stop_patience=150`;
-  `enable_com_polygon=True` (planner cost; the planner's joint-limit margin
-  cost is always on), `enable_com_aware_ik=True` (seed-IK CoM residual). The
+  `enable_com_polygon=True` (the planner's CoM cost, the `ComPolygon` hard
+  constraint, and with `--motion_plan` the trajectory balance gate; the
+  planner's joint-limit margin cost is always on),
+  `enable_com_aware_ik=True` (seed-IK CoM residual, and the re-IK refresh's
+  CoM terms). The
   ablation flags (`enable_com_hard_constraint`,
   `enable_com_init_gate`, `force_adam`, `soft_in_adam`) default to the full
   system.
 
 - [`algorithm.py`](cutamp/algorithm.py) — `setup_cutamp` + `run_cutamp`
-  outer loop. The motion-plan retry sweep lives in `_motion_plan_with_retries`
-  (it skips candidates that repeat a failed plan).
+  outer loop. The motion-plan retry sweep lives in `_motion_plan_with_retries`:
+  a cuRobo failure or a balance-gate rejection moves on to the next
+  candidate, skipping candidates that repeat a failed plan.
 
 - [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
   particles; respects `left_q0` / `right_q0` as fixed initial-state. Holds the
@@ -289,7 +353,7 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 
 - [`cost_function.py`](cutamp/cost_function.py) — hard constraints
   (kinematic, motion, collision, stable placement, and the `ComPolygon`
-  COM-in-hull gate over every `q_*` conf) plus the soft costs listed in
+  CoM-in-rectangle gate on `COM_HALF_EXTENTS` over every `q_*` conf) plus the soft costs listed in
   `SUPPORTED_SOFT_COSTS` (`place_close_to_base`, `joint_limit_margin`,
   `retract_close_to_home`, `minimize_body_movement`, the multi-object
   placement costs, …). `_compute_soft_cost` hard-codes the names, so a new
@@ -328,14 +392,18 @@ every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`utils/plan_processor.py`](cutamp/utils/plan_processor.py) —
   `process_motion_plan` turns the raw plan into the schema-v3 pickle
   `--save_plan` writes: world-frame Trunk and hand poses, joint
-  velocities / accelerations, and Jacobian-based Cartesian velocities.
+  velocities / accelerations, and Jacobian-based Cartesian velocities. A
+  segment the balance gate slowed has more frames at the same `dt`, takes its
+  joint derivatives from the gate's spline, and carries `planner_timing`: the
+  same segment at the motion planner's own timing, in the same format (else
+  `None`).
 
 - Other [`utils/`](cutamp/utils/): `collision.py` (`WorldCollisionCost`,
   sphere-vs-scene distance), `common.py` (pose / transform helpers,
   `get_world_cfg`), `shapes.py` (`sample_greedy_surface_spheres`),
   `rerun_utils.py`, and `timer.py` (`TorchTimer`, GPU-synchronized timing).
 
-### 📁 [`cutamp/tests/`](cutamp/tests/) — 187 tests in 30 files
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 227 tests in 34 files
 
 Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 (`needs_cuda` marker, `make_blocks_t1_world` factory, the module-scoped
@@ -352,7 +420,17 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   CoM-aware seed-IK: fork/cuTAMP penalty parity, FD-checked gradients,
   centering A/B with joint-limit and pose-accuracy guards.
 - [`test_motion_anchor.py`](cutamp/tests/test_motion_anchor.py) — full
-  pipeline: cspace-anchored pick/place terminals, all arrivals COM-in-hull.
+  pipeline: cspace-anchored pick/place terminals, all arrivals
+  CoM-in-rectangle, every exported frame's CoM and ZMP inside
+  `SUPPORT_HALF_EXTENTS`, and slowed segments' `planner_timing`; the no-CoM
+  arm is never gated.
+- [`test_balance_gate.py`](cutamp/tests/test_balance_gate.py) — the
+  trajectory balance gate: the multibody ZMP against a float64 reference,
+  CoM rejects, ZMP slowdowns up to the 4× cap, `_retime`'s endpoints, and
+  the planner timing it keeps.
+- [`test_robot_com.py`](cutamp/tests/test_robot_com.py) — `t1_simplified`'s
+  real-T1 masses and CoM against yourdfpy and `t1.urdf`; the base is the sole
+  plane.
 - [`test_gn_refresh.py`](cutamp/tests/test_gn_refresh.py) /
   [`test_gn_balanced_step.py`](cutamp/tests/test_gn_balanced_step.py) — GN
   refresh, including the Jacobian-convention guard, and the balance-first core.
@@ -365,7 +443,8 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~3.5 min on an RTX 4090).
+(GPU required for the integration tests; ~5.5 min on an RTX 4090: 223
+passed, 4 skipped on 2026-11-03).
 `CUTAMP_SLOW=1` also runs the 4 live `--cuda_graphs` tests in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), and the
 MPC example has its own: `pytest examples/`.
@@ -375,10 +454,13 @@ MPC example has its own: `pytest examples/`.
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
   (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--robot` or `--env`
   flag, no other envs in this branch); `--surface_height` raises the blocks
-  and goal pad, `--seed` seeds the sampling.
+  and goal pad, `--seed` seeds the sampling, and `--save_plan PATH` (or
+  `auto`, next to the run's metrics) saves the processed plan.
 - [`run_ablation.py`](cutamp/scripts/run_ablation.py) — the 2x2 CoM × re-IK
-  ablation study (cells `full`, `no_com`, `no_reik`, `standard` × 4 heights ×
-  5 seeds), one `run_cutamp` subprocess per run, with a resumable manifest.
+  ablation plus `default_reik` (cells `full`, `default_reik`, `no_com`,
+  `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`), one
+  `run_cutamp` subprocess per run that saves its plan (`--save_plan auto`),
+  with a resumable manifest; `--smoke` / `--heights` / `--seeds` shrink it.
 - [`analyze_ablation.py`](cutamp/scripts/analyze_ablation.py) — turns that
   manifest into `results.csv`, `deltas.csv`, `results.md` and figures.
 - [`check_plan_margins.py`](cutamp/scripts/check_plan_margins.py) — per-joint
@@ -401,7 +483,10 @@ balance-first GN refresh replayed as CUDA graphs, the `joint_limit_margin`
 soft cost and CoM-aware IK,
 so placements stay near the
 base, endpoint confs keep off their joint limits, and every arrival lands with
-the COM centered in the support polygon.
+its CoM inside the keyframe rectangle. With `--motion_plan`, every trajectory
+frame also keeps its CoM and ZMP inside the soles shrunk 2 cm: a segment
+whose ZMP would leave them is slowed down, up to 4×, and a candidate that
+still fails is dropped (`motion_solver._balance_gate`).
 
 ```bash
 # Smoke test (no motion plan)
@@ -413,10 +498,13 @@ python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --disable_visualizer
 # With Rerun visualizer
 python -m cutamp.scripts.run_cutamp --motion_plan -n 64
 
-# Save the processed plan (schema v3) for the MPC consumer, then read it back
-# and check its joint-limit margins (margins need balance-first: with
-# --no_reik_balance_first the check fails on all 10 runs at -n 64, seeds 0-9,
-# --soft_cost joint_limit_margin, each on Torso_Pitch's lower side)
+# Save the processed plan (schema v3; a segment the balance gate slowed also
+# carries planner_timing, the planner's own faster timing) for the MPC
+# consumer, then read it back and check its joint-limit margins (margins need
+# balance-first: with --no_reik_balance_first the check failed on all 10 runs
+# at -n 64, seeds 0-9, --soft_cost joint_limit_margin, each on Torso_Pitch's
+# lower side, measured 2026-11-02, before the real-mass model and the
+# trajectory gate)
 python -m cutamp.scripts.run_cutamp --motion_plan -n 64 \
     --save_plan data/motion_plan.pkl
 python examples/load_motion_plan_for_mpc.py data/motion_plan.pkl
@@ -433,7 +521,8 @@ python -m cutamp.scripts.run_cutamp --motion_plan --no_coupled_reik
 # Eager Adam steps and refreshes (no CUDA graphs)
 python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
 
-# 2x2 ablation study, then its table and figures
+# 2x2 ablation study plus default_reik (200 runs at -n 512, each saving its
+# plan), then its table and figures
 python -m cutamp.scripts.run_ablation --out /tmp/ablation-study
 python -m cutamp.scripts.analyze_ablation \
     --manifest /tmp/ablation-study/manifest.json --out docs/ablation
@@ -465,13 +554,17 @@ Peak VRAM with motion planning: about 3 GiB at `-n 64` and 8 GiB at the
 default 256 (the CUDA graphs add about 0.05 and 0.3 GiB);
 `--no_reik_balance_first` takes about 3.5 and 9.5 GiB (see
 `num_particles` in `config.py` for 512 and 1024). These figures and the
-commands above use PyTorch's default allocator.
+commands above use PyTorch's default allocator. They were measured on
+2026-10-31, before the real-mass model and the trajectory balance gate
+(which adds one lazily built `Kinematics` and an FK pass per segment after
+Adam).
 
 ## Key Design Decisions
 
-1. **Single 21-DOF MotionPlanner** — cuRobo v0.8's `GoalToolPose` lets IK
-   target one tool frame at a time on a kinematics that exposes both arms,
-   and the planner then plans every segment in cspace, so we no longer need
+1. **Single 21-DOF MotionPlanner** — cuRobo v0.8's `GoalToolPose` takes a
+   target for every tool frame of a kinematics that exposes both arms (the
+   inactive frames get their current FK pose), and the planner then plans
+   every segment in cspace, so we no longer need
    two MotionGens or per-arm "shared joint" propagation.
 
 2. **Planar base via `extra_links`** — `world → base_j_x → base_j_y →
@@ -492,9 +585,12 @@ commands above use PyTorch's default allocator.
    refresh keep the inactive arm's joints fixed, so that hand rides with the
    trunk when they move the body, and `plan_cspace` holds nothing between
    confs. Both arms are in the optimizer's collision constraints and the
-   planner's collision checks, with two gaps: GN checks no collision (the
-   optimizer rescores every conf each step), and a pick or place segment
-   disables its block or support surface for the whole robot.
+   planner's collision checks, with three gaps: GN checks no collision (the
+   optimizer rescores every conf each step), a pick or place segment
+   disables its block or support surface for the whole robot, and a segment
+   the balance gate slows down is resampled through the planner's frames
+   (`_retime`) without new collision or joint-limit checks on the in-between
+   frames.
 
 4. **Both arms tracked through every trajectory** — body joints are unlocked
    during single-arm planning, so an inactive arm holding a block will still
@@ -503,40 +599,62 @@ commands above use PyTorch's default allocator.
 
 5. **Retract after pick/place** — the per-arm `RetractHolding` (collision checks
    exclude held object) and `RetractFree` (empty gripper) operators move toward
-   `t1_home` after each manipulation. Retract confs start at `t1_home`; hard
-   collision constraints, plus the opt-in `retract_close_to_home` soft cost,
-   shape the result.
+   `t1_home` after each manipulation. Retract confs start at `t1_home`; the
+   hard collision, joint-limit and `ComPolygon` constraints, the default
+   `joint_limit_margin` soft cost (under coupled re-IK) and the opt-in
+   `retract_close_to_home` shape the result.
 
 6. **cuRobo internals isolated** — every workaround that reaches into cuRobo's
    private API lives in
    [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py) so a
-   future cuRobo upgrade has one place to audit. The exceptions are plain
-   `curobo._src` imports (the cost base classes, `utils/collision.py`'s
+   future cuRobo upgrade has one place to audit. The exceptions are the
+   one-off workarounds beside their callers (`_attach_object` /
+   `_detach_object`, `_achieved_pose_errors`), plain `curobo._src` imports
+   (the cost base classes and `SelfCollisionCost`, `utils/collision.py`'s
    scene collision, `config_io`) and the fork edits inside the vendored
-   `curobo/` tree itself (grep `cuTAMP fork`, plus the untagged seed-IK fix);
-   those must travel with any cuRobo upgrade.
+   `curobo/` tree itself (grep `cuTAMP`, plus two untagged ones: the seed-IK
+   fix in `seed_iteration_state_manager.py` and the link-CoM and link-mass
+   fixes in `parser_urdf.py`; `git -C curobo diff ac5f931 main` lists them
+   all); those must travel with any cuRobo upgrade, or the link CoMs come
+   back wrong.
 
-7. **Layered COM safety** — the COM is kept inside the two-foot support
-   polygon by independent layers, each guarding a different frontier:
+7. **Layered COM safety** — the COM is kept inside the real T1's soles,
+   shrunk 2 cm (`SUPPORT_HALF_EXTENTS`, every trajectory frame) and another
+   5 mm for keyframes (`COM_HALF_EXTENTS`), both centred on `COM_CENTER`,
+   1 cm ahead of the ankle axis (`com_polygon_cost.py`), by independent
+   layers, each guarding a different frontier:
    - **CoM-aware seed-IK** (cuRobo fork residual, on by default): the IK
      itself trades hand pose vs COM, recruiting the knees/ankles within
-     joint limits, with a pull-to-center term — endpoint confs come out
-     centered, not edge-parked.
+     joint limits, with a pull-to-center term on a base-centred box
+     (`get_t1_ik_solver`, 2 cm short of the keyframe rectangle at the toe) —
+     endpoint confs come out near the ankle axis, not edge-parked.
    - **Hard `ComPolygon` gate**: every optimizer conf must have COM penalty
      ≤ `COM_TOL`; a post-IK mask + retry backstops the IK.
    - **Balance-first re-IK refresh**: covered confs are outside Adam, so the
      GN refresh puts the CoM first (the pose is least squares inside the
      polygon) and the final pre-check refresh repairs any row still outside
      with the CoM-aware cuRobo IK (`--no_reik_balance_first` instead falls
-     back to that IK for each GN row that leaves the polygon).
+     back to the low-seed CoM-aware cuRobo IK for each GN row that misses
+     pose tolerance or leaves the polygon).
    - **COM-anchored terminals**: pick/place trajectories end exactly at the
      gate-approved conf (`plan_cspace`), so cuRobo can't re-resolve the
      redundancy at the endpoint.
-   - **Planner rollout COM cost**: a soft barrier keeps mid-trajectory
-     frames in-hull between anchored endpoints.
+   - **Planner rollout COM cost**: a soft barrier (`ComOverBasePolygonCost`)
+     pushes mid-trajectory frames toward the keyframe rectangle between
+     anchored endpoints; it cannot guarantee them.
+   - **Trajectory balance gate** (`motion_solver._balance_gate`,
+     `--motion_plan` only): every frame's CoM and multibody ZMP
+     (`com_zmp_in_support`, from the plan's own velocities and
+     accelerations) must stay inside `SUPPORT_HALF_EXTENTS`. A CoM exit fails
+     the candidate; a ZMP exit slows the segment uniformly (`_retime`, up to
+     `RETIME_MAX` = 4×) instead of letting it tip, and fails it past 4×.
    - **`place_close_to_base`** (default soft cost): biases chosen placements
      away from the far-reach regime where no in-limit posture can center
      the COM.
 
-   `--no_com_all` (the ablation umbrella) turns off the seed-IK residual,
-   the gate and its init retry, and the planner cost together.
+   `--no_com_all` (the ablation umbrella) turns off the seed-IK residual
+   and the refresh's CoM terms, the gate and its init retry, the planner
+   cost and the trajectory balance gate together. `place_close_to_base`
+   stays when it is in `--soft_cost`, and the measure-only metrics
+   (`traj_com_violation_frac`, `best_com_margin`, `com_in_polygon_per_conf`)
+   are still recorded.
