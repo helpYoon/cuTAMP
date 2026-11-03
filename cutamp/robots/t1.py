@@ -23,7 +23,7 @@ import copy
 import logging
 from pathlib import Path
 from functools import lru_cache
-from typing import Dict, Literal, Tuple, Union
+from typing import Dict, Literal, NamedTuple, Tuple, Union
 
 import numpy as np
 import rerun as rr
@@ -211,6 +211,37 @@ def get_t1_kinematics(device_cfg: DeviceCfg = None, compute_jacobian: bool = Fal
     cfg = t1_curobo_cfg()
     kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg)
     return Kinematics(kin_cfg, compute_com=True, compute_jacobian=compute_jacobian)
+
+
+class T1Bodies(NamedTuple):
+    """Every massive link of the planning model, for the multibody ZMP (com_polygon_cost.com_zmp_in_support)."""
+    kinematics: Kinematics  # tool frames: the links, mobile_base_link first
+    mass: torch.Tensor      # [L] kg
+    com: torch.Tensor       # [L, 3] in the link frame, m
+    inertia: torch.Tensor   # [L, 3, 3] about the CoM, in the link frame, kg m^2
+
+
+def get_t1_bodies(device_cfg: DeviceCfg = None) -> T1Bodies:
+    """:class:`T1Bodies` of the 21-DOF model. Masses and CoMs are cuRobo's, the ones every ``robot_com`` sums
+    (its virtual links weigh a few grams); inertias are the URDF's, which cuRobo's parser does not keep."""
+    if device_cfg is None:
+        device_cfg = DeviceCfg()
+    cfg = copy.deepcopy(t1_curobo_cfg())  # from_robot_yaml_file writes tool_frames into the dict it is given
+    kp = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg).kinematics_config
+    names = [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0]
+    names.insert(0, names.pop(names.index("mobile_base_link")))
+    kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=names, device_cfg=device_cfg),
+                     compute_spheres=False)
+    kp = kin.config.kinematics_config
+    mass_com = kp.link_masses_com[[kp.link_name_to_idx_map[n] for n in names]]
+    urdf = URDF.load(cfg["robot_cfg"]["kinematics"]["urdf_path"], load_meshes=False, build_scene_graph=False)
+    inertia = np.zeros((len(names), 3, 3))
+    for k, n in enumerate(names):
+        inertial = urdf.link_map[n].inertial if n in urdf.link_map else None
+        if inertial is not None:
+            r = inertial.origin[:3, :3]
+            inertia[k] = r @ inertial.inertia @ r.T
+    return T1Bodies(kin, mass_com[:, 3], mass_com[:, :3], mass_com.new_tensor(inertia))
 
 
 def _trajopt_transition_dict_with_compute_com() -> dict:

@@ -181,6 +181,18 @@ def test_all_segment_arrivals_com_in_hull(seed):
     assert overall["traj_com_violation_frac"] == 0.0
     assert overall["traj_com_min_margin"] >= 0.0 and overall["traj_zmp_min_margin"] >= 0.0
     assert overall["retime_max"] >= 1.0 and overall["plan_duration_s"] > 0.0
+    # ... measured again on the frames actually exported, so a gated segment that never reaches the export
+    # fails here.
+    from cutamp.com_polygon_cost import SUPPORT_HALF_EXTENTS, com_margin_from_base, com_zmp_in_support
+    from cutamp.motion_solver import ZMP_STEP
+    zero, h = torch.zeros_like(q_home), ZMP_STEP
+    for si, seg in enumerate(segments):
+        Q, V, A = (torch.stack([_frame_q(base, idx, seg[f], t) for t in range(seg["T"])])
+                   for base, f in ((q_home, "position"), (zero, "velocity"), (zero, "acceleration")))
+        com, zmp = com_zmp_in_support(world, torch.stack([Q - h * V + h * h / 2 * A, Q, Q + h * V + h * h / 2 * A]), h)
+        for name, xy in (("CoM", com), ("ZMP", zmp)):
+            m = com_margin_from_base(xy, SUPPORT_HALF_EXTENTS).min().item()
+            assert m >= -1e-5, f"segment {si}: exported {name} {-100 * m:.2f} cm outside the support rectangle"
 
 
 @needs_cuda

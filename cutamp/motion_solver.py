@@ -614,6 +614,19 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
 
 # The slowest the balance gate will make a segment: 4x longer, 16x lower accelerations.
 RETIME_MAX = 4.0
+# The balance gate's central-difference step along each frame's motion, s.
+ZMP_STEP = 0.01
+
+
+def _taylor_positions(world: TAMPWorld, planner, plan_js, h: float = ZMP_STEP) -> torch.Tensor:
+    """``[3, T, full_dof]``: each frame's configuration ``h`` s before, at and after it along the plan's own
+    velocity and acceleration, ``q + tau q' + tau^2 / 2 q''`` (com_zmp_in_support's input)."""
+    q, v, a = plan_js.position, plan_js.velocity, plan_js.acceleration
+    return torch.stack([
+        _full_positions(world, planner, JointState.from_position(q + tau * v + 0.5 * tau**2 * a,
+                                                                 joint_names=plan_js.joint_names))
+        for tau in (-h, 0.0, h)
+    ])
 
 
 def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
@@ -651,8 +664,8 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     """The real robot's balance check on every interpolated frame of a segment.
 
     The CoM must stay inside the support rectangle (``SUPPORT_HALF_EXTENTS``); a segment whose CoM leaves it
-    raises RuntimeError, so the planner moves to its next candidate or skeleton. The cart-table ZMP
-    must stay inside too; a segment whose ZMP leaves it is slowed down uniformly until it fits, up to
+    raises RuntimeError, so the planner moves to its next candidate or skeleton. The multibody ZMP, from
+    the plan's own velocities and accelerations, must stay inside too; a segment whose ZMP leaves it is slowed down uniformly until it fits, up to
     ``RETIME_MAX``, past which it raises. Returns ``(plan_js, stats)``: the plan, retimed if needed,
     and ``{"retime", "com_min_margin", "zmp_min_margin"}`` (metres)."""
     from cutamp.com_polygon_cost import (
@@ -660,7 +673,7 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     )
 
     def margins(js):
-        com, zmp = com_zmp_in_support(world, _full_positions(world, planner, js), dt)
+        com, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
         return (com, zmp, com_margin_from_base(com, SUPPORT_HALF_EXTENTS).min().item(),
                 com_margin_from_base(zmp, SUPPORT_HALF_EXTENTS).min().item())
 
@@ -668,15 +681,16 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
         com, zmp, com_m, zmp_m = margins(plan_js)
         if com_m < 0:
             raise RuntimeError(f"trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
-        out, s = plan_js, 1.05 * retime_factor(com, zmp)
+        out, s, tried = plan_js, 1.05 * retime_factor(com, zmp), 1.0
         while zmp_m < 0:
-            if s > RETIME_MAX:
-                raise RuntimeError(f"trajectory ZMP needs a {s:.1f}x slowdown (cap {RETIME_MAX}x)")
-            out = _retime(plan_js, s, dt)
+            if tried >= RETIME_MAX:
+                raise RuntimeError(f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap")
+            tried = min(s, RETIME_MAX)
+            out = _retime(plan_js, tried, dt)
             _, _, com_m, zmp_m = margins(out)
             if com_m < 0:
                 raise RuntimeError(f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
-            s *= 1.25
+            s = 1.25 * tried
     n, n_out = plan_js.position.shape[-2], out.position.shape[-2]
     return out, {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0,
                  "com_min_margin": com_m, "zmp_min_margin": zmp_m}

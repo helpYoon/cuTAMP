@@ -261,15 +261,10 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     return com_margin_from_base(_project_com_to_base(com, base_T))
 
 
-def cart_table_zmp(com_b: torch.Tensor, dt: float, g: float = 9.81) -> torch.Tensor:
-    """Cart-table ZMP ``[T, 2]`` of a support-frame CoM path ``[T, 3]`` sampled every ``dt`` s, z the
-    height above the sole: ``c_xy - c_z / (g + c''_z) * c''_xy``. Ignores the bodies' angular momentum.
-    One-sided differences at the ends overstate a resting end's acceleration, the safe direction."""
-    if com_b.shape[0] < 3:  # too short to differentiate: nothing moves
-        return com_b[:, :2].clone()
-    v = torch.gradient(com_b, spacing=dt, dim=0, edge_order=2)[0]
-    a = torch.gradient(v, spacing=dt, dim=0, edge_order=2)[0]
-    return com_b[:, :2] - com_b[:, 2:] / (g + a[:, 2:]) * a[:, :2]
+def _vee(m: torch.Tensor) -> torch.Tensor:
+    """The vector of a ``[..., 3, 3]`` matrix's skew-symmetric part."""
+    return 0.5 * torch.stack([m[..., 2, 1] - m[..., 1, 2], m[..., 0, 2] - m[..., 2, 0],
+                              m[..., 1, 0] - m[..., 0, 1]], dim=-1)
 
 
 def retime_factor(com_xy: torch.Tensor, zmp_xy: torch.Tensor) -> float:
@@ -282,14 +277,39 @@ def retime_factor(com_xy: torch.Tensor, zmp_xy: torch.Tensor) -> float:
     return max(1.0, math.sqrt(ratio))
 
 
-def com_zmp_in_support(world, q_full: torch.Tensor, dt: float):
-    """``(com_xy [T, 2], zmp_xy [T, 2])`` in the support frame for a trajectory ``[T, full_dof]`` sampled
-    every ``dt`` s; one FK on ``world.kinematics``. mobile_base_link's origin is the sole plane, so the
-    base-frame z is the CoM's height (test_robot_com.py)."""
-    com, base_T = _fk_com_and_base(world, q_full)
-    z = (base_T[:, :3, 2] * (com - base_T[:, :3, 3])).sum(-1, keepdim=True)
-    com_xy = _project_com_to_base(com, base_T)
-    return com_xy, cart_table_zmp(torch.cat([com_xy, z], dim=-1), dt)
+def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
+    """``(com_xy [T, 2], zmp_xy [T, 2])`` in the support frame. ``q3`` ``[3, T, full_dof]`` holds each frame's
+    configuration ``h`` s before, at and after it along the plan's own velocity and acceleration
+    (motion_solver._taylor_positions), so central differences give every link's acceleration and angular
+    acceleration as the plan moves, to O(h^2); one FK on ``world.bodies``.
+
+    The ZMP is the multibody one: over the links, ``sum m (g + z'') x - m z x''`` less the rate of each link's
+    spin about its own CoM (y: plus), over ``sum m (g + z'')``. A trunk swinging above the hips moves it
+    centimetres past the CoM alone's cart-table ZMP. z is the height above mobile_base_link's origin, the sole plane (test_robot_com.py); the
+    base stays put during a segment, so its frame is inertial."""
+    from curobo.types import Pose
+    kin, m, c, inertia = world.bodies
+    T = q3.shape[1]
+    poses = _fk_state(world, q3.reshape(3 * T, -1), kin).tool_poses
+    X = Pose(position=poses.position.reshape(-1, 3), quaternion=poses.quaternion.reshape(-1, 4)).get_matrix()
+    X = X.reshape(3, T, -1, 4, 4)
+    base_inv = X[1, :, :1, :3, :3].transpose(-1, -2)                  # [T, 1, 3, 3]: world -> base frame
+    R = base_inv @ X[..., :3, :3]                                      # [3, T, L, 3, 3]
+    x = (base_inv @ (X[..., :3, 3] - X[1, :, :1, :3, 3]).unsqueeze(-1) + R @ c.unsqueeze(-1)).squeeze(-1)
+    a = (x[2] - 2 * x[1] + x[0]) / h**2                                # link CoM accelerations
+    Rt = R[1].transpose(-1, -2)
+    w = _vee(Rt @ (R[2] - R[0])) / (2 * h)                             # body-frame angular velocity
+    dw = _vee(Rt @ (R[2] - 2 * R[1] + R[0])) / h**2                    # R^T R'' = [dw] + [w]^2, symmetric
+    Iw = (inertia @ w.unsqueeze(-1)).squeeze(-1)
+    spin = (inertia @ dw.unsqueeze(-1)).squeeze(-1) + torch.cross(w, Iw, dim=-1)
+    spin = (R[1] @ spin.unsqueeze(-1)).squeeze(-1).sum(-2)            # [T, 3]: sum of the links' L'
+    x = x[1]
+    f = m * (g + a[..., 2])
+    zmp = torch.stack([(f * x[..., 0] - m * x[..., 2] * a[..., 0]).sum(-1) - spin[:, 1],
+                       (f * x[..., 1] - m * x[..., 2] * a[..., 1]).sum(-1) + spin[:, 0]], dim=-1)
+    centre = _center(x.device, x.dtype)
+    com = (m.unsqueeze(-1) * x[..., :2]).sum(-2) / m.sum()
+    return com - centre, zmp / f.sum(-1, keepdim=True) - centre
 
 
 def compute_com_polygon_penalties(

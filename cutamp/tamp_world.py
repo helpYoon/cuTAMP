@@ -102,6 +102,7 @@ class TAMPWorld:
         self._enable_com_aware_ik = enable_com_aware_ik
         self._ik_refresh_solver = None
         self._kinematics_jac = None
+        self._bodies = None
         self._site_kinematics: Dict[str, Kinematics] = {}
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).
@@ -242,6 +243,15 @@ class TAMPWorld:
                 device_cfg=self.device_cfg, compute_jacobian=True,
             )
         return self._kinematics_jac
+
+    @property
+    def bodies(self):
+        """Every massive link of the robot (:func:`cutamp.robots.t1.get_t1_bodies`, lazily built): the
+        balance gate's multibody ZMP."""
+        if self._bodies is None:
+            from cutamp.robots.t1 import get_t1_bodies
+            self._bodies = get_t1_bodies(device_cfg=self.device_cfg)
+        return self._bodies
 
     def site_kinematics(self, name: str) -> Kinematics:
         """The Adam loop's FK site ``name``: a dedicated, lazily built, CoM-enabled Kinematics
