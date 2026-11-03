@@ -349,13 +349,18 @@ def solve_curobo(
     accum_plans: List[dict] = []
     gate_stats: List[dict] = []
 
-    def gated(plan, dt):
+    def add_segment(plan, dt, arm):
         # The real robot's balance check (balance arms only): every frame's CoM and ZMP inside the support
-        # rectangle, slowing the segment down if its ZMP needs it; a RuntimeError fails the candidate.
-        if not config.enable_com_polygon:
-            return plan
-        plan, stats = _balance_gate(world, planner, plan, dt)
-        gate_stats.append(stats)
+        # rectangle, slowing the segment down if its ZMP needs it; a RuntimeError fails the candidate. A slowed
+        # segment also keeps its motion planner's timing, with the held objects along it.
+        entry = {"dt": dt, "arm": arm}
+        if config.enable_com_polygon:
+            plan, stats, fast = _balance_gate(world, planner, plan, dt)
+            gate_stats.append(stats)
+            if fast is not None:
+                entry["planner_timing"] = {"plan": fast, "held_objs": state.compute_all_held_obj_poses(fast)}
+        entry.update(plan=plan, held_objs=state.compute_all_held_obj_poses(plan))
+        accum_plans.append(entry)
         return plan
 
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
@@ -396,13 +401,7 @@ def solve_curobo(
                     )
                 if not _cspace_plan_succeeded(result):
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
-                dt = _plan_dt(planner)
-                plan = gated(_interp_plan(result), dt)
-
-                accum_plans.append({
-                    "plan": plan, "dt": dt, "arm": arm,
-                    "held_objs": state.compute_all_held_obj_poses(plan),
-                })
+                plan = add_segment(_interp_plan(result), _plan_dt(planner), arm)
                 last_js = _last_timestep_js(plan, planner)
                 state.current_js = last_js
 
@@ -427,12 +426,7 @@ def solve_curobo(
                 # Attach AT the grasp conf. Block tracking from this point uses
                 # inverse(obj_from_grasp) since the gripper is at the intended
                 # grasp pose.
-                dt = _plan_dt(planner)
-                grasp_plan = gated(_interp_plan(grasp_result), dt)
-                accum_plans.append({
-                    "plan": grasp_plan, "dt": dt, "arm": arm,
-                    "held_objs": state.compute_all_held_obj_poses(grasp_plan),
-                })
+                grasp_plan = add_segment(_interp_plan(grasp_result), _plan_dt(planner), arm)
                 last_js = _last_timestep_js(grasp_plan, planner)
 
                 _attach_object(planner, obj_name, last_js, arm)
@@ -461,13 +455,7 @@ def solve_curobo(
                         disable_obstacle=surface_name, ground_op=ground_op,
                     )
 
-                dt = _plan_dt(planner)
-                plan = gated(_interp_plan(place_result), dt)
-
-                accum_plans.append({
-                    "plan": plan, "dt": dt, "arm": arm,
-                    "held_objs": state.compute_all_held_obj_poses(plan),
-                })
+                plan = add_segment(_interp_plan(place_result), _plan_dt(planner), arm)
                 last_js = _last_timestep_js(plan, planner)
                 obj_to_current_pose[obj_name] = world_from_obj_target
 
@@ -666,8 +654,10 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     The CoM must stay inside the support rectangle (``SUPPORT_HALF_EXTENTS``); a segment whose CoM leaves it
     raises RuntimeError, so the planner moves to its next candidate or skeleton. The multibody ZMP, from
     the plan's own velocities and accelerations, must stay inside too; a segment whose ZMP leaves it is slowed down uniformly until it fits, up to
-    ``RETIME_MAX``, past which it raises. Returns ``(plan_js, stats)``: the plan, retimed if needed,
-    and ``{"retime", "com_min_margin", "zmp_min_margin"}`` (metres)."""
+    ``RETIME_MAX``, past which it raises. Returns ``(plan_js, stats, planner_timing)``: the plan, retimed if
+    needed; ``{"retime", "com_min_margin", "zmp_min_margin"}`` (metres); and, for a slowed segment, the same
+    spline sampled without a slowdown: the motion planner's positions exactly, with the spline's velocities and
+    accelerations (the timing test runs both), else None."""
     from cutamp.com_polygon_cost import (
         SUPPORT_HALF_EXTENTS, com_margin_from_base, com_zmp_in_support, retime_factor,
     )
@@ -692,5 +682,5 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
                 raise RuntimeError(f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
             s = 1.25 * tried
     n, n_out = plan_js.position.shape[-2], out.position.shape[-2]
-    return out, {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0,
-                 "com_min_margin": com_m, "zmp_min_margin": zmp_m}
+    stats = {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0, "com_min_margin": com_m, "zmp_min_margin": zmp_m}
+    return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)

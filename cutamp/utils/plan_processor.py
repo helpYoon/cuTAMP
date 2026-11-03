@@ -42,7 +42,8 @@ Output schema per segment::
             "left_hand_quat_xyzw":   [T, 4],
         },
         "velocity": {
-            # Joint velocities: native cuRobo JointState.velocity (required)
+            # Joint velocities: native cuRobo JointState.velocity, or the balance gate's spline's for a
+            # segment it slowed (required)
             "trunk_pitch":                     [T],
             "trunk_yaw":                       [T],
             "ankle_pitch":                     [T],
@@ -59,7 +60,7 @@ Output schema per segment::
             "left_hand_angular_velocity_world":  [T, 3],
         },
         "acceleration": {
-            # Joint accelerations: native cuRobo JointState.acceleration
+            # Joint accelerations: native cuRobo JointState.acceleration, or the gate's spline's
             # (required; cuRobo's bspline trajopt populates it). A missing
             # native derivative raises rather than fabricating an FD.
             "trunk_pitch":                     [T],
@@ -79,6 +80,10 @@ Output schema per segment::
             "left_hand_angular_acceleration_world":  [T, 3],
         },
         "held_objs": {arm: (obj_name, [T, 4, 4] world_from_obj)},
+        # A segment the balance gate slowed down: the same segment at the motion planner's own, faster
+        # timing (the gate's spline sampled without a slowdown: the planner's positions, the spline's
+        # derivatives), as a segment dict of this schema; else None.
+        "planner_timing": dict | None,
     }
 
 **Quaternion convention**: BOTH wxyz (cuRobo native) AND xyzw (ROS / scipy /
@@ -406,6 +411,8 @@ def process_motion_plan(
             "velocity": velocity,
             "acceleration": acceleration,
             "held_objs": held_objs_np,
+            "planner_timing": None if entry.get("planner_timing") is None else process_motion_plan(
+                [{**entry["planner_timing"], "dt": dt, "arm": entry.get("arm")}], kinematics)["segments"][0],
         })
 
     # Runtime metadata is kept compact — the authoritative schema reference

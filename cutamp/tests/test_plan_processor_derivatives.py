@@ -320,3 +320,39 @@ def test_native_joint_passthrough_and_no_two_zero_tail():
     # (drives the accel assertion above and confirms J·q̇ is live).
     lh_vel = np.asarray(seg["velocity"]["left_hand_xyz_dot"])
     assert np.abs(lh_vel[-1]).max() > 1e-3
+
+
+@needs_cuda
+def test_planner_timing_is_processed_beside_its_segment():
+    """A segment the balance gate slowed carries its motion planner's timing (the timing test), processed like
+    the segment itself; every other segment has ``planner_timing`` None."""
+    import numpy as np
+    import torch
+
+    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES
+    from cutamp.utils.plan_processor import _build_processing_kinematics, process_motion_plan
+    from curobo.types import JointState
+
+    kin = _build_processing_kinematics()
+    device = kin.device_cfg.device
+    names = list(kin.joint_names)
+    idx = {n: i for i, n in enumerate(names)}
+
+    def ramp(T):
+        pos = torch.zeros(T, len(names), device=device)
+        pos[:, idx["Left_Shoulder_Pitch"]] = torch.linspace(0.0, -0.6, T, device=device)
+        js = JointState.from_position(pos, joint_names=names)
+        js.velocity, js.acceleration = torch.zeros_like(pos), torch.zeros_like(pos)
+        return js
+
+    slow, fast = ramp(41), ramp(21)
+    out = process_motion_plan([
+        {"plan": slow, "dt": 0.025, "arm": "left", "planner_timing": {"plan": fast, "held_objs": {}}},
+        {"plan": ramp(11), "dt": 0.025, "arm": "left"},
+    ], kinematics=kin)
+    seg, other = out["segments"]
+    pt = seg["planner_timing"]
+    assert seg["T"] == 41 and pt["T"] == 21 and pt["dt"] == 0.025 and pt["arm"] == "left"
+    left = [idx[n] for n in LEFT_ARM_JOINT_NAMES]
+    np.testing.assert_allclose(pt["position"]["left_arm"], fast.position[:, left].cpu().numpy(), rtol=0, atol=1e-6)
+    assert other["planner_timing"] is None

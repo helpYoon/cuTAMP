@@ -104,6 +104,24 @@ def test_retime_preserves_endpoints():
     assert out.acceleration.max().item() == pytest.approx(a.max() / s_eff**2, rel=2e-2)
 
 
+def test_retime_without_slowdown_is_the_motion_planners_timing():
+    # The timing test runs a slowed segment at the motion planner's own timing: the gate's spline sampled
+    # without a slowdown. That reproduces the planner's frames, and the slowed segment is the same curve
+    # played s times slower (frame 2k of a 2x slowdown is frame k, with velocity / 2 and acceleration / 4).
+    from curobo.types import JointState
+
+    from cutamp.motion_solver import _retime
+    _, p, v, a = _min_jerk(1.0, 41)
+    col = lambda x: torch.tensor(x, dtype=torch.float32).view(-1, 1)  # noqa: E731
+    js = JointState(position=col(p), velocity=col(v), acceleration=col(a), joint_names=["j"])
+    fast, slow = _retime(js, 1.0, DT), _retime(js, 2.0, DT)
+    assert fast.position.shape == js.position.shape
+    torch.testing.assert_close(fast.position, js.position, rtol=0, atol=1e-6)
+    torch.testing.assert_close(slow.position[::2], fast.position, rtol=0, atol=1e-6)
+    torch.testing.assert_close(slow.velocity[::2], fast.velocity / 2, rtol=0, atol=1e-5)
+    torch.testing.assert_close(slow.acceleration[::2], fast.acceleration / 4, rtol=0, atol=1e-4)
+
+
 def _ramp(world, moves, T):
     """The rest-to-rest min-jerk move ``moves`` ({joint: delta} from home) over T s at DT, other joints at
     home, as a full-dof JointState in world.kinematics order."""
@@ -194,7 +212,7 @@ def test_gate_slows_a_bow_start_by_the_bodies_zmp():
     ref = _reference_margins(moves, 0.8)
     assert ref["com", "support"] > 0 and ref["zmp", "soles"] > 0 > ref["zmp", "support"]
     world = make_blocks_t1_world()
-    out, stats = _balance_gate(world, None, _torso_ramp(world, -0.5, 0.8), DT)
+    out, stats, _ = _balance_gate(world, None, _torso_ramp(world, -0.5, 0.8), DT)
     assert stats["retime"] > 1.0 and stats["zmp_min_margin"] >= 0
     assert _reference_margins(moves, 0.8 * stats["retime"])["zmp", "support"] >= 0
 
@@ -205,25 +223,29 @@ def test_gate_tries_the_retime_cap():
     # short and the next step (x1.25) overshoots the 4x cap: the gate still tries 4x before giving up.
     from cutamp.motion_solver import RETIME_MAX, _balance_gate
     world = make_blocks_t1_world()
-    out, stats = _balance_gate(world, None, _torso_ramp(world, -0.6, 0.3), DT)
+    out, stats, _ = _balance_gate(world, None, _torso_ramp(world, -0.6, 0.3), DT)
     assert 3.6 < stats["retime"] <= RETIME_MAX and stats["zmp_min_margin"] >= 0
 
 
 @needs_cuda
 def test_gate_slows_fast_lean():
     # A bow to -0.6 is CoM-safe (8 cm), but in 0.5 s its ZMP swings far past the edges.
-    from cutamp.motion_solver import _balance_gate
+    from cutamp.motion_solver import _balance_gate, _retime
     world = make_blocks_t1_world()
     plan = _torso_ramp(world, -0.6, 0.5)
     com, zmp = _gate_view(world, plan)
     margin = lambda xy: com_margin_from_base(xy, SUPPORT_HALF_EXTENTS).min()  # noqa: E731
     assert margin(com) >= 0 > margin(zmp)
-    out, stats = _balance_gate(world, None, plan, DT)
+    out, stats, fast = _balance_gate(world, None, plan, DT)
     assert stats["retime"] > 1.0
     assert out.position.shape[0] == round((plan.position.shape[0] - 1) * stats["retime"]) + 1
     com, zmp = _gate_view(world, out)
     assert margin(zmp) >= 0 and stats["zmp_min_margin"] >= 0
     assert torch.allclose(out.position[-1], plan.position[-1], atol=1e-5)
+    # ... and keeps the segment at the motion planner's timing: the planner's own frames, the gate's spline.
+    assert fast.position.shape == plan.position.shape and fast.joint_names == plan.joint_names
+    torch.testing.assert_close(fast.position, plan.position, rtol=0, atol=1e-5)
+    torch.testing.assert_close(fast.acceleration, _retime(plan, 1.0, DT).acceleration)
 
 
 @needs_cuda
@@ -231,5 +253,5 @@ def test_gate_passes_slow_motion_untouched():
     from cutamp.motion_solver import _balance_gate
     world = make_blocks_t1_world()
     plan = _torso_ramp(world, -0.3, 2.0)
-    out, stats = _balance_gate(world, None, plan, DT)
-    assert out is plan and stats["retime"] == 1.0
+    out, stats, fast = _balance_gate(world, None, plan, DT)
+    assert out is plan and stats["retime"] == 1.0 and fast is None

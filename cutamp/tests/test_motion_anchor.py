@@ -181,6 +181,19 @@ def test_all_segment_arrivals_com_in_hull(seed):
     assert overall["traj_com_violation_frac"] == 0.0
     assert overall["traj_com_min_margin"] >= 0.0 and overall["traj_zmp_min_margin"] >= 0.0
     assert overall["retime_max"] >= 1.0 and overall["plan_duration_s"] > 0.0
+    # A segment the gate slowed keeps its motion planner's timing: fewer frames along the same path, from the
+    # same start to the same arrival; no other segment has one.
+    slowed = [seg for seg in segments if seg["planner_timing"] is not None]
+    assert bool(slowed) == (overall["retime_max"] > 1.0)
+    for seg in slowed:
+        pt = seg["planner_timing"]
+        assert pt["T"] < seg["T"] and pt["dt"] == seg["dt"]
+        assert 1.0 < (seg["T"] - 1) / (pt["T"] - 1) <= overall["retime_max"] + 1e-9
+        assert pt["held_objs"].keys() == seg["held_objs"].keys()
+        assert all(poses.shape[-3] == pt["T"] for _, poses in pt["held_objs"].values())
+        for k in ("trunk_pitch", "knee_pitch", "left_arm", "right_arm"):
+            for t in (0, -1):
+                assert abs(pt["position"][k][t] - seg["position"][k][t]).max() < 1e-5
     # ... measured again on the frames actually exported, so a gated segment that never reaches the export
     # fails here.
     from cutamp.com_polygon_cost import SUPPORT_HALF_EXTENTS, com_margin_from_base, com_zmp_in_support
