@@ -561,14 +561,15 @@ def solve_curobo(
 
 def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
     """Measure-only trajectory CoM audit (recorded in every ablation arm): the plan's frame count,
-    ``traj_com_frames``, and the fraction of them whose CoM leaves the polygon, ``traj_com_violation_frac``."""
+    ``traj_com_frames``, and the fraction of them whose CoM leaves the support rectangle the gate enforces,
+    ``traj_com_violation_frac``."""
     # The whole block is exception-isolated: this audit is MEASURE-ONLY
     # and must never change which plans are produced or accepted. Any
     # failure here (e.g. an unexpected DOF/joint-name mismatch) is logged
     # and swallowed, returning an empty audit dict so
     # ``overall_metrics.update(audit)`` is a no-op and the keys are simply
     # absent — downstream already reads them with ``.get(...)``.
-    from cutamp.com_polygon_cost import compute_com_polygon_mask
+    from cutamp.com_polygon_cost import compute_support_mask
     try:
         total_frames, violation_frames = 0, 0
         with torch.no_grad():
@@ -576,7 +577,7 @@ def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
                 # A later segment's frame 0 is the previous one's last (it is planned from last_js): count it
                 # once, not once per segment (known-bugs N3).
                 full = _full_positions(world, planner, entry["plan"])[1 if i else 0:]
-                ok = compute_com_polygon_mask(world, full)
+                ok = compute_support_mask(world, full)
                 total_frames += int(ok.numel())
                 violation_frames += int((~ok).sum().item())
         return {

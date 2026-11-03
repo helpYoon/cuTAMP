@@ -57,7 +57,7 @@ def test_audit_counts_each_junction_frame_once(monkeypatch):
     from curobo.types import JointState
     import cutamp.com_polygon_cost as cpc
 
-    monkeypatch.setattr(cpc, "compute_com_polygon_mask", lambda world, q: q[:, 0] < 1.0)  # a >= 1: outside
+    monkeypatch.setattr(cpc, "compute_support_mask", lambda world, q: q[:, 0] < 1.0)  # a >= 1: outside
     names = ["a", "b"]
 
     def segment(*a):

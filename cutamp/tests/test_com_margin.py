@@ -45,3 +45,12 @@ def test_projection_subtracts_center():
     assert torch.allclose(c[0], torch.zeros(2), atol=1e-7)
     m = com_margin_from_base(c, SUPPORT_HALF_EXTENTS)
     assert m[1].item() < 0 and m[2].item() > 0
+
+
+def test_support_mask_uses_the_gate_rectangle(monkeypatch):
+    # The trajectory audit counts a frame as outside only when it leaves the rectangle the gate enforces
+    # (SUPPORT_HALF_EXTENTS), not the keyframes' tighter one: x 8.9 cm from the centre is inside.
+    import cutamp.com_polygon_cost as cpc
+    com = torch.tensor([[0.089 + 0.01, 0.0, 0.5], [0.092 + 0.01, 0.0, 0.5], [0.01, 0.137, 0.5]])
+    monkeypatch.setattr(cpc, "_fk_com_and_base", lambda world, q: (com, torch.eye(4).expand(3, 4, 4)))
+    assert cpc.compute_support_mask(None, torch.zeros(3, 1)).tolist() == [True, False, False]

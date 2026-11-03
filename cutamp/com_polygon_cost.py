@@ -245,6 +245,13 @@ def com_margin_from_base(com_in_base: torch.Tensor, half_extents=None) -> torch.
     return (half - com_in_base[..., :2].abs()).min(dim=-1).values
 
 
+def compute_support_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
+    """``[B]`` bool: the CoM is inside or on the support rectangle the trajectory gate enforces
+    (``SUPPORT_HALF_EXTENTS``), for full-cspace configs via FK. Measure-only (the trajectory audit)."""
+    com, base_T = _fk_com_and_base(world, q_batch)
+    return com_margin_from_base(_project_com_to_base(com, base_T), SUPPORT_HALF_EXTENTS) >= 0
+
+
 def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     """``[B]`` stability margins for full-cspace configs via FK.
 
