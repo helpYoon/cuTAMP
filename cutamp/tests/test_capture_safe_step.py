@@ -142,11 +142,11 @@ def test_pairwise_upper_sum_matches_triu_mask():
 
 
 def test_constant_builders_never_evict():
-    from cutamp.com_polygon_cost import _half_extents
+    from cutamp.com_polygon_cost import _center, _half_extents
     from cutamp.cost_function import _device_const
     from cutamp.gn_refresh import _row_layout
 
-    assert [f.cache_info().maxsize for f in (_row_layout, _device_const, _half_extents)] == [None] * 3
+    assert [f.cache_info().maxsize for f in (_row_layout, _device_const, _half_extents, _center)] == [None] * 4
 
 
 @needs_cuda

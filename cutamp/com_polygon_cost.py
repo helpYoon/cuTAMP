@@ -35,13 +35,18 @@ from curobo._src.cost.cost_base_cfg import BaseCostCfg
 
 
 # --- Single source of truth for the COM-over-base-polygon geometry ---
-# Two-foot support hull per actual_robot.urdf: 22.3 cm foot length (X, fore/aft)
-# × 31.2 cm stance width (Y, lateral), centred on mobile_base_link (the ankle
-# axis). t1_simplified carries the real T1's masses, so this model's CoM is the
-# robot's (test_robot_com.py). The cost, the post-IK mask, the per-conf penalties helper, the ComPolygon
-# tolerance, and the planner/IK cost cfgs all reference these so they cannot
-# drift apart.
-COM_HALF_EXTENTS = (0.1115, 0.156)   # (X, Y) half-extents in mobile_base_link frame, meters
+# The real T1's two-foot support region (t1.urdf foot boxes, legs together): the
+# soles span x [-0.1015, +0.1215] about the ankle axis (mobile_base_link) and
+# y +-0.15625, so the rectangle is centred 1 cm ahead of the base origin and
+# shrunk by COM_SAFETY_MARGIN on every side for the model and tracking errors
+# a real robot adds. t1_simplified carries the real T1's masses, so this model's
+# CoM is the robot's (test_robot_com.py). The cost, the post-IK mask, the
+# per-conf penalties helper, the ComPolygon tolerance, the trajectory gate, and
+# the planner/IK cost cfgs all reference these so they cannot drift apart.
+SOLE_HALF_EXTENTS = (0.1115, 0.15625)  # (X, Y) half-extents of the soles' footprint, meters
+COM_CENTER = (0.01, 0.0)               # the footprint's centre in mobile_base_link frame, meters
+COM_SAFETY_MARGIN = 0.02               # model, tracking and sole-edge error budget, meters
+COM_HALF_EXTENTS = tuple(h - COM_SAFETY_MARGIN for h in SOLE_HALF_EXTENTS)  # (0.0915, 0.13625)
 COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
 COM_TOL = COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2  # on-boundary penalty, 4e-4 (known-bugs N5)
@@ -58,8 +63,8 @@ def _half_extents(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 @dataclass
 class ComOverBasePolygonCostCfg(BaseCostCfg):
     #: Half-extents of the rectangle in ``mobile_base_link`` frame (X, Y) in
-    #: meters, as a ``[2]`` tensor. ``COM_HALF_EXTENTS`` = ``(0.1115, 0.156)``
-    #: is the two-foot support hull per actual_robot.urdf.
+    #: meters, as a ``[2]`` tensor, about ``COM_CENTER``. ``COM_HALF_EXTENTS``
+    #: is the real soles' footprint shrunk by ``COM_SAFETY_MARGIN``.
     half_extents: torch.Tensor = None
     #: Distance inside the edge at which the soft barrier starts (meters).
     #: ``0`` disables the barrier (outside-only penalization).
@@ -78,8 +83,15 @@ class ComOverBasePolygonCostCfg(BaseCostCfg):
         )
 
 
+@lru_cache(maxsize=None)
+def _center(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """``COM_CENTER`` on ``device``, made once, like :func:`_half_extents`."""
+    return torch.tensor(COM_CENTER, device=device, dtype=dtype)
+
+
 def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor) -> torch.Tensor:
-    """Project world-frame COM points into the base frame's XY plane.
+    """Project world-frame COM points into the support frame's XY plane: the base
+    frame shifted to the soles' centre, ``COM_CENTER``.
 
     Closed-form SE(3) inverse-transform: ``T_inv @ [p; 1] = R^T (p - t)``.
     Single home of the projection, used by :func:`com_polygon_penalty`.
@@ -89,11 +101,12 @@ def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor) -> torch
         base_T: ``[N, 4, 4]`` SE(3) world pose of the base link.
 
     Returns:
-        ``[N, 2]`` (x, y) COM in base frame.
+        ``[N, 2]`` (x, y) COM offset from the support centre, in base axes.
     """
     R = base_T[:, :3, :3]
     t = base_T[:, :3, 3]
-    return (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+    xy = (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
+    return xy - _center(xy.device, xy.dtype)
 
 
 def com_polygon_penalty(
@@ -199,7 +212,7 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     (which is built with ``compute_com=True``), projects it into the
     ``mobile_base_link`` frame, and returns a boolean mask of which batch
     elements have their COM inside the ``COM_HALF_EXTENTS`` rectangle around
-    the base origin.
+    ``COM_CENTER``.
 
     Args:
         world: TAMPWorld instance. Must have ``world.kinematics`` (built with ``compute_com=True``)

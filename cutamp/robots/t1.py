@@ -381,7 +381,7 @@ def get_t1_ik_solver(
     carries a CoM-over-support-rectangle residual (cuRobo fork) that
     recruits the legs to keep the COM centered while reaching.
     """
-    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
+    from cutamp.com_polygon_cost import COM_CENTER, COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
 
     if device_cfg is None:
         device_cfg = DeviceCfg()
@@ -411,7 +411,10 @@ def get_t1_ik_solver(
         # are the sole on/off gate (the fork derives compute_com from them);
         # geometry params are passed unconditionally.
         seed_com_support_weight=(T1_COM_IK_WEIGHT if enable_com_aware_ik else 0.0),
-        seed_com_half_extents=list(COM_HALF_EXTENTS),
+        # ponytail: the fork's box has no centre, so it gets the largest base-centred box inside
+        # the shifted support rectangle, 2 cm short at the toe; give the fork a centre if seeds
+        # need that room. The real rectangle still gates every conf (com_polygon_cost).
+        seed_com_half_extents=[h - abs(c) for h, c in zip(COM_HALF_EXTENTS, COM_CENTER)],
         seed_com_inside_margin=COM_INSIDE_MARGIN,
         seed_com_inside_weight=COM_INSIDE_WEIGHT,
         seed_com_center_weight=(T1_COM_IK_CENTER_WEIGHT if enable_com_aware_ik else 0.0),

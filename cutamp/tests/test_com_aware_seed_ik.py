@@ -36,7 +36,8 @@ def test_flag_on_seed_cfg_carries_com_params():
     world = _world(enable_com_aware_ik=True)
     cfg = world.ik_solver.seed_ik_solver.config
     assert cfg.com_support_weight == T1_COM_IK_WEIGHT > 0.0
-    assert list(cfg.com_half_extents) == list(COM_HALF_EXTENTS)
+    # The fork's box is centred on the base: the largest one inside the shifted support rectangle.
+    assert list(cfg.com_half_extents) == pytest.approx([0.0815, 0.13625])
     assert cfg.com_inside_margin == COM_INSIDE_MARGIN
     assert cfg.com_inside_weight == COM_INSIDE_WEIGHT
     from cutamp.robots.t1 import T1_COM_IK_CENTER_WEIGHT
@@ -82,9 +83,13 @@ def test_fork_penalty_parity_with_cutamp_reference():
     base_T[:, :3, :3] = R
     base_T[:, :3, 3] = base_pos
     half = torch.tensor([0.1115, 0.156])
-    com_in_base = _project_com_to_base(com_world, base_T)
+    # cuTAMP's rectangle sits at COM_CENTER in the base frame, the fork's at the base origin: shift
+    # cuTAMP's CoM by the centre so both see the same offset.
+    from cutamp.com_polygon_cost import COM_CENTER
+    com_shifted = com_world + (R @ torch.tensor([*COM_CENTER, 0.0])).view(B, 3)
+    com_in_base = _project_com_to_base(com_shifted, base_T)
     for cw in (0.0, 0.01):
-        ref = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0)
+        ref = com_polygon_penalty(com_shifted, base_T, half, 0.02, 1.0)
         ref = ref + cw * ((com_in_base / half) ** 2).sum(-1)
         got = com_support_penalty(com_world, base_pos, quat_wxyz, half, 0.02, 1.0, cw)
         assert torch.allclose(got, ref, atol=1e-5), f"max diff {(got - ref).abs().max()}"
@@ -168,7 +173,7 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
         return com_support_penalty(com, pos, quat, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, 0.0).sum()
 
     # A forward lean so the penalty is active: Torso_Pitch -1.2 with ankle_pitch -0.15 (all else 0)
-    # puts the CoM at x 0.158, past the 0.1115 edge (measured). A deep bow alone (Torso_Pitch -1.5)
+    # puts the CoM at x 0.230, past the 0.0915 edge (measured). A deep bow alone (Torso_Pitch -1.5)
     # barely moves the CoM's x with the torso: d penalty / d Torso_Pitch is only -0.0008 there.
     q0 = torch.zeros(1, model.get_dof(), device=device)
     q0[0, names.index("Torso_Pitch")] = -1.2
