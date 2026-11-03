@@ -21,6 +21,7 @@ Per plan-skeleton operator (T1):
 
 import contextlib
 import logging
+import math
 from typing import List, Optional
 
 import torch
@@ -346,6 +347,17 @@ def solve_curobo(
     q_init = best_particle["left_q0"]
 
     accum_plans: List[dict] = []
+    gate_stats: List[dict] = []
+
+    def gated(plan, dt):
+        # The real robot's balance check (balance arms only): every frame's CoM and ZMP inside the support
+        # rectangle, slowing the segment down if its ZMP needs it; a RuntimeError fails the candidate.
+        if not config.enable_com_polygon:
+            return plan
+        plan, stats = _balance_gate(world, planner, plan, dt)
+        gate_stats.append(stats)
+        return plan
+
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
 
     ts = 0.0
@@ -384,8 +396,8 @@ def solve_curobo(
                     )
                 if not _cspace_plan_succeeded(result):
                     raise RuntimeError(f"Retract plan failed for {ground_op}")
-                plan = _interp_plan(result)
                 dt = _plan_dt(planner)
+                plan = gated(_interp_plan(result), dt)
 
                 accum_plans.append({
                     "plan": plan, "dt": dt, "arm": arm,
@@ -415,8 +427,8 @@ def solve_curobo(
                 # Attach AT the grasp conf. Block tracking from this point uses
                 # inverse(obj_from_grasp) since the gripper is at the intended
                 # grasp pose.
-                grasp_plan = _interp_plan(grasp_result)
                 dt = _plan_dt(planner)
+                grasp_plan = gated(_interp_plan(grasp_result), dt)
                 accum_plans.append({
                     "plan": grasp_plan, "dt": dt, "arm": arm,
                     "held_objs": state.compute_all_held_obj_poses(grasp_plan),
@@ -449,8 +461,8 @@ def solve_curobo(
                         disable_obstacle=surface_name, ground_op=ground_op,
                     )
 
-                plan = _interp_plan(place_result)
                 dt = _plan_dt(planner)
+                plan = gated(_interp_plan(place_result), dt)
 
                 accum_plans.append({
                     "plan": plan, "dt": dt, "arm": arm,
@@ -538,60 +550,32 @@ def solve_curobo(
             )
         cur_t += pos.shape[0] * dt
 
-    return accum_plans, _audit_traj_com(world, planner, accum_plans)
+    metrics = _audit_traj_com(world, planner, accum_plans)
+    metrics["plan_duration_s"] = sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)
+    if gate_stats:
+        metrics["retime_max"] = max(g["retime"] for g in gate_stats)
+        metrics["traj_com_min_margin"] = min(g["com_min_margin"] for g in gate_stats)
+        metrics["traj_zmp_min_margin"] = min(g["zmp_min_margin"] for g in gate_stats)
+    return accum_plans, metrics
 
 
 def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
     """Measure-only trajectory CoM audit (recorded in every ablation arm): the plan's frame count,
     ``traj_com_frames``, and the fraction of them whose CoM leaves the polygon, ``traj_com_violation_frac``."""
-    # Deviates from the task brief's illustrative snippet in two respects:
-    #
-    # 1. accum_plans entries carry trajectories in different DOF forms
-    #    depending on which planner method produced them — either the
-    #    planner's locked active-cspace (18-DOF, missing the locked base
-    #    joints) or the fully articulated form (31-DOF, a superset of
-    #    world.kinematics's 21 joints that already includes the "locked"
-    #    base joints). Unconditionally calling get_full_js (as the brief's
-    #    snippet does) raises ``ValueError: lock_joints is also listed in
-    #    js.joint_names`` on the latter case. Mirror the same conditional
-    #    solve_curobo's playback loop already uses for this exact DOF-form
-    #    ambiguity: only augment with get_full_js when the trajectory is
-    #    short the locked joints; a plain reorder (index-select) handles
-    #    the already-fully-articulated case. That loop also defends against
-    #    ``plan.joint_names`` being None (falling back to the planner's
-    #    active or fully-articulated joint names by shape) — mirrored below
-    #    too, matching the same defensive pattern used in
-    #    ``_last_timestep_js``.
-    #
-    # 2. The whole block is exception-isolated: this audit is MEASURE-ONLY
-    #    and must never change which plans are produced or accepted. Any
-    #    failure here (e.g. an unexpected DOF/joint-name mismatch) is logged
-    #    and swallowed, returning an empty audit dict so
-    #    ``overall_metrics.update(audit)`` is a no-op and the keys are simply
-    #    absent — downstream already reads them with ``.get(...)``.
+    # The whole block is exception-isolated: this audit is MEASURE-ONLY
+    # and must never change which plans are produced or accepted. Any
+    # failure here (e.g. an unexpected DOF/joint-name mismatch) is logged
+    # and swallowed, returning an empty audit dict so
+    # ``overall_metrics.update(audit)`` is a no-op and the keys are simply
+    # absent — downstream already reads them with ``.get(...)``.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
-    audit_full_dof = len(world.kinematics.joint_names)
     try:
         total_frames, violation_frames = 0, 0
         with torch.no_grad():
             for i, entry in enumerate(accum_plans):
-                plan_js = entry["plan"]
                 # A later segment's frame 0 is the previous one's last (it is planned from last_js): count it
                 # once, not once per segment (known-bugs N3).
-                pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])[1 if i else 0:]
-                src_names = getattr(plan_js, "joint_names", None)
-                if src_names is None:
-                    src_names = (
-                        list(planner.kinematics.joint_names)
-                        if pos.shape[-1] == len(planner.kinematics.joint_names)
-                        else list(planner.kinematics.all_articulated_joint_names)
-                    )
-                else:
-                    src_names = list(src_names)
-                js = JointState.from_position(pos, joint_names=src_names)
-                if pos.shape[-1] < audit_full_dof:
-                    js = planner.kinematics.get_full_js(js)
-                full = js.reorder(list(world.kinematics.joint_names)).position
+                full = _full_positions(world, planner, entry["plan"])[1 if i else 0:]
                 ok = compute_com_polygon_mask(world, full)
                 total_frames += int(ok.numel())
                 violation_frames += int((~ok).sum().item())
@@ -602,3 +586,96 @@ def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
     except Exception as e:
         _log.warning(f"Trajectory CoM audit failed (measure-only, ignoring): {e}")
         return {}
+
+
+def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
+    """``[T, full_dof]`` positions of a planner trajectory in ``world.kinematics.joint_names`` order.
+
+    accum_plans entries carry trajectories in different DOF forms depending on which planner method
+    produced them: the planner's locked active cspace (18-DOF, missing the locked base joints) or the
+    fully articulated form (31-DOF, a superset of world.kinematics's 21 joints). Only the first is
+    augmented with get_full_js (on the second it raises ``lock_joints is also listed``); a plain
+    reorder handles both. ``plan.joint_names`` may be None, then the planner's names are picked by
+    shape, as in ``_last_timestep_js``."""
+    pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
+    src_names = getattr(plan_js, "joint_names", None)
+    if src_names is None:
+        src_names = (
+            list(planner.kinematics.joint_names)
+            if pos.shape[-1] == len(planner.kinematics.joint_names)
+            else list(planner.kinematics.all_articulated_joint_names)
+        )
+    js = JointState.from_position(pos, joint_names=list(src_names))
+    if pos.shape[-1] < len(world.kinematics.joint_names):
+        js = planner.kinematics.get_full_js(js)
+    return js.reorder(list(world.kinematics.joint_names)).position
+
+
+# The slowest the balance gate will make a segment: 4x longer, 16x lower accelerations.
+RETIME_MAX = 4.0
+
+
+def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
+    """``plan_js`` slowed down uniformly by about ``s``, resampled every ``dt`` s.
+
+    A C2 cubic spline through the frames, with the native end velocities as boundary conditions,
+    is sampled at ``N' = ceil(s (N - 1)) + 1`` frames, so the slowdown is ``s_eff = (N' - 1) / (N - 1)
+    >= s`` and the last frame is the original's. Velocities scale by ``1 / s_eff``, accelerations by
+    ``1 / s_eff**2``, jerks by ``1 / s_eff**3``."""
+    from scipy.interpolate import CubicSpline
+
+    pos = plan_js.position
+    lead, dof = pos.shape[:-2], pos.shape[-1]
+    q = pos.reshape(-1, dof).double().cpu().numpy()
+    n = q.shape[0]
+    n_new = math.ceil(s * (n - 1)) + 1
+    s_eff = (n_new - 1) / (n - 1)
+    if plan_js.velocity is not None:
+        v = plan_js.velocity.reshape(-1, dof).double().cpu().numpy()
+        bc = ((1, v[0]), (1, v[-1]))
+    else:
+        bc = "clamped"
+    spline = CubicSpline(dt * torch.arange(n).double().numpy(), q, axis=0, bc_type=bc)
+    t = (dt / s_eff * torch.arange(n_new).double()).clamp(max=dt * (n - 1)).numpy()
+
+    def sample(k):
+        x = torch.as_tensor(spline(t, k) / s_eff**k, dtype=pos.dtype, device=pos.device)
+        return x.reshape(*lead, n_new, dof)
+
+    return JointState(position=sample(0), velocity=sample(1), acceleration=sample(2), jerk=sample(3),
+                      joint_names=plan_js.joint_names, dt=plan_js.dt)
+
+
+def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
+    """The real robot's balance check on every interpolated frame of a segment.
+
+    The CoM must stay inside the support rectangle (``SUPPORT_HALF_EXTENTS``); a segment whose CoM leaves it
+    raises RuntimeError, so the planner moves to its next candidate or skeleton. The cart-table ZMP
+    must stay inside too; a segment whose ZMP leaves it is slowed down uniformly until it fits, up to
+    ``RETIME_MAX``, past which it raises. Returns ``(plan_js, stats)``: the plan, retimed if needed,
+    and ``{"retime", "com_min_margin", "zmp_min_margin"}`` (metres)."""
+    from cutamp.com_polygon_cost import (
+        SUPPORT_HALF_EXTENTS, com_margin_from_base, com_zmp_in_support, retime_factor,
+    )
+
+    def margins(js):
+        com, zmp = com_zmp_in_support(world, _full_positions(world, planner, js), dt)
+        return (com, zmp, com_margin_from_base(com, SUPPORT_HALF_EXTENTS).min().item(),
+                com_margin_from_base(zmp, SUPPORT_HALF_EXTENTS).min().item())
+
+    with torch.no_grad():
+        com, zmp, com_m, zmp_m = margins(plan_js)
+        if com_m < 0:
+            raise RuntimeError(f"trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
+        out, s = plan_js, 1.05 * retime_factor(com, zmp)
+        while zmp_m < 0:
+            if s > RETIME_MAX:
+                raise RuntimeError(f"trajectory ZMP needs a {s:.1f}x slowdown (cap {RETIME_MAX}x)")
+            out = _retime(plan_js, s, dt)
+            _, _, com_m, zmp_m = margins(out)
+            if com_m < 0:
+                raise RuntimeError(f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
+            s *= 1.25
+    n, n_out = plan_js.position.shape[-2], out.position.shape[-2]
+    return out, {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0,
+                 "com_min_margin": com_m, "zmp_min_margin": zmp_m}

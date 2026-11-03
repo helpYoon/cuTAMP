@@ -37,7 +37,7 @@ def test_flag_on_seed_cfg_carries_com_params():
     cfg = world.ik_solver.seed_ik_solver.config
     assert cfg.com_support_weight == T1_COM_IK_WEIGHT > 0.0
     # The fork's box is centred on the base: the largest one inside the shifted support rectangle.
-    assert list(cfg.com_half_extents) == pytest.approx([0.0815, 0.13625])
+    assert list(cfg.com_half_extents) == pytest.approx([0.0765, 0.13125])
     assert cfg.com_inside_margin == COM_INSIDE_MARGIN
     assert cfg.com_inside_weight == COM_INSIDE_WEIGHT
     from cutamp.robots.t1 import T1_COM_IK_CENTER_WEIGHT

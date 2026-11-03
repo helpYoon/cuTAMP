@@ -262,6 +262,16 @@ def test_retract_collision_grads_match_per_conf():
         torch.testing.assert_close(g, grads([info])[0])
 
 
+def _support_centre_at_origin():
+    """A base pose that puts the support rectangle's centre (COM_CENTER) at the world origin, so the
+    points below are offsets from it."""
+    import torch
+    from cutamp.com_polygon_cost import COM_CENTER
+    base_T = torch.eye(4).unsqueeze(0)
+    base_T[0, :2, 3] = -torch.tensor(COM_CENTER)
+    return base_T
+
+
 def test_com_polygon_penalty_corner_equals_single_edge():
     # A COM ~1mm inside BOTH edges (near a corner) must score the same as
     # being on a single edge — NOT double. With the buggy summed barrier it
@@ -271,7 +281,7 @@ def test_com_polygon_penalty_corner_equals_single_edge():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = torch.eye(4).unsqueeze(0)
+    base_T = _support_centre_at_origin()
     e = 0.001  # 1mm inside each edge
     com_world = torch.tensor([[0.10 - e, 0.15 - e, 0.0]])
     pen = com_polygon_penalty(com_world, base_T, half, margin, weight)
@@ -286,7 +296,7 @@ def test_com_polygon_penalty_corner_on_boundary_equals_tol():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = torch.eye(4).unsqueeze(0)
+    base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.10, 0.15, 0.0]])
     pen = com_polygon_penalty(com_world, base_T, half, margin, weight)
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
@@ -300,7 +310,7 @@ def test_com_polygon_penalty_single_edge_equals_tol():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = torch.eye(4).unsqueeze(0)
+    base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.10, 0.0, 0.0]])  # on X edge, centered in Y
     pen = com_polygon_penalty(com_world, base_T, half, margin, weight)
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
@@ -319,7 +329,7 @@ def test_com_polygon_penalty_deep_inside_is_zero():
     import torch
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
-    base_T = torch.eye(4).unsqueeze(0)
+    base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.03, 0.04, 0.0]])  # well inside inset rect
     pen = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0)
     assert pen.item() == 0.0
@@ -331,7 +341,7 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = torch.eye(4).unsqueeze(0)
+    base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.101, 0.0, 0.0]])  # 1mm past X edge
     pen = com_polygon_penalty(com_world, base_T, half, margin, weight)
     # outside=0.001 -> 0.001**2; inside barrier saturates at (0.001+0.02)**2.

@@ -68,7 +68,7 @@ def test_audit_counts_each_junction_frame_once(monkeypatch):
     assert ms._audit_traj_com(world, None, plans) == {"traj_com_violation_frac": 1 / 7, "traj_com_frames": 7}
 
 
-def _generate_plan_segments(seed: int):
+def _generate_plan_segments(seed: int, enable_com_polygon: bool = True):
     """Run the full cuTAMP pipeline once for blocks_t1 and return
     ``(world, segments, overall_metrics)``: a TAMPWorld for COM checks, the
     processed motion-plan segments (schema v3), and the ``overall_metrics``
@@ -99,7 +99,7 @@ def _generate_plan_segments(seed: int):
         num_particles=64,
         num_opt_steps=50,
         curobo_plan=True,
-        enable_com_polygon=True,
+        enable_com_polygon=enable_com_polygon,
         # Pin coupled re-IK OFF, which keeps the soft costs out of Adam: these
         # tests assert segment schema + arrival COM-in-hull, which the CoM-aware
         # IK + hard gate guarantee regardless; running the default coupled-reik
@@ -177,5 +177,20 @@ def test_all_segment_arrivals_com_in_hull(seed):
     assert overall["motion_plan_success"] is True
     assert 0.0 <= overall["traj_com_violation_frac"] <= 1.0
     assert overall["traj_com_frames"] > 0
-    # Full system: trajectories should be (near-)fully inside the polygon.
-    assert overall["traj_com_violation_frac"] < 0.05
+    # The balance gate: no frame's CoM or ZMP leaves the support rectangle.
+    assert overall["traj_com_violation_frac"] == 0.0
+    assert overall["traj_com_min_margin"] >= 0.0 and overall["traj_zmp_min_margin"] >= 0.0
+    assert overall["retime_max"] >= 1.0 and overall["plan_duration_s"] > 0.0
+
+
+@needs_cuda
+def test_no_balance_arm_is_not_gated(monkeypatch):
+    # The no-CoM ablation arms keep their plans as planned: the gate never runs, and no gate metric is recorded.
+    import cutamp.motion_solver as ms
+
+    def boom(*a, **k):
+        raise AssertionError("balance gate ran with enable_com_polygon=False")
+
+    monkeypatch.setattr(ms, "_balance_gate", boom)
+    _, segments, overall = _generate_plan_segments(seed=0, enable_com_polygon=False)
+    assert len(segments) > 0 and "retime_max" not in overall and overall["plan_duration_s"] > 0.0

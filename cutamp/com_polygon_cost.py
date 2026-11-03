@@ -24,6 +24,7 @@ Requires:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Type
@@ -37,16 +38,23 @@ from curobo._src.cost.cost_base_cfg import BaseCostCfg
 # --- Single source of truth for the COM-over-base-polygon geometry ---
 # The real T1's two-foot support region (t1.urdf foot boxes, legs together): the
 # soles span x [-0.1015, +0.1215] about the ankle axis (mobile_base_link) and
-# y +-0.15625, so the rectangle is centred 1 cm ahead of the base origin and
-# shrunk by COM_SAFETY_MARGIN on every side for the model and tracking errors
-# a real robot adds. t1_simplified carries the real T1's masses, so this model's
-# CoM is the robot's (test_robot_com.py). The cost, the post-IK mask, the
-# per-conf penalties helper, the ComPolygon tolerance, the trajectory gate, and
+# y +-0.15625, so the rectangles are centred 1 cm ahead of the base origin.
+# SUPPORT_HALF_EXTENTS shrinks the soles by COM_SAFETY_MARGIN on every side for
+# the model and tracking errors a real robot adds: every trajectory frame's CoM
+# and ZMP stay inside it (motion_solver._balance_gate). COM_HALF_EXTENTS, the
+# keyframes' rectangle, sits COM_DYNAMIC_RESERVE further in, so a segment can
+# decelerate into its end conf without the ZMP leaving (a conf on the support
+# edge needed 4-7x slowdowns; with 1 cm the optimizer found no satisfying conf
+# on 2 of 4 blocks_t1 seeds). t1_simplified carries the real T1's masses, so
+# this model's CoM is the robot's (test_robot_com.py). The cost, the post-IK
+# mask, the per-conf penalties helper, the ComPolygon tolerance, the gate, and
 # the planner/IK cost cfgs all reference these so they cannot drift apart.
 SOLE_HALF_EXTENTS = (0.1115, 0.15625)  # (X, Y) half-extents of the soles' footprint, meters
 COM_CENTER = (0.01, 0.0)               # the footprint's centre in mobile_base_link frame, meters
 COM_SAFETY_MARGIN = 0.02               # model, tracking and sole-edge error budget, meters
-COM_HALF_EXTENTS = tuple(h - COM_SAFETY_MARGIN for h in SOLE_HALF_EXTENTS)  # (0.0915, 0.13625)
+SUPPORT_HALF_EXTENTS = tuple(h - COM_SAFETY_MARGIN for h in SOLE_HALF_EXTENTS)  # (0.0915, 0.13625)
+COM_DYNAMIC_RESERVE = 0.005            # keyframe CoM room for an arrival's deceleration, meters
+COM_HALF_EXTENTS = tuple(h - COM_DYNAMIC_RESERVE for h in SUPPORT_HALF_EXTENTS)  # (0.0865, 0.13125)
 COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
 COM_TOL = COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2  # on-boundary penalty, 4e-4 (known-bugs N5)
@@ -64,7 +72,7 @@ def _half_extents(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 class ComOverBasePolygonCostCfg(BaseCostCfg):
     #: Half-extents of the rectangle in ``mobile_base_link`` frame (X, Y) in
     #: meters, as a ``[2]`` tensor, about ``COM_CENTER``. ``COM_HALF_EXTENTS``
-    #: is the real soles' footprint shrunk by ``COM_SAFETY_MARGIN``.
+    #: is the keyframes' rectangle inside the real soles' footprint.
     half_extents: torch.Tensor = None
     #: Distance inside the edge at which the soft barrier starts (meters).
     #: ``0`` disables the barrier (outside-only penalization).
@@ -228,11 +236,12 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     return com_polygon_mask_from_state(_fk_state(world, q_batch))
 
 
-def com_margin_from_base(com_in_base: torch.Tensor) -> torch.Tensor:
+def com_margin_from_base(com_in_base: torch.Tensor, half_extents=None) -> torch.Tensor:
     """Static stability margin (McGhee & Frank): min over the two axes of
     ``h - |c|`` for base-frame CoM points ``[N, >=2]``. Positive inside the
     support rectangle, zero on an edge, negative outside. Metres."""
-    half = _half_extents(com_in_base.device, com_in_base.dtype)
+    half = (_half_extents(com_in_base.device, com_in_base.dtype) if half_extents is None
+            else com_in_base.new_tensor(half_extents))
     return (half - com_in_base[..., :2].abs()).min(dim=-1).values
 
 
@@ -243,6 +252,37 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     ablation study's shared yardstick (recorded in every arm)."""
     com, base_T = _fk_com_and_base(world, q_batch)
     return com_margin_from_base(_project_com_to_base(com, base_T))
+
+
+def cart_table_zmp(com_b: torch.Tensor, dt: float, g: float = 9.81) -> torch.Tensor:
+    """Cart-table ZMP ``[T, 2]`` of a support-frame CoM path ``[T, 3]`` sampled every ``dt`` s, z the
+    height above the sole: ``c_xy - c_z / (g + c''_z) * c''_xy``. Ignores the bodies' angular momentum.
+    One-sided differences at the ends overstate a resting end's acceleration, the safe direction."""
+    if com_b.shape[0] < 3:  # too short to differentiate: nothing moves
+        return com_b[:, :2].clone()
+    v = torch.gradient(com_b, spacing=dt, dim=0, edge_order=2)[0]
+    a = torch.gradient(v, spacing=dt, dim=0, edge_order=2)[0]
+    return com_b[:, :2] - com_b[:, 2:] / (g + a[:, 2:]) * a[:, :2]
+
+
+def retime_factor(com_xy: torch.Tensor, zmp_xy: torch.Tensor) -> float:
+    """The uniform slowdown ``s >= 1`` that brings every frame's ZMP inside the support rectangle, given
+    its CoM is: slowing by ``s`` divides the ZMP's offset from the CoM by ``s**2``, and an offset no larger
+    than the CoM's room to the edge keeps the ZMP inside. ``inf`` if an offset frame has no room."""
+    room = (com_xy.new_tensor(SUPPORT_HALF_EXTENTS) - com_xy.abs()).clamp_min(0.0)
+    off = (zmp_xy - com_xy).abs()
+    ratio = torch.where(off > 0, off / room, torch.zeros_like(off)).max().item()
+    return max(1.0, math.sqrt(ratio))
+
+
+def com_zmp_in_support(world, q_full: torch.Tensor, dt: float):
+    """``(com_xy [T, 2], zmp_xy [T, 2])`` in the support frame for a trajectory ``[T, full_dof]`` sampled
+    every ``dt`` s; one FK on ``world.kinematics``. mobile_base_link's origin is the sole plane, so the
+    base-frame z is the CoM's height (test_robot_com.py)."""
+    com, base_T = _fk_com_and_base(world, q_full)
+    z = (base_T[:, :3, 2] * (com - base_T[:, :3, 3])).sum(-1, keepdim=True)
+    com_xy = _project_com_to_base(com, base_T)
+    return com_xy, cart_table_zmp(torch.cat([com_xy, z], dim=-1), dt)
 
 
 def compute_com_polygon_penalties(

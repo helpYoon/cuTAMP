@@ -201,14 +201,11 @@ class TestTrajoptCost:
 
     @needs_cuda
     def test_planner_keeps_ankle_under_upper_limit(self):
-        # Seed-1 LeftPlace conf, the worst seed-1 case on the doubled CoM: with a
-        # zero ankle-upper band the COM-polygon cost pushed the ankle +5.7 mrad
-        # past its 0 rad limit late in the path, and cuRobo rejected the plan
-        # (T1_TRAJOPT_ANKLE_UPPER_MARGIN). On the corrected CoM the band no
-        # longer binds on seed 1: with a zero band this conf and all eight
-        # arrivals of a fresh seed-1 plan reach home with the ankle at most
-        # 0.0 rad, its home value (measured 2026-11-01). The band stays as a
-        # guard. Movables are disabled and nothing is attached: only the cost
+        # The seed-1 arrival nearest the keyframe edge on the real-mass model (segment 2, 1.3 mm inside;
+        # measured 2026-11-03 with test_motion_anchor's config), so the COM-polygon cost binds from the
+        # start. On the doubled CoM, a zero ankle-upper band let that cost push the ankle +5.7 mrad past
+        # its 0 rad limit late in the path, and cuRobo rejected the plan (T1_TRAJOPT_ANKLE_UPPER_MARGIN);
+        # the band stays as a guard. Movables are disabled and nothing is attached: only the cost
         # balance is under test.
         from cutamp.motion_solver import _planner_js_from_full
         from cutamp.tests.conftest import make_blocks_t1_world
@@ -220,9 +217,9 @@ class TestTrajoptCost:
         names = world.kinematics.joint_names
         home = torch.tensor(t1_home, device=world.device).view(1, -1)
         place = torch.tensor([
-            0.0, 0.0, 0.0, -0.000876, 0.125940, -1.256779, -0.914472,
-            -1.294457, -0.780726, -0.645564, -0.472266, -0.965657, 0.231727, 0.644361,
-            -0.085731, 1.281193, 0.194918, 1.131778, -0.168810, 0.564520, 0.245527,
+            0.0, 0.0, 0.0, -0.074629, 0.486822, -1.640513, 0.787149,
+            -0.115971, -1.094335, 0.497059, -0.912529, -0.603024, -1.355798, -0.299165,
+            -0.703938, 0.229998, -0.959692, 0.015361, -1.422563, -0.615999, -0.178122,
         ], device=world.device).view(1, -1)
         result = planner.plan_cspace(
             _planner_js_from_full(planner, place, names), _planner_js_from_full(planner, home, names),
