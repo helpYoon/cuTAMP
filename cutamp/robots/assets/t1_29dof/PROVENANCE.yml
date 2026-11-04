@@ -1,0 +1,46 @@
+# Provenance of the pinned copy of bfm_wm's Booster T1 (design call 18). Every file under `copied` is a
+# verbatim copy, never edited; a change to bfm_wm's T1 means retraining, re-exporting, re-pinning and
+# re-testing together. `from` names the source repo and commit, `path` the file there.
+licence: BSD-3-Clause, Copyright (c) 2025, BoosterRobotics (booster_assets' LICENSE, copied beside these files)
+booster_assets: 12a97516f57469078707afb587a5f84c1cb110d1
+bfm_wm:
+  363aef5: 363aef50f1f9dadd9cc86e5a692e5a611d8e849b  # URDF, meshes, t1.xml
+  4cd9178: 4cd91788adfec7f1d312f15de74c3d7da78fab31  # npz, mjb
+copied:
+  LICENSE: {from: booster_assets, path: LICENSE, sha1: 60abd1a7f1a78d4b03282e3bc5b6bf7c80a08808}
+  urdf/T1_29dof.urdf: {from: bfm_wm 363aef5, path: assets/t1/t1_description/urdf/T1_29dof.urdf, sha1: 89ff2a5dfc3dda25e1d02639ce5c2d407ee93421}
+  meshes/AL1.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL1.STL, sha1: abdc309d6beeb26828d8ec206a246adecebd65aa}
+  meshes/AL2.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL2.STL, sha1: 304ba94d843c1feeb5f889918cbf3e857ebb914e}
+  meshes/AL3.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL3.STL, sha1: b60f7caaba0044379930f71d01f7891e6aa28fc8}
+  meshes/AL4.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL4.STL, sha1: 79c7829a770192cef650e8002a5bc93ab4092494}
+  meshes/AL5.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL5.STL, sha1: d5604dfd6b0a9fa427d02b2742d355c0ae9d7fdd}
+  meshes/AL6.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL6.STL, sha1: 09535492d768355afa7ed1c4d8f90c555de534d7}
+  meshes/AL7.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AL7.STL, sha1: 68af35881038cd75d1c0599e0ca5f729b21ff694}
+  meshes/AR1.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR1.STL, sha1: c28ed2e867af9006580f7d6a639cd48bde2f4157}
+  meshes/AR2.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR2.STL, sha1: 7153ddac0e7c4a2cc4b351c126f192ce1cdd4e2d}
+  meshes/AR3.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR3.STL, sha1: 7945d16d57bfe6082a8035e76e46b97878e318f6}
+  meshes/AR4.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR4.STL, sha1: c87b7e4252ae68cb24179226e865c144a9ed3ebe}
+  meshes/AR5.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR5.STL, sha1: 9a64f2a9633c3cb4435ab1e67e9da5596a619fb3}
+  meshes/AR6.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR6.STL, sha1: 6d18dbc3db1b42ca01cf88fcb35bc5e0a4ed65b7}
+  meshes/AR7.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/AR7.STL, sha1: 5b216392a44e678bd2ab1f2f0143c21cb1c7dab0}
+  meshes/Ankle_Cross_Left.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Ankle_Cross_Left.STL, sha1: 1f84b20511bac9c568c9228185aae02b07beed9c}
+  meshes/Ankle_Cross_Right.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Ankle_Cross_Right.STL, sha1: 9c6a5bf75a47e066dbb25ef5b85fb2d2d804c41d}
+  meshes/H1.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/H1.STL, sha1: c44288e08d0645d18744f443a265fe6698a0d21a}
+  meshes/H2.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/H2.STL, sha1: cbbb882b9f434d83170bed41908189704625f921}
+  meshes/Hip_Pitch_Left.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Hip_Pitch_Left.STL, sha1: 34516f13c8dc00f6f1ad9e2b66d6af65053f390f}
+  meshes/Hip_Pitch_Right.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Hip_Pitch_Right.STL, sha1: 1cf4d3b5ac9bffee67176bff17b181cea3999159}
+  meshes/Hip_Roll_Left.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Hip_Roll_Left.STL, sha1: ac9ecd424dbab4d37afc73ff229ca62c63cc541e}
+  meshes/Hip_Roll_Right.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Hip_Roll_Right.STL, sha1: 3a97bc6b074ca90f17b2b89488f7ce332bfab046}
+  meshes/Hip_Yaw_Left.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Hip_Yaw_Left.STL, sha1: 7a962038f906a80fd70ddd956ccb8a97200ba415}
+  meshes/Hip_Yaw_Right.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Hip_Yaw_Right.STL, sha1: 34cd13d0fb5d54d290f7fb5551940c17de4da421}
+  meshes/Logo.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Logo.STL, sha1: 4a813008098455cc80175dd96c41b11bf043765b}
+  meshes/Shank_Left.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Shank_Left.STL, sha1: a549bbd994bd86386972407c7087286f8f878fb0}
+  meshes/Shank_Right.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Shank_Right.STL, sha1: 935b48a43ea8a99eec4faaf4d08cfd038ab4f6c4}
+  meshes/Trunk.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Trunk.STL, sha1: 84dd0c4b8a284f4b965a8980446cc098b8f0c861}
+  meshes/Waist.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/Waist.STL, sha1: a5ce00493776a89bd89c9b512a091bc30070d726}
+  meshes/left_foot_link.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/left_foot_link.STL, sha1: a488673f486109c12956c4b9043cc3fbbcec53b2}
+  meshes/right_foot_link.STL: {from: bfm_wm 363aef5, path: assets/t1/t1_description/meshes/right_foot_link.STL, sha1: 747da1acb46f827a9ec584d36dbf198cba2a0721}
+  t1_actuators.npz: {from: bfm_wm 4cd9178, path: assets/t1/mujoco/t1_actuators.npz, sha1: 0224c2324bb8033c8a5f90438a351eb63b7ee432}
+not_copied:  # bfm_wm's own; the plan check runs on them there, and the MuJoCo fixture is stamped with t1.xml's
+  t1.xml: {from: bfm_wm 363aef5, path: assets/t1/t1_description/mjcf/t1.xml, sha1: 589d99941cb52f2880ca6706cc6e2ea47ee6f3cd}
+  t1_newton.mjb: {from: bfm_wm 4cd9178, path: assets/t1/mujoco/t1_newton.mjb, sha1: 4f2c66648bc3864a7cb999da2847d98d4ff85e8b}
