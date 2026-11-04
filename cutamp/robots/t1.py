@@ -223,7 +223,8 @@ class T1Bodies(NamedTuple):
 
 def get_t1_bodies(device_cfg: DeviceCfg = None) -> T1Bodies:
     """:class:`T1Bodies` of the 21-DOF model. Masses and CoMs are cuRobo's, the ones every ``robot_com`` sums
-    (its virtual links weigh a few grams); inertias are the URDF's, which cuRobo's parser does not keep."""
+    (its virtual links weigh a few grams); inertias are read from the URDF, and equal the ones cuRobo keeps
+    (``test_curobo_link_inertias_match_the_urdf``)."""
     if device_cfg is None:
         device_cfg = DeviceCfg()
     cfg = copy.deepcopy(t1_curobo_cfg())  # from_robot_yaml_file writes tool_frames into the dict it is given
