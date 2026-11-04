@@ -2,6 +2,7 @@
 - 12 sole rows in GN's level 1 hold both soles on the stance, beside the active CoM rows, and the base columns are
   free (``_row_layout`` freezes them only where ``model.lock_base``);
 - level 1 holds the CoM in the real legs' keyframe rectangle (ruling R22);
+- each call ends with a closing step, so the soles hold after every call, out-of-reach targets included;
 - the merge gate (``gn_gate``) and the kinematic constraint both check the soles against the stance.
 The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module. Each takes its
 confs from ``real_plan``, so no test solves the world's 64-row IK at another batch size (ruling R25)."""
@@ -14,11 +15,14 @@ from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _poses, _s
 
 #: The 3 cm move of every hand target in the GN tests.
 MOVE = (0.03, 0.0, 0.0)
+#: A move no balanced conf standing on the stance can follow: 30 cm forward and 20 cm down.
+FAR = (0.30, 0.0, -0.20)
 
 
 def _first_pick(world, plan):
     """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the init's IK solved
-    (a row whose IK failed holds home)."""
+    (a row whose IK failed holds home). The first skeleton follows PYTHONHASHSEED: on blocks_t1 its first pick has
+    64 solved rows, every CoM inside the keyframe rectangle, on one init, and 46, 27 of them outside, on the other."""
     skeleton, particles = plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     conf = op.values[-1]
@@ -26,22 +30,11 @@ def _first_pick(world, plan):
     return op.operator.metadata.arm, conf, q[(q != _home(world)).any(-1)]
 
 
-def _balanced_pick(world, plan):
-    """``(arm, q [k, dof])``: :func:`_first_pick`'s solved rows whose CoM starts inside the keyframe rectangle, as
-    Adam and every refresh keep the covered confs. The first skeleton follows PYTHONHASHSEED: on blocks_t1 its first
-    pick has 64 such rows on one init and 19 of 46 on the other. The init's CoM gate is best effort (ruling R24)."""
-    from cutamp.com_polygon_cost import compute_com_polygon_mask
-    arm, _, q = _first_pick(world, plan)
-    q = q[compute_com_polygon_mask(world, q)]
-    assert len(q) >= 16, len(q)
-    return arm, q
-
-
-def _moved_targets(world, q, arm):
-    """``(targets [B, 4, 4], before [B])``: each row's own hand pose at ``q`` moved by ``MOVE``, and its hand error
-    there (3 cm)."""
+def _moved_targets(world, q, arm, move=MOVE):
+    """``(targets [B, 4, 4], before [B])``: each row's own hand pose at ``q`` moved by ``move``, and its hand error
+    there."""
     targets = _poses(world, q, world.tool_frame_for_arm(arm))
-    targets[:, :3, 3] += torch.tensor(MOVE, device=q.device)
+    targets[:, :3, 3] += torch.tensor(move, device=q.device)
     return targets, _hand_error(world, q, targets, arm)
 
 
@@ -96,20 +89,41 @@ def test_sole_rows_match_finite_differences(real_world, real_plan):
         assert float(err.max()) <= 1e-3, model.joint_names[int(free[err.argmax()])]
 
 
+def _assert_soles_held(world, q):
+    pos, rot = _sole_errors(world, q)
+    assert float(pos.max()) <= 1e-3 and float(rot.max()) <= 0.01, (float(pos.max()), float(rot.max()))
+
+
 @needs_cuda
 def test_gn_holds_the_soles(real_world, real_plan):
-    # Hand targets moved 3 cm: GN reaches toward them with the legs and the base, holding both soles on the stance
-    # and the CoM in the keyframe rectangle (level 1).
+    # Every solved pick row, its hand target moved 3 cm: after one call GN has reached toward it with the legs and
+    # the base, holding both soles on the stance and the CoM in the keyframe rectangle (level 1), also on the rows
+    # whose CoM starts outside, which need the largest moves.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_project_balanced
-    arm, q0 = _balanced_pick(real_world, real_plan)
+    arm, _, q0 = _first_pick(real_world, real_plan)
     targets, before = _moved_targets(real_world, q0, arm)
     q = gn_project_balanced(real_world, q0, targets, arm)
-    pos, rot = _sole_errors(real_world, q)
-    assert float(pos.max()) <= 1e-3 and float(rot.max()) <= 0.01, (float(pos.max()), float(rot.max()))
+    _assert_soles_held(real_world, q)
     assert bool(compute_com_polygon_mask(real_world, q).all())
     after = _hand_error(real_world, q, targets, arm)
     assert float(after.median()) < float(before.median()), (float(before.median()), float(after.median()))
+
+
+@needs_cuda
+def test_gn_holds_the_soles_out_of_reach(real_world, real_plan):
+    # Hand targets no balanced conf on the stance can reach: four calls, each from the last result as successive
+    # refreshes run, keep both soles on the stance after every call, and every hand stays over 2 cm off, so the feet
+    # did not slide to fake the reach. Reaching for them drives joints into their limits on every call, where a
+    # clamped step or the drift of a saturated last step would move the soles.
+    from cutamp.gn_refresh import gn_project_balanced
+    arm, _, q = _first_pick(real_world, real_plan)
+    targets, _ = _moved_targets(real_world, q, arm, FAR)
+    for _ in range(4):
+        q = gn_project_balanced(real_world, q, targets, arm)
+        _assert_soles_held(real_world, q)
+        hand = _hand_error(real_world, q, targets, arm)
+        assert float(hand.min()) > 0.02, float(hand.min())
 
 
 @needs_cuda
@@ -117,7 +131,7 @@ def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monk
     # Ruling R22: _balanced_step's half=None default is the simplified rectangle, so every real-leg call passes the
     # real legs' own, with the sole rows.
     import cutamp.gn_refresh as gn_refresh
-    arm, q0 = _balanced_pick(real_world, real_plan)
+    arm, _, q0 = _first_pick(real_world, real_plan)
     targets, _ = _moved_targets(real_world, q0, arm)
     calls, step = [], gn_refresh._balanced_step
 
@@ -135,7 +149,7 @@ def test_gn_without_sole_rows_slides_the_soles(real_world, real_plan, monkeypatc
     # The same reach with the sole rows zeroed: the free base and legs carry the hand, and the soles slide off the
     # stance, so the rows bear the load.
     import cutamp.gn_refresh as gn_refresh
-    arm, q0 = _balanced_pick(real_world, real_plan)
+    arm, _, q0 = _first_pick(real_world, real_plan)
     targets, _ = _moved_targets(real_world, q0, arm)
 
     def zeros(state, sole_idx, goals, col_mask):

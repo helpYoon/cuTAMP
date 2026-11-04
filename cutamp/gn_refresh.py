@@ -180,11 +180,16 @@ def _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
     rot = roma.unitquat_to_rotmat(quat.roll(-1, dims=-1))
     r_pos = world_from_ee[:, :3, 3] - pos
     r_rot = _rotmat_to_rotvec(world_from_ee[:, :3, :3] @ rot.transpose(-1, -2))
-    # Rows 0-2 linear, 3-5 angular, world frame (finite-diff verified;
-    # see test_gn_refresh.py).
+    return torch.cat([r_pos, r_rot], dim=-1), _row_tool_jacobian(state, frames, col_mask, is_left)
+
+
+def _row_tool_jacobian(state, frames, col_mask, is_left):
+    """Each row's own arm's column-masked tool Jacobian ``[N, 6, dof]``: rows 0-2
+    linear, 3-5 angular, world frame (finite-diff verified; see test_gn_refresh.py)."""
+    (_, left_idx), (_, right_idx) = frames
     jacs = state.tool_jacobians[:, 0]
     jac = torch.where(is_left.view(-1, 1, 1), jacs[:, left_idx], jacs[:, right_idx])
-    return torch.cat([r_pos, r_rot], dim=-1), jac * col_mask.unsqueeze(1)
+    return jac * col_mask.unsqueeze(1)
 
 
 def _sole_residual_and_jacobian(state, sole_idx: Tuple[int, int], goals: torch.Tensor, col_mask: torch.Tensor):
@@ -282,6 +287,70 @@ def _fraction_that_fits(base, extra):
     return room.amin(-1, keepdim=True).clamp(0.0, 1.0)
 
 
+def _fraction_in_limits(pos, extra, lower, upper):
+    """Largest ``f`` in [0, 1] with ``lower <= pos + f * extra <= upper`` on every joint that ``extra`` moves,
+    ``[B, 1]``: 0 where it pushes a joint already at a limit further."""
+    room = torch.where(extra > 0, upper - pos, pos - lower).clamp_min(0.0)
+    frac = torch.where(extra == 0, 1.0, room / extra.abs().clamp_min(1e-12))
+    return frac.amin(-1, keepdim=True).clamp(0.0, 1.0)
+
+
+def _scaled_step(q, dq1, dq2, lower, upper, limits: bool):
+    """Levels 1-2's step, trust region in priority order: ``dq1`` scaled into the ``GN_STEP_CLAMP`` box, plus the
+    largest fraction of ``dq2`` that still fits. With ``limits`` (the sole rows), each fraction also keeps every
+    joint inside [``lower``, ``upper``]: the caller's final clamp would cut a crossing joint's motion, and that cut
+    moves the soles by the joint's column of the sole Jacobian. Scaling a level keeps it in level 1's null space;
+    cutting one joint's motion does not."""
+    f1 = _fraction_that_fits(torch.zeros_like(dq1), dq1)
+    if limits:
+        f1 = torch.minimum(f1, _fraction_in_limits(q, dq1, lower, upper))
+    step = f1 * dq1
+    f2 = _fraction_that_fits(step, dq2)
+    if limits:
+        f2 = torch.minimum(f2, _fraction_in_limits(q + step, dq2, lower, upper))
+    return step + f2 * dq2
+
+
+def _crossing_joints(q, dq1, dq2, lower, upper):
+    """``[B, dof]`` bool: the joints that levels 1-2's box-scaled step (as :func:`_balanced_step` scales it) would
+    carry past a limit, either level pushing them outward."""
+    s1 = _fraction_that_fits(torch.zeros_like(dq1), dq1) * dq1
+    s2 = _fraction_that_fits(s1, dq2) * dq2
+    p1, p2 = q + s1, q + s1 + s2
+    return ((p1 > upper) & (s1 > 0)) | ((p1 < lower) & (s1 < 0)) | ((p2 > upper) & (s2 > 0)) | ((p2 < lower) & (s2 < 0))
+
+
+def _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask, is_left):
+    """The step that ends a call on a model with soles, from a pose-only FK ``state`` at ``q``: the 12 sole rows
+    against ``goals`` as level 1, and the hand rows, held where they are, as level 2 in their null space, so the
+    hand does not ride the correction. Each iteration's level 1 holds the soles only to first order, so a
+    saturated last step leaves a second-order drift that nothing else in the call would correct.
+
+    No CoM rows (so no autograd) and no margin level. Joints at a limit are frozen, and one re-solve freezes the
+    joints the first solve would carry past one; then the step is scaled into the box and the limits as levels
+    1-2 are (:func:`_scaled_step`). Without the re-solve, a joint near its limit capped the correction on some
+    out-of-reach rows, leaving 2.9 mm. Float64, as :func:`_prioritized_step` with soles, but it projects the hand
+    rows off level 1 as ``h - (h a^+) a``, without that function's ``[N, dof, dof]`` projector: 0.6 ms against
+    0.95 ms per solve at 2048 rows, captured."""
+    f64 = torch.float64
+    r_sole, jac_sole = _sole_residual_and_jacobian(state, sole_idx, goals, col_mask)
+    a0, h0 = jac_sole.to(f64), _row_tool_jacobian(state, frames, col_mask, is_left).to(f64)
+    t1 = r_sole.to(f64).unsqueeze(-1)
+    eye12 = 1e-6 * torch.eye(12, device=q.device, dtype=f64)
+    eye6 = GN_DAMPING * torch.eye(6, device=q.device, dtype=f64)
+    free = col_mask * ((q < upper - 1e-5) & (q > lower + 1e-5))
+    for _ in range(2):
+        fc = free.to(f64).unsqueeze(1)
+        a, h = a0 * fc, h0 * fc
+        a_pinv = a.mT @ torch.linalg.inv_ex(a @ a.mT + eye12)[0]          # [N, dof, 12]
+        dq1 = a_pinv @ t1
+        jn = h - (h @ a_pinv) @ a                                         # [N, 6, dof]
+        dq2 = jn.mT @ torch.linalg.solve_ex(jn @ jn.mT + eye6, -(h @ dq1))[0]
+        dq1, dq2 = dq1.squeeze(-1).to(q.dtype), dq2.squeeze(-1).to(q.dtype)
+        free = free * ~_crossing_joints(q, dq1, dq2, lower, upper)
+    return _scaled_step(q, dq1, dq2, lower, upper, limits=True)
+
+
 def _spd_solve(M, b):
     """``M^-1 b`` for a batch of SPD ``M``, by Cholesky and two triangular
     solves: batched 21x21 f64 LU dispatches to MAGMA, which syncs."""
@@ -329,6 +398,8 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
         pushed = ~locked & (com_lin.abs() > inner) & (com_lin.sign() * (jac_com @ s3.unsqueeze(-1)).squeeze(-1) > 0)
         free = free * ~crossed
         locked = locked | pushed
+    if soles:  # the last round's crossings get no re-solve: scale it inside the limits, as levels 1-2 are
+        s3 = _fraction_in_limits(q + step, s3, lower, upper) * s3
     return s3
 
 
@@ -359,6 +430,10 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_
     # discards the CoM-correcting part of the step and the pose part walks
     # the CoM out. The rounds always run in full: a round whose sets didn't
     # change recomputes the same step, and stopping early needs a host read.
+    # With the sole rows, a joint the box-scaled step would carry past a limit
+    # is frozen too, and the step is then scaled inside the limits: scaling
+    # alone stalls a level whenever its step pushes a joint at a limit (on
+    # blocks_t1's pick confs it left the CoM outside on 16 of 46 rows).
     active = com.abs() > half
     com_target = com.sign() * inner
     free = torch.ones_like(q)
@@ -370,15 +445,15 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_
         com_lin = com + (jac_com @ dq.unsqueeze(-1)).squeeze(-1)
         pushed_out = ~active & (com_lin.abs() > half)
         blocked = ((q >= upper - 1e-5) & (dq > 0)) | ((q <= lower + 1e-5) & (dq < 0))
+        if jac_sole is not None:
+            blocked |= _crossing_joints(q, dq1, dq2, lower, upper)
         blocked &= free.bool()
         com_target = torch.where(pushed_out, com_lin.sign() * inner, com_target)
         active = active | pushed_out
         free = free * ~blocked
 
-    # Trust region in priority order: scale dq1 into the box, then add the
-    # largest fraction of dq2 that still fits; level 3 takes what room is left.
-    step = _fraction_that_fits(torch.zeros_like(dq1), dq1) * dq1
-    step = step + _fraction_that_fits(step, dq2) * dq2
+    # Level 3 takes what room levels 1-2 leave.
+    step = _scaled_step(q, dq1, dq2, lower, upper, limits=jac_sole is not None)
     margin_err = ((band_lo - q).clamp_min(0) - (q - band_hi).clamp_min(0)) * col_mask
     return step + _margin_step(q, step, margin_err, jac, jac_com, com, active, inner, free, lower, upper, jac_sole)
 
@@ -417,6 +492,14 @@ def gn_project_balanced(
       keeps steps sane where the two levels conflict;
     - the CoM Jacobian comes from autograd through cuRobo's FK, so each
       iteration costs about two pose-only iterations.
+
+    On a model with soles, every level's step also stays inside the joint
+    limits (crossing joints frozen, then each level scaled), so the final
+    clamp cuts nothing that would move the soles, and the call ends with
+    :func:`_sole_closing_step`, which closes the soles' residual that the last
+    iteration leaves (second-order drift of a saturated step) without moving
+    the hand. Together they hold the soles within 0.1 mm after each call on
+    blocks_t1's pick confs, out-of-reach targets included.
 
     Otherwise the contract is :func:`gn_project`'s, except that ``arms`` holds
     one arm per IK dep (a bare ``str`` is one): rows are ``len(arms)`` equal
@@ -471,6 +554,11 @@ def gn_project_balanced(
                                   half=support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole)
             q = (q + step).clamp(lower, upper)
 
+    if sole_idx:
+        with torch.no_grad():
+            state = kin.compute_kinematics(JointState.from_position(q, joint_names=joint_names))
+            q = (q + _sole_closing_step(state, frames, sole_idx, world.stance_soles, q, lower, upper, col_mask,
+                                        is_left)).clamp(lower, upper)
     return q.detach()
 
 
