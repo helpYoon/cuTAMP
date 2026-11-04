@@ -184,14 +184,15 @@ def _ik_for_pose_com_safe(
         # forward + tip" basin). Larger perturbations push seeds into
         # the leaned-back / squatted basins where COM-feasible solutions
         # live. Noise scales 0.1, 0.2, 0.3, ... rad and is masked to
-        # body + active arm only (the inactive arm stays locked, and the
-        # base where the model locks it).
+        # body + active arm only: the base and the inactive arm stay at q_init.
+        # ponytail: the stage 3 plan's decision 10 keeps this mask on both
+        # models. The real legs' base is their root, so there the body noise
+        # moves only the feet; revisit the mask with walks (stage 5).
         noise_std = 0.1 * (_attempt + 1)
         seed = world.q_init.unsqueeze(0).expand(batch_size, -1).clone()
         noise = torch.randn(batch_size, full_dof, device=device) * noise_std
         model = world.model
-        if model.lock_base:
-            noise[:, model.base] = 0.0  # base locked
+        noise[:, model.base] = 0.0  # base locked
         if arm == "left":
             noise[:, model.right_arm] = 0.0  # right arm locked
         elif arm == "right":

@@ -258,3 +258,35 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
     assert real_world.bodies.kinematics.tool_frames[0] == "stance" and float(real_world.bodies.mass[0]) == 0.0
     with pytest.raises(NotImplementedError):
         get_t1_motion_planner(REAL_LEGS, real_world.world_cfg)
+
+
+@needs_cuda
+def test_retry_seed_keeps_the_base_at_q_init(real_world, monkeypatch):
+    # Decision 10 keeps the CoM-gate retries' noise mask in stage 3: the noise moves the body and the active arm only.
+    # The base is the real legs' root, so every retry seed holds its six columns, like the inactive arm's, at q_init.
+    # IK and the CoM mask are stubbed: every row fails the gate, so all three retries run, and only their seeds count.
+    import cutamp.com_polygon_cost as com_polygon_cost
+    import cutamp.particle_initialization as particle_initialization
+
+    class _Result:
+        def copy_at_batch_indices(self, other, idx):
+            pass
+
+    n, m, q0, seeds = 8, real_world.model, real_world.q_init, []
+
+    def _ik(world, world_from_ee, arm, *, current_state_q=None):
+        if current_state_q is not None:
+            seeds.append(current_state_q)
+        return _Result()
+
+    monkeypatch.setattr(particle_initialization, "_ik_for_pose", _ik)
+    monkeypatch.setattr(particle_initialization, "_ik_solution_to_full_q", lambda result, world: q0.expand(n, -1))
+    monkeypatch.setattr(com_polygon_cost, "compute_com_polygon_mask",
+                        lambda world, q: torch.zeros(len(q), dtype=torch.bool, device=q.device))
+    particle_initialization._ik_for_pose_com_safe(real_world, torch.eye(4, device=q0.device).expand(n, 4, 4), "left")
+    assert len(seeds) == 3
+    for seed in seeds:
+        for held in (m.base, m.right_arm):
+            assert torch.equal(seed[:, held], q0[held].expand(n, -1))
+        for noisy in (m.body, m.left_arm):
+            assert not torch.equal(seed[:, noisy], q0[noisy].expand(n, -1))
