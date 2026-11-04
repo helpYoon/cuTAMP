@@ -74,24 +74,43 @@ def test_goal_soles_come_from_the_stance(real_world):
 
 @needs_cuda
 def test_retry_keeps_sole_goals_on_the_stance(real_world):
-    # Reachable targets, solved from retry seeds: every solved conf stands on the stance (Review Focus 2).
+    # Reachable targets, solved from retry seeds and from seeds off the stance: every solved conf stands on the stance
+    # (Review Focus 2).
     from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask, _retry_seed
     world, n = real_world, 16
     names = list(world.model.joint_names)
     reach = _home(world).repeat(n, 1)
     reach[:, names.index("Left_Shoulder_Pitch")] += torch.linspace(-0.1, -0.4, n, device=world.device)
     targets = _poses(world, reach, world.tool_frame_for_arm("left"))
+
+    def solve(ee, seeds):
+        """``(ok [k], q [k, dof])`` of ``_ik_for_pose`` on ``k`` rows. The fork pads a short batch up to the solver's
+        max_batch_size, but not its current state's jerk (solver_ik.py:62-74), so once a solver has solved one batch
+        size, another raises in its goal buffer's copy_. Every solve in this module is therefore full size: pad here
+        as the fork does, with copies of row 0."""
+        k = len(seeds)
+        pad = world.ik_solver.config.max_batch_size - k
+        result = _ik_for_pose(world, torch.cat([ee, ee[:1].expand(pad, -1, -1)]), "left",
+                              current_state_q=torch.cat([seeds, seeds[:1].expand(pad, -1)]))
+        return _ik_success_mask(result)[:k], _ik_solution_to_full_q(result, world)[:k]
+
     torch.manual_seed(0)
-    seeds = _retry_seed(world, n, "left", 0.3)
-    # The fork pads a short batch up to the solver's max_batch_size, but not its current state's jerk
-    # (solver_ik.py:62-74), so once a solver has solved one batch size, another raises in its goal buffer's copy_.
-    # Every solve in this module is therefore full size: pad here as the fork does, with copies of row 0.
-    pad = world.ik_solver.config.max_batch_size - n
-    result = _ik_for_pose(world, torch.cat([targets, targets[:1].expand(pad, -1, -1)]), "left",
-                          current_state_q=torch.cat([seeds, seeds[:1].expand(pad, -1)]))
-    ok = _ik_success_mask(result)[:n]
+    ok, q = solve(targets, _retry_seed(world, n, "left", 0.3))
     assert int(ok.sum()) >= 12, ok
-    pos, rot = _sole_errors(world, _ik_solution_to_full_q(result, world)[:n][ok])
+    pos, rot = _sole_errors(world, q[ok])
+    assert float(pos.max()) <= POS_TOL and float(rot.max()) <= ROT_TOL, (pos, rot)
+
+    # Off the stance (review F3): the pre-R21 seed (_inline_seed) holds the base and noises the legs, so its soles
+    # swing off the stance. Only _ik_for_pose's stance goals (fixed=world.sole_goals(...)) bring them back: goals
+    # from FK at the seed would hold them there. The refresh's cuRobo fallback and final repair (optimize_plan.py)
+    # rely on this, since they start from particles Adam has moved.
+    torch.manual_seed(0)
+    off = _inline_seed(world, 4, "left", 0.3)
+    pos, _ = _sole_errors(world, off)
+    assert float(pos.min()) > 0.05, pos
+    ok, q = solve(targets[::4], off)
+    assert int(ok.sum()) >= 2, ok
+    pos, rot = _sole_errors(world, q[ok])
     assert float(pos.max()) <= POS_TOL and float(rot.max()) <= ROT_TOL, (pos, rot)
 
 
@@ -156,8 +175,9 @@ def test_simplified_retry_seed_unchanged():
 @needs_cuda
 def test_init_confs_stand_on_the_stance(real_world, real_plan):
     # Rows whose IK failed hold home (_store_ik_q), which stands on the stance too; the IK-solved rows are the rest.
-    # Not checked: their CoM. The init's CoM gate is best effort on both models: it keeps an IK-solved row that fails
-    # every retry, as about half the IK-solved place rows on blocks_t1 do, on either model.
+    # Not checked: their CoM (ruling R24). The init's CoM gate is best effort on both models: it keeps an IK-solved
+    # row that fails every retry, as about half the IK-solved place rows on blocks_t1 do, on either model. GN's
+    # balance-first projection and the balance gate enforce the CoM downstream.
     skeleton, particles = real_plan
     home = _home(real_world)
     reaches, retracts = _ops(skeleton, "pick", "place"), _ops(skeleton, "retract")

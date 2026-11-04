@@ -362,8 +362,10 @@ class TAMPWorld:
             from cutamp.particle_initialization import _ik_for_pose  # import cycle at module level
 
             refresh = self.ik_refresh_solver
-            # The seed here is already the answer; without this the LBFGS stage
-            # exits early, stays uncaptured, and captures mid-optimization.
+            # On the simplified model the seed here is already the answer; on
+            # the real legs the soles' goals are the stance while q is a random
+            # conf. Either way the LBFGS stage must not exit early: it would stay
+            # uncaptured, and capture later, mid-optimization.
             exit_early, refresh.config.exit_early = refresh.config.exit_early, False
             try:
                 ee = kin_state.tool_poses.get_link_pose(

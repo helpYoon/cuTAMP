@@ -253,15 +253,20 @@ def _ik_for_pose_com_safe(
 ):
     """Call ``_ik_for_pose``; verify COM-in-polygon; retry failed particles.
 
-    Backstop behind the CoM-aware seed-IK residual (Layer 1, cuRobo
-    fork): verifies COM-in-polygon and retries the failed subset. The
-    residual makes violations rare; this wrapper guarantees
-    gate-consistency of stored confs. cuRobo's seed sampler has internal
-    randomization so retries may converge to different (feasible)
-    solutions.
+    A best-effort backstop behind the CoM-aware seed-IK residual (Layer 1,
+    cuRobo fork). Each of up to ``max_retries`` rounds re-solves the batch
+    from a noisier start conf (``_retry_seed``) and copies the new results,
+    success flags included, into the rows still outside, whether or not
+    they land inside. Rows that fail every retry are kept: the caller's
+    ``_store_ik_q`` resets only IK failures, to home (``world.q_init``). On
+    blocks_t1 about half the IK-solved place rows stay outside after 3
+    retries, on either model (ruling R24). The CoM is enforced downstream,
+    by GN's balance-first projection (``gn_refresh.gn_project_balanced``)
+    and by the balance gate on every trajectory frame
+    (``motion_solver._balance_gate``).
 
-    Returns the last batch result (best effort). Logs final failure count
-    at WARNING level so persistent failures are visible.
+    Returns the last batch result. Logs the final count of rows outside at
+    WARNING level so persistent failures are visible.
     """
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     result = _ik_for_pose(world, world_from_ee, arm)
