@@ -293,13 +293,20 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
     return s3
 
 
-def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask):
+def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask, half=None):
     """One balance-first step ``[N, dof]``, levels 1-3 of :func:`gn_project_balanced`,
     on ``jac`` and ``jac_com`` already masked by ``col_mask``. Every op is
-    row-wise, so a row's step doesn't depend on which deps share the call."""
+    row-wise, so a row's step doesn't depend on which deps share the call.
+
+    ``com`` is the CoM about the support's centre, in its frame, and ``half``
+    the rectangle level 1 holds it in: a support's ``keyframe_half``, the
+    simplified model's when ``None``."""
     from cutamp.com_polygon_cost import _half_extents
 
-    half = _half_extents(q.device, q.dtype)
+    if half is None:
+        from cutamp.robots.t1 import SIMPLIFIED
+        half = SIMPLIFIED.support.keyframe_half
+    half = _half_extents(half, q.device, q.dtype)
     inner = half - GN_COM_MARGIN
     damping = (GN_DAMPING + (r * r).sum(-1)).view(-1, 1, 1)
 
@@ -344,8 +351,9 @@ def gn_project_balanced(
     """Balance-first variant of :func:`gn_project` (``config.reik_balance_first``).
 
     Each step is a three-level hierarchy (Kanoun et al. T-RO 2011; Escande et
-    al. IJRR 2014): (1) keep the base-frame CoM inside the support rectangle
-    shrunk by ``GN_COM_MARGIN``; (2) least squares on the pose residual in
+    al. IJRR 2014): (1) keep the CoM, in the support frame of
+    ``world.model.support``, inside its keyframe rectangle shrunk by
+    ``GN_COM_MARGIN``; (2) least squares on the pose residual in
     whatever freedom level 1 leaves; (3) move joints out of the
     ``joint_limit_margin`` bands (robots/t1.py margins) in whatever freedom
     is left, in small steps (:func:`_margin_step`). An unreachable target
@@ -378,6 +386,7 @@ def gn_project_balanced(
 
     N = q_full.shape[0]
     arms = (arms,) if isinstance(arms, str) else tuple(arms)
+    support = world.model.support
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
     band_lo = lower + _device_const(world.model.margin_lower, q.device, q.dtype)
     band_hi = upper - _device_const(world.model.margin_upper, q.device, q.dtype)
@@ -387,12 +396,14 @@ def gn_project_balanced(
             q_g = q.detach().requires_grad_(True)
             with torch.enable_grad():
                 state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
-                with torch.no_grad():  # base joints are pinned, so the base pose is constant
+                # The support frame is constant: the simplified base is pinned, and the real legs' stance hangs off
+                # the world, not off their free base. Held under no_grad, so CoM gradients never reach it (design 7.4).
+                with torch.no_grad():
                     base_T = (
-                        state.tool_poses.get_link_pose("mobile_base_link", make_contiguous=True)
+                        state.tool_poses.get_link_pose(support.link, make_contiguous=True)
                         .get_matrix().reshape(N, 4, 4)
                     )
-                com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
+                com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T, support.center)
                 # Clone: cuRobo's backward writes into a reused buffer, so without
                 # it the second grad call overwrites the x row with the y row.
                 jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
@@ -406,7 +417,8 @@ def gn_project_balanced(
             com, jac_com = q.new_zeros(N, 2), q.new_zeros(N, 2, q.shape[-1])
         with torch.no_grad():
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
-            step = _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask)
+            step = _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask,
+                                  half=support.keyframe_half)
             q = (q + step).clamp(lower, upper)
 
     return q.detach()
@@ -438,4 +450,4 @@ def gn_gate(
     pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
     ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
     pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
-    return (pos_err < pos_tol) & (rot_err < rot_tol), com_polygon_mask_from_state(state)
+    return (pos_err < pos_tol) & (rot_err < rot_tol), com_polygon_mask_from_state(state, world.model.support)

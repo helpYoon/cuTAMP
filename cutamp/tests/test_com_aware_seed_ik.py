@@ -87,9 +87,9 @@ def test_fork_penalty_parity_with_cutamp_reference():
     # cuTAMP's CoM by the centre so both see the same offset.
     from cutamp.com_polygon_cost import COM_CENTER
     com_shifted = com_world + (R @ torch.tensor([*COM_CENTER, 0.0])).view(B, 3)
-    com_in_base = _project_com_to_base(com_shifted, base_T)
+    com_in_base = _project_com_to_base(com_shifted, base_T, COM_CENTER)
     for cw in (0.0, 0.01):
-        ref = com_polygon_penalty(com_shifted, base_T, half, 0.02, 1.0)
+        ref = com_polygon_penalty(com_shifted, base_T, half, 0.02, 1.0, COM_CENTER)
         ref = ref + cw * ((com_in_base / half) ** 2).sum(-1)
         got = com_support_penalty(com_world, base_pos, quat_wxyz, half, 0.02, 1.0, cw)
         assert torch.allclose(got, ref, atol=1e-5), f"max diff {(got - ref).abs().max()}"
@@ -220,7 +220,7 @@ def _forward_reach_solutions(world, n_fwd=4, n_lat=3, unreachable=False):
 def _com_abs_x(world, q_full):
     from cutamp.com_polygon_cost import _fk_com_and_base, _project_com_to_base
     com_world, base_T = _fk_com_and_base(world, q_full)
-    return _project_com_to_base(com_world, base_T)[:, 0].abs()
+    return _project_com_to_base(com_world, base_T, world.model.support.center)[:, 0].abs()
 
 
 @needs_cuda

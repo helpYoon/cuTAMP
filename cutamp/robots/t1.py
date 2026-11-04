@@ -427,8 +427,8 @@ def get_t1_motion_planner(
     Legs (ankle/knee), Torso_Pitch, Waist_Yaw, and both arms remain free.
 
     When ``enable_com_polygon`` is True (default), the planner gets a soft
-    cost penalizing trajectories whose mass-weighted COM projects outside a
-    20×30 cm rectangle in ``mobile_base_link`` frame. Note the kinematics
+    cost penalizing trajectories whose mass-weighted COM projects outside the
+    model's keyframe rectangle (``model.support``). Note the kinematics
     kernel always builds with ``compute_com=True`` (cheap, useful for any
     future COM-based cost or diagnostic) — the flag only gates registration
     of the cost itself.
@@ -466,7 +466,6 @@ def get_t1_motion_planner(
         from cutamp.com_polygon_cost import (
             ComOverBasePolygonCost,
             ComOverBasePolygonCostCfg,
-            COM_HALF_EXTENTS,
             COM_INSIDE_MARGIN,
             COM_INSIDE_WEIGHT,
         )
@@ -493,9 +492,11 @@ def get_t1_motion_planner(
         cost_cfg = ComOverBasePolygonCostCfg(
             weight=[5.0e5],
             device_cfg=rollout_device_cfg,
-            half_extents=torch.tensor(COM_HALF_EXTENTS),
+            half_extents=torch.tensor(model.support.keyframe_half),
             inside_margin=COM_INSIDE_MARGIN,
             inside_weight=COM_INSIDE_WEIGHT,
+            base_link_name=model.support.link,
+            center=model.support.center,
         )
         add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     if enable_joint_limit_margin:

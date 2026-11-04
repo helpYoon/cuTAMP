@@ -76,14 +76,14 @@ def test_retime_factor_scales_with_square():
     # Slowing by s divides the ZMP's offset from the CoM by s^2.
     hx = SUPPORT_HALF_EXTENTS[0]
     com = torch.tensor([[hx - 0.01, 0.0]])
-    assert retime_factor(com, com + torch.tensor([[0.04, 0.0]])) == pytest.approx(2.0)
-    assert retime_factor(com, com + torch.tensor([[0.005, 0.0]])) == 1.0
+    assert retime_factor(com, com + torch.tensor([[0.04, 0.0]]), SUPPORT_HALF_EXTENTS) == pytest.approx(2.0)
+    assert retime_factor(com, com + torch.tensor([[0.005, 0.0]]), SUPPORT_HALF_EXTENTS) == 1.0
 
 
 def test_retime_factor_zero_room_is_inf():
     hx = SUPPORT_HALF_EXTENTS[0]
     com = torch.tensor([[hx, 0.0]])
-    assert retime_factor(com, com + torch.tensor([[0.001, 0.0]])) == math.inf
+    assert retime_factor(com, com + torch.tensor([[0.001, 0.0]]), SUPPORT_HALF_EXTENTS) == math.inf
 
 
 def test_retime_preserves_endpoints():

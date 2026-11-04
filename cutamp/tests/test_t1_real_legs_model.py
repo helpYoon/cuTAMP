@@ -24,12 +24,19 @@ from cutamp.tests.conftest import needs_cuda
 
 CUTAMP = Path(__file__).resolve().parents[1]
 T1_29DOF = CUTAMP / "robots" / "assets" / "t1_29dof"
-SIMPLIFIED_CONSTANTS = re.compile(
-    r"\b(CUROBO_DOF|URDF_DOF|BASE_DOF|BASE_INDICES|BODY_INDICES|LEFT_ARM_INDICES|RIGHT_ARM_INDICES|"
-    r"JOINT_NAMES_FULL|t1_home|T1_LIMIT_MARGIN_LOWER|T1_LIMIT_MARGIN_UPPER)\b"
-)
+SIMPLIFIED_NAMES = ("CUROBO_DOF", "URDF_DOF", "BASE_DOF", "BASE_INDICES", "BODY_INDICES", "LEFT_ARM_INDICES",
+                    "RIGHT_ARM_INDICES", "JOINT_NAMES_FULL", "t1_home", "T1_LIMIT_MARGIN_LOWER",
+                    "T1_LIMIT_MARGIN_UPPER")
+SIMPLIFIED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES)})\b")
 #: The definitions, their re-exports, and a script that checks simplified plans only.
 MAY_READ_SIMPLIFIED_CONSTANTS = {"robots/t1.py", "robots/__init__.py", "scripts/check_plan_margins.py"}
+#: Task 3 extends the list with the simplified support region and its frame, which ``world.model.support`` replaces.
+SUPPORT_NAMES = ("COM_HALF_EXTENTS", "SUPPORT_HALF_EXTENTS", "COM_CENTER", "mobile_base_link")
+EXTENDED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES + SUPPORT_NAMES)})\b")
+#: Their definitions, the sphere editor, which edits the simplified model only, and the real legs' build script,
+#: which names the simplified legs it replaces.
+MAY_READ_EXTENDED_CONSTANTS = MAY_READ_SIMPLIFIED_CONSTANTS | {
+    "com_polygon_cost.py", "scripts/robot_sphere_editor.py", "robots/assets/t1_29dof/build_planner_model.py"}
 LEGS = {
     side: {f"{link}_{side.title()}" for link in ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Shank", "Ankle_Cross")}
     | {f"{side}_foot_link", f"{side}_sole_link"}
@@ -145,16 +152,24 @@ def test_real_legs_refuses_ablation_paths(kw):
         validate_tamp_config(TAMPConfiguration(robot="real_legs", **kw))
 
 
-def test_no_module_reads_simplified_constants():
-    # A simplified slice, home or margin read where world.model should be gives plausible, wrong numbers on the
-    # real legs (Review Focus 1). Comments count too.
+def simplified_reads(pattern: re.Pattern, allowed: set) -> list:
+    """``path:line: text`` of every line of cutamp's modules, comments included, that ``pattern`` matches: tests and
+    the ``allowed`` files (paths relative to cutamp/) aside."""
     hits = []
     for path in sorted(CUTAMP.rglob("*.py")):
         rel = path.relative_to(CUTAMP).as_posix()
-        if rel.startswith("tests/") or rel in MAY_READ_SIMPLIFIED_CONSTANTS:
+        if rel.startswith("tests/") or rel in allowed:
             continue
         hits += [f"{rel}:{k}: {line.strip()}" for k, line in enumerate(path.read_text().splitlines(), 1)
-                 if SIMPLIFIED_CONSTANTS.search(line)]
+                 if pattern.search(line)]
+    return hits
+
+
+def test_no_module_reads_simplified_constants():
+    # A simplified slice, home or margin read where world.model should be gives plausible, wrong numbers on the
+    # real legs (Review Focus 1). Comments count too. Task 3's extended list, with its wider allow-list, is
+    # test_real_legs_support.test_extended_grep's.
+    hits = simplified_reads(SIMPLIFIED_CONSTANTS, MAY_READ_SIMPLIFIED_CONSTANTS)
     assert not hits, "\n".join(hits)
 
 

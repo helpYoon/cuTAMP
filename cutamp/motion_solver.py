@@ -549,8 +549,8 @@ def solve_curobo(
 
 def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
     """Measure-only trajectory CoM audit (recorded in every ablation arm): the plan's frame count,
-    ``traj_com_frames``, and the fraction of them whose CoM leaves the support rectangle the gate enforces,
-    ``traj_com_violation_frac``."""
+    ``traj_com_frames``, and the fraction of them whose CoM leaves the support rectangle the gate enforces
+    (``world.model.support.gate_half``, through ``compute_support_mask``), ``traj_com_violation_frac``."""
     # The whole block is exception-isolated: this audit is MEASURE-ONLY
     # and must never change which plans are produced or accepted. Any
     # failure here (e.g. an unexpected DOF/joint-name mismatch) is logged
@@ -651,27 +651,28 @@ def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
 def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     """The real robot's balance check on every interpolated frame of a segment.
 
-    The CoM must stay inside the support rectangle (``SUPPORT_HALF_EXTENTS``); a segment whose CoM leaves it
-    raises RuntimeError, so the planner moves to its next candidate or skeleton. The multibody ZMP, from
-    the plan's own velocities and accelerations, must stay inside too; a segment whose ZMP leaves it is slowed down uniformly until it fits, up to
-    ``RETIME_MAX``, past which it raises. Returns ``(plan_js, stats, planner_timing)``: the plan, retimed if
-    needed; ``{"retime", "com_min_margin", "zmp_min_margin"}`` (metres); and, for a slowed segment, the same
-    spline sampled without a slowdown: the motion planner's positions exactly, with the spline's velocities and
-    accelerations (the timing test runs both), else None."""
-    from cutamp.com_polygon_cost import (
-        SUPPORT_HALF_EXTENTS, com_margin_from_base, com_zmp_in_support, retime_factor,
-    )
+    The CoM must stay inside the gate's support rectangle (``world.model.support.gate_half``); a segment whose
+    CoM leaves it raises RuntimeError, so the planner moves to its next candidate or skeleton. The multibody ZMP,
+    from the plan's own velocities and accelerations, must stay inside too; a segment whose ZMP leaves it is
+    slowed down uniformly until it fits, up to ``RETIME_MAX``, past which it raises. Returns
+    ``(plan_js, stats, planner_timing)``: the plan, retimed if needed; ``{"retime", "com_min_margin",
+    "zmp_min_margin"}`` (metres); and, for a slowed segment, the same spline sampled without a slowdown: the
+    motion planner's positions exactly, with the spline's velocities and accelerations (the timing test runs
+    both), else None."""
+    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, retime_factor
+
+    half = world.model.support.gate_half
 
     def margins(js):
         com, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
-        return (com, zmp, com_margin_from_base(com, SUPPORT_HALF_EXTENTS).min().item(),
-                com_margin_from_base(zmp, SUPPORT_HALF_EXTENTS).min().item())
+        return (com, zmp, com_margin_from_base(com, half).min().item(),
+                com_margin_from_base(zmp, half).min().item())
 
     with torch.no_grad():
         com, zmp, com_m, zmp_m = margins(plan_js)
         if com_m < 0:
             raise RuntimeError(f"trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
-        out, s, tried = plan_js, 1.05 * retime_factor(com, zmp), 1.0
+        out, s, tried = plan_js, 1.05 * retime_factor(com, zmp, half), 1.0
         while zmp_m < 0:
             if tried >= RETIME_MAX:
                 raise RuntimeError(f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap")
