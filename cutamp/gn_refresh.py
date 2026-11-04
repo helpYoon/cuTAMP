@@ -576,8 +576,9 @@ def gn_gate(
 
     Returns ``(pose_ok [N], com_ok [N])``: ``_achieved_pose_errors`` (the
     checker's metric, on each row's own arm) strictly under ``pos_tol`` and
-    ``rot_tol``, on the real legs both soles' errors against the stance too,
-    and ``compute_com_polygon_mask``. ``q_full`` must be contiguous float32 on
+    ``rot_tol``, on the real legs both soles' errors against the stance too
+    (:func:`soles_on_stance`, on the same tolerances), and
+    ``compute_com_polygon_mask``. ``q_full`` must be contiguous float32 on
     the kinematics device, as cuRobo's FK requires.
     """
     from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
@@ -591,9 +592,18 @@ def gn_gate(
     pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
     pose_ok = (pos_err < pos_tol) & (rot_err < rot_tol)
     if world.model.sole_frames:
-        # A conf whose soles left the stance passes com_ok on a support polygon it no longer stands on (design 7.4).
-        soles = torch.stack([state.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix()
-                             for frame in world.model.sole_frames], dim=1)  # [N, 2, 4, 4]
-        sole_pos, sole_rot = curobo_pose_error(soles, world.stance_soles)
-        pose_ok = pose_ok & ((sole_pos < pos_tol) & (sole_rot < rot_tol)).all(-1)
+        pose_ok = pose_ok & soles_on_stance(world, state, pos_tol, rot_tol)
     return pose_ok, com_polygon_mask_from_state(state, world.model.support)
+
+
+def soles_on_stance(world, state, pos_tol: float, rot_tol: float) -> torch.Tensor:
+    """``[N]`` bool: both soles' pose errors against the stance (``world.stance_soles``, the checker's metric)
+    strictly under ``pos_tol`` and ``rot_tol``, on an FK ``state`` of ``world.kinematics`` or one of its sites.
+    For a model with soles: a conf whose soles left the stance passes a CoM check on a support polygon it no
+    longer stands on (design 7.4)."""
+    from cutamp.costs import curobo_pose_error
+
+    soles = torch.stack([state.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix()
+                         for frame in world.model.sole_frames], dim=1)  # [N, 2, 4, 4]
+    sole_pos, sole_rot = curobo_pose_error(soles, world.stance_soles)
+    return ((sole_pos < pos_tol) & (sole_rot < rot_tol)).all(-1)

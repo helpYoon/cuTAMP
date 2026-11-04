@@ -27,7 +27,7 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
-from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced
+from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced, soles_on_stance
 from cutamp.particle_initialization import (
     _achieved_pose_errors,
     _ik_for_pose,
@@ -580,12 +580,13 @@ class ParticleOptimizer:
             else:
                 # Final pre-check refresh: REPAIR-ONLY, on the full-strength
                 # main solver. Measure which rows actually fail the checker's
-                # kinematic tolerance or the CoM gate and only overwrite those
-                # — a blanket success-masked overwrite perturbs already-good
-                # rows' soft costs (measured best_soft 18.6 -> 22.8 on one
-                # run). Full batch always: cuRobo pads sub-capacity batches
-                # internally, so subsets save nothing.
-                from cutamp.com_polygon_cost import compute_com_polygon_mask
+                # kinematic tolerances (the hand's, and on a model with soles
+                # the soles' against the stance) or the CoM gate, and only
+                # overwrite those — a blanket success-masked overwrite perturbs
+                # already-good rows' soft costs (measured best_soft 18.6 -> 22.8
+                # on one run). Full batch always: cuRobo pads sub-capacity
+                # batches internally, so subsets save nothing.
+                from cutamp.com_polygon_cost import _fk_state, compute_com_polygon_mask
                 pos_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err")
                 rot_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err")
                 with torch.no_grad():
@@ -593,6 +594,12 @@ class ParticleOptimizer:
                         world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
                     )
                     ok_now = (pos_err < pos_tol) & (rot_err < rot_tol)
+                    if world.model.sole_frames:
+                        ok_now &= soles_on_stance(
+                            world, _fk_state(world, particles[dep.q_name].detach()),
+                            self.constraint_checker._get_tol(KinematicConstraint.type, "sole_pos_err"),
+                            self.constraint_checker._get_tol(KinematicConstraint.type, "sole_rot_err"),
+                        )
                     if self.config.enable_com_aware_ik:  # off in the no-CoM ablation
                         ok_now &= compute_com_polygon_mask(world, particles[dep.q_name])
                 if bool(ok_now.all()):

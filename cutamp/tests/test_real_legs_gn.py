@@ -3,7 +3,8 @@
   free (``_row_layout`` freezes them only where ``model.lock_base``);
 - level 1 holds the CoM in the real legs' keyframe rectangle (ruling R22);
 - each call ends with a closing step, so the soles hold after every call, out-of-reach targets included;
-- the merge gate (``gn_gate``) and the kinematic constraint both check the soles against the stance.
+- the merge gate (``gn_gate``), the final repair and the kinematic constraint all check the soles against the
+  stance.
 The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module. Each takes its
 confs from ``real_plan``, so no test solves the world's 64-row IK at another batch size (ruling R25)."""
 
@@ -172,6 +173,22 @@ def test_gate_rejects_drifted_soles(real_world):
     pose_ok, com_ok = gn_gate(real_world, q, targets, "left", POS_TOL, ROT_TOL)
     assert pose_ok.tolist() == [True, False]
     assert com_ok.tolist() == [True, True]
+
+
+@needs_cuda
+def test_soles_on_stance_at_the_checker_tolerances(real_world):
+    # The final repair's sole test, on world.kinematics and the checker's own sole tolerances: home stands on the
+    # stance, and home shifted 1 cm by base_j_x does not.
+    from cutamp.com_polygon_cost import _fk_state
+    from cutamp.gn_refresh import soles_on_stance
+    from cutamp.scripts.utils import default_constraint_to_tol
+    from cutamp.task_planning.constraints import KinematicConstraint
+
+    tol = default_constraint_to_tol[KinematicConstraint.type]
+    q = _home(real_world).repeat(2, 1)
+    q[1, list(real_world.model.joint_names).index("base_j_x")] += 0.01
+    ok = soles_on_stance(real_world, _fk_state(real_world, q), tol["sole_pos_err"], tol["sole_rot_err"])
+    assert ok.tolist() == [True, False]
 
 
 @needs_cuda
