@@ -122,7 +122,8 @@ def test_real_legs_layout():
         ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll")}
     assert (m.base, m.left_arm, m.right_arm, m.body) == (slice(0, 6), slice(6, 13), slice(13, 20), slice(20, 33))
     assert not any(m.margin_lower + m.margin_upper) and len(m.margin_lower) == len(m.margin_upper) == 33
-    assert len(m.home) == 33 and m.sole_frames == ("left_sole_link", "right_sole_link") and m.envelope is None
+    assert len(m.home) == 33 and m.sole_frames == ("left_sole_link", "right_sole_link")
+    assert m.envelope.name == "route_a_start" and SIMPLIFIED.envelope is None
     assert SIMPLIFIED.home == t1_home and SIMPLIFIED.base == BASE_INDICES and SIMPLIFIED.joint_names == JOINT_NAMES_FULL
     assert SIMPLIFIED.lock_base and SIMPLIFIED.sole_frames == ()
 

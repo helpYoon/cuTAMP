@@ -57,7 +57,14 @@ default_constraint_to_tol = {
     # sole_*: the real legs' soles against the stance (design 7.4), on the hand's tolerances.
     KinematicConstraint.type: {"pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": 0.005, "sole_rot_err": 0.05},
     # retract_*: the real legs' retract confs, which join the motion constraints (design 7.3).
-    Motion.type: {"joint_limit": 0.0, "self_collision": 0.0, "retract_joint_limit": 0.0, "retract_self_collision": 0.0},
+    # trunk_tilt: the Trunk tilt past the envelope's maximum, at every conf (call 22).
+    Motion.type: {
+        "joint_limit": 0.0,
+        "self_collision": 0.0,
+        "retract_joint_limit": 0.0,
+        "retract_self_collision": 0.0,
+        "trunk_tilt": 0.0,
+    },
     StablePlacement.type: {
         # You might need to add additional tolerances if your support surfaces have different names
         "goal_in_xy": 1e-3,

@@ -8,6 +8,7 @@
 # its affiliates is strictly prohibited.
 
 import itertools
+import math
 from collections import defaultdict
 from functools import lru_cache
 from typing import Dict, Optional, Tuple, Union
@@ -20,6 +21,7 @@ from curobo.types import JointState
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
+from cutamp.joint_limit_cost import trunk_tilt_excess
 from cutamp.rollout import Rollout, get_retract_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
@@ -118,6 +120,12 @@ class CostFunction:
         self.retract_self_collision_cost_fn = (
             SelfCollisionCost(self_collision_config) if world.model.sole_frames and self.retract_info else None
         )
+        # The envelope's Trunk tilt bound (call 22), as trunk_tilt_excess's arguments after the confs: the base's pitch
+        # and roll columns, and the cosine of the maximum tilt.
+        envelope, names = world.model.envelope, world.model.joint_names
+        self.trunk_tilt_args = None if envelope is None else (
+            names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(envelope.trunk_tilt_max)
+        )
 
         # Conf parameters for kinematic constraints, order in rollout should match
         self.kinematic_confs, self.kinematic_actions = zip(*(con.params for con in self.kinematic_constraints))
@@ -215,7 +223,8 @@ class CostFunction:
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
         """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and, on the
-        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``)."""
+        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope,
+        also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 
@@ -230,6 +239,9 @@ class CostFunction:
         values = {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals}
         if self.retract_self_collision_cost_fn is not None and self._particles is not None:
             values.update(self._retract_motion_values())
+        if self.trunk_tilt_args is not None:
+            # ponytail: the retract confs are left out: their base and body are locked at home, which stands upright.
+            values["trunk_tilt"] = trunk_tilt_excess(confs, *self.trunk_tilt_args)
         motion_cost = {
             "type": "constraint",
             "constraints": self.motion_constraints,

@@ -8,7 +8,8 @@ Two planning models of the Booster T1, each a :class:`T1Model`, chosen by
 - ``SIMPLIFIED`` (the default): the 21-DOF model described below, its planar
   base locked;
 - ``REAL_LEGS``: bfm_wm's pinned 33-DOF T1 (``assets/t1_29dof``, design 7.2),
-  its legs on six massless base joints, standing on the home stance. Its
+  its legs on six massless base joints, standing on the home stance, its
+  limits cut to route A's envelope (``assets/envelopes``, call 22). Its
   motion planner is not built yet (``get_t1_motion_planner`` raises).
 
 Consumers read names, slices, home, margins and the support region from
@@ -34,6 +35,7 @@ handled at planning time in ``cutamp/t1_state.py``, and is a no-op (see
 
 import copy
 import logging
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from functools import lru_cache
@@ -60,6 +62,7 @@ from cutamp.com_polygon_cost import (
     SUPPORT_HALF_EXTENTS,
     support_rectangles,
 )
+from cutamp.robots.envelope import Envelope, load_envelope
 from cutamp.utils.common import action_4dof_to_mat4x4
 from cutamp.utils.rerun_utils import clean_rerun_path, log_scene
 
@@ -213,7 +216,7 @@ class T1Model:
     margin_upper: Tuple[float, ...]
     support: Support
     sole_frames: Tuple[str, ...]         # () | ("left_sole_link", "right_sole_link")
-    envelope: Optional["Envelope"]       # route A's envelope (design 7.10); None until it is loaded
+    envelope: Optional[Envelope]         # what the policy may be sent (design 7.10, call 22); its limits are cut to it
 
 
 SIMPLIFIED = T1Model(
@@ -276,7 +279,7 @@ def _load_real_legs() -> T1Model:
         # The stance link sits at the home mid-sole, on the floor: the rectangle is centred on it.
         support=Support("stance", (0.0, 0.0), gate_half, keyframe_half),
         sole_frames=("left_sole_link", "right_sole_link"),
-        envelope=None,
+        envelope=load_envelope("route_a_start"),  # by name: route A has no checkpoint to pick it by (design 7.10)
     )
 
 
@@ -298,7 +301,8 @@ def get_model(name: str) -> T1Model:
 @lru_cache(maxsize=None)
 def t1_curobo_cfg(model: T1Model) -> dict:
     """``model``'s cuRobo robot config, its asset paths resolved to absolutes, without the YAML's ``cutamp``
-    block (the model's own data, which cuRobo never reads). Shared: deep-copy it before editing."""
+    block (the model's own data, which cuRobo never reads), its limits cut to ``model.envelope``. Shared:
+    deep-copy it before editing."""
     cfg = load_yaml(str(model.cfg_path))
     cfg.pop("cutamp", None)
     kinematics = cfg["robot_cfg"]["kinematics"]
@@ -308,7 +312,36 @@ def t1_curobo_cfg(model: T1Model) -> dict:
     if isinstance(kinematics.get("collision_spheres"), str):
         kinematics["collision_spheres"] = str(model.asset_root / kinematics["collision_spheres"])
     kinematics["asset_root_path"] = str(model.asset_root)
+    if model.envelope is not None:
+        _cut_to_envelope(kinematics, model.envelope)
     return cfg
+
+
+def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
+    """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: the Trunk
+    height floor raises ``base_j_z``'s lower limit, and each listed joint's range raises its ``position_limit_clip``,
+    which cuRobo takes off both ends of the URDF range (kinematics_loader.py:1119-1120). Raises if a range leaves
+    nothing of the soft range."""
+    base_z = next(link for link in kinematics["extra_links"].values() if link.get("joint_name") == "base_j_z")
+    lower, upper = base_z["joint_limits"]
+    if envelope.trunk_height_min >= upper:
+        raise ValueError(f"envelope {envelope.name!r}: Trunk floor {envelope.trunk_height_min} m >= base_j_z's {upper}")
+    base_z["joint_limits"] = [max(lower, envelope.trunk_height_min), upper]
+
+    urdf = ET.parse(kinematics["urdf_path"]).getroot()
+    urdf_limits = {joint.get("name"): joint.find("limit") for joint in urdf.findall("joint")}
+    cspace = kinematics["cspace"]
+    clip = cspace["position_limit_clip"]
+    for joint, (lo, hi) in envelope.joint_ranges.items():
+        i = cspace["joint_names"].index(joint)
+        hard_lo, hard_hi = (float(urdf_limits[joint].get(side)) for side in ("lower", "upper"))
+        # ponytail: the clip cuts both ends alike, so an off-centre range loses its wider side's excess (today's
+        # checkpoint's Waist, -0.50 to +0.58, would plan in +-0.50); route_a_start's Waist range is centred.
+        cut = max(clip[i], lo - hard_lo, hard_hi - hi)
+        if hard_lo + cut >= hard_hi - cut:
+            raise ValueError(f"envelope {envelope.name!r}: {joint}'s range {(lo, hi)} leaves nothing of its soft range "
+                             f"{(hard_lo + clip[i], hard_hi - clip[i])}")
+        clip[i] = cut
 
 
 def _lock_mobile_base(model: T1Model, cfg_dict: dict) -> dict:
