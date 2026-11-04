@@ -46,9 +46,11 @@ def test_live_lockstep_through_cutamp_demo(tmp_path, monkeypatch, n, step_spy):
 
 @needs_cuda
 @needs_slow
-def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch):
-    # The real legs' larger shapes, with the 12 sole rows inside G_refresh and the retract confs' motion FK and
-    # self-collision cost inside G_step: every spied replay matches its eager twin (the spies raise).
+@pytest.mark.parametrize("n", [64, 512])
+def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
+    # The real legs' larger shapes, with the 12 sole rows and the closing step inside G_refresh and the retract
+    # confs' motion FK and self-collision cost inside G_step: every spied replay matches its eager twin (the spies
+    # raise), at the test batch and at the speed gate's 512 particles.
     from cutamp.cost_function import CostFunction
 
     retract_calls, retract_values = [], CostFunction._retract_motion_values
@@ -59,7 +61,7 @@ def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch):
 
     monkeypatch.setattr(CostFunction, "_retract_motion_values", count)
     replays, eager = install_step_replay_spy(monkeypatch), install_refresh_spy(monkeypatch)
-    _run_demo(tmp_path, monkeypatch, 64, robot="real_legs")
+    _run_demo(tmp_path, monkeypatch, n, robot="real_legs")
     assert max(map(len, replays)) >= 20 and len(eager) >= 1
     assert retract_calls  # the skeleton has retracts, so the replayed G_step holds their motion cost
 
