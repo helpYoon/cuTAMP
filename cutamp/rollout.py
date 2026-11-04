@@ -81,6 +81,7 @@ class Rollout(TypedDict):
     conf_params: List[str]
     robot_spheres: torch.Tensor  # [num_particles, *h, n, 4]
     world_from_ee: torch.Tensor  # [num_particles, *h, 4, 4]
+    world_from_soles: Optional[torch.Tensor]  # [num_particles, *h, 2, 4, 4] on the real legs; None without soles
     world_from_tool_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     world_from_ee_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     gripper_close: List[bool]
@@ -113,6 +114,7 @@ class RolloutFunction:
 
     def __call__(self, particles: Particles) -> Rollout:
         num_particles = particles["left_q0"].shape[0]
+        sole_frames = self.world.model.sole_frames
 
         # Stack and FK in one shot. confs shape: (num_particles, num_timesteps, dof).
         if self.conf_params:
@@ -143,11 +145,19 @@ class RolloutFunction:
             world_from_ee = torch.stack(
                 [frame_to_mat[frame][:, t] for t, frame in enumerate(conf_frames)], dim=1
             )
+            # Both soles at every conf, for the kinematic constraint's check against the stance (design 7.4).
+            world_from_soles = torch.stack([
+                ee_pose.get_link_pose(frame, make_contiguous=True).get_matrix().view(*confs.shape[:2], 4, 4)
+                for frame in sole_frames
+            ], dim=2) if sole_frames else None
 
             # Robot spheres: shared across tool frames; reshape directly.
             robot_spheres = kin_state.robot_spheres.view(num_particles, confs.shape[1], -1, 4)
         else:
             world_from_ee = torch.empty(num_particles, 0, 4, 4, device=self.world.device)
+            world_from_soles = (
+                torch.empty(num_particles, 0, len(sole_frames), 4, 4, device=self.world.device) if sole_frames else None
+            )
             robot_spheres = torch.empty(num_particles, 0, 0, 4, device=self.world.device)
 
         # Walk operators to produce action targets.
@@ -251,6 +261,7 @@ class RolloutFunction:
             conf_params=self.conf_params,
             robot_spheres=robot_spheres,
             world_from_ee=world_from_ee,
+            world_from_soles=world_from_soles,
             world_from_tool_desired=world_from_tool_desired,
             world_from_ee_desired=world_from_ee_desired,
             gripper_close=gripper_close,

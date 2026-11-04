@@ -22,7 +22,8 @@ from cutamp.com_polygon_cost import COM_TOL
 
 
 default_constraint_to_mult = {
-    KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0},
+    # sole_*: the real legs' soles against the stance at every conf (design 7.4), weighted as the hand is.
+    KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0},
     StablePlacement.type: {"goal_support": 2.0},
     TrajectoryLength.type: {"traj_length": 1e-3},
     # ComPolygon penalty values are O(1e-4 to 1e-3) in m²; multiplier 10
@@ -53,7 +54,8 @@ default_constraint_to_tol = {
     Collision.type: {"default": 1e-3},
     # Based on cuRobo thresholds: https://github.com/NVlabs/curobo/blob/2fbffc35225398cf9d5f382804faa9de2608753b/src/curobo/wrap/reacher/ik_solver.py#L127-L128
     # Can lower position for high precision, but should be fine for now.
-    KinematicConstraint.type: {"pos_err": 0.005, "rot_err": 0.05},
+    # sole_*: the real legs' soles against the stance (design 7.4), on the hand's tolerances.
+    KinematicConstraint.type: {"pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": 0.005, "sole_rot_err": 0.05},
     # retract_*: the real legs' retract confs, which join the motion constraints (design 7.3).
     Motion.type: {"joint_limit": 0.0, "self_collision": 0.0, "retract_joint_limit": 0.0, "retract_self_collision": 0.0},
     StablePlacement.type: {

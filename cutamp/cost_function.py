@@ -197,12 +197,19 @@ class CostFunction:
         self._rollout_validated = True
 
     def kinematic_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Kinematic constraints - i.e., pose error between actual and desired end-effector poses."""
+        """Kinematic constraints - i.e., pose error between actual and desired end-effector poses. On the real
+        legs also both soles' error against the stance at every conf, ``sole_pos_err`` and ``sole_rot_err``
+        ``[N, 2H]``: a conf whose feet drifted would pass the CoM gate on a support polygon it no longer stands
+        on (design 7.4)."""
         pos_errs, rot_errs = curobo_pose_error(rollout["world_from_ee"], rollout["world_from_ee_desired"])
+        values = {"pos_err": pos_errs, "rot_err": rot_errs}
+        if rollout["world_from_soles"] is not None:
+            sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.stance_soles)  # [N, H, 2]
+            values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
         kinematic_cost = {
             "type": "constraint",
             "constraints": self.kinematic_constraints,
-            "values": {"pos_err": pos_errs, "rot_err": rot_errs},
+            "values": values,
         }
         return kinematic_cost
 

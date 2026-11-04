@@ -45,10 +45,12 @@ per-refresh fallback):
 ``gn_project_balanced`` is the balance-first variant behind
 ``config.reik_balance_first``: CoM-in-polygon is a hard first level, the
 pose is least squares inside it, and joint-limit margins use what is left.
+On the real legs, whose base columns are free, level 1 also holds both soles
+on the stance (12 rows, design 7.4), and ``gn_gate`` checks them.
 """
 
 from functools import lru_cache
-from typing import Sequence
+from typing import Sequence, Tuple
 
 import roma
 import torch
@@ -185,6 +187,22 @@ def _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
     return torch.cat([r_pos, r_rot], dim=-1), jac * col_mask.unsqueeze(1)
 
 
+def _sole_residual_and_jacobian(state, sole_idx: Tuple[int, int], goals: torch.Tensor, col_mask: torch.Tensor):
+    """Both soles' world-frame residual ``[N, 12]`` against ``goals`` ``[2, 4, 4]``, rows [left Δpos, left
+    rotvec, right Δpos, right rotvec] (:func:`_pose_residual_and_jacobian`'s metric), and their column-masked
+    Jacobian ``[N, 12, dof]``. ``sole_idx`` holds the soles' indices among the tool frames."""
+    N = col_mask.shape[0]
+    poses = state.tool_poses
+    pos = torch.stack([poses.position[:, 0, i] for i in sole_idx], dim=1)        # [N, 2, 3]
+    quat = torch.stack([poses.quaternion[:, 0, i] for i in sole_idx], dim=1)     # [N, 2, 4], wxyz
+    rot = roma.unitquat_to_rotmat(quat.roll(-1, dims=-1))
+    r_pos = goals[:, :3, 3] - pos
+    r_rot = _rotmat_to_rotvec(goals[:, :3, :3] @ rot.transpose(-1, -2))
+    jacs = state.tool_jacobians[:, 0]
+    jac = torch.stack([jacs[:, i] for i in sole_idx], dim=1).reshape(N, 12, -1)
+    return torch.cat([r_pos, r_rot], dim=-1).reshape(N, 12), jac * col_mask.unsqueeze(1)
+
+
 def gn_project(
     world,
     q_full: torch.Tensor,
@@ -223,23 +241,39 @@ def gn_project(
     return q
 
 
-def _prioritized_step(jac_com, com, active, com_target, jac, r, damping):
+def _prioritized_step(jac_com, com, active, com_target, jac, r, damping, jac_sole=None, r_sole=None):
     """One two-level step (Siciliano-Slotine form). Level 1 moves the active
-    CoM axes to ``com_target`` with minimum norm; level 2 is damped GN on the
-    pose residual inside the null space of the active CoM rows. Inactive CoM
-    rows are zeroed, so they drop out of both levels."""
-    a = active.to(jac.dtype)
+    CoM axes to ``com_target`` with minimum norm and, given the sole rows
+    ``jac_sole`` ``[B, 12, dof]`` and ``r_sole`` ``[B, 12]``, closes the soles'
+    residual, whose rows are always active; level 2 is damped GN on the pose
+    residual inside the null space of level 1. Inactive CoM rows are zeroed,
+    so they drop out of both levels.
+
+    With the sole rows both levels run in float64: cuRobo turns TF32 matmuls
+    on, and the 14-row Gram (condition number ~1e3) amplified their ~1e-3
+    relative error into level 2's null space. On 64 balanced blocks_t1 pick
+    confs reaching 3 cm, float32 left 3 with a sole 1.5-12 mm off the stance
+    after a call, float64 none over 0.35 mm."""
+    dtype = jac.dtype
+    a = active.to(dtype)
     ja = jac_com * a.unsqueeze(-1)                                  # [B, 2, dof]
-    gram = ja @ ja.transpose(-1, -2) + 1e-6 * torch.eye(2, device=jac.device, dtype=jac.dtype)
-    ja_pinv = ja.transpose(-1, -2) @ torch.linalg.inv_ex(gram)[0]   # [B, dof, 2]
-    dq1 = (ja_pinv @ ((com_target - com) * a).unsqueeze(-1)).squeeze(-1)
+    t1 = (com_target - com) * a
+    if jac_sole is not None:
+        f64 = torch.float64
+        ja = torch.cat([ja, jac_sole], dim=1).to(f64)               # [B, 14, dof]
+        t1 = torch.cat([t1, r_sole], dim=1).to(f64)
+        jac, r, damping = jac.to(f64), r.to(f64), damping.to(f64)
+    # Batched LU stays in cuBLAS's sync-free kernels up to 16 x 16, so these inverses capture.
+    gram = ja @ ja.transpose(-1, -2) + 1e-6 * torch.eye(ja.shape[1], device=jac.device, dtype=jac.dtype)
+    ja_pinv = ja.transpose(-1, -2) @ torch.linalg.inv_ex(gram)[0]   # [B, dof, 2 | 14]
+    dq1 = (ja_pinv @ t1.unsqueeze(-1)).squeeze(-1)
     eye_dof = torch.eye(jac.shape[-1], device=jac.device, dtype=jac.dtype)
     jn = jac @ (eye_dof - ja_pinv @ ja)                             # [B, 6, dof]
     eye6 = torch.eye(6, device=jac.device, dtype=jac.dtype)
     rhs = r - (jac @ dq1.unsqueeze(-1)).squeeze(-1)
     y = torch.linalg.solve_ex(jn @ jn.transpose(-1, -2) + damping * eye6, rhs.unsqueeze(-1))[0]
     dq2 = (jn.transpose(-1, -2) @ y).squeeze(-1)
-    return dq1, dq2
+    return dq1.to(dtype), dq2.to(dtype)
 
 
 def _fraction_that_fits(base, extra):
@@ -256,12 +290,13 @@ def _spd_solve(M, b):
     return torch.linalg.solve_triangular(L.mT, y, upper=True)
 
 
-def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lower, upper):
+def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lower, upper, jac_sole=None):
     """Level 3: move joints with nonzero ``margin_err`` (rad to their margin
     band's edge) by at most ``GN_MARGIN_STEP``, on top of the levels 1-2
-    ``step``, without moving the pose or the ``locked`` CoM axes to first
-    order. Its task Jacobian is a joint selector, so its projected Jacobian is
-    the selected rows of the null-space projector.
+    ``step``, without moving the pose, the ``locked`` CoM axes or, given
+    ``jac_sole``, the soles to first order. Its task Jacobian is a joint
+    selector, so its projected Jacobian is the selected rows of the
+    null-space projector.
 
     Active sets, re-solved three times like levels 1-2: a CoM axis this step
     would push past ``inner`` is locked, and a joint it would push past a
@@ -269,14 +304,18 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
     Float64 because the explicit projector is ill-conditioned (cond(A A^T)
     ~5e5 on place confs): in float32 it leaked ~5e-3 of each step into the
     pose, the damped solve amplified that ~15x, and ~80/512 place confs lost
-    their pose per refresh.
+    their pose per refresh. With the sole rows the projector's Gram is
+    20 x 20, past the 16 x 16 up to which batched LU stays sync-free (beyond
+    it the solve syncs and fails a capture), so it takes :func:`_spd_solve`.
     """
     f64 = torch.float64
     eye_dof = torch.eye(q.shape[-1], device=q.device, dtype=f64)
-    eye8 = torch.eye(8, device=q.device, dtype=f64)
+    soles = () if jac_sole is None else (jac_sole,)
+    eye_a = torch.eye(jac_com.shape[1] + sum(s.shape[1] for s in soles) + jac.shape[1], device=q.device, dtype=f64)
     for _ in range(3):
-        a = (torch.cat([jac_com * locked.to(q.dtype).unsqueeze(-1), jac], dim=1) * free.unsqueeze(1)).to(f64)
-        proj = eye_dof - a.transpose(-1, -2) @ torch.linalg.solve_ex(a @ a.transpose(-1, -2) + 1e-12 * eye8, a)[0]
+        a = (torch.cat([jac_com * locked.to(q.dtype).unsqueeze(-1), *soles, jac], dim=1) * free.unsqueeze(1)).to(f64)
+        gram = a @ a.transpose(-1, -2) + 1e-12 * eye_a
+        proj = eye_dof - a.transpose(-1, -2) @ (_spd_solve(gram, a) if soles else torch.linalg.solve_ex(gram, a)[0])
         sel = (margin_err * free != 0).to(f64)
         m = sel.unsqueeze(-1) * proj                                # [B, dof, dof]
         rhs = sel * (margin_err - step).to(f64)
@@ -293,14 +332,17 @@ def _margin_step(q, step, margin_err, jac, jac_com, com, locked, inner, free, lo
     return s3
 
 
-def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask, half=None):
+def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask, half=None,
+                   jac_sole=None, r_sole=None):
     """One balance-first step ``[N, dof]``, levels 1-3 of :func:`gn_project_balanced`,
-    on ``jac`` and ``jac_com`` already masked by ``col_mask``. Every op is
-    row-wise, so a row's step doesn't depend on which deps share the call.
+    on ``jac``, ``jac_com`` and ``jac_sole`` already masked by ``col_mask``. Every
+    op is row-wise, so a row's step doesn't depend on which deps share the call.
 
     ``com`` is the CoM about the support's centre, in its frame, and ``half``
     the rectangle level 1 holds it in: a support's ``keyframe_half``, the
-    simplified model's when ``None``."""
+    simplified model's when ``None``. ``jac_sole`` and ``r_sole`` are the real
+    legs' 12 sole rows (:func:`_sole_residual_and_jacobian`): level 1 closes
+    them beside the active CoM axes, and levels 2-3 move in their null space."""
     from cutamp.com_polygon_cost import _half_extents
 
     if half is None:
@@ -322,7 +364,8 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_
     free = torch.ones_like(q)
     for _ in range(3):
         fc = free.unsqueeze(1)
-        dq1, dq2 = _prioritized_step(jac_com * fc, com, active, com_target, jac * fc, r, damping)
+        dq1, dq2 = _prioritized_step(jac_com * fc, com, active, com_target, jac * fc, r, damping,
+                                     None if jac_sole is None else jac_sole * fc, r_sole)
         dq = dq1 + dq2
         com_lin = com + (jac_com @ dq.unsqueeze(-1)).squeeze(-1)
         pushed_out = ~active & (com_lin.abs() > half)
@@ -337,7 +380,7 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_
     step = _fraction_that_fits(torch.zeros_like(dq1), dq1) * dq1
     step = step + _fraction_that_fits(step, dq2) * dq2
     margin_err = ((band_lo - q).clamp_min(0) - (q - band_hi).clamp_min(0)) * col_mask
-    return step + _margin_step(q, step, margin_err, jac, jac_com, com, active, inner, free, lower, upper)
+    return step + _margin_step(q, step, margin_err, jac, jac_com, com, active, inner, free, lower, upper, jac_sole)
 
 
 def gn_project_balanced(
@@ -353,7 +396,9 @@ def gn_project_balanced(
     Each step is a three-level hierarchy (Kanoun et al. T-RO 2011; Escande et
     al. IJRR 2014): (1) keep the CoM, in the support frame of
     ``world.model.support``, inside its keyframe rectangle shrunk by
-    ``GN_COM_MARGIN``; (2) least squares on the pose residual in
+    ``GN_COM_MARGIN``, and on the real legs both soles on the stance
+    (``world.stance_soles``), since their free base and leg columns would
+    otherwise slide them; (2) least squares on the pose residual in
     whatever freedom level 1 leaves; (3) move joints out of the
     ``joint_limit_margin`` bands (robots/t1.py margins) in whatever freedom
     is left, in small steps (:func:`_margin_step`). An unreachable target
@@ -378,8 +423,9 @@ def gn_project_balanced(
     dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and frozen columns.
 
     ``balance=False`` (the no-CoM ablation, ``config.enable_com_aware_ik``
-    off) drops level 1: a zero CoM and CoM Jacobian leave both CoM active
-    sets empty, so the step is levels 2-3 alone, with no CoM autograd.
+    off) drops level 1's CoM rows: a zero CoM and CoM Jacobian leave both CoM
+    active sets empty, so the step is levels 2-3 alone (beside the sole rows,
+    which a model with soles keeps), with no CoM autograd.
     """
     from cutamp.com_polygon_cost import _project_com_to_base
     from cutamp.cost_function import _device_const
@@ -390,6 +436,7 @@ def gn_project_balanced(
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
     band_lo = lower + _device_const(world.model.margin_lower, q.device, q.dtype)
     band_hi = upper - _device_const(world.model.margin_upper, q.device, q.dtype)
+    sole_idx = tuple(list(kin.tool_frames).index(frame) for frame in world.model.sole_frames)  # () when simplified
 
     for _ in range(iters):
         if balance:
@@ -417,8 +464,11 @@ def gn_project_balanced(
             com, jac_com = q.new_zeros(N, 2), q.new_zeros(N, 2, q.shape[-1])
         with torch.no_grad():
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
+            r_sole, jac_sole = (
+                _sole_residual_and_jacobian(state, sole_idx, world.stance_soles, col_mask) if sole_idx else (None, None)
+            )
             step = _balanced_step(q, r, jac, jac_com, com, lower, upper, band_lo, band_hi, col_mask,
-                                  half=support.keyframe_half)
+                                  half=support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole)
             q = (q + step).clamp(lower, upper)
 
     return q.detach()
@@ -438,8 +488,9 @@ def gn_gate(
 
     Returns ``(pose_ok [N], com_ok [N])``: ``_achieved_pose_errors`` (the
     checker's metric, on each row's own arm) strictly under ``pos_tol`` and
-    ``rot_tol``, and ``compute_com_polygon_mask``. ``q_full`` must be
-    contiguous float32 on the kinematics device, as cuRobo's FK requires.
+    ``rot_tol``, on the real legs both soles' errors against the stance too,
+    and ``compute_com_polygon_mask``. ``q_full`` must be contiguous float32 on
+    the kinematics device, as cuRobo's FK requires.
     """
     from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
     from cutamp.costs import curobo_pose_error
@@ -450,4 +501,11 @@ def gn_gate(
     pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
     ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
     pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
-    return (pos_err < pos_tol) & (rot_err < rot_tol), com_polygon_mask_from_state(state, world.model.support)
+    pose_ok = (pos_err < pos_tol) & (rot_err < rot_tol)
+    if world.model.sole_frames:
+        # A conf whose soles left the stance passes com_ok on a support polygon it no longer stands on (design 7.4).
+        soles = torch.stack([state.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix()
+                             for frame in world.model.sole_frames], dim=1)  # [N, 2, 4, 4]
+        sole_pos, sole_rot = curobo_pose_error(soles, world.stance_soles)
+        pose_ok = pose_ok & ((sole_pos < pos_tol) & (sole_rot < rot_tol)).all(-1)
+    return pose_ok, com_polygon_mask_from_state(state, world.model.support)
