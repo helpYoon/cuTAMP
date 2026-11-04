@@ -217,12 +217,21 @@ def test_install_floor_wrench_hooks_only_trajopt(biped):
 
     with planner(trajopt_transition_model=_trajopt_transition_dict_with_compute_com()) as mp:
         install_floor_wrench(mp, BASE_JOINTS, SOLES)
-        assert all(r.transition_model._external_wrench_fn is not None
-                   for r in mp.trajopt_solver.get_all_rollout_instances())
         assert all(r.transition_model._external_wrench_fn is None for r in mp.ik_solver.get_all_rollout_instances())
         start = JointState.from_position(_q(biped.names).view(1, -1), joint_names=biped.names)
         goal = JointState.from_position(_q(biped.names, CROUCH).view(1, -1), joint_names=biped.names)
         result = mp.plan_cspace(goal, start)
         assert result is not None and bool(result.success.all())
+        # What the cost and the success test see (each rollout's cost and metrics transitions, and the
+        # interpolated re-check): at rest the floor holds the robot and the base joints carry nothing.
+        ts = mp.trajopt_solver
+        q = _q(ts.joint_names).view(1, 1, -1)
+        rest = JointState(position=q, velocity=torch.zeros_like(q), acceleration=torch.zeros_like(q),
+                          jerk=torch.zeros_like(q), joint_names=ts.joint_names)
+        base = [ts.joint_names.index(j) for j in BASE_JOINTS]
+        rollouts = list(ts.get_all_rollout_instances()) + list(ts.additional_metrics_rollouts.values())
+        base_load = [float(tm.compute_augmented_state(rest).joint_torque[..., base].abs().max())
+                     for r in rollouts for tm in (r.transition_model, r.metrics_transition_model)]
+        assert max(base_load) <= 0.05, base_load  # [cost, metrics] per rollout
     with planner() as mp, pytest.raises(ValueError, match="compute_com"):
         install_floor_wrench(mp, BASE_JOINTS, SOLES)

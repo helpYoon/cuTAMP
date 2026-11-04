@@ -81,13 +81,17 @@ def make_floor_wrench_fn(
 
 
 def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str], sole_frames: tuple[str, str]) -> None:
-    """Hook the floor wrench into every trajopt rollout of ``planner``, before its first plan.
+    """Hook the floor wrench into trajopt's own transitions. Call it before ``planner``'s first plan or
+    warm-up: cuRobo's CUDA graphs keep the hook they were captured with.
 
-    The IK solver and the graph planner keep RNEA's single pass (7.4a). Raises ``ValueError`` if a
-    trajopt rollout has no dynamics or was built without ``compute_com``.
+    cuRobo gives each rollout two transitions: its cost's (``transition_model``) and its metrics'
+    (``metrics_transition_model``, which the success test runs); the interpolated re-check runs on the
+    extra metrics rollouts. All of them get the hook. The IK solver and the graph planner keep RNEA's
+    single pass (7.4a). Raises ``ValueError`` if one has no dynamics or was built without ``compute_com``.
     """
     solver = planner.trajopt_solver
-    transitions = [r.transition_model for r in solver.get_all_rollout_instances()]
+    rollouts = list(solver.get_all_rollout_instances()) + list(solver.additional_metrics_rollouts.values())
+    transitions = [tm for r in rollouts for tm in (r.transition_model, r.metrics_transition_model)]
     for tm in transitions:
         if tm.robot_dynamics is None or not tm.config.compute_com:
             raise ValueError("install_floor_wrench needs trajopt built with load_dynamics and compute_com")
