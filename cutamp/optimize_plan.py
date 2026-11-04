@@ -623,7 +623,8 @@ class ParticleOptimizer:
     def _capture_step(self, body: _StepBody, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
         """Capture ``body`` as G_step. Each warm-up drops every ``.grad``, so the captured AccumulateGrad
         gives each param a graph-owned ``.grad`` that every replay rewrites in place (never zero_grad it).
-        The guard covers the particles, those grads and the step's three FK sites."""
+        The guard covers the particles, those grads and the step's FK sites: three, and on the real legs the
+        retract confs' motion site (cost_function.motion_costs)."""
         body.clear_autograd()
 
         def warmup() -> None:
@@ -635,7 +636,8 @@ class ParticleOptimizer:
             "G_step", body, warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
                 [*body.particles.values(), *(p.grad for p in body.params)],
-                [world.site_kinematics(s) for s in ("rollout", "retract", "com")],
+                [world.site_kinematics(s) for s in ("rollout", "retract", "com")
+                 + (("retract_motion",) if world.model.sole_frames else ())],
             ),
         )
 

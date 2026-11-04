@@ -26,6 +26,9 @@ Per-operator locking policy for T1, on the planning model's slices
   Retract): lock the inactive arm (the 7 DOFs of the non-active arm), and
   the base on a model that locks it (the simplified model's planar base,
   ``model.lock_base``). Active arm + legs/torso remain free.
+* Retract on a model with planted soles (the real legs): a retract conf
+  stands where its reach stood (design 7.3), so its base and body are locked
+  too, at home, where particle init puts them. Only its active arm moves.
 """
 
 from __future__ import annotations
@@ -61,11 +64,12 @@ def get_conf_locked_dofs(
         if conf_name not in ground_op.values:
             continue
         meta = ground_op.operator.metadata
-        if meta.arm == "left":
-            return base + right_arm
-        if meta.arm == "right":
-            return base + left_arm
-        return []
+        if meta.arm not in ("left", "right"):
+            return []
+        idle_arm = right_arm if meta.arm == "left" else left_arm
+        if meta.action_type == "retract" and model.sole_frames:
+            return _indices(model.base) + _indices(model.body) + idle_arm
+        return base + idle_arm
     return []
 
 

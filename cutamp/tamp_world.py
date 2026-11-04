@@ -24,7 +24,7 @@ from curobo.inverse_kinematics import InverseKinematics
 from curobo.kinematics import Kinematics
 from curobo.motion_planner import MotionPlanner
 from curobo.scene import Obstacle, Scene
-from curobo.types import DeviceCfg, GoalToolPose, JointState
+from curobo.types import DeviceCfg, GoalToolPose, JointState, Pose
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.robots import RobotContainer
@@ -50,8 +50,9 @@ from cutamp.utils.shapes import sample_greedy_surface_spheres
 
 _log = logging.getLogger(__name__)
 
-#: The Adam loop's FK sites, each on its own Kinematics (TAMPWorld.site_kinematics).
-FK_SITES = ("rollout", "retract", "com", "gate")
+#: The Adam loop's FK sites, each on its own Kinematics (TAMPWorld.site_kinematics). "retract_motion" is the real
+#: legs' retract confs for the motion constraints (cost_function.motion_costs).
+FK_SITES = ("rollout", "retract", "com", "gate", "retract_motion")
 
 
 class TAMPWorld:
@@ -97,7 +98,8 @@ class TAMPWorld:
         # (matches the planner). Particle init holds the inactive hand where
         # the IK's start conf puts it (home, or a CoM-gate retry's perturbed
         # seed), so that arm's joints counter-rotate as the body bends (the
-        # per-DOF cspace pin is a no-op). A conf whose IK fails starts at home
+        # per-DOF cspace pin is a no-op), and on the real legs both soles on
+        # the stance (sole_goals). A conf whose IK fails starts at home
         # instead (_store_ik_q). The balance-first refresh then moves the body
         # with the inactive arm's joints fixed, so that hand rides with the
         # trunk, most at those home confs (known-bugs B15).
@@ -143,15 +145,22 @@ class TAMPWorld:
             ).position.flatten().detach().cpu(),
         }
 
-        # The planted soles' world poses at the model's home: every action stands on this one stance.
+        # The planted soles' world poses at the model's home: every action stands on this one stance. The FK poses
+        # stay too, as the soles' IK goals (sole_goals), so those goals are the stance bit for bit.
+        self._stance_sole_poses: Dict[str, Pose] = {}
         self._stance_soles: Optional[torch.Tensor] = None
         if self.model.sole_frames:
             stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
             stance_ks = self.kinematics.compute_kinematics(stance_js)
+            for frame in self.model.sole_frames:
+                pose = stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True)
+                # Copies: a single conf's pose is a view of cuRobo's FK buffers, which the next FK call rewrites.
+                self._stance_sole_poses[frame] = Pose(
+                    position=pose.position.detach().clone(), quaternion=pose.quaternion.detach().clone(),
+                )
             self._stance_soles = torch.stack([
-                stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(4, 4)
-                for frame in self.model.sole_frames
-            ]).detach()
+                pose.get_matrix().reshape(4, 4) for pose in self._stance_sole_poses.values()
+            ])
 
     # ---- Container delegates ------------------------------------------------
 
@@ -204,6 +213,17 @@ class TAMPWorld:
         """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction);
         ``None`` on a model without soles (the simplified one)."""
         return self._stance_soles
+
+    def sole_goals(self, n: int) -> Optional[Dict[str, Pose]]:
+        """Each of ``model.sole_frames``' stance pose, repeated ``n`` times: the planted soles' IK goals
+        (design 7.3: from the stance, never from FK at the IK seed). ``None`` on a model without soles
+        (the simplified one)."""
+        if not self.model.sole_frames:
+            return None
+        return {
+            frame: Pose(position=pose.position.repeat(n, 1), quaternion=pose.quaternion.repeat(n, 1))
+            for frame, pose in self._stance_sole_poses.items()
+        }
 
     # ---- Movables and indexing ---------------------------------------------
 

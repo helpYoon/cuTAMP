@@ -54,7 +54,8 @@ default_constraint_to_tol = {
     # Based on cuRobo thresholds: https://github.com/NVlabs/curobo/blob/2fbffc35225398cf9d5f382804faa9de2608753b/src/curobo/wrap/reacher/ik_solver.py#L127-L128
     # Can lower position for high precision, but should be fine for now.
     KinematicConstraint.type: {"pos_err": 0.005, "rot_err": 0.05},
-    Motion.type: {"joint_limit": 0.0, "self_collision": 0.0},
+    # retract_*: the real legs' retract confs, which join the motion constraints (design 7.3).
+    Motion.type: {"joint_limit": 0.0, "self_collision": 0.0, "retract_joint_limit": 0.0, "retract_self_collision": 0.0},
     StablePlacement.type: {
         # You might need to add additional tolerances if your support surfaces have different names
         "goal_in_xy": 1e-3,

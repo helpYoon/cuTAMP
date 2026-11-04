@@ -1,5 +1,5 @@
-"""Each in-loop FK site (rollout, retract, CoM, gate) has its own never-reset
-cuRobo Kinematics (``TAMPWorld.site_kinematics``)."""
+"""Each in-loop FK site (rollout, retract, CoM, gate, and the real legs' retract_motion) has its own
+never-reset cuRobo Kinematics (``TAMPWorld.site_kinematics``)."""
 
 import pytest
 import torch
@@ -12,7 +12,7 @@ def test_site_kinematics_are_dedicated():
     from cutamp.tamp_world import FK_SITES
     world = make_blocks_t1_world()
     kins = [world.site_kinematics(s) for s in FK_SITES]
-    assert len({id(k) for k in (*kins, world.kinematics, world.kinematics_jac)}) == 6
+    assert len({id(k) for k in (*kins, world.kinematics, world.kinematics_jac)}) == len(FK_SITES) + 2 == 7
     assert all(world.site_kinematics(s) is k for s, k in zip(FK_SITES, kins))
     assert all(k.config is world.kinematics.config and k.compute_com and not k.compute_jacobian for k in kins)
     with pytest.raises(ValueError, match="rollout"):

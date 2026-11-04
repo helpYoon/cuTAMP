@@ -102,6 +102,26 @@ def real_world(_real_world_slot):
     return _real_world_slot[0]
 
 
+@pytest.fixture(scope="module")
+def real_plan(real_world):
+    """``[skeleton, particles]``: blocks_t1's first task plan (which follows PYTHONHASHSEED) and its seeded 64-particle
+    init on ``real_world``. Read-only: tests run on ``clone_particles(particles)``. A list, so teardown can free the
+    particles while pytest still holds the yielded object; ``real_world``'s slot then empties the cache."""
+    from cutamp.config import TAMPConfiguration
+    from cutamp.particle_initialization import ParticleInitializer
+    from cutamp.t1_domain import all_t1_operators
+    from cutamp.task_planning import task_plan_generator
+
+    skeleton = next(task_plan_generator(real_world.initial_state, real_world.goal_state, all_t1_operators))
+    torch.manual_seed(0)
+    # robot= here, not dataclasses.replace: __post_init__ resolves the model's default soft costs (ruling R20)
+    particles = ParticleInitializer(real_world, TAMPConfiguration(robot="real_legs", num_particles=64))(skeleton)
+    plan = [skeleton, particles]
+    del skeleton, particles  # the list holds the only references
+    yield plan
+    plan.clear()
+
+
 def clone_particles(particles: dict) -> dict:
     """Fresh leaf copies of ``particles``, each keeping its ``requires_grad``."""
     return {k: v.detach().clone().requires_grad_(v.requires_grad) for k, v in particles.items()}

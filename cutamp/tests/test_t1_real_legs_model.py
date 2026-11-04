@@ -276,10 +276,11 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
 
 
 @needs_cuda
-def test_retry_seed_keeps_the_base_at_q_init(real_world, monkeypatch):
-    # Decision 10 keeps the CoM-gate retries' noise mask in stage 3: the noise moves the body and the active arm only.
-    # The base is the real legs' root, so every retry seed holds its six columns, like the inactive arm's, at q_init.
-    # IK and the CoM mask are stubbed: every row fails the gate, so all three retries run, and only their seeds count.
+def test_retry_rounds_seed_from_retry_seed(real_world, monkeypatch):
+    # Ruling R21 (it amends decision 10): each CoM-gate retry round starts IK from _retry_seed's conf, at sigma 0.1,
+    # 0.2 and 0.3, which stands the real legs on the stance (test_real_legs_init.py checks its seeds). The noise moves
+    # the body and the active arm; the inactive arm holds q_init. IK and the CoM mask are stubbed: every row fails the
+    # gate, so all three retries run, and only their seeds count.
     import cutamp.com_polygon_cost as com_polygon_cost
     import cutamp.particle_initialization as particle_initialization
 
@@ -287,21 +288,28 @@ def test_retry_seed_keeps_the_base_at_q_init(real_world, monkeypatch):
         def copy_at_batch_indices(self, other, idx):
             pass
 
-    n, m, q0, seeds = 8, real_world.model, real_world.q_init, []
+    n, m, q0, seeds, made = 8, real_world.model, real_world.q_init, [], []
+    retry_seed = particle_initialization._retry_seed
 
     def _ik(world, world_from_ee, arm, *, current_state_q=None):
         if current_state_q is not None:
             seeds.append(current_state_q)
         return _Result()
 
+    def _seed(world, batch_size, arm, noise_std):
+        made.append(((batch_size, arm, noise_std), retry_seed(world, batch_size, arm, noise_std)))
+        return made[-1][1]
+
     monkeypatch.setattr(particle_initialization, "_ik_for_pose", _ik)
+    monkeypatch.setattr(particle_initialization, "_retry_seed", _seed)
     monkeypatch.setattr(particle_initialization, "_ik_solution_to_full_q", lambda result, world: q0.expand(n, -1))
     monkeypatch.setattr(com_polygon_cost, "compute_com_polygon_mask",
                         lambda world, q: torch.zeros(len(q), dtype=torch.bool, device=q.device))
+    torch.manual_seed(0)
     particle_initialization._ik_for_pose_com_safe(real_world, torch.eye(4, device=q0.device).expand(n, 4, 4), "left")
-    assert len(seeds) == 3
+    assert [args for args, _ in made] == [(n, "left", pytest.approx(sigma)) for sigma in (0.1, 0.2, 0.3)]
+    assert len(seeds) == 3 and all(seed is q for seed, (_, q) in zip(seeds, made))
     for seed in seeds:
-        for held in (m.base, m.right_arm):
-            assert torch.equal(seed[:, held], q0[held].expand(n, -1))
+        assert torch.equal(seed[:, m.right_arm], q0[m.right_arm].expand(n, -1))
         for noisy in (m.body, m.left_arm):
             assert not torch.equal(seed[:, noisy], q0[noisy].expand(n, -1))

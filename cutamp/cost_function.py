@@ -113,6 +113,11 @@ class CostFunction:
             self_collision_kin_config=self.world.kinematics.get_self_collision_config(),
         )
         self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
+        # On the real legs the retract confs join the joint-limit and self-collision constraints (design 7.3), on a
+        # cost of their own: an instance rewrites its output and gradient buffers on every call of one shape.
+        self.retract_self_collision_cost_fn = (
+            SelfCollisionCost(self_collision_config) if world.model.sole_frames and self.retract_info else None
+        )
 
         # Conf parameters for kinematic constraints, order in rollout should match
         self.kinematic_confs, self.kinematic_actions = zip(*(con.params for con in self.kinematic_constraints))
@@ -202,7 +207,8 @@ class CostFunction:
         return kinematic_cost
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Motion constraints — joint-limit violation + self-collision cost."""
+        """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and, on the
+        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 
@@ -214,12 +220,32 @@ class CostFunction:
         self.self_collision_cost_fn.setup_batch_tensors(b, h)
         self_coll_vals = self.self_collision_cost_fn.forward(robot_spheres).squeeze(-1)
 
+        values = {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals}
+        if self.retract_self_collision_cost_fn is not None and self._particles is not None:
+            values.update(self._retract_motion_values())
         motion_cost = {
             "type": "constraint",
             "constraints": self.motion_constraints,
-            "values": {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals},
+            "values": values,
         }
         return motion_cost
+
+    def _retract_motion_values(self) -> Dict[str, torch.Tensor]:
+        """``retract_joint_limit`` and ``retract_self_collision``, each ``[N, R]`` over ``retract_info``'s confs,
+        from one FK of every retract conf on its own site (TAMPWorld.site_kinematics)."""
+        q = torch.stack([self._particles[name] for name, _, _ in self.retract_info], dim=1)  # [N, R, dof]
+        n, r = q.shape[0], q.shape[1]
+        kin_state = self.world.site_kinematics("retract_motion").compute_kinematics(
+            JointState.from_position(q.view(n * r, -1))
+        )
+        joint_limits = self.world.joint_limits
+        self.retract_self_collision_cost_fn.setup_batch_tensors(n, r)
+        return {
+            "retract_joint_limit": dist_from_bounds_jit(q, joint_limits[0], joint_limits[1]),
+            "retract_self_collision": self.retract_self_collision_cost_fn.forward(
+                kin_state.robot_spheres.view(n, r, -1, 4)
+            ).squeeze(-1),
+        }
 
     def stable_placement_costs(
         self, rollout: Rollout, obj_to_spheres: Dict[str, torch.Tensor]  # each [b, t, n, 4]
