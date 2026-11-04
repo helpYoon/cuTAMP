@@ -85,7 +85,7 @@ def cutamp_demo(
 def entrypoint():
     import argparse
 
-    from cutamp.config import SUPPORTED_SOFT_COSTS
+    from cutamp.config import SUPPORTED_ROBOTS, SUPPORTED_SOFT_COSTS
     _defaults = TAMPConfiguration()
 
     parser = argparse.ArgumentParser(
@@ -93,6 +93,11 @@ def entrypoint():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    parser.add_argument(
+        "--robot", choices=SUPPORTED_ROBOTS, default=_defaults.robot,
+        help="Planning model: the 21-DOF simplified T1, or bfm_wm's 33-DOF T1 standing on its home stance "
+             "(real_legs, which runs only the full system: no ablation flags).",
+    )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
     )
@@ -140,9 +145,11 @@ def entrypoint():
     parser.add_argument(
         "--soft_cost",
         nargs="*",
-        default=list(_defaults.soft_cost or []),
+        default=None,
         choices=list(SUPPORTED_SOFT_COSTS),
-        help="Soft cost(s) to optimize (default: from TAMPConfiguration). Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
+        help="Soft cost(s) to optimize (default: TAMPConfiguration's for --robot: place_close_to_base and "
+             "joint_limit_margin, plus minimize_body_movement on real_legs; a bare --soft_cost runs none). "
+             "Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
     parser.add_argument(
@@ -255,6 +262,7 @@ def entrypoint():
         import torch
         torch.manual_seed(args.seed)
     config = TAMPConfiguration(
+        robot=args.robot,
         num_particles=args.num_particles,
         num_opt_steps=args.num_opt_steps,
         early_stop_patience=args.early_stop_patience,

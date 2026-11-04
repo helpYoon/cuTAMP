@@ -29,14 +29,6 @@ from cutamp._curobo_internals import (
 )
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
-from cutamp.robots.t1 import (
-    BASE_INDICES,
-    LEFT_ARM_INDICES,
-    LEFT_ARM_JOINT_NAMES,
-    RIGHT_ARM_INDICES,
-    RIGHT_ARM_JOINT_NAMES,
-    t1_home,
-)
 from cutamp.samplers import (
     grasp_4dof_sampler,
     place_4dof_sampler,
@@ -137,9 +129,10 @@ def _ik_for_pose(
             # no-op (``cspace_target_weight`` is 0, and that term's target is a
             # zero joint vector, not these joints' current values). The inactive
             # frame's target in ``goal`` is what holds that hand in the world.
+            model = world.model
             write_cspace_target_dof_weight(
                 [ik], build_pin_weights(
-                    ik, RIGHT_ARM_JOINT_NAMES if arm == "left" else LEFT_ARM_JOINT_NAMES,
+                    ik, model.joint_names[model.right_arm if arm == "left" else model.left_arm],
                 ),
             )
         seed_config = (
@@ -191,15 +184,18 @@ def _ik_for_pose_com_safe(
         # forward + tip" basin). Larger perturbations push seeds into
         # the leaned-back / squatted basins where COM-feasible solutions
         # live. Noise scales 0.1, 0.2, 0.3, ... rad and is masked to
-        # body + active arm only (base & inactive arm stay locked).
+        # body + active arm only (the inactive arm stays locked, and the
+        # base where the model locks it).
         noise_std = 0.1 * (_attempt + 1)
         seed = world.q_init.unsqueeze(0).expand(batch_size, -1).clone()
         noise = torch.randn(batch_size, full_dof, device=device) * noise_std
-        noise[:, BASE_INDICES] = 0.0  # base locked
+        model = world.model
+        if model.lock_base:
+            noise[:, model.base] = 0.0  # base locked
         if arm == "left":
-            noise[:, RIGHT_ARM_INDICES] = 0.0  # right arm locked
+            noise[:, model.right_arm] = 0.0  # right arm locked
         elif arm == "right":
-            noise[:, LEFT_ARM_INDICES] = 0.0  # left arm locked
+            noise[:, model.left_arm] = 0.0  # left arm locked
         seed = seed + noise
         # Clamp the perturbed seed to joint limits so large-sigma retries don't
         # hand cuRobo an out-of-limits current_state. Limits come from the same
@@ -267,7 +263,7 @@ def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
     """Build a full-cspace ``[B, len(world.kinematics.joint_names)]`` tensor
     from an IK result. Locked-out joints (e.g. mobile base) are filled from
     the IK kinematics' own ``lock_jointstate`` — same source the planner uses,
-    so values stay consistent without an external ``t1_home`` reference.
+    so values stay consistent without an external home reference.
     """
     ik = world.ik_solver
     sol_js = JointState.from_position(
@@ -440,9 +436,9 @@ class ParticleInitializer:
                     raise ValueError(f"{q_start_param=} should already be bound")
                 if q_retract in particles:
                     raise ValueError(f"{q_retract=} shouldn't already be bound")
-                home = torch.tensor(t1_home, device=device)
+                home = torch.tensor(world.model.home, device=device)
                 particles[q_retract] = home.expand(num_particles, -1).clone()
-                log_debug(f"{header}. Initialized q_retract to t1_home")
+                log_debug(f"{header}. Initialized q_retract to the model's home")
 
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")

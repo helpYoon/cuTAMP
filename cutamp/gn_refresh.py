@@ -55,10 +55,6 @@ import torch
 
 from curobo.types import JointState, Pose
 
-from cutamp.robots.t1 import (
-    BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES, T1_LIMIT_MARGIN_LOWER, T1_LIMIT_MARGIN_UPPER,
-)
-
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
 # fallback-rate or gn_fail instrumentation shows a fat non-converged band.
 GN_ITERS = 3
@@ -92,19 +88,21 @@ GN_MARGIN_STEP = 0.03
 
 
 @lru_cache(maxsize=None)
-def _row_layout(arms: tuple[str, ...], n: int, dof: int, device, dtype):
+def _row_layout(model, arms: tuple[str, ...], n: int, dof: int, device, dtype):
     """``(col_mask [n, dof], is_left [n])`` for ``n`` rows in ``len(arms)`` equal
-    dep-major blocks, block ``i`` on ``arms[i]``: the columns GN may move (the base
-    and the inactive arm stay frozen, so that hand rides with the trunk; known-bugs
-    B15) and each row's tool frame. Cached, since building it is a host-to-device
+    dep-major blocks, block ``i`` on ``arms[i]``: the columns GN may move in
+    ``model``'s cspace (the inactive arm stays frozen, so that hand rides with
+    the trunk, known-bugs B15, and so does the base where ``model.lock_base``)
+    and each row's tool frame. Cached, since building it is a host-to-device
     copy; never mutate or evict it: a captured CUDA graph keeps reading its
     addresses."""
     if not arms or n % len(arms) or not set(arms) <= {"left", "right"}:
         raise ValueError(f"{n} rows over arms {arms}: need equal dep blocks, each 'left' or 'right'")
     col_mask = torch.ones(len(arms), dof, dtype=dtype)
-    col_mask[:, BASE_INDICES] = 0.0
+    if model.lock_base:
+        col_mask[:, model.base] = 0.0
     for i, arm in enumerate(arms):
-        col_mask[i, RIGHT_ARM_INDICES if arm == "left" else LEFT_ARM_INDICES] = 0.0
+        col_mask[i, model.right_arm if arm == "left" else model.left_arm] = 0.0
     is_left = torch.tensor([arm == "left" for arm in arms])
     return (
         col_mask.repeat_interleave(n // len(arms), dim=0).to(device),
@@ -126,7 +124,7 @@ def _setup(world, q_full: torch.Tensor, arms: tuple[str, ...]):
     limits = world.kinematics.get_joint_limits().position
     lower = limits[0].to(q.device, q.dtype)
     upper = limits[1].to(q.device, q.dtype)
-    col_mask, is_left = _row_layout(arms, q.shape[0], q.shape[1], q.device, q.dtype)
+    col_mask, is_left = _row_layout(world.model, arms, q.shape[0], q.shape[1], q.device, q.dtype)
     return kin, frames, joint_names, q, lower, upper, col_mask, is_left
 
 
@@ -381,8 +379,8 @@ def gn_project_balanced(
     N = q_full.shape[0]
     arms = (arms,) if isinstance(arms, str) else tuple(arms)
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
-    band_lo = lower + _device_const(T1_LIMIT_MARGIN_LOWER, q.device, q.dtype)
-    band_hi = upper - _device_const(T1_LIMIT_MARGIN_UPPER, q.device, q.dtype)
+    band_lo = lower + _device_const(world.model.margin_lower, q.device, q.dtype)
+    band_hi = upper - _device_const(world.model.margin_upper, q.device, q.dtype)
 
     for _ in range(iters):
         if balance:
@@ -435,7 +433,7 @@ def gn_gate(
     from cutamp.costs import curobo_pose_error
 
     arms = (arms,) if isinstance(arms, str) else tuple(arms)
-    _, is_left = _row_layout(arms, q_full.shape[0], q_full.shape[1], q_full.device, q_full.dtype)
+    _, is_left = _row_layout(world.model, arms, q_full.shape[0], q_full.shape[1], q_full.device, q_full.dtype)
     state = _fk_state(world, q_full, kin)
     pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
     ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()

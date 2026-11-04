@@ -739,7 +739,7 @@ class ParticleOptimizer:
         # this operator (e.g., base + inactive arm during arm operations).
         # See cutamp/conf_locking.py for the policy.
         grad_masks = build_grad_masks(
-            plan_skeleton, particles, param_to_type, Conf,
+            plan_skeleton, particles, param_to_type, Conf, world.model,
         )
         num_total_params = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
         opt_metrics["optimizer"] = {

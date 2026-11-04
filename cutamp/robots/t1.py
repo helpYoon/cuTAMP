@@ -2,7 +2,20 @@
 T1 Robot Module — Single-MotionPlanner Humanoid Support for cuTAMP (cuRobo v0.8)
 ================================================================================
 
-Booster T1 humanoid as a single 21-DOF MotionPlanner. The planner sees:
+Two planning models of the Booster T1, each a :class:`T1Model`, chosen by
+``TAMPConfiguration.robot`` (``--robot``):
+
+- ``SIMPLIFIED`` (the default): the 21-DOF model described below, its planar
+  base locked;
+- ``REAL_LEGS``: bfm_wm's pinned 33-DOF T1 (``assets/t1_29dof``, design 7.2),
+  its legs on six massless base joints, standing on the home stance. Its
+  motion planner is not built yet (``get_t1_motion_planner`` raises).
+
+Consumers read names, slices, home, margins and the support region from
+``world.model``. The simplified model's module constants below remain for its
+own tests and scripts.
+
+The simplified model is a single 21-DOF MotionPlanner. The planner sees:
 
     - 3 DOF planar base (base_j_x, base_j_y, base_j_yaw, virtual via extra_links)
     - 2 DOF leg (ankle_pitch, knee_pitch — revolute, mounted on the mobile base)
@@ -21,9 +34,10 @@ handled at planning time in ``cutamp/t1_state.py``, and is a no-op (see
 
 import copy
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from functools import lru_cache
-from typing import Dict, Literal, NamedTuple, Tuple, Union
+from typing import Dict, Literal, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import rerun as rr
@@ -39,6 +53,13 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Scene
 from curobo.types import DeviceCfg
 
+from cutamp.com_polygon_cost import (
+    COM_CENTER,
+    COM_HALF_EXTENTS,
+    LOAD_GUARD_A,
+    SUPPORT_HALF_EXTENTS,
+    support_rectangles,
+)
 from cutamp.utils.common import action_4dof_to_mat4x4
 from cutamp.utils.rerun_utils import clean_rerun_path, log_scene
 
@@ -161,78 +182,208 @@ T1_TRAJOPT_ANKLE_UPPER_MARGIN = 0.02
 
 
 # =============================================================================
+# Planning models
+# =============================================================================
+
+T1_29DOF_DIR = Path(__file__).parent / "assets" / "t1_29dof"
+
+
+class Support(NamedTuple):
+    """Where the CoM must stay: axis-aligned half-extents about ``center``, in the frame of ``link``."""
+    link: str                            # the support frame, z = 0 on the sole plane
+    center: Tuple[float, float]          # the region's centre in that frame
+    gate_half: Tuple[float, float]       # per-frame trajectory gate
+    keyframe_half: Tuple[float, float]   # confs: masks, penalties, GN, seed IK, trajopt cost
+
+
+@dataclass(frozen=True, eq=False)        # identity hash: usable in lru_cache keys
+class T1Model:
+    """One planning model of the T1: its cuRobo config, cspace layout, home and support region."""
+    name: str                            # "simplified" | "real_legs"
+    cfg_path: Path                       # the cuRobo robot YAML
+    asset_root: Path                     # where its relative asset paths resolve
+    joint_names: Tuple[str, ...]         # == world.kinematics.joint_names
+    base: slice
+    body: slice                          # legs and trunk joints (minimize_body_movement)
+    left_arm: slice
+    right_arm: slice
+    home: Tuple[float, ...]
+    lock_base: bool                      # simplified: base out of IK, planner and GN columns
+    margin_lower: Tuple[float, ...]      # joint_limit_margin bands inside each limit, rad
+    margin_upper: Tuple[float, ...]
+    support: Support
+    sole_frames: Tuple[str, ...]         # () | ("left_sole_link", "right_sole_link")
+    envelope: Optional["Envelope"]       # route A's envelope (design 7.10); None until it is loaded
+
+
+SIMPLIFIED = T1Model(
+    name="simplified",
+    cfg_path=T1_CONFIG_PATH,
+    asset_root=T1_ASSETS_DIR,
+    joint_names=JOINT_NAMES_FULL,
+    base=BASE_INDICES,
+    body=BODY_INDICES,
+    left_arm=LEFT_ARM_INDICES,
+    right_arm=RIGHT_ARM_INDICES,
+    home=t1_home,
+    lock_base=True,
+    margin_lower=T1_LIMIT_MARGIN_LOWER,
+    margin_upper=T1_LIMIT_MARGIN_UPPER,
+    support=Support("mobile_base_link", COM_CENTER, SUPPORT_HALF_EXTENTS, COM_HALF_EXTENTS),
+    sole_frames=(),
+    envelope=None,
+)
+
+
+def _span(names: Tuple[str, ...], members) -> slice:
+    """The slice of ``names`` that ``members`` fill; raises unless they fill it without a gap."""
+    idx = sorted(names.index(n) for n in members)
+    if not idx or idx != list(range(idx[0], idx[0] + len(idx))):
+        raise ValueError(f"joints {sorted(members)} are not contiguous in {names}")
+    return slice(idx[0], idx[-1] + 1)
+
+
+def _load_real_legs() -> T1Model:
+    """The real-leg model (design 7.2), from the ``cutamp`` block that build_planner_model.py writes into
+    t1_29dof.yml: cuRobo's joint order for that file's tool frames, home (bfm_wm's default_q, on the base pose
+    that stands the soles flat on the floor) and the sole geometry."""
+    cfg_path = T1_29DOF_DIR / "t1_29dof.yml"
+    block = load_yaml(str(cfg_path))["cutamp"]
+    names = tuple(block["joint_order"])
+    base = _span(names, [n for n in names if n.startswith("base_j_")])
+    left_arm, right_arm = _span(names, LEFT_ARM_JOINT_NAMES), _span(names, RIGHT_ARM_JOINT_NAMES)
+    taken = set(names[base] + names[left_arm] + names[right_arm])
+    body = _span(names, [n for n in names if n not in taken])
+    if (base, left_arm, right_arm, body) != (slice(0, 6), slice(6, 13), slice(13, 20), slice(20, 33)):
+        raise ValueError(f"{cfg_path.name}: base, arms and body moved in the joint order {names}")
+    home = tuple(float(v) for v in block["home"])
+    if len(home) != len(names):
+        raise ValueError(f"{cfg_path.name}: {len(home)} home values for {len(names)} joints")
+    gate_half, keyframe_half = support_rectangles(tuple(block["sole_box"]), block["sole_y"], LOAD_GUARD_A)
+    return T1Model(
+        name="real_legs",
+        cfg_path=cfg_path,
+        asset_root=T1_29DOF_DIR,
+        joint_names=names,
+        base=base,
+        body=body,
+        left_arm=left_arm,
+        right_arm=right_arm,
+        home=home,
+        lock_base=False,
+        margin_lower=(0.0,) * len(names),  # the limits are already bfm_wm's soft limits (call 17)
+        margin_upper=(0.0,) * len(names),
+        # The stance link sits at the home mid-sole, on the floor: the rectangle is centred on it.
+        support=Support("stance", (0.0, 0.0), gate_half, keyframe_half),
+        sole_frames=("left_sole_link", "right_sole_link"),
+        envelope=None,
+    )
+
+
+REAL_LEGS = _load_real_legs()
+_MODELS: Dict[str, T1Model] = {model.name: model for model in (SIMPLIFIED, REAL_LEGS)}
+
+
+def get_model(name: str) -> T1Model:
+    """The planning model that ``TAMPConfiguration.robot`` names."""
+    if name not in _MODELS:
+        raise ValueError(f"Unknown robot {name!r}; supported: {tuple(_MODELS)}")
+    return _MODELS[name]
+
+
+# =============================================================================
 # Config loading
 # =============================================================================
 
-@lru_cache(maxsize=1)
-def t1_curobo_cfg() -> dict:
-    """Load the T1 v0.8 robot config and resolve asset paths to absolutes."""
-    cfg = load_yaml(str(T1_CONFIG_PATH))
+@lru_cache(maxsize=None)
+def t1_curobo_cfg(model: T1Model) -> dict:
+    """``model``'s cuRobo robot config, its asset paths resolved to absolutes, without the YAML's ``cutamp``
+    block (the model's own data, which cuRobo never reads). Shared: deep-copy it before editing."""
+    cfg = load_yaml(str(model.cfg_path))
+    cfg.pop("cutamp", None)
     kinematics = cfg["robot_cfg"]["kinematics"]
 
     if isinstance(kinematics.get("urdf_path"), str):
-        kinematics["urdf_path"] = str(T1_ASSETS_DIR / kinematics["urdf_path"])
+        kinematics["urdf_path"] = str(model.asset_root / kinematics["urdf_path"])
     if isinstance(kinematics.get("collision_spheres"), str):
-        kinematics["collision_spheres"] = str(T1_ASSETS_DIR / kinematics["collision_spheres"])
-    kinematics["asset_root_path"] = str(T1_ASSETS_DIR)
+        kinematics["collision_spheres"] = str(model.asset_root / kinematics["collision_spheres"])
+    kinematics["asset_root_path"] = str(model.asset_root)
     return cfg
 
 
-def _lock_mobile_base(cfg_dict: dict) -> dict:
-    """Extend ``lock_joints`` to fix the 3 base DOFs at 0. Mutates in place.
+def _lock_mobile_base(model: T1Model, cfg_dict: dict) -> dict:
+    """Extend ``lock_joints`` to fix ``model``'s base DOFs at 0. Mutates in place.
 
     Locked joints are removed from cspace, so IK and trajopt cannot drift the
-    base during arm operations.
+    base during arm operations. Only for a model with ``lock_base``.
     """
     lock_joints = cfg_dict["robot_cfg"]["kinematics"].setdefault("lock_joints", {})
-    for name in JOINT_NAMES_FULL[BASE_INDICES]:
+    for name in model.joint_names[model.base]:
         lock_joints[name] = 0.0
     return cfg_dict
+
+
+def _check_joint_order(model: T1Model, joint_names, cfg_dict: dict) -> None:
+    """Raise unless a build's joints are ``model.joint_names`` less the ones ``cfg_dict`` locks, in that order.
+
+    cuRobo orders the cspace by walking the tool frames, then adds ``position_limit_clip`` (the real legs' soft
+    limits, call 17) without reordering it (``CSpaceParams.inplace_reindex``, cspace_params.py:156-171). A build
+    in another order would put the soft limits on the wrong joints, silently, and every consumer indexes q by
+    ``model``'s slices."""
+    locked = cfg_dict["robot_cfg"]["kinematics"].get("lock_joints") or {}
+    want = tuple(n for n in model.joint_names if n not in locked)
+    if tuple(joint_names) != want:
+        raise RuntimeError(f"cuRobo built the {model.name} model's joints as {list(joint_names)}, not {list(want)}")
 
 
 # =============================================================================
 # Kinematics, IK, and MotionPlanner factories
 # =============================================================================
 
-def get_t1_kinematics(device_cfg: DeviceCfg = None, compute_jacobian: bool = False) -> Kinematics:
-    """Single 21-DOF Kinematics for T1 (both arms + planar base).
+def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None, compute_jacobian: bool = False) -> Kinematics:
+    """``model``'s Kinematics over its whole cspace (both arms and the base, which nothing here locks).
 
     Always built with ``compute_com=True`` so ``KinematicsState.robot_com``
     is populated on every FK call (COM constraint/gate consumers). Measured
     overhead vs the plain kernel: none (0.126 vs 0.127 ms per 1024-batch FK).
 
     ``compute_jacobian=True`` additionally populates
-    ``KinematicsState.tool_jacobians`` ``[b, h, num_tool_frames, 6, 21]``
+    ``KinematicsState.tool_jacobians`` ``[b, h, num_tool_frames, 6, dof]``
     (rows 0-2 linear / 3-5 angular, world frame; verified against finite
     differences). Used by the Gauss-Newton reIK refresh.
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg = t1_curobo_cfg()
+    cfg = t1_curobo_cfg(model)
     kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg)
-    return Kinematics(kin_cfg, compute_com=True, compute_jacobian=compute_jacobian)
+    kin = Kinematics(kin_cfg, compute_com=True, compute_jacobian=compute_jacobian)
+    _check_joint_order(model, kin.joint_names, cfg)
+    return kin
 
 
 class T1Bodies(NamedTuple):
     """Every massive link of the planning model, for the multibody ZMP (com_polygon_cost.com_zmp_in_support)."""
-    kinematics: Kinematics  # tool frames: the links, mobile_base_link first
+    kinematics: Kinematics  # tool frames: the support frame (massless on the real legs), then the links
     mass: torch.Tensor      # [L] kg
     com: torch.Tensor       # [L, 3] in the link frame, m
     inertia: torch.Tensor   # [L, 3, 3] about the CoM, in the link frame, kg m^2
 
 
-def get_t1_bodies(device_cfg: DeviceCfg = None) -> T1Bodies:
-    """:class:`T1Bodies` of the 21-DOF model. Masses and CoMs are cuRobo's, the ones every ``robot_com`` sums
-    (its virtual links weigh a few grams); inertias are read from the URDF, and equal the ones cuRobo keeps
-    (``test_curobo_link_inertias_match_the_urdf``)."""
+def get_t1_bodies(model: T1Model, device_cfg: DeviceCfg = None) -> T1Bodies:
+    """:class:`T1Bodies` of ``model``: its support frame (``model.support.link``), then every massive link. Masses
+    and CoMs are cuRobo's, the ones every ``robot_com`` sums (the simplified model's virtual links weigh a few
+    grams); inertias are read from the URDF, and equal the ones cuRobo keeps
+    (``test_curobo_link_inertias_match_the_urdf``). A frame the URDF lacks, such as the real legs' ``stance``,
+    weighs nothing."""
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg = copy.deepcopy(t1_curobo_cfg())  # from_robot_yaml_file writes tool_frames into the dict it is given
+    cfg = copy.deepcopy(t1_curobo_cfg(model))  # from_robot_yaml_file writes tool_frames into the dict it is given
     kp = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg).kinematics_config
-    names = [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0]
-    names.insert(0, names.pop(names.index("mobile_base_link")))
+    support = model.support.link
+    names = [support] + [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0 and n != support]
     kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=names, device_cfg=device_cfg),
                      compute_spheres=False)
+    _check_joint_order(model, kin.joint_names, cfg)
     kp = kin.config.kinematics_config
     mass_com = kp.link_masses_com[[kp.link_name_to_idx_map[n] for n in names]]
     urdf = URDF.load(cfg["robot_cfg"]["kinematics"]["urdf_path"], load_meshes=False, build_scene_graph=False)
@@ -262,6 +413,7 @@ def _trajopt_transition_dict_with_compute_com() -> dict:
 
 
 def get_t1_motion_planner(
+    model: T1Model,
     scene: Scene,
     *,
     use_cuda_graph: bool = True,
@@ -285,10 +437,16 @@ def get_t1_motion_planner(
     hinge² cost that keeps the trajectory interior a soft 0.1 rad band away
     from joint position limits (zero band on the home-side bounds, except
     ``T1_TRAJOPT_ANKLE_UPPER_MARGIN`` on ankle-upper).
+
+    Only the simplified model has a motion planner yet; any other raises ``NotImplementedError``.
     """
+    if model.name != SIMPLIFIED.name:
+        raise NotImplementedError(f"no motion planner for the {model.name} model yet")
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg_dict = _lock_mobile_base(copy.deepcopy(t1_curobo_cfg()))
+    cfg_dict = copy.deepcopy(t1_curobo_cfg(model))
+    if model.lock_base:
+        _lock_mobile_base(model, cfg_dict)
     cfg = MotionPlannerCfg.create(
         robot=cfg_dict,
         scene_model=scene,
@@ -302,6 +460,7 @@ def get_t1_motion_planner(
         trajopt_transition_model=_trajopt_transition_dict_with_compute_com(),
     )
     planner = MotionPlanner(cfg)
+    _check_joint_order(model, planner.kinematics.joint_names, cfg_dict)
     if enable_com_polygon:
         from cutamp._curobo_internals import add_extra_cost
         from cutamp.com_polygon_cost import (
@@ -344,8 +503,8 @@ def get_t1_motion_planner(
         from cutamp.joint_limit_cost import JointLimitMarginCost, JointLimitMarginCostCfg
 
         # Joint-limit margin: hinge² on entering a per-joint/per-side band
-        # inside the position limits (margins: T1_LIMIT_MARGIN_LOWER/UPPER
-        # above). Endpoint configs are handled by the cutamp-side soft cost;
+        # inside the position limits (margins: the model's margin_lower/upper).
+        # Endpoint configs are handled by the cutamp-side soft cost;
         # this keeps the trajectory INTERIOR away from limits between
         # endpoints. Home-side bounds carry zero margin, so the home dwell
         # waypoints that legitimately sit ON the knee/torso bounds cost
@@ -356,16 +515,16 @@ def get_t1_motion_planner(
         limits = rollout.transition_model.joint_limits.position  # [2, dof_active]
         active_names = list(planner.kinematics.joint_names)
         assert len(active_names) == limits.shape[1], (active_names, limits.shape)
-        name_to_full = {n: i for i, n in enumerate(JOINT_NAMES_FULL)}
+        name_to_full = {n: i for i, n in enumerate(model.joint_names)}
         missing = [n for n in active_names if n not in name_to_full]
-        assert not missing, f"planner joints missing from JOINT_NAMES_FULL: {missing}"
+        assert not missing, f"planner joints missing from the model's joint names: {missing}"
         full_idx = [name_to_full[n] for n in active_names]
         m_lo = torch.tensor(
-            [T1_LIMIT_MARGIN_LOWER[i] for i in full_idx],
+            [model.margin_lower[i] for i in full_idx],
             device=limits.device, dtype=limits.dtype,
         )
         m_hi = torch.tensor(
-            [T1_LIMIT_MARGIN_UPPER[i] for i in full_idx],
+            [model.margin_upper[i] for i in full_idx],
             device=limits.device, dtype=limits.dtype,
         )
         m_hi[active_names.index("ankle_pitch")] = T1_TRAJOPT_ANKLE_UPPER_MARGIN
@@ -386,6 +545,7 @@ def get_t1_motion_planner(
 
 
 def get_t1_ik_solver(
+    model: T1Model,
     scene: Scene,
     *,
     max_batch_size: int = 64,
@@ -395,9 +555,10 @@ def get_t1_ik_solver(
     use_cuda_graph: bool = False,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
-    """InverseKinematics solver for T1 with the mobile base locked.
+    """InverseKinematics solver for ``model``, its base locked when ``model.lock_base``.
 
-    Always built with both tool frames from ``t1_planar_base.yml``. During
+    Always built with every tool frame of the model's YAML (on the simplified
+    model, both hands from ``t1_planar_base.yml``). During
     particle-init IK calls the multi-frame goal (``_build_multi_frame_goal``)
     holds the inactive *hand* where the IK's start conf puts it (home, or a
     CoM-gate retry's perturbed seed), so the inactive arm's joints
@@ -405,19 +566,24 @@ def get_t1_ik_solver(
     known-bugs B15). The cspace pin written beside it is a no-op
     (``T1State.pin_for_arm_action``).
 
-    The 3 base DOFs (``base_j_x``, ``base_j_y``, ``base_j_yaw``) are pinned
-    at 0 — IK cannot drift the base during particle init. Legs / torso /
-    waist / arms remain free.
+    On the simplified model the 3 base DOFs (``base_j_x``, ``base_j_y``,
+    ``base_j_yaw``) are pinned at 0 — IK cannot drift the base during
+    particle init. Legs / torso / waist / arms remain free. The real legs'
+    six base joints stay free.
 
     When ``enable_com_aware_ik`` is True (default), the seed-IK LM solver
     carries a CoM-over-support-rectangle residual (cuRobo fork) that
-    recruits the legs to keep the COM centered while reaching.
+    recruits the legs to keep the COM centered while reaching. Its frame and
+    box come from ``model.support``.
     """
-    from cutamp.com_polygon_cost import COM_CENTER, COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
+    from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
 
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg_dict = _lock_mobile_base(copy.deepcopy(t1_curobo_cfg()))
+    support = model.support
+    cfg_dict = copy.deepcopy(t1_curobo_cfg(model))
+    if model.lock_base:
+        _lock_mobile_base(model, cfg_dict)
     cfg = InverseKinematicsCfg.create(
         robot=cfg_dict,
         scene_model=scene,
@@ -443,16 +609,19 @@ def get_t1_ik_solver(
         # are the sole on/off gate (the fork derives compute_com from them);
         # geometry params are passed unconditionally.
         seed_com_support_weight=(T1_COM_IK_WEIGHT if enable_com_aware_ik else 0.0),
-        # ponytail: the fork's box has no centre, so it gets the largest base-centred box inside
-        # the shifted support rectangle, 2 cm short at the toe; give the fork a centre if seeds
-        # need that room. The real rectangle still gates every conf (com_polygon_cost).
-        seed_com_half_extents=[h - abs(c) for h, c in zip(COM_HALF_EXTENTS, COM_CENTER)],
+        # ponytail: the fork's box has no centre, so it gets the largest frame-centred box inside
+        # the support rectangle: on the simplified model, shifted 1 cm ahead of the base, the box
+        # is 2 cm short at the toe; give the fork a centre if seeds need that room. On the real
+        # legs' stance the rectangle is centred, so the box is the keyframe rectangle itself. The
+        # real rectangle still gates every conf (com_polygon_cost).
+        seed_com_half_extents=[h - abs(c) for h, c in zip(support.keyframe_half, support.center)],
         seed_com_inside_margin=COM_INSIDE_MARGIN,
         seed_com_inside_weight=COM_INSIDE_WEIGHT,
         seed_com_center_weight=(T1_COM_IK_CENTER_WEIGHT if enable_com_aware_ik else 0.0),
-        seed_com_base_link_name="mobile_base_link",
+        seed_com_base_link_name=support.link,
     )
     ik_solver = InverseKinematics(cfg)
+    _check_joint_order(model, ik_solver.kinematics.joint_names, cfg_dict)
     return ik_solver
 
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Type
+from typing import Tuple, Type
 
 import torch
 
@@ -58,6 +58,25 @@ COM_HALF_EXTENTS = tuple(h - COM_DYNAMIC_RESERVE for h in SUPPORT_HALF_EXTENTS) 
 COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
 COM_TOL = COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2  # on-boundary penalty, 4e-4 (known-bugs N5)
+LOAD_GUARD_A = 0.1                   # each foot carries at least this share of the weight (design call 5)
+
+
+def support_rectangles(
+    sole_box: Tuple[float, float], sole_y: float, a: float
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """``(gate_half, keyframe_half)`` about the mid-sole of two side-by-side soles, each a ``sole_box`` (x, y)
+    rectangle whose centre sits ``sole_y`` to either side, under the load guard ``a`` (design 7.4).
+
+    The soles' hull is ``|x| <= sole_box[0] / 2``, ``|y| <= sole_y + sole_box[1] / 2``. The load guard's region
+    S_a, where some load split gives each foot at least ``a`` of the weight, keeps x and narrows y by
+    ``2 sole_y a``. The gate is S_a inside the hull shrunk by ``COM_SAFETY_MARGIN`` (at a = 0.1 the margin binds
+    only in x), and the keyframes' rectangle sits ``COM_DYNAMIC_RESERVE`` further in, as on the simplified model.
+    Both soles stand on one stance, so the region is this rectangle in the stance frame."""
+    hull = (sole_box[0] / 2, sole_y + sole_box[1] / 2)
+    s_a_y = hull[1] - 2 * sole_y * a
+    gate = (hull[0] - COM_SAFETY_MARGIN, min(s_a_y, hull[1] - COM_SAFETY_MARGIN))
+    keyframe = tuple(h - COM_DYNAMIC_RESERVE for h in gate)
+    return gate, keyframe
 
 
 @lru_cache(maxsize=None)

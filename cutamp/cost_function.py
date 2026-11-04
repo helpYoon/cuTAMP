@@ -430,15 +430,15 @@ class CostFunction:
             return _pairwise_upper_sum(yaw_diffs)
         
         # Retract close to home — penalize body slice (post-base) deviation
-        # from the configured T1 home pose.
+        # from the model's home pose.
         elif cost_name == "retract_close_to_home":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for retract_close_to_home soft cost")
 
-            from cutamp.robots.t1 import BASE_DOF, t1_home
-            home_t = _device_const(t1_home, device)
-            # Penalize body (leg+torso+arms) deviation; ignore base x/y/yaw.
-            body_slice = slice(BASE_DOF, len(t1_home))
+            model = self.world.model
+            home_t = _device_const(model.home, device)
+            # Penalize body (leg+torso+arms) deviation; ignore the base, which comes first.
+            body_slice = slice(model.base.stop, len(model.home))
             home_body = home_t[body_slice]
 
             retract_param_names = [info[0] for info in self.retract_info]
@@ -453,34 +453,36 @@ class CostFunction:
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for minimize_body_movement soft cost")
 
-            from cutamp.robots.t1 import BODY_INDICES, t1_home
-            home_body = _device_const(t1_home[BODY_INDICES], device)
+            body = self.world.model.body
+            home_body = _device_const(self.world.model.home[body], device)
 
             config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
             if config_params:
                 all_configs = torch.stack([self._particles[p] for p in config_params], dim=1)
-                return (all_configs[:, :, BODY_INDICES] - home_body).pow(2).sum(dim=(1, 2))
+                return (all_configs[:, :, body] - home_body).pow(2).sum(dim=(1, 2))
             return torch.zeros(num_particles, device=device)
 
         # Joint-limit margin — keep endpoint configurations a soft band away
-        # from position limits. Per-joint/per-side margins from robots/t1.py
+        # from position limits. Per-joint/per-side margins from the model
         # (zero on the home-side bounds the standing posture sits ON, so home
-        # costs exactly 0). q0s are excluded inside the helper: the initial
-        # robot state must never acquire margin gradients (Phase-2 LBFGS
-        # re-leafs every cloned particle).
+        # costs exactly 0; zero everywhere on the real legs, whose limits are
+        # already the policy's soft limits, so the cost is 0 there). q0s are
+        # excluded inside the helper: the initial robot state must never
+        # acquire margin gradients (Phase-2 LBFGS re-leafs every cloned
+        # particle).
         elif cost_name == "joint_limit_margin":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for joint_limit_margin soft cost")
 
             from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
-            from cutamp.robots.t1 import T1_LIMIT_MARGIN_LOWER, T1_LIMIT_MARGIN_UPPER
 
-            limits = self.world.joint_limits  # [2, 21], row 0 = lower
+            model = self.world.model
+            limits = self.world.joint_limits  # [2, dof], row 0 = lower
             return joint_limit_margin_soft_cost(
                 self._particles,
                 limits,
-                _device_const(T1_LIMIT_MARGIN_LOWER, device, limits.dtype),
-                _device_const(T1_LIMIT_MARGIN_UPPER, device, limits.dtype),
+                _device_const(model.margin_lower, device, limits.dtype),
+                _device_const(model.margin_upper, device, limits.dtype),
                 num_particles,
                 device,
             )

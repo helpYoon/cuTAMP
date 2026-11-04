@@ -1,7 +1,8 @@
 """Joint-limit margin costs.
 
-Two consumers share the margin definition (cutamp/robots/t1.py
-``T1_LIMIT_MARGIN_LOWER/UPPER``) and the same hinge² penalty:
+Two consumers share the margin definition (the planning model's
+``margin_lower`` / ``margin_upper``, cutamp/robots/t1.py) and the same hinge²
+penalty:
 
 * :func:`joint_limit_margin_soft_cost` — cuTAMP particle-side soft cost over
   segment-endpoint configurations. The load-bearing fix: empirical analysis

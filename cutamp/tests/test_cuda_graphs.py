@@ -71,8 +71,8 @@ def test_failed_capture_restores_default_stream():
 def test_guard_trips_on_resize():
     from curobo.types import JointState
     from cutamp.cuda_graphs import CapturedGraph, graph_ptrs
-    from cutamp.robots.t1 import get_t1_kinematics
-    kin = get_t1_kinematics()
+    from cutamp.robots.t1 import SIMPLIFIED, get_t1_kinematics
+    kin = get_t1_kinematics(SIMPLIFIED)
     q = (0.1 * torch.randn(4, len(kin.joint_names), device="cuda")).requires_grad_()
 
     def body():  # square(): cuRobo's FK backward needs a contiguous grad, and sum()'s is expanded
@@ -104,7 +104,7 @@ def _graph_config(**kw):
 @pytest.mark.parametrize("sc", [None, *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
 def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
     world, skeleton, base = blocks_t1_plan
-    config = _graph_config(num_opt_steps=2, soft_cost=None if sc is None else [sc])
+    config = _graph_config(num_opt_steps=2, soft_cost=[] if sc is None else [sc])
     replays = install_step_replay_spy(monkeypatch)
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
                          visualizer=SpyVis(config))

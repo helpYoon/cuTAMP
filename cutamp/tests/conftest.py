@@ -11,6 +11,8 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+from cutamp.robots.t1 import REAL_LEGS, SIMPLIFIED
+
 _cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
 #: Skips unless a GPU is visible; reads no CUDA state, so collection initializes none.
 needs_cuda = pytest.mark.skipif(
@@ -19,18 +21,16 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-def make_blocks_t1_world(**tamp_world_kwargs):
-    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests."""
-    import torch
+def make_blocks_t1_world(model=SIMPLIFIED, **tamp_world_kwargs):
+    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``model``, starting at its home."""
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.robots import load_t1_container
-    from cutamp.robots.t1 import t1_home
     from cutamp.tamp_world import TAMPWorld
     dc = DeviceCfg()
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    robot = load_t1_container(dc)
-    q_init = torch.as_tensor(t1_home, dtype=torch.float32, device=dc.device)
+    robot = load_t1_container(model, dc)
+    q_init = torch.as_tensor(model.home, dtype=torch.float32, device=dc.device)
     return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, **tamp_world_kwargs)
 
 
@@ -81,6 +81,25 @@ def blocks_t1_plan():
     sys.last_type = sys.last_value = sys.last_traceback = None
     gc.collect()
     torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def _real_world_slot():
+    """Holds ``real_world``'s world, so teardown can free it: ``real_world`` is torn down first, and with it pytest's
+    own reference to the world."""
+    slot = [make_blocks_t1_world(model=REAL_LEGS, collision_activation_distance=0.0, ik_max_batch_size=64)]
+    yield slot
+    slot.clear()
+    sys.last_type = sys.last_value = sys.last_traceback = None  # a failed test's traceback holds its locals
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def real_world(_real_world_slot):
+    """The blocks_t1 world on the real-leg model, its IK sized for 64 particles. A module using it must not build a
+    second world (two OOM a 24 GiB card)."""
+    return _real_world_slot[0]
 
 
 def clone_particles(particles: dict) -> dict:

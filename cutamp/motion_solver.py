@@ -505,8 +505,8 @@ def solve_curobo(
         pos = plan.position
         while pos.dim() > 2:
             pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
-        # Reproject to JOINT_NAMES_FULL (21-DOF) so T1RerunRobot can splice
-        # in the locked base DOFs. Planner trajectories arrive in either
+        # Reproject to the model's full cspace (21-DOF) so T1RerunRobot can
+        # splice in the locked base DOFs. Planner trajectories arrive in either
         # active cspace (18-DOF) or fully articulated form (31-DOF including
         # head + grippers) depending on which planner method produced them.
         full_dof = len(full_joint_names)

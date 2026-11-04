@@ -161,10 +161,10 @@ def _reference_margins(moves, T):
 def test_bodies_leave_the_robot_config_alone():
     # The bodies' kinematics is built from the cached robot config, whose tool frames every later IK solver
     # and motion planner reads: rewritten to the 36 links, the next run in the process found no IK solution.
-    from cutamp.robots.t1 import get_t1_bodies, t1_curobo_cfg
-    before = list(t1_curobo_cfg()["robot_cfg"]["kinematics"]["tool_frames"])
-    get_t1_bodies()
-    assert t1_curobo_cfg()["robot_cfg"]["kinematics"]["tool_frames"] == before
+    from cutamp.robots.t1 import SIMPLIFIED, get_t1_bodies, t1_curobo_cfg
+    before = list(t1_curobo_cfg(SIMPLIFIED)["robot_cfg"]["kinematics"]["tool_frames"])
+    get_t1_bodies(SIMPLIFIED)
+    assert t1_curobo_cfg(SIMPLIFIED)["robot_cfg"]["kinematics"]["tool_frames"] == before
 
 
 @needs_cuda

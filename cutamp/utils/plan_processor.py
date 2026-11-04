@@ -151,13 +151,14 @@ def _build_processing_kinematics(device_cfg: Optional[DeviceCfg] = None) -> Kine
     planning — only as a one-time FK over the saved trajectory points.
 
     Mobile base is locked (same as the planner) so the active cspace
-    matches ``planner.kinematics.joint_names``.
+    matches ``planner.kinematics.joint_names``. Simplified-model plans only:
+    the real legs have no motion planner yet.
     """
-    from cutamp.robots.t1 import t1_curobo_cfg, _lock_mobile_base
+    from cutamp.robots.t1 import SIMPLIFIED, t1_curobo_cfg, _lock_mobile_base
 
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg_dict = _lock_mobile_base(copy.deepcopy(t1_curobo_cfg()))
+    cfg_dict = _lock_mobile_base(SIMPLIFIED, copy.deepcopy(t1_curobo_cfg(SIMPLIFIED)))
     cfg_dict["robot_cfg"]["kinematics"]["tool_frames"] = [
         LEFT_TOOL_FRAME, RIGHT_TOOL_FRAME, TRUNK_LINK,
     ]

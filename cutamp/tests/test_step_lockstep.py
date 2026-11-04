@@ -194,7 +194,7 @@ def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
     world, skeleton, base = blocks_t1_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
                                reik_balance_first=balance_first, cuda_graphs=False, enable_visualizer=False,
-                               soft_cost=None if sc is None else [sc])
+                               soft_cost=[] if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
     assert len(steps) == 5

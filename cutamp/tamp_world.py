@@ -11,11 +11,12 @@
 
 The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics, a
 single multi-tool-frame InverseKinematics solver, and a MotionPlanner
-factory. T1 exposes two tool frames in ``robot_container.tool_frames``.
+factory, all on the planning model ``world.model``. T1 exposes two tool
+frames in ``robot_container.tool_frames``.
 """
 
 import logging
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -27,7 +28,14 @@ from curobo.types import DeviceCfg, GoalToolPose, JointState
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.robots import RobotContainer
-from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, get_t1_ik_solver, get_t1_motion_planner
+from cutamp.robots.t1 import (
+    TOOL_FRAME_FOR_ARM,
+    T1Model,
+    get_t1_bodies,
+    get_t1_ik_solver,
+    get_t1_kinematics,
+    get_t1_motion_planner,
+)
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
 from cutamp.utils.collision import WorldCollisionCost
@@ -50,7 +58,8 @@ class TAMPWorld:
     """A TAMPEnvironment plus T1 kinematics, a Scene, and motion-planner factory.
 
     T1 exposes two tool frames (left + right base_link) via the
-    ``RobotContainer``. ``q_init`` is a single 21-DOF vector.
+    ``RobotContainer``. ``q_init`` is a single full-cspace vector of the
+    container's model (``world.model``).
     """
 
     def __init__(
@@ -93,7 +102,7 @@ class TAMPWorld:
         # with the inactive arm's joints fixed, so that hand rides with the
         # trunk, most at those home confs (known-bugs B15).
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
-            self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
+            self.model, self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
             enable_com_aware_ik=enable_com_aware_ik,
         )
         self._reik_num_seeds = reik_num_seeds
@@ -134,7 +143,22 @@ class TAMPWorld:
             ).position.flatten().detach().cpu(),
         }
 
+        # The planted soles' world poses at the model's home: every action stands on this one stance.
+        self._stance_soles: Optional[torch.Tensor] = None
+        if self.model.sole_frames:
+            stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
+            stance_ks = self.kinematics.compute_kinematics(stance_js)
+            self._stance_soles = torch.stack([
+                stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(4, 4)
+                for frame in self.model.sole_frames
+            ]).detach()
+
     # ---- Container delegates ------------------------------------------------
+
+    @property
+    def model(self) -> T1Model:
+        """The planning model: joint names, slices, home, margins and support region."""
+        return self.robot_container.model
 
     @property
     def kinematics(self) -> Kinematics:
@@ -174,6 +198,12 @@ class TAMPWorld:
     @property
     def q_init(self) -> torch.Tensor:
         return self._q_init
+
+    @property
+    def stance_soles(self) -> Optional[torch.Tensor]:
+        """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction);
+        ``None`` on a model without soles (the simplified one)."""
+        return self._stance_soles
 
     # ---- Movables and indexing ---------------------------------------------
 
@@ -232,15 +262,14 @@ class TAMPWorld:
     def kinematics_jac(self) -> Kinematics:
         """Jacobian-enabled twin of ``kinematics`` (lazily built).
 
-        Same 21-DOF model, but ``compute_jacobian=True`` so every FK call
+        Same model, but ``compute_jacobian=True`` so every FK call
         also fills ``tool_jacobians``. Separate instance because the flag is
         baked into the kernel buffers at construction. Used by the GN reIK
         refresh (``cutamp/gn_refresh.py``).
         """
         if self._kinematics_jac is None:
-            from cutamp.robots.t1 import get_t1_kinematics
             self._kinematics_jac = get_t1_kinematics(
-                device_cfg=self.device_cfg, compute_jacobian=True,
+                self.model, device_cfg=self.device_cfg, compute_jacobian=True,
             )
         return self._kinematics_jac
 
@@ -249,8 +278,7 @@ class TAMPWorld:
         """Every massive link of the robot (:func:`cutamp.robots.t1.get_t1_bodies`, lazily built): the
         balance gate's multibody ZMP."""
         if self._bodies is None:
-            from cutamp.robots.t1 import get_t1_bodies
-            self._bodies = get_t1_bodies(device_cfg=self.device_cfg)
+            self._bodies = get_t1_bodies(self.model, device_cfg=self.device_cfg)
         return self._bodies
 
     def site_kinematics(self, name: str) -> Kinematics:
@@ -282,7 +310,7 @@ class TAMPWorld:
             return self.ik_solver
         if self._ik_refresh_solver is None:
             self._ik_refresh_solver = get_t1_ik_solver(
-                self.world_cfg, device_cfg=self.device_cfg,
+                self.model, self.world_cfg, device_cfg=self.device_cfg,
                 max_batch_size=self._ik_max_batch_size,
                 enable_com_aware_ik=self._enable_com_aware_ik,
                 num_seeds=self._reik_num_seeds,
@@ -338,6 +366,7 @@ class TAMPWorld:
         """
         scene_with_movables = get_world_cfg(self.env, include_movables=True)
         return get_t1_motion_planner(
+            self.model,
             scene_with_movables,
             use_cuda_graph=use_cuda_graph,
             collision_activation_distance=collision_activation_distance,

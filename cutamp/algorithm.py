@@ -28,7 +28,7 @@ from cutamp.experiment_logger import ExperimentLogger
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
-from cutamp.robots import load_t1_container, t1_home
+from cutamp.robots import get_model, load_t1_container
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
@@ -296,11 +296,12 @@ def setup_cutamp(
 
     # Loading robot can be done offline, so doesn't count towards timing
     tensor_args = TensorDeviceType()
-    robot_container = load_t1_container(device_cfg=tensor_args)
+    model = get_model(config.robot)
+    robot_container = load_t1_container(model, device_cfg=tensor_args)
 
-    # v0.8 single-MotionPlanner: q_init is a single full-DOF vector for every robot.
+    # v0.8 single-MotionPlanner: q_init is a single full-DOF vector of the model's cspace.
     if q_init is None:
-        q_init = t1_home
+        q_init = model.home
     q_init = tensor_args.to_device(q_init)
 
     # Load TAMP world and warmup IK solver
