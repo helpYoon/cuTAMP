@@ -1,6 +1,6 @@
 """Motion planning on the real legs with planted feet and cuRobo's torque check (design 7.4a, 7.5): the floor's push on
 every trajopt transition, SegmentTorques against trajopt's own torques, the balance gate's sole, tilt and torque checks,
-the failed-trajopt reason, and blocks_t1 end to end through cutamp_demo.
+the failed-trajopt reason, and blocks_t1 end to end through cutamp_demo, with its saved raw plan.
 
 The slow end-to-end test comes first: cutamp_demo builds its own world, and the module's ``real_world`` and ``planner``
 must not exist beside it (two worlds OOM a 24 GiB card). Module fixtures are built at their first use, so pytest's
@@ -9,8 +9,10 @@ file order keeps them apart."""
 import dataclasses
 import math
 import os
+import pickle
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -128,7 +130,7 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
     torch.manual_seed(0)  # run_cutamp's --seed 0
     config = TAMPConfiguration(robot="real_legs", num_particles=64, curobo_plan=True, enable_visualizer=False,
                                experiment_root=str(tmp_path))
-    rc.cutamp_demo(env, config)
+    rc.cutamp_demo(env, config, experiment_id="e2e", save_plan="auto")
 
     curobo_plan, _, metrics = seen["run"]
     assert metrics["found_solution"] and metrics["motion_plan_success"], metrics.get("motion_plan_failures")
@@ -141,6 +143,27 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
         assert float(pos.max()) < SOLE_POS_TOL and float(rot.max()) < SOLE_ROT_TOL, (k, float(pos.max()))
         excess = (torques(entry["plan"]).abs() - torques.effort).amax(0)
         assert float(excess.max()) <= 0.0, (k, world.model.joint_names[int(excess.argmax())], float(excess.max()))
+
+    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned, in the model's 33 joints, and
+    # each segment starting where the one before it ends.
+    with open(tmp_path / "e2e" / "motion_plan.pkl", "rb") as f:
+        raw = pickle.load(f)
+    names = list(REAL_LEGS.joint_names)
+    assert len(names) == 33
+    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage3-raw", "real_legs", names)
+    assert len(raw["segments"]) == len(curobo_plan)
+    for k, (seg, entry) in enumerate(zip(raw["segments"], curobo_plan)):
+        assert set(seg) == {"arm", "dt", "position", "velocity", "acceleration", "planner_timing"}, k
+        assert (seg["arm"], seg["dt"]) == (entry["arm"], entry["dt"]), k
+        assert (seg["planner_timing"] is None) == (entry.get("planner_timing") is None), k
+        for timing in [seg] + ([seg["planner_timing"]] if seg["planner_timing"] is not None else []):
+            n = len(timing["position"])
+            for key in ("position", "velocity", "acceleration"):
+                assert timing[key].dtype == np.float32 and timing[key].shape == (n, 33), (k, key)
+        np.testing.assert_array_equal(seg["position"], _full_positions(world, None, entry["plan"]).cpu().numpy())
+        if k:
+            np.testing.assert_allclose(seg["position"][0], raw["segments"][k - 1]["position"][-1], rtol=0, atol=1e-5,
+                                       err_msg=f"segment {k} starts away from segment {k - 1}'s end")
 
 
 @pytest.fixture(scope="module")

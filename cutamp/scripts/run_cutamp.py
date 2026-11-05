@@ -45,6 +45,8 @@ def cutamp_demo(
         ``None`` — don't save the motion plan (default).
         ``"auto"`` — save to ``<experiment_root>/<experiment_id>/motion_plan.pkl``.
         Any other string — save to that path (parent directory auto-created).
+    The simplified model's plan is saved in schema 3, a real-leg plan raw
+    (``"stage3-raw"``); see cutamp/utils/plan_processor.py for both.
     """
     setup_logging()
 
@@ -68,14 +70,18 @@ def cutamp_demo(
         else:
             out_path = Path(save_plan)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # Process into the structured [trunk, arms, hands] schema and pickle.
-        # See cutamp/utils/plan_processor.py for the output schema.
-        from cutamp.utils.plan_processor import process_motion_plan
-        processed = process_motion_plan(curobo_plan)
+        # The simplified model's plan is processed into the structured [trunk, arms, hands] schema 3; a real-leg
+        # plan is saved raw, in its model's joint order, until stage 6's schema 4 (decision 9). See
+        # cutamp/utils/plan_processor.py for both.
+        from cutamp.robots.t1 import SIMPLIFIED, get_model
+        from cutamp.utils.plan_processor import process_motion_plan, raw_motion_plan
+        model = get_model(config.robot)
+        processed = process_motion_plan(curobo_plan) if model is SIMPLIFIED else raw_motion_plan(curobo_plan, model)
         with open(out_path, "wb") as f:
             pickle.dump(processed, f)
         n_traj = len(curobo_plan)
-        _log.info(f"Saved processed motion plan ({n_traj} segments) to {out_path}")
+        _log.info(f"Saved the motion plan ({n_traj} segments, schema_version {processed['schema_version']!r}) "
+                  f"to {out_path}")
     elif save_plan is not None and curobo_plan is None:
         _log.warning(f"--save_plan requested but no motion plan was generated (curobo_plan is None)")
 
@@ -250,9 +256,10 @@ def entrypoint():
         const="auto",
         default=None,
         help=(
-            "Save the processed motion plan as a pickle (no arg: "
-            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path). "
-            "See cutamp/utils/plan_processor.py for the schema."
+            "Save the motion plan as a pickle (no arg: "
+            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): schema 3 "
+            "on the simplified model, the raw 'stage3-raw' plan on the real legs. "
+            "See cutamp/utils/plan_processor.py for both."
         ),
     )
 

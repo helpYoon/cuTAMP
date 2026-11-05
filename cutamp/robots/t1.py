@@ -10,8 +10,7 @@ Two planning models of the Booster T1, each a :class:`T1Model`, chosen by
 - ``REAL_LEGS``: bfm_wm's pinned 33-DOF T1 (``assets/t1_29dof``, design 7.2),
   its legs on six massless base joints whose limits are the legs' reach,
   standing on the home stance, its limits cut to route A's envelope
-  (``assets/envelopes``, call 22). Its motion planner is not built yet
-  (``get_t1_motion_planner`` raises).
+  (``assets/envelopes``, call 22).
 
 Consumers read names, slices, home, margins and the support region from
 ``world.model``. The simplified model's module constants below remain for its
@@ -107,6 +106,10 @@ TOOL_FRAME_FOR_ARM: Dict[str, str] = {"left": LEFT_TOOL_FRAME, "right": RIGHT_TO
 # Gripper (4-bar parallel linkage): 4 joints, 1 effective DOF.
 GRIPPER_OPEN: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
 GRIPPER_CLOSED: Tuple[float, ...] = (1.0, -1.0, -1.0, 1.0)
+# Each hand's four gripper joints, in GRIPPER_OPEN's and GRIPPER_CLOSED's order (both models' URDFs name them so).
+GRIPPER_JOINT_NAMES: Dict[str, Tuple[str, ...]] = {
+    side: tuple(f"{side}_{link}" for link in ("Link1", "Link11", "Link2", "Link22")) for side in ("left", "right")
+}
 
 # Home pose: base at origin; leg standing straight (max height); torso pitch +
 # yaw neutral; arms in neutral pre-grasp.
@@ -810,6 +813,22 @@ def base_se3_from_q(q_curobo) -> torch.Tensor:
     return action_4dof_to_mat4x4(torch.tensor([x, y, 0.0, yaw], dtype=torch.float32))
 
 
+def trunk_pose_from_q(model: T1Model, q) -> torch.Tensor:
+    """``[..., 4, 4]`` float64 world_from_Trunk of real-leg confs ``q`` ``[..., len(model.joint_names)]``.
+
+    The floating base's six joints (x, y, z, pitch, roll, yaw) chain ``base_link_z`` -> ``base_link_pitch``
+    (Y_ROT) -> ``base_link_roll`` (X_ROT) -> ``base_link_yaw`` (Z_ROT) -> ``Trunk`` with identity offsets
+    (t1_29dof.yml), so the Trunk sits at (x, y, z) with R = Ry(pitch) Rx(roll) Rz(yaw). Use to anchor the URDF
+    visualization at the planned base pose.
+    """
+    q = torch.as_tensor(q, dtype=torch.float64)
+    base = q[..., [model.joint_names.index(f"base_j_{a}") for a in ("x", "y", "z", "pitch", "roll", "yaw")]]
+    pose = torch.eye(4, dtype=torch.float64).repeat(*q.shape[:-1], 1, 1)
+    pose[..., :3, :3] = roma.euler_to_rotmat("YXZ", base[..., 3:])  # intrinsic: Ry(pitch) Rx(roll) Rz(yaw)
+    pose[..., :3, 3] = base[..., :3]
+    return pose
+
+
 def _get_scene_transforms(
     scene: trimesh.Scene, root_node: str, root_path: Union[str, None] = None
 ) -> Dict[str, np.ndarray]:
@@ -840,21 +859,34 @@ def _get_scene_transforms(
 
 
 class T1RerunRobot:
-    """Rerun URDF robot for T1 with planar-base awareness.
+    """Rerun URDF robot for the T1 on ``model``, its base pose logged as a ``Transform3D`` on the robot's root
+    entity (``name``), so the rendered robot moves with the planner.
 
-    Accepts joint vectors of length:
+    On the simplified model it accepts joint vectors of length:
       - 21: cuRobo cspace (base + body). The first 3 DOFs are the planar
         base SE(2) ``(x, y, yaw)``, which the URDF doesn't include — they
         live as cuRobo ``extra_links``. We log them as a ``Transform3D`` on
         the robot's root entity so the rendered robot moves with the planner.
       - 28: URDF actuated joints (planar base ignored; robot stays at origin).
+
+    On the real legs it accepts the model's 33-DOF conf, in ``model.joint_names`` order. The six base joints, also
+    cuRobo ``extra_links``, give the Trunk's world pose (:func:`trunk_pose_from_q`). Every URDF joint is set by name:
+    the model's from the conf, the fingers from the gripper state (:meth:`set_grippers`), and the others the
+    planner locks (the head) at their locked values, 0. The optimizer's rollout appends a 4-joint gripper command
+    to its confs, which is ignored: the fingers follow the gripper state.
     """
 
-    def __init__(self, name: str, urdf: URDF, q_neutral=None, load_mesh: bool = True):
+    def __init__(self, name: str, urdf: URDF, model: T1Model, q_neutral=None, load_mesh: bool = True):
         self.name = name
         self.urdf = urdf
+        self.model = model
         self._left_gripper: Tuple[float, ...] = GRIPPER_OPEN
         self._right_gripper: Tuple[float, ...] = GRIPPER_OPEN
+        if model is not SIMPLIFIED:
+            self._locked = dict(t1_curobo_cfg(model)["robot_cfg"]["kinematics"].get("lock_joints") or {})
+            unset = set(urdf.actuated_joint_names) - set(model.joint_names) - set(self._locked)
+            if unset:
+                raise ValueError(f"URDF joints {sorted(unset)} are neither in the {model.name} model nor locked")
         rr.log(self.urdf.base_link, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
         log_scene(scene=self.urdf.scene, node=self.urdf.base_link, path=self.name, static=False, add_mesh=load_mesh)
         if q_neutral is not None:
@@ -865,9 +897,29 @@ class T1RerunRobot:
         self._right_gripper = tuple(right)
 
     def _log_base_transform(self, q_curobo) -> None:
-        """Apply the SE(2) planar base transform to the robot's root entity."""
-        m = base_se3_from_q(q_curobo).numpy()
+        """Apply the base transform of the conf ``q_curobo`` to the robot's root entity: the simplified model's
+        planar SE(2), or the real legs' Trunk pose."""
+        if self.model is SIMPLIFIED:
+            m = base_se3_from_q(q_curobo).numpy()
+        else:
+            m = trunk_pose_from_q(self.model, q_curobo).numpy()
         rr.log(self.name, rr.Transform3D(translation=m[:3, 3], mat3x3=m[:3, :3]))
+
+    def _real_legs_conf(self, joint_positions: list) -> list:
+        """The real legs' conf in ``joint_positions``, without the gripper command the optimizer's rollout
+        appends."""
+        n = len(self.model.joint_names)
+        if len(joint_positions) not in (n, n + len(GRIPPER_OPEN)):
+            raise ValueError(f"Expected the {self.model.name} model's {n} joints, optionally followed by a "
+                             f"{len(GRIPPER_OPEN)}-joint gripper command, got {len(joint_positions)} values")
+        return joint_positions[:n]
+
+    def _real_legs_urdf_cfg(self, q: list) -> list:
+        """The URDF's actuated joints, by name, at the real-leg conf ``q``."""
+        value = {**self._locked, **dict(zip(self.model.joint_names, q))}
+        for side, state in (("left", self._left_gripper), ("right", self._right_gripper)):
+            value.update(zip(GRIPPER_JOINT_NAMES[side], state))
+        return [value[n] for n in self.urdf.actuated_joint_names]
 
     def set_joint_positions(self, joint_positions) -> None:
         if hasattr(joint_positions, "tolist"):
@@ -875,7 +927,11 @@ class T1RerunRobot:
         elif hasattr(joint_positions, "__iter__"):
             joint_positions = list(joint_positions)
 
-        if len(joint_positions) == CUROBO_DOF:
+        if self.model is not SIMPLIFIED:
+            q = self._real_legs_conf(joint_positions)
+            self._log_base_transform(q)
+            joint_positions = self._real_legs_urdf_cfg(q)
+        elif len(joint_positions) == CUROBO_DOF:
             self._log_base_transform(joint_positions)
             joint_positions = curobo_to_urdf_joints(
                 joint_positions, left_gripper=self._left_gripper, right_gripper=self._right_gripper,
@@ -910,7 +966,12 @@ class T1RerunRobot:
             raise ValueError(f"joint_positions must be a 2D tensor of shape (n, d), got {joint_positions.shape}")
 
         base_columns = None
-        if joint_positions.shape[-1] == CUROBO_DOF:
+        if self.model is not SIMPLIFIED:
+            confs = [self._real_legs_conf(q) for q in joint_positions.tolist()]
+            base_mats = trunk_pose_from_q(self.model, confs).numpy()
+            base_columns = rr.Transform3D.columns(mat3x3=base_mats[:, :3, :3], translation=base_mats[:, :3, 3])
+            joint_positions = torch.tensor([self._real_legs_urdf_cfg(q) for q in confs], dtype=torch.float64)
+        elif joint_positions.shape[-1] == CUROBO_DOF:
             # Build per-frame SE(2) columns BEFORE collapsing to URDF DOFs.
             base_mats = np.stack([base_se3_from_q(q).numpy() for q in joint_positions])
             base_columns = rr.Transform3D.columns(
@@ -958,18 +1019,18 @@ class T1RerunRobot:
         return path_to_components
 
 
-def load_t1_rerun(load_mesh: bool = True) -> T1RerunRobot:
-    """Load the T1 URDF for Rerun visualization."""
-    urdf_path = T1_ASSETS_DIR / "t1_simplified.urdf"
+def load_t1_rerun(model: T1Model, load_mesh: bool = True) -> T1RerunRobot:
+    """Load ``model``'s URDF, the one its cuRobo config plans on, for Rerun visualization, at home."""
+    urdf_path = Path(t1_curobo_cfg(model)["robot_cfg"]["kinematics"]["urdf_path"])
     if not urdf_path.exists():
         raise FileNotFoundError(f"T1 URDF not found at {urdf_path}")
 
     def _locate_t1_asset(fname: str) -> str:
         if fname.startswith("package://"):
-            return str(T1_ASSETS_DIR / fname.replace("package://", ""))
-        full_path = T1_ASSETS_DIR / fname
+            return str(model.asset_root / fname.replace("package://", ""))
+        full_path = model.asset_root / fname
         return str(full_path) if full_path.exists() else fname
 
     urdf = URDF.load(str(urdf_path), filename_handler=_locate_t1_asset)
-    full_neutral = curobo_to_urdf_joints(t1_home)
-    return T1RerunRobot("t1", urdf, q_neutral=full_neutral, load_mesh=load_mesh)
+    full_neutral = curobo_to_urdf_joints(t1_home) if model is SIMPLIFIED else model.home
+    return T1RerunRobot("t1", urdf, model, q_neutral=full_neutral, load_mesh=load_mesh)

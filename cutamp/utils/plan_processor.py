@@ -5,6 +5,10 @@ structured form for MPC tracking on the real T1.
 ``plan["schema_version"]``. Older pickles will be rejected by the consumer
 example with a clear regenerate-with-current-code message.
 
+Schema 3 serves the simplified model's plans only. A real-leg plan
+(``--robot real_legs``) is saved as planned by :func:`raw_motion_plan`,
+``schema_version "stage3-raw"``, until stage 6's schema-4 export (design 7.6).
+
 v3 stores ``trunk_xyz`` as the raw sim FK output (sim ``t1_simplified.urdf``
 Trunk world pose). The on-robot model the MPC uses, ``t1.urdf``, has a Trunk
 frame IDENTICAL to the sim's (verified: FK of every Trunk child matches to
@@ -128,7 +132,7 @@ Velocity / acceleration sources:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import copy
 import numpy as np
@@ -137,11 +141,17 @@ import torch
 from curobo.kinematics import Kinematics, KinematicsCfg
 from curobo.types import DeviceCfg, JointState
 
+if TYPE_CHECKING:
+    from cutamp.robots.t1 import T1Model
+
 
 # FK target link names (both hands + Trunk). Must match URDF link names.
 LEFT_TOOL_FRAME = "left_hand_link"
 RIGHT_TOOL_FRAME = "right_hand_link"
 TRUNK_LINK = "Trunk"
+
+# raw_motion_plan's schema_version: a real-leg plan as planned, until stage 6's schema 4.
+RAW_SCHEMA_VERSION = "stage3-raw"
 
 
 def _build_processing_kinematics(device_cfg: Optional[DeviceCfg] = None) -> Kinematics:
@@ -152,7 +162,7 @@ def _build_processing_kinematics(device_cfg: Optional[DeviceCfg] = None) -> Kine
 
     Mobile base is locked (same as the planner) so the active cspace
     matches ``planner.kinematics.joint_names``. Simplified-model plans only:
-    the real legs have no motion planner yet.
+    real-leg plans are saved by :func:`raw_motion_plan`.
     """
     from cutamp.robots.t1 import SIMPLIFIED, t1_curobo_cfg, _lock_mobile_base
 
@@ -432,3 +442,48 @@ def process_motion_plan(
         "quaternion_convention": "wxyz (cuRobo) + xyzw (ROS/scipy/Eigen) both emitted; pick to match your stack",
         "schema_doc": "see cutamp/utils/plan_processor.py module docstring for full schema",
     }
+
+
+def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict[str, Any]:
+    """A real-leg ``solve_curobo`` plan as planned (decision 9), until stage 6's schema-4 export (design 7.6)::
+
+        {
+            "schema_version": "stage3-raw",
+            "model": model.name,                     # "real_legs"
+            "joint_names": list(model.joint_names),  # the base's six joints included
+            "segments": [{
+                "arm": "left" | "right" | None,
+                "dt": float,                         # s between frames: cuRobo's interpolation_dt
+                "position": [T, n],                  # float32, in joint_names order
+                "velocity": [T, n],
+                "acceleration": [T, n],
+                # A segment the balance gate slowed: the same segment at the motion planner's own timing, as the
+                # same three arrays ([T', n] at the same dt); else None.
+                "planner_timing": {"position", "velocity", "acceleration"} | None,
+            }],
+        }
+
+    The joint values are the planner's own; the joints it locks (the head, the fingers) are left out. As in
+    :func:`process_motion_plan`, a segment without native velocities or accelerations raises rather than having
+    them fabricated."""
+    names = list(model.joint_names)
+
+    def frames(plan_js: JointState) -> Dict[str, np.ndarray]:
+        if plan_js.joint_names is None:
+            raise ValueError("Motion plan segment has no joint names, so it cannot be put in the model's order")
+        cols = [list(plan_js.joint_names).index(n) for n in names]
+        out = {}
+        for key in ("position", "velocity", "acceleration"):
+            x = getattr(plan_js, key)
+            if x is None:
+                raise RuntimeError(f"Motion plan segment lacks native joint {key}; refusing to fabricate it")
+            # One trajectory: any leading dims are 1.
+            out[key] = x.detach().reshape(x.shape[-2:])[:, cols].to(torch.float32).cpu().numpy()
+        return out
+
+    segments = []
+    for entry in curobo_plan:
+        fast = entry.get("planner_timing")
+        segments.append({"arm": entry.get("arm"), "dt": float(entry["dt"]), **frames(entry["plan"]),
+                         "planner_timing": None if fast is None else frames(fast["plan"])})
+    return {"schema_version": RAW_SCHEMA_VERSION, "model": model.name, "joint_names": names, "segments": segments}

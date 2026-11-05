@@ -15,7 +15,7 @@ import torch
 from curobo.scene import Mesh
 
 from cutamp.config import TAMPConfiguration
-from cutamp.robots import load_t1_rerun
+from cutamp.robots import get_model, load_t1_rerun
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.rerun_utils import log_curobo_pose_to_rerun, curobo_to_rerun, log_curobo_mesh_to_rerun, AXIS_LENGTH
 
@@ -67,7 +67,8 @@ class Visualizer:
 
 
 class RerunVisualizer(Visualizer):
-    """Wrapper around rerun for easier visualization, and switching in different visualizers."""
+    """Wrapper around rerun for easier visualization, and switching in different visualizers. Shows the robot on
+    ``config.robot``'s planning model."""
 
     def __init__(
         self,
@@ -78,7 +79,7 @@ class RerunVisualizer(Visualizer):
         spawn: bool,
     ):
         rr.init(application_id, recording_id=recording_id, spawn=spawn)
-        self.robot = load_t1_rerun(load_mesh=config.viz_robot_mesh)
+        self.robot = load_t1_rerun(get_model(config.robot), load_mesh=config.viz_robot_mesh)
         super().__init__(config, q_init)
 
     def set_time_sequence(self, timeline: str, val: int):
