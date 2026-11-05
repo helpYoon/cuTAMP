@@ -27,7 +27,7 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
-from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced, soles_on_stance
+from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced, soles_on_stance, tilt_within_bound
 from cutamp.particle_initialization import (
     _achieved_pose_errors,
     _ik_for_pose,
@@ -38,7 +38,7 @@ from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
-from cutamp.task_planning.constraints import KinematicConstraint
+from cutamp.task_planning.constraints import KinematicConstraint, Motion
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -613,6 +613,12 @@ class ParticleOptimizer:
                 n_fail = int((~success).sum().item())
                 # Repair-only merge: already-good rows keep their q.
                 success = success & ~ok_now
+                if world.model.envelope is not None:
+                    # cuRobo's IK does not see the envelope's tilt bound, which GN holds: on blocks_t1's floor scene
+                    # it bowed 9 of 11 repaired rows past it, each trading a hand, sole or CoM failure for a tilt one,
+                    # so a repair past the bound is not taken.
+                    success &= tilt_within_bound(world, new_q,
+                                                 self.constraint_checker._get_tol(Motion.type, "trunk_tilt"))
                 with torch.no_grad():
                     merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
