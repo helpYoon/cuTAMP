@@ -28,14 +28,14 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
         q1, q3 = float(particle["left_q1"][0]), float(particle["left_q3"][0])
         planned.append((q1, q3))
         if q1 == 0 or q3 == 0:  # pick fails on q1 == 0, else place fails on q3 == 0
-            e = RuntimeError("plan failed")
+            e = RuntimeError("pick failed: torque" if q1 == 0 else "place failed: other")
             e.op_idx = 1 if q1 == 0 else 2
             raise e
         return "PLAN", {}
 
     monkeypatch.setattr(alg, "solve_curobo", fake_solve_curobo)
     candidates = [cand(0, 0), cand(0, 1), cand(1, 0), cand(1, 0), cand(1, 1)]
-    plan, _, skip, attempts, rank = alg._motion_plan_with_retries(
+    plan, _, skip, attempts, rank, failures = alg._motion_plan_with_retries(
         {"plan_skeleton": skeleton}, candidates, None, None, None, None,
     )
     # (0, 1) repeats (0, 0) through the failing pick; the second (1, 0) repeats
@@ -43,6 +43,8 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
     assert planned == [(0, 0), (1, 0), (1, 1)]
     # rank names the planned particle, which attempts can't once candidates are skipped (known-bugs N3)
     assert (plan, skip, attempts, rank) == ("PLAN", False, 3, 4)
+    # Each planned candidate that failed keeps its message, so a report can count those lost to torque (7.4a).
+    assert failures == ["pick failed: torque", "place failed: other"]
 
 
 def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):

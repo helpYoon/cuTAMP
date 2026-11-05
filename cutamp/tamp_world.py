@@ -27,6 +27,7 @@ from curobo.scene import Obstacle, Scene
 from curobo.types import DeviceCfg, GoalToolPose, JointState, Pose
 
 from cutamp.envs import TAMPEnvironment
+from cutamp.floor_wrench import SegmentTorques
 from cutamp.robots import RobotContainer
 from cutamp.robots.t1 import (
     TOOL_FRAME_FOR_ARM,
@@ -114,6 +115,7 @@ class TAMPWorld:
         self._ik_refresh_solver = None
         self._kinematics_jac = None
         self._bodies = None
+        self._segment_torques = None
         self._site_kinematics: Dict[str, Kinematics] = {}
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).
@@ -300,6 +302,15 @@ class TAMPWorld:
         if self._bodies is None:
             self._bodies = get_t1_bodies(self.model, device_cfg=self.device_cfg)
         return self._bodies
+
+    @property
+    def segment_torques(self) -> SegmentTorques:
+        """cuRobo's two RNEA passes with the floor's push on a plan's frames
+        (:class:`cutamp.floor_wrench.SegmentTorques`, lazily built): the balance gate's torque check on the segments
+        it slows, and the reason a trajopt failed. A model standing on soles only (the real legs)."""
+        if self._segment_torques is None:
+            self._segment_torques = SegmentTorques(self.model, self.device_cfg)
+        return self._segment_torques
 
     def site_kinematics(self, name: str) -> Kinematics:
         """The Adam loop's FK site ``name``: a dedicated, lazily built, CoM-enabled Kinematics

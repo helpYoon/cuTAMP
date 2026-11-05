@@ -19,12 +19,12 @@ def _run_demo(tmp_path, monkeypatch, n, robot="simplified") -> list:
     from cutamp.scripts.run_cutamp import cutamp_demo
 
     monkeypatch.setattr(cutamp.algorithm, "Visualizer", lambda config, q_init: SpyVis(config))  # the vis block runs
-    # The real legs keep their default minimize_body_movement, as the speed gate's real-leg cell does, and plan no
-    # motion: get_t1_motion_planner has no real-leg planner yet.
+    # The real legs keep their default minimize_body_movement, as the speed gate's real-leg cell does. Both models plan
+    # motions, so every cell captures beside the planner-build thread.
     real = robot == "real_legs"
     config = TAMPConfiguration(robot=robot, num_particles=n, reik_balance_first=True, cuda_graphs=True,
                                soft_cost=["joint_limit_margin"] + (["minimize_body_movement"] if real else []),
-                               enable_visualizer=False, curobo_plan=not real, experiment_root=str(tmp_path))
+                               enable_visualizer=False, curobo_plan=True, experiment_root=str(tmp_path))
     cutamp_demo(load_env(os.path.join(get_env_dir(), "blocks_t1.yml")), config)
     return [json.loads(p.read_text()) for p in sorted(tmp_path.glob("*/optimization/opt_*.json"))]
 

@@ -201,7 +201,7 @@ def _motion_plan_with_retries(
     timer: TorchTimer,
     visualizer,
     get_planner=None,
-) -> Tuple[Optional[dict], Optional[dict], bool, int, Optional[int]]:
+) -> Tuple[Optional[dict], Optional[dict], bool, int, Optional[int], List[str]]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
@@ -212,7 +212,7 @@ def _motion_plan_with_retries(
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
 
-    Returns ``(curobo_plan, audit, skip_plan, attempts, rank)``:
+    Returns ``(curobo_plan, audit, skip_plan, attempts, rank, failures)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
         failed.
       - ``audit``: the measure-only trajectory CoM audit dict from
@@ -222,9 +222,12 @@ def _motion_plan_with_retries(
       - ``attempts``: number of candidates actually planned (skips excluded).
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
+      - ``failures``: each planned candidate's failure message, in order. On
+        the real legs a failed trajopt's message names its reason, so a report
+        can count the candidates lost to torque (design 7.4a).
     """
     skeleton = plan_info["plan_skeleton"]
-    last_err, tried, failed = None, 0, []
+    last_err, tried, failed, failures = None, 0, [], []
     for rank, particle in enumerate(candidates):
         if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed):
             _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
@@ -239,17 +242,18 @@ def _motion_plan_with_retries(
                 _log.warning(
                     f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
                 )
-            return curobo_plan, audit, False, tried, rank
+            return curobo_plan, audit, False, tried, rank, failures
         except NotImplementedError as e:
             _log.warning(
                 f"Motion planning not supported for this plan: {e}. Trying next plan..."
             )
-            return None, None, True, tried, None
+            return None, None, True, tried, None, failures
         except RuntimeError as e:
             _log.warning(
                 f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
             )
             last_err = e
+            failures.append(str(e))
             # ponytail: keys on every value read up to the failing op (all ops if untagged), so
             # a candidate differing only in values that op never sees (a pick conf before a
             # shared retract) still replans; key on the op's own start/goal/world if that matters.
@@ -260,7 +264,7 @@ def _motion_plan_with_retries(
         f"Exhausted {len(candidates)} particle retries ({tried} planned); giving up on this plan. "
         f"Last error: {last_err}"
     )
-    return None, None, False, tried, None
+    return None, None, False, tried, None, failures
 
 
 def _com_margin(world: TAMPWorld, particle: dict) -> float:
@@ -442,6 +446,7 @@ def run_cutamp(
         # enough to attempt planning. Runs without curobo_plan never had
         # a chance to plan, so the key stays absent for them.
         overall_metrics["motion_plan_success"] = False
+        overall_metrics["motion_plan_failures"] = []  # every failed candidate's message, over the skeletons planned
     curobo_plan = None
     found_solution = False
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker, planner_busy=planner_busy)
@@ -477,12 +482,13 @@ def run_cutamp(
                     plan_info, config, constraint_checker, cost_reducer,
                     n=config.motion_plan_max_retries,
                 )
-                curobo_plan, traj_audit, skip_plan, attempts, rank = _motion_plan_with_retries(
+                curobo_plan, traj_audit, skip_plan, attempts, rank, failures = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
                     get_planner=get_planner,
                 )
                 overall_metrics["motion_plan_success"] = bool(curobo_plan)
                 overall_metrics["motion_plan_attempts"] = attempts
+                overall_metrics["motion_plan_failures"] += failures
                 if skip_plan or curobo_plan is None:
                     continue
                 overall_metrics.update(traj_audit)

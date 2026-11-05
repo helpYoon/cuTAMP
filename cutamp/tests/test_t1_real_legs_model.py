@@ -263,8 +263,10 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
     # and every factory's limits, by name.
     from cutamp.robots.t1 import get_t1_motion_planner
     soft = _yaml_soft_limits()
+    planner = get_t1_motion_planner(REAL_LEGS, real_world.world_cfg, use_cuda_graph=False)
     builds = {"kinematics": real_world.kinematics, "kinematics_jac": real_world.kinematics_jac,
-              "bodies": real_world.bodies.kinematics, "ik": real_world.ik_solver.kinematics}
+              "bodies": real_world.bodies.kinematics, "ik": real_world.ik_solver.kinematics,
+              "planner": planner.kinematics}
     for what, kin in builds.items():
         names = list(kin.joint_names)
         assert names == list(REAL_LEGS.joint_names), what
@@ -272,8 +274,9 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
         want_lo, want_hi = np.array([soft[n] for n in names]).T
         assert np.abs(lo - want_lo).max() < 1e-6 and np.abs(hi - want_hi).max() < 1e-6, what
     assert real_world.bodies.kinematics.tool_frames[0] == "stance" and float(real_world.bodies.mass[0]) == 0.0
-    with pytest.raises(NotImplementedError):
-        get_t1_motion_planner(REAL_LEGS, real_world.world_cfg)
+    # The planner keeps the YAML's tool frames in the YAML's order (R12); the floor hook and the CoM cost find theirs.
+    yml = yaml.safe_load((T1_29DOF / "t1_29dof.yml").read_text())["robot_cfg"]["kinematics"]["tool_frames"]
+    assert list(planner.kinematics.tool_frames) == list(planner.trajopt_solver.tool_frames) == yml
 
 
 @needs_cuda

@@ -36,6 +36,7 @@ handled at planning time in ``cutamp/t1_state.py``, and is a no-op (see
 
 import copy
 import logging
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -462,9 +463,19 @@ def get_t1_motion_planner(
     enable_joint_limit_margin: bool = True,
     device_cfg: DeviceCfg = None,
 ) -> MotionPlanner:
-    """Single MotionPlanner for the T1 with the mobile base locked.
+    """Single MotionPlanner for the T1: on the simplified model with the mobile base locked (legs, Torso_Pitch,
+    Waist_Yaw and both arms free), on the real legs with every joint free, the base included.
 
-    Legs (ankle/knee), Torso_Pitch, Waist_Yaw, and both arms remain free.
+    On a model standing on soles (the real legs, design 7.4a and 7.5) the planner also:
+
+    - runs cuRobo's RNEA in trajopt (``load_dynamics``), whose cspace cost and success test bound every joint's torque
+      at the URDF's effort, with the floor's push on the planted soles (``install_floor_wrench``, hooked before any
+      plan or warm-up: cuRobo's CUDA graphs keep the hook they were captured with). cuRobo's energy term keeps its
+      default weight;
+    - holds both soles on the stance at every waypoint (pose tracking at non-terminal scale 1.0, stage 2's verified
+      weight), tracks the hands at the terminal only, and leaves the ``stance`` frame untracked (it is world-fixed,
+      and the CoM cost's support frame);
+    - bounds the Trunk tilt (``TrunkTiltCost``, weight 1e5) when the envelope sets a maximum. Route A's sets none.
 
     When ``enable_com_polygon`` is True (default), the planner gets a soft
     cost penalizing trajectories whose mass-weighted COM projects outside the
@@ -476,17 +487,17 @@ def get_t1_motion_planner(
     ``enable_joint_limit_margin`` (default True) additionally registers a
     hinge² cost that keeps the trajectory interior a soft 0.1 rad band away
     from joint position limits (zero band on the home-side bounds, except
-    ``T1_TRAJOPT_ANKLE_UPPER_MARGIN`` on ankle-upper).
-
-    Only the simplified model has a motion planner yet; any other raises ``NotImplementedError``.
+    ``T1_TRAJOPT_ANKLE_UPPER_MARGIN`` on ankle-upper). The simplified model
+    only: the real legs' limits are bfm_wm's soft limits, with no further
+    margin (call 17).
     """
-    if model.name != SIMPLIFIED.name:
-        raise NotImplementedError(f"no motion planner for the {model.name} model yet")
     if device_cfg is None:
         device_cfg = DeviceCfg()
     cfg_dict = copy.deepcopy(t1_curobo_cfg(model))
     if model.lock_base:
         _lock_mobile_base(model, cfg_dict)
+    if model.sole_frames:
+        cfg_dict["robot_cfg"]["load_dynamics"] = True
     cfg = MotionPlannerCfg.create(
         robot=cfg_dict,
         scene_model=scene,
@@ -501,6 +512,21 @@ def get_t1_motion_planner(
     )
     planner = MotionPlanner(cfg)
     _check_joint_order(model, planner.kinematics.joint_names, cfg_dict)
+    if model.sole_frames:
+        from curobo.types import ToolPoseCriteria
+        from cutamp.floor_wrench import install_floor_wrench
+
+        install_floor_wrench(planner, model.joint_names[model.base], model.sole_frames)
+        criteria = {
+            frame: ToolPoseCriteria.track_position_and_orientation(non_terminal_scale=0.0)  # the hands
+            for frame in planner.kinematics.tool_frames
+        }
+        criteria.update({
+            frame: ToolPoseCriteria.track_position_and_orientation(non_terminal_scale=1.0)
+            for frame in model.sole_frames
+        })
+        criteria[model.support.link] = ToolPoseCriteria.disabled()
+        planner.update_tool_pose_criteria(criteria)
     if enable_com_polygon:
         from cutamp._curobo_internals import add_extra_cost
         from cutamp.com_polygon_cost import (
@@ -539,7 +565,21 @@ def get_t1_motion_planner(
             center=model.support.center,
         )
         add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
-    if enable_joint_limit_margin:
+    if model.envelope is not None and model.envelope.trunk_tilt_max is not None:
+        from cutamp._curobo_internals import add_extra_cost
+        from cutamp.joint_limit_cost import TrunkTiltCost, TrunkTiltCostCfg
+
+        # The envelope's Trunk tilt bound (call 22) along the trajectory: GN and the Motion value hold it at the confs.
+        active_names = list(planner.kinematics.joint_names)
+        tilt_cfg = TrunkTiltCostCfg(
+            weight=[1.0e5],
+            device_cfg=planner.trajopt_solver.optimizer_rollouts[0].device_cfg,
+            pitch_index=active_names.index("base_j_pitch"),
+            roll_index=active_names.index("base_j_roll"),
+            cos_max=math.cos(model.envelope.trunk_tilt_max),
+        )
+        add_extra_cost(planner, "trunk_tilt", TrunkTiltCost(tilt_cfg))
+    if enable_joint_limit_margin and not model.sole_frames:
         from cutamp._curobo_internals import add_extra_cost
         from cutamp.joint_limit_cost import JointLimitMarginCost, JointLimitMarginCostCfg
 
