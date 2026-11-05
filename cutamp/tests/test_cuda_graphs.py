@@ -150,13 +150,12 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
     assert next(busy) == 8                           # consulted once per step, until the capture
 
 
-# On both models; None is the default model and shares the module's world. The memory reading is byte-exact on the
-# simplified model. On the real legs the final check repairs with cuRobo's CUDA-graphed IK, whose line search
-# (line_search_strategy.py, jit_get_x_set) alternates two blocks of one size class, about 1.2 MB each, held on the
-# C++ side. The bytes requested stay the same from call to call, but the caching allocator counts a block at the
-# size of the cached block it lands in, so the reading moves (by 16 KiB between this test's two calls), bounded.
-# The real legs get that 16 KiB bound, which a real leak still fails. (test_cuda_graphs_whole_call compares the
-# calls' results bitwise, not their memory.)
+# On both models; None is the default model and shares the module's world. The leak check is the bytes the tensors
+# request, exact on both models. On the real legs the final check repairs with cuRobo's CUDA-graphed IK, whose line
+# search (line_search_strategy.py, jit_get_x_set) reuses cached blocks of one size class, about 1.2 MB each, held on
+# the C++ side. The caching allocator counts each request at the size of the block it lands in, so there
+# memory_allocated moves between calls (by 16 to 80 KiB, seen) with nothing new held; it is exact only on the
+# simplified model. (test_cuda_graphs_whole_call compares the calls' results bitwise, not their memory.)
 @needs_cuda
 @pytest.mark.parametrize("blocks_t1_plan", ["simplified", pytest.param(None, id="default")], indirect=True)
 def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
@@ -164,7 +163,7 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=10, robot=world.model.name)
     plan_info, mem, sites, released = make_plan_info(world, skeleton, clone_particles(base), config), [], [], []
-    orig = CapturedGraph.release
+    orig, req = CapturedGraph.release, []            # req: the bytes the tensors request, after each call
 
     def release(self):                               # what each release must free; no strong refs kept
         outs = [weakref.ref(t) for t in (self.outputs or ()) if isinstance(t, torch.Tensor)]
@@ -184,14 +183,14 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
         pools = {p for _, p, _ in released}
         assert not [s for s in torch.cuda.memory_snapshot() if s["segment_pool_id"] in pools]  # nor a pool block
         mem.append(torch.cuda.memory_allocated())
+        req.append(torch.cuda.memory_stats()["requested_bytes.all.current"])
         sites.append(_site_ptrs(world))
     # The FK sites outlive the call, sized by the batch they last ran. Same plan, so the same
     # buffers after both calls: they count the same in both readings and can't hide a leak.
     assert sites[1] == sites[0]
+    assert req[1] == req[0], (req, mem)              # nothing a tensor holds grows from call to call
     if world.model.name == "simplified":
-        assert mem[1] == mem[0]                      # and nothing grows from call to call
-    else:                                            # cuRobo IK's line-search blocks, see above
-        assert abs(mem[1] - mem[0]) <= 16 * 1024, mem
+        assert mem[1] == mem[0]                      # nor the allocator's blocks (see above for the real legs)
 
 
 @needs_cuda

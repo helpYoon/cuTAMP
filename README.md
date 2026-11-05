@@ -495,8 +495,9 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   the reference math; every graph replay bitwise against eager. The full
   system runs on the default model; the ablation arms, and joint_limit_margin's
   step body (the real legs' bands are zero), on the simplified one. The memory
-  reading across two optimize calls runs on both: byte-exact on the simplified
-  model, within 16 KiB on the real legs (cuRobo IK's line-search blocks).
+  check across two optimize calls runs on both: the bytes the tensors request
+  are exact on both models; the allocator's block count is exact only on the
+  simplified one (on the real legs cuRobo IK's line search reuses cached blocks).
 - [`test_t1_real_legs_model.py`](cutamp/tests/test_t1_real_legs_model.py),
   [`test_t1_29dof_assets.py`](cutamp/tests/test_t1_29dof_assets.py), the
   `test_real_legs_*.py` files and
