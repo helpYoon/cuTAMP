@@ -493,7 +493,7 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~6 min on an RTX 4090: 340
+(GPU required for the integration tests; ~6 min on an RTX 4090: 342
 passed, 8 skipped on 2026-11-05).
 `CUTAMP_SLOW=1` also runs the 8 slow live tests: 6 `--cuda_graphs` runs in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), the floor
