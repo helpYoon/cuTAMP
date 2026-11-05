@@ -19,20 +19,21 @@ if TYPE_CHECKING:
 def base_wrench(q_base: torch.Tensor, tau_base: torch.Tensor):
     """The wrench the six base joints apply, in the world frame: ``(F, M, P)``, each ``[..., 3]``.
 
-    The joints are x, y, z (prismatic along the world axes), then yaw (z), pitch (y), roll (x), all
+    The joints are x, y, z (prismatic along the world axes), then pitch (y), roll (x), yaw (z), all
     turning about the pelvis point ``P = q[..., :3]``. ``F`` is the force and ``M`` the moment about P.
     """
-    yaw, pitch = q_base[..., 3], q_base[..., 4]
-    cy, sy, cp, sp = yaw.cos(), yaw.sin(), pitch.cos(), pitch.sin()
-    zero = torch.zeros_like(yaw)
-    a = torch.stack([zero, zero, zero + 1], -1)       # the yaw, pitch and roll axes in the world
-    b = torch.stack([-sy, cy, zero], -1)
-    c = torch.stack([cy * cp, sy * cp, -sp], -1)
+    pitch, roll = q_base[..., 3], q_base[..., 4]
+    cp, sp, cr, sr = pitch.cos(), pitch.sin(), roll.cos(), roll.sin()
+    zero = torch.zeros_like(pitch)
+    a = torch.stack([zero, zero + 1, zero], -1)       # the pitch, roll and yaw axes in the world
+    b = torch.stack([cp, zero, -sp], -1)
+    c = torch.stack([cr * sp, -sr, cr * cp], -1)
     t = tau_base[..., 3:]
-    # Solves [a b c]^T M = tau_rot in closed form (no linalg call, so it captures in a CUDA graph).
-    # ponytail: singular at |pitch| = 90 deg, which a standing pelvis never reaches.
+    # Solves [a b c]^T M = tau_rot in closed form (no linalg call, so it captures in a CUDA graph): a . (b x c) is
+    # -cos(roll). Singular at |roll| = 90 deg, the Trunk on its side, which planted soles never reach (the base's
+    # roll limit stops 0.1 rad short of it).
     moment = (t[..., 0:1] * torch.cross(b, c, dim=-1) + t[..., 1:2] * torch.cross(c, a, dim=-1)
-              + t[..., 2:3] * torch.cross(a, b, dim=-1)) / -cp[..., None]
+              + t[..., 2:3] * torch.cross(a, b, dim=-1)) / -cr[..., None]
     return tau_base[..., :3], moment, q_base[..., :3]
 
 

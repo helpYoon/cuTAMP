@@ -15,7 +15,7 @@ from cutamp.tests.conftest import needs_cuda
 
 needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
-BASE = [("x", "X_PRISM"), ("y", "Y_PRISM"), ("z", "Z_PRISM"), ("yaw", "Z_ROT"), ("pitch", "Y_ROT"), ("roll", "X_ROT")]
+BASE = [("x", "X_PRISM"), ("y", "Y_PRISM"), ("z", "Z_PRISM"), ("pitch", "Y_ROT"), ("roll", "X_ROT"), ("yaw", "Z_ROT")]
 BASE_JOINTS = [f"base_j_{n}" for n, _ in BASE]
 SOLES = ("sole_l", "sole_r")
 CROUCH = {"hip": -0.4, "knee": 0.8, "ankle": -0.4}
@@ -55,17 +55,18 @@ def test_split_follows_the_com():
 
 
 def test_base_wrench_inverts_the_joint_map():
-    # τ_base by hand: the force along x, y, z, then the moment about P along the yaw, pitch and roll
-    # axes in the world, from scipy's rotations rather than base_wrench's formulas.
+    # τ_base by hand: the force along x, y, z, then the moment about P along the pitch, roll and yaw
+    # axes in the world, from scipy's rotations rather than base_wrench's formulas. Roll, the middle
+    # angle, stays inside the base's limit, clear of the singularity.
     rng = np.random.default_rng(0)
     n = 64
     F, M, P = rng.normal(size=(3, n, 3))
     ang = rng.uniform(-np.pi, np.pi, size=(n, 3))
     ang[:, 1] = rng.uniform(-1.0, 1.0, n)
     ang[:2, 1] = (1.0, -1.0)
-    a = np.tile([0.0, 0.0, 1.0], (n, 1))
-    b = Rotation.from_euler("z", ang[:, 0]).apply([0.0, 1.0, 0.0])
-    c = Rotation.from_euler("ZY", ang[:, :2]).apply([1.0, 0.0, 0.0])
+    a = np.tile([0.0, 1.0, 0.0], (n, 1))
+    b = Rotation.from_euler("Y", ang[:, 0]).apply([1.0, 0.0, 0.0])
+    c = Rotation.from_euler("YX", ang[:, :2]).apply([0.0, 0.0, 1.0])
     tau = np.concatenate([F, np.stack([(a * M).sum(1), (b * M).sum(1), (c * M).sum(1)], 1)], 1)
     got = base_wrench(torch.tensor(np.concatenate([P, ang], 1)), torch.tensor(tau))
     for g, want in zip(got, (F, M, P)):

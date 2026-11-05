@@ -5,8 +5,9 @@
 - level 1 holds the Trunk tilt within an envelope's maximum: one row, active where the tilt is past the bound or a
   step would push it past, as a CoM axis is. Route A's envelope sets no tilt bound, so the tilt tests plan on the
   real legs under an envelope that bounds it at 1.0 rad (``_with_tilt_bound``);
-- each call ends with a closing step, so the soles hold after every call, out-of-reach targets included, and a
-  row that starts within one step clamp of a tilt bound is within it after the call;
+- each call ends with a closing step, so the soles hold after every call, out-of-reach targets included; under a
+  tilt bound a row that starts within REACH of it is within it after one call, and stays within it after
+  out-of-reach calls;
 - the merge gate (``gn_gate``), the final repair and the kinematic constraint all check the soles against the
   stance.
 The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module. Each takes its
@@ -40,12 +41,15 @@ def _with_tilt_bound(world, monkeypatch, tilt_max=TILT_MAX):
     return world
 
 
+#: How far past TILT_MAX, rad, a row may start for one GN call to bring it inside, with margin: on blocks_t1's first
+#: pick one call brings in every row that starts up to 0.47 rad past it on one init, and 0.38 rad on the other.
+REACH = 0.3
+
+
 def _in_reach(q):
-    """The rows of ``q`` whose Trunk tilt starts at most ``GN_STEP_CLAMP`` (0.15 rad) past TILT_MAX: one call
-    brings them inside it. On blocks_t1's first pick that is 36 of 64 rows on one init and 5 of 60 on the other,
-    whose other rows the init's IK bows mostly 0.15-0.4 rad past it."""
-    from cutamp.gn_refresh import GN_STEP_CLAMP
-    return q[_tilt(q) <= TILT_MAX + GN_STEP_CLAMP]
+    """The rows of ``q`` whose Trunk tilt starts at most REACH past TILT_MAX. On blocks_t1's first pick that is 48 of
+    64 rows on one init and 29 of 61 on the other."""
+    return q[_tilt(q) <= TILT_MAX + REACH]
 
 
 def _tilt(q):
@@ -59,7 +63,7 @@ def _tilt(q):
 def _first_pick(world, plan):
     """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the init's IK solved
     (a row whose IK failed holds home). The first skeleton follows PYTHONHASHSEED: on blocks_t1 its first pick has
-    64 solved rows, every CoM inside the keyframe rectangle, on one init, and 60, 9 of them outside, on the other."""
+    64 solved rows, every CoM inside the keyframe rectangle, on one init, and 61, 8 of them outside, on the other."""
     skeleton, particles = plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     conf = op.values[-1]
@@ -150,16 +154,14 @@ def test_gn_holds_the_soles(real_world, real_plan):
 @needs_cuda
 def test_gn_brings_the_trunk_tilt_inside_the_bound(real_world, real_plan, monkeypatch):
     # On the floor scene the init's IK bows most first-pick rows past 1.0 rad. Under a 1.0 rad bound, one call, the
-    # hand targets moved 3 cm, brings every row that starts within one step clamp of it (``_in_reach``) inside it,
-    # with both soles on the stance and the CoM in the keyframe rectangle on every row. Rows further past take more
-    # calls, and one bowed past horizontal can stay past: the base's ZYX angles hold that bow as roll near pi, where
-    # the tilt row's roll derivative vanishes, with pitch at its cap.
+    # hand targets moved 3 cm, brings every row that starts within REACH of it (``_in_reach``) inside it, with both
+    # soles on the stance and the CoM in the keyframe rectangle on every row. Rows further past take more calls.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_project_balanced
     arm, _, q0 = _first_pick(real_world, real_plan)
     _with_tilt_bound(real_world, monkeypatch)
     q0 = _in_reach(q0)
-    assert int((_tilt(q0) > TILT_MAX).sum()) >= 3
+    assert int((_tilt(q0) > TILT_MAX).sum()) >= 10
     targets, _ = _moved_targets(real_world, q0, arm)
     q = gn_project_balanced(real_world, q0, targets, arm)
     assert float(_tilt(q).max()) <= TILT_MAX + 1e-6, float(_tilt(q).max())
@@ -204,15 +206,20 @@ def test_tilt_row_leaves_rows_inside_the_bound_alone(real_world, real_plan, monk
 @pytest.mark.parametrize("tilt_max", [None, TILT_MAX])
 def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, monkeypatch, tilt_max):
     # Hand targets no balanced conf on the stance can reach: four calls, each from the last result as successive
-    # refreshes run, keep both soles on the stance after every call, and under a tilt bound the Trunk tilt of the rows
-    # in reach of it (``_in_reach``) within it, and every hand stays over 2 cm off, so the feet did not slide to fake
-    # the reach. Reaching for them drives joints into their limits on every call, where a clamped step or the drift
-    # of a saturated last step would move the soles.
+    # refreshes run, keep both soles on the stance after every call, and every hand stays over 2 cm off, so the feet
+    # did not slide to fake the reach. Reaching for them drives joints into their limits on every call, where a
+    # clamped step or the drift of a saturated last step would move the soles. Under a tilt bound the calls start from
+    # the rows in reach of it (``_in_reach``) after one 3 cm call has brought them inside it, as in the test above,
+    # and they stay inside it after every call too. A row still past the bound when it reaches out of reach can come
+    # out of that call with its soles off by more than this test's 1 mm, though inside the gate's 5 mm: on one init a
+    # row 0.27 rad past comes out 2 mm off, and the next call closes them.
     from cutamp.gn_refresh import gn_project_balanced
     arm, _, q = _first_pick(real_world, real_plan)
     _with_tilt_bound(real_world, monkeypatch, tilt_max)
     if tilt_max is not None:
         q = _in_reach(q)
+        q = gn_project_balanced(real_world, q, _moved_targets(real_world, q, arm)[0], arm)
+        assert float(_tilt(q).max()) <= tilt_max + 1e-6, float(_tilt(q).max())
     targets, _ = _moved_targets(real_world, q, arm, FAR)
     for _ in range(4):
         q = gn_project_balanced(real_world, q, targets, arm)

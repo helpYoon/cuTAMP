@@ -116,7 +116,7 @@ def _yaml_soft_limits() -> dict:
 def test_real_legs_layout():
     m = REAL_LEGS
     assert len(m.joint_names) == 33 and not m.lock_base
-    assert m.joint_names[m.base] == tuple(f"base_j_{n}" for n in ("x", "y", "z", "yaw", "pitch", "roll"))
+    assert m.joint_names[m.base] == tuple(f"base_j_{n}" for n in ("x", "y", "z", "pitch", "roll", "yaw"))
     assert m.joint_names[m.left_arm][0] == "Left_Shoulder_Pitch" and m.joint_names[m.right_arm][-1] == "Right_Hand_Roll"
     assert set(m.joint_names[m.body]) == {"Waist"} | {f"{s}_{j}" for s in ("Left", "Right") for j in
         ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll")}

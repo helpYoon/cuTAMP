@@ -45,28 +45,28 @@ robot_cfg:
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-0.046, 0.772]
         link_mass: 0.0
-      base_link_yaw:
-        parent_link_name: base_link_z
-        link_name: base_link_yaw
-        joint_name: base_j_yaw
-        joint_type: Z_ROT
-        fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [-3.141592653589793, 3.141592653589793]
-        link_mass: 0.0
       base_link_pitch:
-        parent_link_name: base_link_yaw
+        parent_link_name: base_link_z
         link_name: base_link_pitch
         joint_name: base_j_pitch
         joint_type: Y_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [-1.4707963267948965, 1.4707963267948965]
+        joint_limits: [-3.141592653589793, 3.141592653589793]
         link_mass: 0.0
       base_link_roll:
         parent_link_name: base_link_pitch
-        child_link_name: Trunk
         link_name: base_link_roll
         joint_name: base_j_roll
         joint_type: X_ROT
+        fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+        joint_limits: [-1.4707963267948965, 1.4707963267948965]
+        link_mass: 0.0
+      base_link_yaw:
+        parent_link_name: base_link_roll
+        child_link_name: Trunk
+        link_name: base_link_yaw
+        joint_name: base_j_yaw
+        joint_type: Z_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-3.141592653589793, 3.141592653589793]
         link_mass: 0.0
@@ -113,10 +113,10 @@ robot_cfg:
     self_collision_ignore:
       base_link_x: [base_link_y]
       base_link_y: [base_link_x, base_link_z]
-      base_link_z: [base_link_y, base_link_yaw]
-      base_link_yaw: [base_link_z, base_link_pitch]
-      base_link_pitch: [base_link_yaw, base_link_roll]
-      base_link_roll: [base_link_pitch, Trunk]
+      base_link_z: [base_link_y, base_link_pitch]
+      base_link_pitch: [base_link_z, base_link_roll]
+      base_link_roll: [base_link_pitch, base_link_yaw]
+      base_link_yaw: [base_link_roll, Trunk]
       Waist: [Trunk, H1, H2, AL1, AL2, AL3, AR1, AR2, AR3, Hip_Pitch_Left, Hip_Roll_Left, Hip_Yaw_Left, Hip_Pitch_Right, Hip_Roll_Right,
         Hip_Yaw_Right]
       Trunk: [Waist, H1, H2, AL1, AL2, AL3, AL4, AR1, AR2, AR3, AR4, Hip_Pitch_Left, Hip_Roll_Left, Hip_Yaw_Left, Hip_Pitch_Right,
@@ -152,7 +152,7 @@ robot_cfg:
       Hip_Yaw_Right: [Waist, Trunk, Shank_Right]
       Shank_Right: [Hip_Yaw_Right, Ankle_Cross_Right, right_foot_link]
     cspace:
-      joint_names: [base_j_x, base_j_y, base_j_z, base_j_yaw, base_j_pitch, base_j_roll, Left_Shoulder_Pitch, Left_Shoulder_Roll,
+      joint_names: [base_j_x, base_j_y, base_j_z, base_j_pitch, base_j_roll, base_j_yaw, Left_Shoulder_Pitch, Left_Shoulder_Roll,
         Left_Elbow_Pitch, Left_Elbow_Yaw, Left_Wrist_Pitch, Left_Wrist_Yaw, Left_Hand_Roll, Right_Shoulder_Pitch, Right_Shoulder_Roll,
         Right_Elbow_Pitch, Right_Elbow_Yaw, Right_Wrist_Pitch, Right_Wrist_Yaw, Right_Hand_Roll, Waist, Left_Hip_Pitch, Left_Hip_Roll,
         Left_Hip_Yaw, Left_Knee_Pitch, Right_Hip_Pitch, Right_Hip_Roll, Right_Hip_Yaw, Right_Knee_Pitch, Left_Ankle_Pitch,
@@ -177,7 +177,7 @@ robot_cfg:
       max_acceleration: 15.0
       max_jerk: 100.0
 cutamp:
-  joint_order: [base_j_x, base_j_y, base_j_z, base_j_yaw, base_j_pitch, base_j_roll, Left_Shoulder_Pitch, Left_Shoulder_Roll,
+  joint_order: [base_j_x, base_j_y, base_j_z, base_j_pitch, base_j_roll, base_j_yaw, Left_Shoulder_Pitch, Left_Shoulder_Roll,
     Left_Elbow_Pitch, Left_Elbow_Yaw, Left_Wrist_Pitch, Left_Wrist_Yaw, Left_Hand_Roll, Right_Shoulder_Pitch, Right_Shoulder_Roll,
     Right_Elbow_Pitch, Right_Elbow_Yaw, Right_Wrist_Pitch, Right_Wrist_Yaw, Right_Hand_Roll, Waist, Left_Hip_Pitch, Left_Hip_Roll,
     Left_Hip_Yaw, Left_Knee_Pitch, Right_Hip_Pitch, Right_Hip_Roll, Right_Hip_Yaw, Right_Knee_Pitch, Left_Ankle_Pitch, Left_Ankle_Roll,

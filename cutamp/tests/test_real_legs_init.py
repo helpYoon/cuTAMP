@@ -118,8 +118,8 @@ def test_retry_keeps_sole_goals_on_the_stance(real_world):
 def test_retry_seeds_stand_on_the_stance(real_world):
     # Ruling R21: the legs draw their pitch once per pair and hold their roll and yaw, and the base puts the left sole
     # on the stance; the right sole follows. Standing on the stance, a seed's Trunk is in the legs' reach, so its base
-    # leaves the box only on a bow within 0.1 rad of horizontal (the pitch cap): none of these do. Under a box cut
-    # lower, a row whose base would leave it keeps home's base and body.
+    # could leave the box only by leaning within 0.1 rad of its side (the roll cap), which legs bent alike in pitch
+    # never do. Under a box cut lower, a row whose base would leave it keeps home's base and body.
     from cutamp.particle_initialization import _retry_seed, _stand_on_the_stance
     world, m, n = real_world, real_world.model, 256
     names, home = list(m.joint_names), _home(real_world)

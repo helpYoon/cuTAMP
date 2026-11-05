@@ -66,21 +66,23 @@ FINGERS = tuple(f"{s}_Link{n}" for s, _ in SIDES for n in ("1", "11", "2", "22")
 GRIPPER_LINKS = tuple(f"{s}_{n}" for s, _ in SIDES for n in ("base_link", "Link1", "Link2", "Link11", "Link22"))
 BODY_JOINTS = [j for j in T1_JOINT_NAMES if j not in HEAD]
 
-# The floating base: six massless single-axis joints from world to Trunk, x, y, z, then ZYX Euler (stage 2, REPORT.md
-# section 5): floor_wrench.base_wrench assumes this order and is singular only at |pitch| = 90 deg. They exist only
-# because cuRobo needs a fixed root, so their limits are the legs' reach (_base_limits), never a bound of their own.
-BASE = (("x", "X_PRISM"), ("y", "Y_PRISM"), ("z", "Z_PRISM"), ("yaw", "Z_ROT"), ("pitch", "Y_ROT"), ("roll", "X_ROT"))
+# The floating base: six massless single-axis joints from world to Trunk, x, y, z, then YXZ Euler: pitch about the
+# world's y, roll, then yaw about the Trunk's z (floor_wrench.base_wrench assumes this order). YXZ is singular at
+# |roll| = 90 deg, the Trunk lying on its side, which planted soles cannot reach. Stage 2's ZYX was singular at a
+# 90 deg bow, which floor picks reach. The joints exist only because cuRobo needs a fixed root, so their limits are
+# the legs' reach (_base_limits), never a bound of their own.
+BASE = (("x", "X_PRISM"), ("y", "Y_PRISM"), ("z", "Z_PRISM"), ("pitch", "Y_ROT"), ("roll", "X_ROT"), ("yaw", "Z_ROT"))
 BASE_JOINTS = [f"base_j_{n}" for n, _ in BASE]
 # _base_limits samples the Trunk's pose over each leg: Trunk to the sole, Waist included, since it turns the pelvis both
 # hips hang from. LEG_GRID values per joint span its soft range, ends included; the REFINE_STARTS best samples of each
 # x, y and z extreme start a bounded L-BFGS-B. x, y and z then get BASE_MARGIN on each side, rounded out to the mm.
-# Pitch stops PITCH_MARGIN short of ZYX's singularity at |pitch| = pi/2, where base_wrench divides by cos(pitch) and
-# the yaw and roll axes line up: there 1/cos(pitch) is 10.0.
+# Roll stops ROLL_MARGIN short of the singularity at |roll| = pi/2, where base_wrench divides by cos(roll) and the
+# pitch and yaw axes line up: there 1/cos(roll) is 10.0.
 LEG_CHAIN = ("Waist", "Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll")
 LEG_GRID = 7
 REFINE_STARTS = 8
 BASE_MARGIN = 0.01  # m
-PITCH_MARGIN = 0.1  # rad
+ROLL_MARGIN = 0.1  # rad
 
 SOFT_LIMIT_FACTOR = 0.9  # bfm_wm robot/t1.py:118, T1_CFG.soft_joint_pos_limit_factor (call 17)
 ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's top speed, npz v_max (7.4a)
@@ -230,8 +232,8 @@ def _trunk_on_sole(joints: dict, leg: tuple, q: np.ndarray) -> tuple[np.ndarray,
 
 
 def _leg_reach(joints: dict, home: dict, side: str, Side: str) -> dict:
-    """``{coordinate: (min, max)}``: the extremes of the Trunk's base coordinates (x, y, z and ZYX's yaw, pitch and
-    roll) over the ``side`` leg's soft limits, with its sole on its home pose. x, y and z are refined; the angles are
+    """``{coordinate: (min, max)}``: the extremes of the Trunk's base coordinates (x, y, z and YXZ's pitch, roll and
+    yaw) over the ``side`` leg's soft limits, with its sole on its home pose. x, y and z are refined; the angles are
     the grid's."""
     leg = ("Waist", *(f"{Side}_{joint}" for joint in LEG_CHAIN[1:]))
     chain = [joints[name] for name in leg]
@@ -257,8 +259,8 @@ def _leg_reach(joints: dict, home: dict, side: str, Side: str) -> dict:
                                 bounds=list(zip(lower, upper))).fun for start in starts)
             ends.append(-sign * float(best))
         extremes[n] = tuple(ends)
-    yaw, roll = np.arctan2(rot[:, 1, 0], rot[:, 0, 0]), np.arctan2(rot[:, 2, 1], rot[:, 2, 2])
-    pitch = np.arctan2(-rot[:, 2, 0], np.hypot(rot[:, 2, 1], rot[:, 2, 2]))
+    pitch, yaw = np.arctan2(rot[:, 0, 2], rot[:, 2, 2]), np.arctan2(rot[:, 1, 0], rot[:, 1, 1])
+    roll = np.arctan2(-rot[:, 1, 2], np.hypot(rot[:, 0, 2], rot[:, 2, 2]))
     extremes.update({n: (float(a.min()), float(a.max())) for n, a in (("yaw", yaw), ("pitch", pitch), ("roll", roll))})
     return extremes
 
@@ -268,18 +270,18 @@ def _base_limits(joints: dict, home: dict) -> dict:
     pose, holds every Trunk pose that both planted soles allow, so the overlap of the two never binds before the legs
     do: x, y and z take it, BASE_MARGIN wider.
 
-    In ZYX a bow past 90 degrees flips yaw and roll by pi, so each leg reaches every yaw and roll, and pitch up to the
-    singularity: those three end at the chart's edges, pitch PITCH_MARGIN short of it."""
+    One leg alone turns the Trunk every way, so pitch and yaw end at the chart's edges, and roll ROLL_MARGIN short of
+    the singularity: a lean onto the Trunk's side, which both planted soles keep it far from."""
     reach = [_leg_reach(joints, home, side, Side) for side, Side in SIDES]
     lo = {n: max(r[n][0] for r in reach) for n in reach[0]}
     hi = {n: min(r[n][1] for r in reach) for n in reach[0]}
     limits = {n: (math.floor((lo[n] - BASE_MARGIN) * 1000) / 1000, math.ceil((hi[n] + BASE_MARGIN) * 1000) / 1000)
               for n in "xyz"}
-    cap = math.pi / 2 - PITCH_MARGIN
-    assert lo["pitch"] < -cap and hi["pitch"] > cap, (lo["pitch"], hi["pitch"])
-    for n in ("yaw", "roll"):
+    cap = math.pi / 2 - ROLL_MARGIN
+    assert lo["roll"] < -cap and hi["roll"] > cap, (lo["roll"], hi["roll"])
+    for n in ("pitch", "yaw"):
         assert lo[n] < 0.01 - math.pi and hi[n] > math.pi - 0.01, (n, lo[n], hi[n])
-    limits.update(yaw=(-math.pi, math.pi), pitch=(-cap, cap), roll=(-math.pi, math.pi))
+    limits.update(pitch=(-math.pi, math.pi), roll=(-cap, cap), yaw=(-math.pi, math.pi))
     return limits
 
 

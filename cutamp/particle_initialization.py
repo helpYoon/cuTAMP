@@ -160,8 +160,8 @@ def _ik_for_pose(
 #: and roll and yaw hold q_init's, so the legs stay mirrored.
 _MIRRORED_LEG_JOINTS = ("Hip_Pitch", "Knee_Pitch", "Ankle_Pitch")
 _HELD_LEG_JOINTS = ("Hip_Roll", "Hip_Yaw", "Ankle_Roll")
-#: The floating base's joints in ``model.base`` order: x, y, z, then ZYX Euler (build_planner_model.py's ``BASE``).
-_BASE_JOINTS = ("base_j_x", "base_j_y", "base_j_z", "base_j_yaw", "base_j_pitch", "base_j_roll")
+#: The floating base's joints in ``model.base`` order: x, y, z, then YXZ Euler (build_planner_model.py's ``BASE``).
+_BASE_JOINTS = ("base_j_x", "base_j_y", "base_j_z", "base_j_pitch", "base_j_roll", "base_j_yaw")
 
 
 def _retry_seed(world: TAMPWorld, batch_size: int, arm: Optional[str], noise_std: float) -> torch.Tensor:
@@ -232,9 +232,9 @@ def _stand_on_the_stance(
     q_base = seed[:, model.base]
     # B' = S @ inv(W) @ B, as rotation and translation.
     rot = stance[:3, :3] @ sole[:, :3, :3].transpose(-1, -2)
-    new_rot = rot @ roma.euler_to_rotmat("ZYX", q_base[:, 3:])
+    new_rot = rot @ roma.euler_to_rotmat("YXZ", q_base[:, 3:])
     new_pos = (rot @ (q_base[:, :3] - sole[:, :3, 3]).unsqueeze(-1)).squeeze(-1) + stance[:3, 3]
-    new_base = torch.cat([new_pos, roma.rotmat_to_euler("ZYX", new_rot)], dim=-1)
+    new_base = torch.cat([new_pos, roma.rotmat_to_euler("YXZ", new_rot)], dim=-1)
     inside = ((lower[model.base] <= new_base) & (new_base <= upper[model.base])).all(-1, keepdim=True)
     home = torch.tensor(model.home, device=seed.device, dtype=seed.dtype)
     out = seed.clone()
