@@ -183,7 +183,8 @@ def test_gate_plan_interleaves(tmp_path):
     plan = build_gate_plan()
     assert len(plan) == 160
     assert [(r["height"], r["seed"], r["n"], r["cell"]) for r in plan[:4]] == [
-        (0.0, 0, 256, "simplified"), (0.0, 0, 256, "real_legs"), (0.0, 0, 512, "simplified"), (0.0, 0, 512, "real_legs"),
+        (0.0, 0, 256, "simplified"), (0.0, 0, 256, "real_legs"),
+        (0.0, 0, 512, "simplified"), (0.0, 0, 512, "real_legs"),
     ]
     assert len({r["experiment_id"] for r in plan}) == 160
     for r in plan:

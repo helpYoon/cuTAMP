@@ -3,7 +3,7 @@ call 18).
 
 Neither of cuTAMP's Python environments has MuJoCo, so ``write_mujoco_fixture.py`` stores MuJoCo's FK, masses,
 inertias and soft limits on bfm_wm's t1.xml in ``mujoco_fixture.npz``, and the planner model is checked against it.
-The model is built here straight from ``t1_29dof.yml``: Task 2's model loader does not exist yet."""
+The model is built here straight from ``t1_29dof.yml``."""
 
 import hashlib
 import importlib.util
@@ -102,7 +102,8 @@ def test_copy_matches_provenance():
 @pytest.mark.skipif(not BFM_WM.is_dir(), reason="needs bfm_wm's checkout")
 def test_copy_and_fixture_match_bfm_wm():
     prov = _provenance()
-    entries = [e for section in ("copied", "not_copied") for e in prov[section].values() if e["from"].startswith("bfm_wm")]
+    entries = [e for section in ("copied", "not_copied") for e in prov[section].values()
+               if e["from"].startswith("bfm_wm")]
     assert len(entries) == 35  # the URDF, 31 meshes, the npz, t1.xml and the mjb
     for entry in entries:
         assert _sha1(BFM_WM / entry["path"]) == entry["sha1"], entry["path"]
@@ -196,7 +197,8 @@ def test_planner_urdf_adds_only_world_and_gripper():
     world = p_joints["world_joint"]
     assert world.get("type") == "fixed" and world.find("parent").get("link") == "world"
     assert world.find("child").get("link") == "Trunk"
-    assert [float(x) for x in (*world.find("origin").get("xyz").split(), *world.find("origin").get("rpy").split())] == [0.0] * 6
+    origin = world.find("origin")
+    assert [float(x) for x in (*origin.get("xyz").split(), *origin.get("rpy").split())] == [0.0] * 6
     assert all(p_links[n].find("inertial") is None for n in gripper_links)  # the gripper weighs nothing
     meshes = [m.get("filename") for m in planner.iter("mesh")]
     assert meshes and all(not Path(f).is_absolute() and (T1_29DOF / f).is_file() for f in meshes), meshes
@@ -291,7 +293,8 @@ def test_ankle_pitch_speed_cap():
     fx_names = [str(j) for j in fx["joint_names"]]
     v_max = np.load(T1_29DOF / "t1_actuators.npz")["v_max"]
     urdf_velocity = {j.get("name"): float(j.find("limit").get("velocity"))
-                     for j in ET.parse(T1_29DOF / "t1_planner.urdf").getroot().findall("joint") if j.find("limit") is not None}
+                     for j in ET.parse(T1_29DOF / "t1_planner.urdf").getroot().findall("joint")
+                     if j.find("limit") is not None}
     kin = _kin()
     names = list(kin.joint_names)
     velocity = kin.get_joint_limits().velocity.double().cpu().numpy()

@@ -19,8 +19,8 @@ def _mid_sole_xy(world) -> torch.Tensor:
 
 
 def test_extended_grep():
-    # Task 2's list plus the simplified support region and its frame: a 1 cm centre or a mobile_base_link read where
-    # world.model.support should be gives plausible, wrong numbers on the real legs (Review Focus 1).
+    # test_t1_real_legs_model's list plus the simplified support region and its frame: a 1 cm centre or a
+    # mobile_base_link read where world.model.support should be gives plausible, wrong numbers on the real legs.
     hits = simplified_reads(EXTENDED_CONSTANTS, MAY_READ_EXTENDED_CONSTANTS)
     assert not hits, "\n".join(hits)
 

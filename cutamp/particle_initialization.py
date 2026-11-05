@@ -9,8 +9,8 @@
 
 """Particle initialization under cuRobo v0.8 single-MotionPlanner architecture.
 
-Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single 21-DOF
-vector in T1's full cspace order.
+Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single vector in
+the model's full cspace order (21 or 33 joints).
 """
 
 import logging
@@ -156,7 +156,7 @@ def _ik_for_pose(
         restore_cspace_target_dof_weight([ik], snapshot)
 
 
-#: A retry's leg noise on a model with soles (ruling R21): each pitch joint draws once per pair, left onto right,
+#: A retry's leg noise on a model with soles: each pitch joint draws once per pair, left onto right,
 #: and roll and yaw hold q_init's, so the legs stay mirrored.
 _MIRRORED_LEG_JOINTS = ("Hip_Pitch", "Knee_Pitch", "Ankle_Pitch")
 _HELD_LEG_JOINTS = ("Hip_Roll", "Hip_Yaw", "Ankle_Roll")
@@ -171,9 +171,9 @@ def _retry_seed(world: TAMPWorld, batch_size: int, arm: Optional[str], noise_std
     so does the base of the simplified model, which is its root.
 
     On a model with soles (the real legs) the root is the trunk, so that noise
-    would swing the soles. There the stance is the noise's root instead (ruling
-    R21): the legs draw each pitch once per pair and hold roll and yaw, and the
-    base is re-solved so that the first sole sits on its stance pose
+    would swing the soles. There the stance is the noise's root instead: the
+    legs draw each pitch once per pair and hold roll and yaw, and the base is
+    re-solved so that the first sole sits on its stance pose
     (``_stand_on_the_stance``).
     """
     model = world.model
@@ -260,7 +260,7 @@ def _ik_for_pose_com_safe(
     they land inside. Rows that fail every retry are kept: the caller's
     ``_store_ik_q`` resets only IK failures, to home (``world.q_init``). On
     blocks_t1 about half the IK-solved place rows stay outside after 3
-    retries, on either model (ruling R24). The CoM is enforced downstream,
+    retries, on either model. The CoM is enforced downstream,
     by GN's balance-first projection (``gn_refresh.gn_project_balanced``)
     and by the balance gate on every trajectory frame
     (``motion_solver._balance_gate``).

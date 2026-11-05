@@ -114,7 +114,7 @@ def real_plan(real_world):
 
     skeleton = next(task_plan_generator(real_world.initial_state, real_world.goal_state, all_t1_operators))
     torch.manual_seed(0)
-    # robot= here, not dataclasses.replace: __post_init__ resolves the model's default soft costs (ruling R20)
+    # robot= here, not dataclasses.replace: __post_init__ resolves the model's default soft costs
     particles = ParticleInitializer(real_world, TAMPConfiguration(robot="real_legs", num_particles=64))(skeleton)
     plan = [skeleton, particles]
     del skeleton, particles  # the list holds the only references

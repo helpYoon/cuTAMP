@@ -55,7 +55,7 @@ class _RealLegs:
         self.trunk_kin = get_t1_bodies(REAL_LEGS, device_cfg).kinematics  # the gate's Trunk FK (_check_planted)
         self.effort = self.torques.effort.cpu().numpy()
         # cuRobo's own limit, never the URDF's velocity times the YAML's velocity_scale: the fork applies that scale
-        # twice (ruling R15).
+        # twice.
         self.velocity_limit = self.torques.kin.get_joint_limits().velocity[1].cpu().numpy()
         with torch.no_grad():
             self.stance = self._soles(device_cfg.to_device(REAL_LEGS.home).unsqueeze(0)).clone()  # [1, 2, 4, 4]
@@ -101,7 +101,8 @@ class _RealLegs:
         drift_m = drift_rad = tilt = 0.0
         unslowed_over = []
         for k, seg in enumerate(plan["segments"]):
-            p, v, a = (torch.as_tensor(seg[key], device=self.device) for key in ("position", "velocity", "acceleration"))
+            p, v, a = (torch.as_tensor(seg[key], device=self.device)
+                       for key in ("position", "velocity", "acceleration"))
             with torch.no_grad():
                 tau = self.torques(JointState(position=p, velocity=v, acceleration=a, joint_names=self.names))
                 peak = tau.abs().amax(0).cpu().numpy()
@@ -146,7 +147,8 @@ def build_report(study: Path) -> dict:
     return {
         "study": str(study), "runs": runs, "joints": legs.joints(runs),
         "summary": {
-            "runs": len(runs), "max_tilt": extreme(max, "max_tilt"), "max_sole_drift_m": extreme(max, "max_sole_drift_m"),
+            "runs": len(runs), "max_tilt": extreme(max, "max_tilt"),
+            "max_sole_drift_m": extreme(max, "max_sole_drift_m"),
             "max_sole_drift_rad": extreme(max, "max_sole_drift_rad"), "min_com_margin": extreme(min, "com_min_margin"),
             "min_zmp_margin": extreme(min, "zmp_min_margin"), "retime_max": extreme(max, "retime_max"),
             "unslowed_over_effort": sum(len(r["unslowed_over_effort"]) for r in runs),
@@ -199,7 +201,8 @@ def _markdown(report: dict) -> str:
         )
     lines += [
         "",
-        f"Over every run: max tilt {num(s['max_tilt'], 3)} rad; max sole drift {num(s['max_sole_drift_m'], 2, 1000)} mm "
+        f"Over every run: max tilt {num(s['max_tilt'], 3)} rad; "
+        f"max sole drift {num(s['max_sole_drift_m'], 2, 1000)} mm "
         f"and {num(s['max_sole_drift_rad'], 4)} rad; min CoM margin {num(s['min_com_margin'], scale=100)} cm; min ZMP "
         f"margin {num(s['min_zmp_margin'], 3, 100)} cm; largest slowdown {num(s['retime_max'])}x.",
     ]

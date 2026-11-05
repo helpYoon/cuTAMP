@@ -328,8 +328,8 @@ def test_planning_s_sums_the_top_timers(tmp_path):
 
 
 def test_torque_failures_count_both_forms(tmp_path):
-    # Task 7: a failed candidate's message names torque in trajopt's reason (": torque") and in the balance gate's raise
-    # on a slowed segment. Trajopt's ": other" and the gate's ZMP raise don't count.
+    # A failed candidate's message names torque in trajopt's reason (": torque") and in the balance gate's raise on a
+    # slowed segment. Trajopt's ": other" and the gate's ZMP raise don't count.
     from types import SimpleNamespace
 
     import torch
@@ -455,8 +455,9 @@ def test_main_gate_writes_gate_outputs(tmp_path, monkeypatch):
 @needs_cuda
 def test_real_legs_report_on_a_still_home_plan(tmp_path):
     # real_legs_report on a raw plan of two still segments at home: cuRobo's torques with the floor's push give
-    # design 7.4a's feet-on-the-floor statics (knees -4.57, ankle pitches +3.92 N m), the soles sit on the stance, the
-    # Trunk's tilt is home's, and the margins come from overall_metrics. A schema-3 plan beside it is not a real-leg one.
+    # design 7.4a's feet-on-the-floor statics (knees -4.57, ankle pitches +3.92 N m), the soles sit on the stance,
+    # the Trunk's tilt is home's, and the margins come from overall_metrics. A schema-3 plan beside it is not a
+    # real-leg one.
     import pickle
 
     import numpy as np
@@ -491,8 +492,9 @@ def test_real_legs_report_on_a_still_home_plan(tmp_path):
         assert abs(joints[f"{side}_Ankle_Pitch"]["peak_torque"] - 3.92) <= 0.3
         assert joints[f"{side}_Knee_Pitch"]["effort"] == pytest.approx(130.5)
         assert joints[f"{side}_Knee_Pitch"]["knee_speed"] == pytest.approx(6.71)
-        assert joints[f"{side}_Ankle_Pitch"]["velocity_limit"] == pytest.approx(7.29)  # cuRobo's, not 9.57 (R15)
-    assert joints["Waist"]["knee_speed"] == pytest.approx(1.88) and joints["Waist"]["velocity_limit"] == pytest.approx(14.66)
+        assert joints[f"{side}_Ankle_Pitch"]["velocity_limit"] == pytest.approx(7.29)  # cuRobo's, not 9.57
+    assert joints["Waist"]["knee_speed"] == pytest.approx(1.88)
+    assert joints["Waist"]["velocity_limit"] == pytest.approx(14.66)
     assert all(j["peak_speed"] == 0.0 for j in joints.values())
     home_tilt = float(torch.acos(trunk_pose_from_q(REAL_LEGS, REAL_LEGS.home)[2, 2]))
     assert run["max_tilt"] == pytest.approx(home_tilt, abs=1e-4)

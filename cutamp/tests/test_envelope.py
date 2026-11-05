@@ -141,7 +141,7 @@ def test_cut_names_a_missing_trunk_floor_joint():
 
 def test_trunk_tilt_value():
     # The tilt is the angle between the Trunk's z axis and the vertical, arccos(cos(pitch) cos(roll)), for the base's
-    # yaw-pitch-roll: 0, 1.0 (on the bound) and 0.946 rad pass, 1.006 rad at (0.75, 0.75) fails.
+    # pitch, roll, then yaw (YXZ): 0, 1.0 (on the bound) and 0.946 rad pass, 1.006 rad at (0.75, 0.75) fails.
     from cutamp.joint_limit_cost import trunk_tilt_excess
     confs = torch.tensor(REAL_LEGS.home).repeat(2, 4, 1)  # [N, H, dof]
     for t, (pitch, roll) in enumerate(((0.0, 0.0), (1.0, 0.0), (0.7, 0.7), (0.75, 0.75))):

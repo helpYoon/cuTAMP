@@ -667,8 +667,8 @@ class ParticleOptimizer:
         visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
         q_last = rollout["confs"][best_idx, -1].tolist()
 
-        # v0.8: configs are full 21-DOF (T1) or single chain DOF (others).
-        # T1RerunRobot maps 21 → 28 URDF actuated joints internally.
+        # v0.8: configs are the model's full cspace (T1: 21 or 33 joints) or a
+        # single chain's DOF (others). T1RerunRobot maps them onto the URDF.
         visualizer.set_joint_positions(q_last)
         for obj in rollout["obj_to_pose"]:
             mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]

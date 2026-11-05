@@ -9,7 +9,7 @@
 
 """Particle-rollout under cuRobo v0.8 single-MotionPlanner architecture.
 
-Configurations are single 21-DOF vectors (T1's full cspace). One FK
+Configurations are single vectors in the model's cspace (21 or 33 joints). One FK
 call covers the whole chain; for multi-tool robots we extract per-timestep
 ee/tool poses by looking up which arm each timestep's conf belongs to.
 """
@@ -94,7 +94,7 @@ class Rollout(TypedDict):
 class RolloutFunction:
     """Roll out a plan skeleton under the v0.8 single-MotionPlanner kinematics.
 
-    Multi-tool robots (T1) compute FK once over the full 21-DOF cspace; per
+    Multi-tool robots (T1) compute FK once over the model's full cspace; per
     timestep we select the active arm's tool-frame pose from the FK output.
     """
 

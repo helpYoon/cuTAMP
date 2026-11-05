@@ -23,8 +23,8 @@ Spec: docs/superpowers/specs/2026-06-11-joint-limit-margin-design.md
 The Trunk tilt bound (design call 22), which an envelope may set (route A's sets none), has three consumers of
 :func:`trunk_tilt_cosine`: the Motion value ``trunk_tilt`` over the real legs' confs (cutamp/cost_function.py) and
 :class:`TrunkTiltCost` on the motion planner, both through :func:`trunk_tilt_excess`, and GN's tilt row
-(cutamp/gn_refresh.py), which projects the covered confs onto the bound. A box on the base's pitch and roll would cut a pure bow to the bound over sqrt(2),
-so the tilt is a cost.
+(cutamp/gn_refresh.py), which projects the covered confs onto the bound. A box on the base's pitch and roll would
+cut a pure bow to the bound over sqrt(2), so the tilt is a cost.
 """
 
 from __future__ import annotations
@@ -136,8 +136,8 @@ JointLimitMarginCostCfg.class_type = JointLimitMarginCost
 def trunk_tilt_cosine(q: torch.Tensor, pitch_index: int, roll_index: int) -> torch.Tensor:
     """``q.shape[:-1]``: ``cos(pitch) cos(roll)``, the cosine of the Trunk's tilt from the vertical.
 
-    The base turns by yaw, then pitch, then roll, so the Trunk's z axis keeps ``cos(pitch) cos(roll)`` of the
-    vertical, whatever the yaw. ``q`` is ``[..., dof]``. Capture-safe."""
+    The base's chain is pitch, then roll, then yaw (YXZ), so the Trunk's z axis keeps ``cos(pitch) cos(roll)``
+    of the vertical, whatever the yaw. ``q`` is ``[..., dof]``. Capture-safe."""
     return torch.cos(q[..., pitch_index]) * torch.cos(q[..., roll_index])
 
 

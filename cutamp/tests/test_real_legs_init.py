@@ -1,4 +1,4 @@
-"""Particle init on the stance (design 7.3; ruling R21). On the real legs:
+"""Particle init on the stance (design 7.3). On the real legs:
 - the IK's sole goals are the stance's, never FK at the IK seed;
 - a CoM-gate retry's noisy seed stands on the stance, its base re-solved there (the stance is the noise's root, as
   the planar base is the simplified model's);
@@ -51,7 +51,7 @@ def _span(*slices) -> set:
 
 @needs_cuda
 def test_goal_soles_come_from_the_stance(real_world):
-    # The goal's soles are the stance's, bit for bit, whatever the seed (Review Focus 2); the idle hand keeps its FK
+    # The goal's soles are the stance's, bit for bit, whatever the seed; the idle hand keeps its FK
     # pose at the seed, as today.
     from curobo.types import JointState, Pose
     from cutamp.particle_initialization import _build_multi_frame_goal, _retry_seed
@@ -74,8 +74,7 @@ def test_goal_soles_come_from_the_stance(real_world):
 
 @needs_cuda
 def test_retry_keeps_sole_goals_on_the_stance(real_world):
-    # Reachable targets, solved from retry seeds and from seeds off the stance: every solved conf stands on the stance
-    # (Review Focus 2).
+    # Reachable targets, solved from retry seeds and from seeds off the stance: every solved conf stands on the stance.
     from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask, _retry_seed
     world, n = real_world, 16
     names = list(world.model.joint_names)
@@ -100,14 +99,14 @@ def test_retry_keeps_sole_goals_on_the_stance(real_world):
     pos, rot = _sole_errors(world, q[ok])
     assert float(pos.max()) <= POS_TOL and float(rot.max()) <= ROT_TOL, (pos, rot)
 
-    # Off the stance (review F3): the pre-R21 seed (_inline_seed) holds the base and noises the legs, so its soles
+    # Off the stance: the old inline retry seed (_inline_seed) holds the base and noises the legs, so its soles
     # swing off the stance. Only _ik_for_pose's stance goals (fixed=world.sole_goals(...)) bring them back: goals
     # from FK at the seed would hold them there. The refresh's cuRobo fallback and final repair (optimize_plan.py)
     # rely on this, since they start from particles Adam has moved.
     torch.manual_seed(0)
     off = _inline_seed(world, 4, "left", 0.3)
     pos, _ = _sole_errors(world, off)
-    assert float(pos.min()) > 0.05, pos
+    assert float(pos.min()) > 2 * POS_TOL, pos
     ok, q = solve(targets[::4], off)
     assert int(ok.sum()) >= 2, ok
     pos, rot = _sole_errors(world, q[ok])
@@ -116,7 +115,7 @@ def test_retry_keeps_sole_goals_on_the_stance(real_world):
 
 @needs_cuda
 def test_retry_seeds_stand_on_the_stance(real_world):
-    # Ruling R21: the legs draw their pitch once per pair and hold their roll and yaw, and the base puts the left sole
+    # The legs draw their pitch once per pair and hold their roll and yaw, and the base puts the left sole
     # on the stance; the right sole follows. Standing on the stance, a seed's Trunk is in the legs' reach, so its base
     # could leave the box only by leaning within 0.1 rad of its side (the roll cap), which legs bent alike in pitch
     # never do. Under a box cut lower, a row whose base would leave it keeps home's base and body.
@@ -182,7 +181,7 @@ def test_simplified_retry_seed_unchanged():
 @needs_cuda
 def test_init_confs_stand_on_the_stance(real_world, real_plan):
     # Rows whose IK failed hold home (_store_ik_q), which stands on the stance too; the IK-solved rows are the rest.
-    # Not checked: their CoM (ruling R24). The init's CoM gate is best effort on both models: it keeps an IK-solved
+    # Not checked: their CoM. The init's CoM gate is best effort on both models: it keeps an IK-solved
     # row that fails every retry, as about half the IK-solved place rows on blocks_t1 do, on either model. GN's
     # balance-first projection and the balance gate enforce the CoM downstream.
     skeleton, particles = real_plan

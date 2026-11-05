@@ -52,9 +52,10 @@ _log = logging.getLogger(__name__)
 def _planner_js_from_full(planner, full_pos, full_joint_names):
     """Build a planner-native JointState from a full-cspace position vector.
 
-    The mobile base is locked in the planner config (``get_t1_motion_planner``
-    extends ``lock_joints`` with ``base_j_x/y/yaw``), so the planner's cspace
-    is 18-DOF while particles + ``world.kinematics`` stay 21-DOF. cuRobo's
+    On a model with ``lock_base`` the planner config locks the mobile base
+    (``get_t1_motion_planner`` extends ``lock_joints`` with ``base_j_x/y/yaw``),
+    so the planner's cspace drops those joints while particles and
+    ``world.kinematics`` keep the model's full cspace (21 or 33 joints). cuRobo's
     ``get_active_js`` reorders + drops locked joints based on ``joint_names``,
     which is why we must set ``joint_names`` on the full-cspace JointState.
     """
@@ -75,7 +76,7 @@ def _plan_arm_to_conf(
     world: Optional[TAMPWorld] = None,
 ):
     """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
-    conf ``conf_full`` (full 21-DOF), via ``plan_cspace`` — so the executed
+    conf ``conf_full`` (the model's full cspace), via ``plan_cspace`` — so the executed
     arrival equals the hard-COM-checked conf instead of a free Cartesian
     redundancy solution. Mirrors the retract branch. ``disable_obstacle`` (if
     given) is temporarily removed from the world during planning, so terminal
@@ -530,10 +531,11 @@ def solve_curobo(
         pos = plan.position
         while pos.dim() > 2:
             pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
-        # Reproject to the model's full cspace (21-DOF) so T1RerunRobot can
-        # splice in the locked base DOFs. Planner trajectories arrive in either
-        # active cspace (18-DOF) or fully articulated form (31-DOF including
-        # head + grippers) depending on which planner method produced them.
+        # Reproject to the model's full cspace (21 or 33 joints), the form
+        # T1RerunRobot takes. Planner trajectories arrive in either the active
+        # cspace (without the simplified model's locked base) or the fully
+        # articulated form (with the head and grippers) depending on which
+        # planner method produced them.
         full_dof = len(full_joint_names)
         if pos.shape[-1] != full_dof:
             src_names = getattr(plan, "joint_names", None)
@@ -606,8 +608,8 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
     """``[T, full_dof]`` positions of a planner trajectory in ``world.kinematics.joint_names`` order.
 
     accum_plans entries carry trajectories in different DOF forms depending on which planner method
-    produced them: the planner's locked active cspace (18-DOF, missing the locked base joints) or the
-    fully articulated form (31-DOF, a superset of world.kinematics's 21 joints). Only the first is
+    produced them: the planner's active cspace (on the simplified model, without the locked base joints) or
+    the fully articulated form (a superset of world.kinematics's 21 or 33 joints). Only the first is
     augmented with get_full_js (on the second it raises ``lock_joints is also listed``); a plain
     reorder handles both. ``plan.joint_names`` may be None, then the planner's names are picked by
     shape, as in ``_last_timestep_js``."""

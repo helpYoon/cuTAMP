@@ -1,7 +1,7 @@
 """GN and the gates on the real legs (design 7.4). On the real legs:
 - 12 sole rows in GN's level 1 hold both soles on the stance, beside the active CoM rows, and the base columns are
   free (``_row_layout`` freezes them only where ``model.lock_base``);
-- level 1 holds the CoM in the real legs' keyframe rectangle (ruling R22);
+- level 1 holds the CoM in the real legs' keyframe rectangle;
 - level 1 holds the Trunk tilt within an envelope's maximum: one row, active where the tilt is past the bound or a
   step would push it past, as a CoM axis is. Route A's envelope sets no tilt bound, so the tilt tests plan on the
   real legs under an envelope that bounds it at 1.0 rad (``_with_tilt_bound``);
@@ -11,7 +11,8 @@
 - the merge gate (``gn_gate``), the final repair and the kinematic constraint all check the soles against the
   stance.
 The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module. Each takes its
-confs from ``real_plan``, so no test solves the world's 64-row IK at another batch size (ruling R25)."""
+confs from ``real_plan``, so no test solves the world's 64-row IK at another batch size: once the fork's IK
+solver has solved one batch size, a solve at another raises."""
 
 import dataclasses
 
@@ -232,7 +233,7 @@ def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, monkeypatch, til
 
 @needs_cuda
 def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monkeypatch):
-    # Ruling R22: _balanced_step's half=None default is the simplified rectangle, so every real-leg call passes the
+    # _balanced_step's half=None default is the simplified rectangle, so every real-leg call passes the
     # real legs' own, with the sole rows.
     import cutamp.gn_refresh as gn_refresh
     arm, _, q0 = _first_pick(real_world, real_plan)

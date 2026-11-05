@@ -31,7 +31,7 @@ SIMPLIFIED_NAMES = ("CUROBO_DOF", "URDF_DOF", "BASE_DOF", "BASE_INDICES", "BODY_
 SIMPLIFIED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES)})\b")
 #: The definitions, their re-exports, and a script that checks simplified plans only.
 MAY_READ_SIMPLIFIED_CONSTANTS = {"robots/t1.py", "robots/__init__.py", "scripts/check_plan_margins.py"}
-#: Task 3 extends the list with the simplified support region and its frame, which ``world.model.support`` replaces.
+#: The extended list adds the simplified support region and its frame, which ``world.model.support`` replaces.
 SUPPORT_NAMES = ("COM_HALF_EXTENTS", "SUPPORT_HALF_EXTENTS", "COM_CENTER", "mobile_base_link")
 EXTENDED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES + SUPPORT_NAMES)})\b")
 #: Their definitions, the sphere editor, which edits the simplified model only, and the real legs' build script,
@@ -93,7 +93,7 @@ def _leg_gap(kin, q: torch.Tensor) -> float:
 
 def hips_crossed(world) -> torch.Tensor:
     """Home with both Hip_Roll joints at their inward soft limits, so the thighs cross: a self-colliding conf
-    (ruling R5, reused by Task 4's retract test)."""
+    (test_real_legs_init's retract test reuses it)."""
     names, (lo, hi) = list(world.model.joint_names), world.joint_limits
     q = _home(world)
     q[names.index("Left_Hip_Roll")] = lo[names.index("Left_Hip_Roll")]  # +x roll swings a foot to +y: left is out
@@ -174,7 +174,7 @@ def simplified_reads(pattern: re.Pattern, allowed: set) -> list:
 
 def test_no_module_reads_simplified_constants():
     # A simplified slice, home or margin read where world.model should be gives plausible, wrong numbers on the
-    # real legs (Review Focus 1). Comments count too. Task 3's extended list, with its wider allow-list, is
+    # real legs. Comments count too. The extended list, with its wider allow-list, is
     # test_real_legs_support.test_extended_grep's.
     hits = simplified_reads(SIMPLIFIED_CONSTANTS, MAY_READ_SIMPLIFIED_CONSTANTS)
     assert not hits, "\n".join(hits)
@@ -264,7 +264,7 @@ def test_world_on_real_legs(real_world):
 
 @needs_cuda
 def test_factories_keep_the_soft_limits_on_their_joints(real_world):
-    # Ruling R12: cuRobo never reorders position_limit_clip with the cspace, so a build whose joint order differs from
+    # cuRobo never reorders position_limit_clip with the cspace, so a build whose joint order differs from
     # the YAML's puts the soft limits on the wrong joints, silently. Each factory asserts the order; this checks it
     # and every factory's limits, by name.
     from cutamp.robots.t1 import get_t1_motion_planner
@@ -280,14 +280,14 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
         want_lo, want_hi = np.array([soft[n] for n in names]).T
         assert np.abs(lo - want_lo).max() < 1e-6 and np.abs(hi - want_hi).max() < 1e-6, what
     assert real_world.bodies.kinematics.tool_frames[0] == "stance" and float(real_world.bodies.mass[0]) == 0.0
-    # The planner keeps the YAML's tool frames in the YAML's order (R12); the floor hook and the CoM cost find theirs.
+    # The planner keeps the YAML's tool frames in the YAML's order; the floor hook and the CoM cost find theirs.
     yml = yaml.safe_load((T1_29DOF / "t1_29dof.yml").read_text())["robot_cfg"]["kinematics"]["tool_frames"]
     assert list(planner.kinematics.tool_frames) == list(planner.trajopt_solver.tool_frames) == yml
 
 
 @needs_cuda
 def test_retry_rounds_seed_from_retry_seed(real_world, monkeypatch):
-    # Ruling R21 (it amends decision 10): each CoM-gate retry round starts IK from _retry_seed's conf, at sigma 0.1,
+    # Each CoM-gate retry round starts IK from _retry_seed's conf, at sigma 0.1,
     # 0.2 and 0.3, which stands the real legs on the stance (test_real_legs_init.py checks its seeds). The noise moves
     # the body and the active arm; the inactive arm holds q_init. IK and the CoM mask are stubbed: every row fails the
     # gate, so all three retries run, and only their seeds count.

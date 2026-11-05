@@ -105,7 +105,7 @@ def _transition_torques(tm, js) -> torch.Tensor:
 @needs_cuda
 @needs_slow
 def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
-    # The only test of the --robot real_legs path (ruling R18): cutamp_demo -> setup_cutamp builds the world from
+    # The only test of the --robot real_legs path: cutamp_demo -> setup_cutamp builds the world from
     # get_model, load_t1_container and q_init = REAL_LEGS.home. The spies only record.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
@@ -127,7 +127,7 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
         return solve(plan_info, particle, world, *args, **kwargs)
 
     def top_spy(plan_info, config, constraint_checker, cost_reducer, n):
-        # The satisfying particles' retract values (Task 4 put them in the Motion loss and the mask).
+        # The satisfying particles' retract values, which the Motion loss and the mask include.
         particles = plan_info["particles"]
         with torch.no_grad():
             cost_dict = plan_info["cost_fn"](plan_info["rollout_fn"](particles), particles)
@@ -206,7 +206,7 @@ def test_static_home_torques(real_world):
 
 @needs_cuda
 def test_trajopt_caps_ankle_pitch_at_its_top_speed(planner):
-    # The fork applies cspace.velocity_scale twice (ruling R14): t1_29dof.yml carries sqrt(7.29 / 12.57) on both
+    # The fork applies cspace.velocity_scale twice: t1_29dof.yml carries sqrt(7.29 / 12.57) on both
     # Ankle_Pitch joints, so every trajopt transition must read 7.29 rad/s, the motor's top speed (design 7.4a).
     for tm in _transitions(planner):
         names = list(tm.joint_names)
@@ -223,7 +223,7 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
     assert len(transitions) >= 4
     assert all(tm._external_wrench_fn is not None for tm in transitions)
     assert all(r.transition_model._external_wrench_fn is None for r in planner.ik_solver.get_all_rollout_instances())
-    # The trajopt CoM cost finds its support frame among the planner's tool poses (ruling R23).
+    # The trajopt CoM cost finds its support frame among the planner's tool poses.
     assert "stance" in planner.trajopt_solver.tool_frames
     assert all("stance" in tm.robot_model.tool_frames for tm in transitions)
     names = list(planner.trajopt_solver.joint_names)
@@ -235,7 +235,7 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
 
 @needs_cuda
 def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner):
-    # Route A's envelope sets no tilt bound (ruling R28), so its planner has no TrunkTiltCost; under an envelope with
+    # Route A's envelope sets no tilt bound, so its planner has no TrunkTiltCost; under an envelope with
     # one, trajopt bounds the tilt (weight 1e5, the bound's cosine, on the base's pitch and roll columns).
     from cutamp._curobo_internals import iter_rollouts
     from cutamp.joint_limit_cost import JointLimitMarginCost, TrunkTiltCost
@@ -364,8 +364,7 @@ def test_gate_checks_the_soles_and_tilt_of_the_frames_it_returns(real_world, pla
 def test_gate_rejects_sole_drift(real_world, planner, monkeypatch):
     import cutamp.com_polygon_cost as cpc
     from cutamp.motion_solver import _audit_traj_com, _balance_gate
-    # Every CoM and ZMP margin the real-leg gate and audit take is against the gate's rectangle about the stance
-    # (ruling R23).
+    # Every CoM and ZMP margin the real-leg gate and audit take is against the gate's rectangle about the stance.
     halves, margin = [], cpc.com_margin_from_base
 
     def spy(xy, half):
