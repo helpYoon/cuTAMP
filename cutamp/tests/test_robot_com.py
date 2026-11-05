@@ -10,6 +10,7 @@ import pytest
 import yourdfpy
 from scipy.spatial.transform import Rotation
 
+from cutamp.robots.t1 import SIMPLIFIED as SIMPLIFIED_MODEL
 from cutamp.robots.t1 import JOINT_NAMES_FULL, T1_ASSETS_DIR, get_t1_bodies, t1_curobo_cfg, t1_home
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
@@ -89,9 +90,9 @@ def test_parsed_link_inertia_is_the_urdf_tensor_in_the_link_frame(tmp_path):
 def test_curobo_link_inertias_match_the_urdf():
     # The ZMP gate reads inertias from the URDF itself (get_t1_bodies); cuRobo's copy must agree.
     # The YAML's extra links are not the URDF's: they keep LinkParams' default 1e-4 at any mass.
-    b = get_t1_bodies()
+    b = get_t1_bodies(SIMPLIFIED_MODEL)
     kp = b.kinematics.config.kinematics_config
-    extra = set(t1_curobo_cfg()["robot_cfg"]["kinematics"]["extra_links"])
+    extra = set(t1_curobo_cfg(SIMPLIFIED_MODEL)["robot_cfg"]["kinematics"]["extra_links"])
     for k, name in enumerate(b.kinematics.tool_frames):  # the massive links, in b's order
         if name in extra:
             continue
@@ -102,11 +103,12 @@ def test_curobo_link_inertias_match_the_urdf():
 @needs_cuda
 def test_whole_robot_com_matches_yourdfpy():
     # The planner's CoM (cuRobo FK, base at 0) at home, the zero conf, two bows and 20 random confs.
-    # The YAML's five 0.01 kg base links, absent from the URDF, move it by under 0.2 mm.
+    # The YAML's five 0.01 kg base links, absent from the URDF, move it by under 0.2 mm. On the simplified model:
+    # the reference is t1_simplified.urdf, and the bows bend its Torso_Pitch.
     import torch
 
     from cutamp.com_polygon_cost import _fk_com_and_base
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED_MODEL)
     names = list(world.kinematics.joint_names)
     home = world.q_init.view(1, -1)
     bows = home.repeat(2, 1)

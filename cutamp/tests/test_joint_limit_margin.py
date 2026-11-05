@@ -11,6 +11,7 @@ from cutamp.robots.t1 import (
     BASE_INDICES,
     CUROBO_DOF,
     JOINT_NAMES_FULL,
+    SIMPLIFIED,
     T1_ASSETS_DIR,
     T1_JOINT_LIMIT_MARGIN,
     T1_LIMIT_MARGIN_LOWER,
@@ -206,11 +207,11 @@ class TestTrajoptCost:
         # start. On the doubled CoM, a zero ankle-upper band let that cost push the ankle +5.7 mrad past
         # its 0 rad limit late in the path, and cuRobo rejected the plan (T1_TRAJOPT_ANKLE_UPPER_MARGIN);
         # the band stays as a guard. Movables are disabled and nothing is attached: only the cost
-        # balance is under test.
+        # balance is under test. The arrival, the ankle and its band are the simplified model's.
         from cutamp.motion_solver import _planner_js_from_full
         from cutamp.tests.conftest import make_blocks_t1_world
 
-        world = make_blocks_t1_world()
+        world = make_blocks_t1_world(model=SIMPLIFIED)
         planner = world.get_motion_planner(collision_activation_distance=0.0025)
         for obj in world.movables:
             planner.scene_collision_checker.enable_obstacle(name=obj.name, enable=False)
@@ -237,7 +238,9 @@ class TestSoftCostWiring:
 
         assert "joint_limit_margin" in SUPPORTED_SOFT_COSTS
         cfg = TAMPConfiguration()
-        assert set(cfg.soft_cost) == {"place_close_to_base", "joint_limit_margin"}  # default-on, nothing dropped
+        # Default-on on both models, nothing dropped; the real legs, the default, add minimize_body_movement.
+        assert set(cfg.soft_cost) == {"place_close_to_base", "joint_limit_margin", "minimize_body_movement"}
+        assert set(TAMPConfiguration(robot="simplified").soft_cost) == {"place_close_to_base", "joint_limit_margin"}
         validate_tamp_config(cfg)                              # whitelist accepts it
         # Unregistered names pass through UNWEIGHTED in CostReducer — the
         # weight entry is mandatory.

@@ -45,6 +45,8 @@ def cutamp_demo(
         ``None`` — don't save the motion plan (default).
         ``"auto"`` — save to ``<experiment_root>/<experiment_id>/motion_plan.pkl``.
         Any other string — save to that path (parent directory auto-created).
+    The simplified model's plan is saved in schema 3, a real-leg plan raw
+    (``"stage3-raw"``); see cutamp/utils/plan_processor.py for both.
     """
     setup_logging()
 
@@ -68,14 +70,18 @@ def cutamp_demo(
         else:
             out_path = Path(save_plan)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # Process into the structured [trunk, arms, hands] schema and pickle.
-        # See cutamp/utils/plan_processor.py for the output schema.
-        from cutamp.utils.plan_processor import process_motion_plan
-        processed = process_motion_plan(curobo_plan)
+        # The simplified model's plan is processed into the structured [trunk, arms, hands] schema 3; a real-leg
+        # plan is saved raw, in its model's joint order, until stage 6's schema 4 (decision 9). See
+        # cutamp/utils/plan_processor.py for both.
+        from cutamp.robots.t1 import SIMPLIFIED, get_model
+        from cutamp.utils.plan_processor import process_motion_plan, raw_motion_plan
+        model = get_model(config.robot)
+        processed = process_motion_plan(curobo_plan) if model is SIMPLIFIED else raw_motion_plan(curobo_plan, model)
         with open(out_path, "wb") as f:
             pickle.dump(processed, f)
         n_traj = len(curobo_plan)
-        _log.info(f"Saved processed motion plan ({n_traj} segments) to {out_path}")
+        _log.info(f"Saved the motion plan ({n_traj} segments, schema_version {processed['schema_version']!r}) "
+                  f"to {out_path}")
     elif save_plan is not None and curobo_plan is None:
         _log.warning(f"--save_plan requested but no motion plan was generated (curobo_plan is None)")
 
@@ -85,7 +91,7 @@ def cutamp_demo(
 def entrypoint():
     import argparse
 
-    from cutamp.config import SUPPORTED_SOFT_COSTS
+    from cutamp.config import SUPPORTED_ROBOTS, SUPPORTED_SOFT_COSTS
     _defaults = TAMPConfiguration()
 
     parser = argparse.ArgumentParser(
@@ -93,6 +99,11 @@ def entrypoint():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    parser.add_argument(
+        "--robot", choices=SUPPORTED_ROBOTS, default=_defaults.robot,
+        help="Planning model: real_legs (the default), bfm_wm's 33-DOF T1 standing on its home stance, which runs "
+             "only the full system (no ablation flags), or simplified, the 21-DOF T1 the paper's ablation arms run on.",
+    )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
     )
@@ -140,9 +151,11 @@ def entrypoint():
     parser.add_argument(
         "--soft_cost",
         nargs="*",
-        default=list(_defaults.soft_cost or []),
+        default=None,
         choices=list(SUPPORTED_SOFT_COSTS),
-        help="Soft cost(s) to optimize (default: from TAMPConfiguration). Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
+        help="Soft cost(s) to optimize (default: TAMPConfiguration's for --robot: place_close_to_base and "
+             "joint_limit_margin, plus minimize_body_movement on real_legs; a bare --soft_cost runs none). "
+             "Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
     parser.add_argument(
@@ -243,9 +256,10 @@ def entrypoint():
         const="auto",
         default=None,
         help=(
-            "Save the processed motion plan as a pickle (no arg: "
-            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path). "
-            "See cutamp/utils/plan_processor.py for the schema."
+            "Save the motion plan as a pickle (no arg: "
+            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): schema 3 "
+            "on the simplified model, the raw 'stage3-raw' plan on the real legs. "
+            "See cutamp/utils/plan_processor.py for both."
         ),
     )
 
@@ -255,6 +269,7 @@ def entrypoint():
         import torch
         torch.manual_seed(args.seed)
     config = TAMPConfiguration(
+        robot=args.robot,
         num_particles=args.num_particles,
         num_opt_steps=args.num_opt_steps,
         early_stop_patience=args.early_stop_patience,

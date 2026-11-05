@@ -1,9 +1,12 @@
-"""Analysis pipeline on synthetic experiment dirs (no GPU)."""
+"""Analysis pipeline on synthetic experiment dirs (no GPU, except the real-leg report's test, which runs cuRobo)."""
 import json
 import statistics
 from pathlib import Path
 
-from cutamp.scripts.analyze_ablation import aggregate, aggregate_deltas, compute_deltas, load_study
+import pytest
+
+from cutamp.scripts.analyze_ablation import aggregate, aggregate_deltas, compute_deltas, gate_summary, load_study
+from cutamp.tests.conftest import needs_cuda
 
 
 def _fake_run(root: Path, cell, height, seed, sat=100, sat_com=90):
@@ -291,3 +294,267 @@ def test_restored_init_reaches_the_table(tmp_path):
     rows = {line.split(" | ")[0]: line for line in (tmp_path / "results.md").read_text().splitlines()}
     assert rows["| CoM only (no re-IK)"].endswith("| 0 ± 0 | 1.00 ± 0.00 |")
     assert rows["| Full (CoM + balance-first re-IK)"].endswith("| — | — |")
+
+
+def _timers(**totals):
+    """A timer_metrics.json body (TorchTimer.get_summaries) with one call per timer."""
+    return {name: {"total": t, "mean": t, "median": t, "std": 0.0, "count": 1} for name, t in totals.items()}
+
+
+TOP_TIMERS = {"load_tamp_world": 0.41, "warmup_ik_solver": 1.15, "get_plan_generator": 0.003,
+              "sample_initial_plans": 2.71, "sort_plans": 0.0002, "start_optimization": 8.06}
+
+
+def test_planning_s_sums_the_top_timers(tmp_path):
+    # Design section 8: planning time is the sum of the top-level timers. The stage times nest inside them (seed IK in
+    # sample_initial_plans; trajopt and the final repair in start_optimization), and first_solution overlaps.
+    nested = {"initialize_particles": 3.1, "curobo_planning": 1.7, "final_repair": 0.45, "first_solution": 5.0,
+              "optimization_step": 2.6, "curobo_motion_gen_warmup": 0.3, "setup_optimizer": 0.2}
+    runs = [_fake_run(tmp_path, "real_legs", 0.5, s) for s in (0, 1, 2)]
+    for run, timers in zip(runs, (_timers(**TOP_TIMERS, **nested),
+                                  _timers(**{k: v for k, v in TOP_TIMERS.items() if k != "sort_plans"}))):
+        (Path(run["experiment_path"]) / "timer_metrics.json").write_text(json.dumps(timers))
+    runs[0]["n"] = 256
+    (tmp_path / "manifest.json").write_text(json.dumps(runs))
+    full, partial, none = load_study(tmp_path / "manifest.json")
+    assert full["planning_s"] == pytest.approx(sum(TOP_TIMERS.values()), abs=1e-12)
+    assert (full["seed_ik_s"], full["trajopt_s"], full["final_repair_s"], full["load_tamp_world_s"]) == (
+        3.1, 1.7, 0.45, 0.41)
+    assert full["n"] == 256 and full["ms_per_step"] == 1000.0 * 30.0 / 2
+    # A sum missing a top timer would understate the run: it reports none.
+    assert partial["planning_s"] is None and partial["load_tamp_world_s"] == 0.41 and partial["seed_ik_s"] is None
+    assert none["n"] is None
+    assert all(none[k] is None for k in ("planning_s", "seed_ik_s", "trajopt_s", "final_repair_s", "load_tamp_world_s"))
+
+
+def test_torque_failures_count_every_torque_form(tmp_path):
+    # A failed candidate's message names torque in trajopt's reason (": torque") and in each of the balance gate's
+    # torque raises: no time scale up to the cap keeps every effort (_torque_scale), or the frames it returns pass one
+    # (_check_torques). Trajopt's ": other" and the gate's velocity and ZMP raises don't count.
+    from types import SimpleNamespace
+
+    import torch
+
+    from cutamp.motion_solver import RETIME_MAX, _check_torques, _check_velocity, _plan_failed, _torque_scale
+    from cutamp.robots.t1 import REAL_LEGS
+
+    n = len(REAL_LEGS.joint_names)
+
+    class Torques:  # world.segment_torques's interface: [T, dof] torques, and an effort and a speed limit per joint
+        def __init__(self, tau):
+            self.tau, self.effort, self.velocity = tau, torch.ones(n), torch.ones(n)
+
+        def __call__(self, js):
+            return torch.full((getattr(js, "position", torch.zeros(3, n)).shape[0], n), self.tau)
+
+    def world(tau):
+        return SimpleNamespace(model=REAL_LEGS, segment_torques=Torques(tau))
+
+    rest = torch.zeros(3, n)
+    js = SimpleNamespace(position=rest, velocity=rest + 2 * RETIME_MAX, acceleration=rest,
+                         joint_names=list(REAL_LEGS.joint_names))  # twice the speed limit at the slowdown cap
+    raised = []
+    for check, args in ((_check_torques, (world(2.0), None)), (_torque_scale, (world(2.0), js, 0.5, RETIME_MAX)),
+                        (_check_velocity, (world(0.5), js, RETIME_MAX))):
+        with pytest.raises(RuntimeError) as e:
+            check(*args)
+        raised.append(str(e.value))
+    result = SimpleNamespace(js_solution=object(), get_interpolated_plan=lambda: None)  # a trajopt result
+    messages = [str(_plan_failed(world(2.0), result, "Retract plan failed for op")), *raised,
+                str(_plan_failed(world(0.5), result, "Retract plan failed for op")),
+                f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
+    assert messages[0].endswith(": torque") and messages[4].endswith(": other")
+    assert f"at the {RETIME_MAX}x slowdown cap" in messages[2] and "velocity passes" in messages[3]
+    runs = [_fake_run(tmp_path, "real_legs", 0.5, s) for s in (0, 1)]
+    _patch(runs[0], {"motion_plan_failures": messages})
+    (tmp_path / "manifest.json").write_text(json.dumps(runs))
+    assert [r["torque_failures"] for r in load_study(tmp_path / "manifest.json")] == [3, None]
+
+
+def _gate_records(ratio=1.4, n=64, balanced=40, slow_tail=1.0):
+    """40 runs per model at ``n``: simplified planning times 10 s + k / 4, the real legs ``ratio`` times as long, with
+    their top five ``slow_tail`` times longer again, and ``balanced`` of their 40 plans balanced."""
+    records = []
+    for k in range(40):
+        for cell, scale in (("simplified", 1.0), ("real_legs", ratio * (slow_tail if k >= 35 else 1.0))):
+            real = cell == "real_legs"
+            records.append({
+                "cell": cell, "n": n, "height": 0.0, "seed": k, "found_solution": 1.0, "motion_plan_success": 1.0,
+                "stable_plan": float(not real or k < balanced), "planning_s": (10.0 + 0.25 * k) * scale,
+                "seed_ik_s": 4.0 * scale, "ms_per_step": 8.75 * scale, "trajopt_s": 2.0 * scale,
+                "final_repair_s": 0.45, "load_tamp_world_s": 0.4, "torque_failures": int(real and k < 3),
+            })
+    return records
+
+
+def test_gate_summary_flags():
+    # Design section 8, at the user's n 64: decided there, the real legs pass with 40/40 on all three counts, a median planning-time
+    # ratio of at most 1.5 and a p90 ratio of at most 2.0 (numpy's linear percentile).
+    import numpy as np
+
+    s = gate_summary(_gate_records(1.4) + _gate_records(1.6, n=256))
+    assert s["decided_at"] == 64 and s["pass"] == {"success": True, "median": True, "p90": True, "pass": True}
+    at = s["by_n"][64]
+    simplified, real = at["cells"]["simplified"], at["cells"]["real_legs"]
+    times = [10.0 + 0.25 * k for k in range(40)]
+    assert simplified["planning_s"] == pytest.approx({"median": float(np.percentile(times, 50)),
+                                                      "p90": float(np.percentile(times, 90))})
+    assert simplified["planning_s"]["p90"] == pytest.approx(18.775)  # 35.1 of 39 places in: 18.75 + 0.1 * 0.25
+    assert at["ratio"]["median"] == pytest.approx(1.4) and at["ratio"]["p90"] == pytest.approx(1.4)
+    counts = ("runs", "timed", "found_solution", "motion_plan_success", "stable_plan", "torque_failures")
+    assert {k: real[k] for k in counts} == {"runs": 40, "timed": 40, "found_solution": 40, "motion_plan_success": 40,
+                                            "stable_plan": 40, "torque_failures": 3}
+    assert real["stage_medians"] == pytest.approx({"seed_ik_s": 5.6, "ms_per_step": 12.25, "trajopt_s": 2.8,
+                                                   "final_repair_s": 0.45, "load_tamp_world_s": 0.4})
+    assert simplified["torque_failures"] == 0
+    # Another n is reported, but it does not decide.
+    assert s["by_n"][256]["flags"]["median"] is False and s["by_n"][256]["ratio"]["median"] == pytest.approx(1.6)
+
+    assert gate_summary(_gate_records(1.6))["pass"] == {"success": True, "median": False, "p90": True, "pass": False}
+    assert gate_summary(_gate_records(1.4, balanced=39))["pass"] == {
+        "success": False, "median": True, "p90": True, "pass": False}
+    slow = gate_summary(_gate_records(1.4, slow_tail=2.0))["by_n"][64]
+    assert slow["ratio"]["median"] == pytest.approx(1.4) and slow["ratio"]["p90"] == pytest.approx(2.8)
+    assert slow["flags"] == {"success": True, "median": True, "p90": False, "pass": False}
+    # A run that never finished drops out of load_study, so a cell short of its 40 runs cannot pass, the baseline's
+    # included: a missing simplified run would move the ratios as much.
+    for cell in ("real_legs", "simplified"):
+        short = [r for r in _gate_records(1.4) if not (r["cell"] == cell and r["seed"] == 0)]
+        assert gate_summary(short)["pass"]["success"] is False, cell
+        # A run missing a top-level timer has no planning time: it drops out of the median and p90, so it fails too.
+        untimed = [{**r, "planning_s": None} if r["cell"] == cell and r["seed"] == 0 else r for r in _gate_records(1.4)]
+        summary = gate_summary(untimed)
+        assert summary["pass"]["success"] is False, cell
+        assert (summary["by_n"][64]["cells"][cell]["runs"], summary["by_n"][64]["cells"][cell]["timed"]) == (40, 39)
+    assert gate_summary(_gate_records(1.4, n=256))["pass"] is None
+
+
+def test_gate_md_tells_a_short_study_from_a_failed_one(tmp_path):
+    # A study short of the gate's 40 runs per model says so beside its FAIL; one with all 40 runs that fails does not.
+    from cutamp.scripts.analyze_ablation import _write_gate_md
+    _write_gate_md(gate_summary(_gate_records(1.6)), tmp_path / "failed.md")
+    failed = (tmp_path / "failed.md").read_text()
+    assert "**FAIL**." in failed and "not 40 runs" not in failed
+    short = [r for r in _gate_records(1.4) if not (r["cell"] == "real_legs" and r["seed"] < 3)]
+    _write_gate_md(gate_summary(short), tmp_path / "short.md")
+    assert "**FAIL** (not 40 runs: real_legs 37)." in (tmp_path / "short.md").read_text()
+
+
+def test_main_gate_writes_gate_outputs(tmp_path, monkeypatch):
+    import sys
+
+    from cutamp.scripts import analyze_ablation
+
+    runs = []
+    for cell in ("simplified", "real_legs"):
+        run = {**_fake_run(tmp_path, cell, 0.5, 0), "n": 64}
+        (Path(run["experiment_path"]) / "timer_metrics.json").write_text(json.dumps(_timers(**TOP_TIMERS)))
+        runs.append(run)
+    (tmp_path / "manifest.json").write_text(json.dumps(runs))
+    monkeypatch.setattr(sys, "argv", ["analyze_ablation", "--manifest", str(tmp_path / "manifest.json"),
+                                      "--out", str(tmp_path / "out"), "--gate"])
+    analyze_ablation.main()
+    summary = json.loads((tmp_path / "out" / "gate.json").read_text())
+    assert summary["by_n"]["64"]["ratio"]["median"] == pytest.approx(1.0)
+    assert summary["pass"]["success"] is False  # one run per model, not the gate's 40
+    md = (tmp_path / "out" / "gate.md").read_text()
+    assert "## n = 64" in md and "| real_legs | 1 | 1 |" in md  # runs, and runs with a planning time
+    assert "**FAIL** (not 40 runs: simplified 1, real_legs 1)." in md
+    assert "| failed past an effort |" in md and "Failed past an effort counts the motion-plan candidates" in md
+
+
+@needs_cuda
+def test_real_legs_report_on_a_still_home_plan(tmp_path):
+    # real_legs_report on a raw plan of two still segments at home: cuRobo's torques with the floor's push give
+    # design 7.4a's feet-on-the-floor statics (knees -4.57, ankle pitches +3.92 N m), the soles sit on the stance,
+    # the Trunk's tilt is home's, and the margins come from overall_metrics. A schema-3 plan beside it is not a
+    # real-leg one.
+    import pickle
+
+    import numpy as np
+    import torch
+
+    from cutamp.robots.t1 import REAL_LEGS, trunk_pose_from_q
+    from cutamp.scripts import real_legs_report
+
+    names = list(REAL_LEGS.joint_names)
+    still = np.tile(np.asarray(REAL_LEGS.home, dtype=np.float32), (3, 1))
+    zero = np.zeros_like(still)
+    segment = {"arm": None, "dt": 0.025, "position": still, "velocity": zero, "acceleration": zero,
+               "planner_timing": None}
+    study = tmp_path / "study" / "experiments"
+    for exp_id, plan in (("gate_real_legs_n256_h050_s0", {"schema_version": "stage3-raw", "model": "real_legs",
+                                                           "joint_names": names, "segments": [segment, segment]}),
+                         ("gate_simplified_n256_h050_s0", {"schema_version": 3})):
+        (study / exp_id).mkdir(parents=True)
+        with open(study / exp_id / "motion_plan.pkl", "wb") as f:
+            pickle.dump(plan, f)
+    (study / "gate_real_legs_n256_h050_s0" / "overall_metrics.json").write_text(json.dumps(
+        {"traj_com_min_margin": 0.03, "traj_zmp_min_margin": 0.02, "retime_max": 1.0}))
+
+    prefix = tmp_path / "out" / "report"
+    real_legs_report.main(["--study", str(tmp_path / "study"), "--out", str(prefix)])
+    report = json.loads(prefix.with_suffix(".json").read_text())
+    assert [r["run"] for r in report["runs"]] == ["gate_real_legs_n256_h050_s0"]
+    run, joints = report["runs"][0], {j["joint"]: j for j in report["joints"]}
+    assert len(joints) == 27 and not any(j.startswith("base_j_") for j in joints)  # the actuated joints
+    for side in ("Left", "Right"):
+        assert abs(joints[f"{side}_Knee_Pitch"]["peak_torque"] - 4.57) <= 0.3
+        assert abs(joints[f"{side}_Ankle_Pitch"]["peak_torque"] - 3.92) <= 0.3
+        assert joints[f"{side}_Knee_Pitch"]["effort"] == pytest.approx(130.5)
+        assert joints[f"{side}_Knee_Pitch"]["knee_speed"] == pytest.approx(6.71)
+        assert joints[f"{side}_Ankle_Pitch"]["velocity_limit"] == pytest.approx(7.29)  # cuRobo's, not 9.57
+    assert joints["Waist"]["knee_speed"] == pytest.approx(1.88)
+    assert joints["Waist"]["velocity_limit"] == pytest.approx(14.66)
+    assert all(j["peak_speed"] == 0.0 for j in joints.values())
+    home_tilt = float(torch.acos(trunk_pose_from_q(REAL_LEGS, REAL_LEGS.home)[2, 2]))
+    assert run["max_tilt"] == pytest.approx(home_tilt, abs=1e-4)
+    assert run["max_sole_drift_m"] < 1e-5 and run["max_sole_drift_rad"] < 1e-3
+    assert (run["segments"], run["slowed"], run["com_min_margin"], run["zmp_min_margin"], run["retime_max"]) == (
+        2, 0, 0.03, 0.02, 1.0)
+    assert run["unslowed_over_effort"] == []
+    md = prefix.with_suffix(".md").read_text()
+    assert "| Left_Knee_Pitch |" in md and "| gate_real_legs_n256_h050_s0 |" in md
+
+
+@needs_cuda
+def test_real_legs_report_counts_sped_up_and_slowed_segments(tmp_path):
+    # On the real legs the gate can speed a segment up (s < 1) as well as slow it: each retimed segment keeps the
+    # planner's timing, so its s is its frames over the planner's. The report counts both, takes the gate's time
+    # scales and binding checks (by check) from overall_metrics, and writes them in its tables.
+    import pickle
+
+    import numpy as np
+
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.scripts import real_legs_report
+
+    names = list(REAL_LEGS.joint_names)
+
+    def still(n):
+        position = np.tile(np.asarray(REAL_LEGS.home, dtype=np.float32), (n, 1))
+        return {"position": position, "velocity": np.zeros_like(position), "acceleration": np.zeros_like(position)}
+
+    segments = [{"arm": "left", "dt": 0.025, **still(3), "planner_timing": still(5)},   # sped up, s = 0.5
+                {"arm": "left", "dt": 0.025, **still(5), "planner_timing": still(3)},   # slowed, s = 2
+                {"arm": "right", "dt": 0.025, **still(3), "planner_timing": None}]       # s = 1
+    run = tmp_path / "study" / "gate_real_legs_n256_h000_s0"
+    run.mkdir(parents=True)
+    with open(run / "motion_plan.pkl", "wb") as f:
+        pickle.dump({"schema_version": "stage3-raw", "model": "real_legs", "joint_names": names,
+                     "segments": segments}, f)
+    (run / "overall_metrics.json").write_text(json.dumps({
+        "traj_com_min_margin": 0.03, "traj_zmp_min_margin": 0.02, "retime_min": 0.5, "retime_max": 2.0,
+        "retime_binding": {"velocity Waist": 1, "zmp": 1, "torque Left_Knee_Pitch": 1}}))
+
+    prefix = tmp_path / "out" / "report"
+    real_legs_report.main(["--study", str(tmp_path / "study"), "--out", str(prefix)])
+    report = json.loads(prefix.with_suffix(".json").read_text())
+    (r,) = report["runs"]
+    assert (r["segments"], r["slowed"], r["sped_up"], r["retime_min"], r["retime_max"]) == (3, 1, 1, 0.5, 2.0)
+    assert r["binding"] == {"torque": 1, "velocity": 1, "zmp": 1}
+    assert (report["summary"]["retime_min"], report["summary"]["retime_max"]) == (0.5, 2.0)
+    assert r["unslowed_over_effort"] == []  # only the segment at the planner's timing is read for it
+    md = prefix.with_suffix(".md").read_text()
+    assert "| gate_real_legs_n256_h000_s0 | 3 | 1 | 1 | 0.50 | 2.00 | torque 1, velocity 1, zmp 1 |" in md
+    assert "time scales from 0.50x to 2.00x" in md

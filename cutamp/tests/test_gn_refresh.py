@@ -2,7 +2,10 @@
 
 CUDA-only: exercises the real T1 kinematics kernel — the Jacobian convention
 check is the load-bearing regression (GN silently diverges if cuRobo ever
-changes row order or frame).
+changes row order or frame). The tests run on conftest's default model, except
+the pose-only ``gn_project`` (the paper's pose-only refresh arm, which only the
+simplified model runs, design call 15) and the margin bands (the real legs have
+none, call 17): those build the simplified model.
 """
 import math
 from unittest import mock
@@ -11,11 +14,12 @@ import pytest
 import roma
 import torch
 
+from cutamp.robots.t1 import SIMPLIFIED
 from cutamp.tests.conftest import cupti_sync_events, make_blocks_t1_world, needs_cuda, sync_debug_error
 
 
 def _four_dep_stack(world):
-    """``(q [32, 21], T [32, 4, 4], arms)``: four arm-sorted 8-row IK deps. Per arm, one IK
+    """``(q [32, dof], T [32, 4, 4], arms)``: four arm-sorted 8-row IK deps. Per arm, one IK
     solution for a target at (0.35, +-0.25, 0.25) feeds a warm dep (target drifted by mm) and a
     far dep (x = 0.9, out of balanced reach)."""
     from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask
@@ -64,13 +68,13 @@ def test_tool_jacobian_matches_finite_differences():
     frame_idx = list(kin.tool_frames).index(frame)
 
     torch.manual_seed(0)
-    q0 = world.q_init.unsqueeze(0).clone() + 0.05 * torch.randn(1, 21, device="cuda")
+    q0 = world.q_init.unsqueeze(0).clone() + 0.05 * torch.randn(1, world.q_init.numel(), device="cuda")
     pos0, quat0, state = _fk_pose(world, q0, frame)
-    J = state.tool_jacobians[0, 0, frame_idx].clone()  # [6, 21]
+    J = state.tool_jacobians[0, 0, frame_idx].clone()  # [6, dof]
     R0 = _quat_to_mat(quat0)[0]
 
     eps = 1e-3
-    for k in [3, 5, 8, 12]:  # ankle, torso, left arm joints
+    for k in range(q0.shape[1]):  # every column: base, arms, legs and trunk
         dq = torch.zeros_like(q0)
         dq[0, k] = eps
         pos1, quat1, _ = _fk_pose(world, q0 + dq, frame)
@@ -92,7 +96,7 @@ def test_gn_project_converges_from_warm_start():
         _achieved_pose_errors, _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask,
     )
 
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)  # gn_project is the pose-only arm's refresh
     B = 8
     target = torch.eye(4, device="cuda").unsqueeze(0).expand(B, 4, 4).contiguous()
     target[:, :3, 3] = torch.tensor([0.35, 0.25, 0.25], device="cuda")
@@ -124,7 +128,7 @@ def test_gn_project_respects_locked_dofs():
     from cutamp.gn_refresh import gn_project
     from cutamp.robots.t1 import BASE_INDICES, RIGHT_ARM_INDICES
 
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)  # gn_project is the pose-only arm's refresh
     B = 4
     q0 = world.q_init.unsqueeze(0).expand(B, 21).clone()
     target = torch.eye(4, device="cuda").unsqueeze(0).expand(B, 4, 4).contiguous()
@@ -190,7 +194,7 @@ def test_gn_project_balanced_leaves_margin_bands_holding_pose_and_com():
     )
     from cutamp.robots.t1 import T1_LIMIT_MARGIN_LOWER
 
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)  # only the simplified model has margin bands
     B = 8
     target = torch.eye(4, device="cuda").unsqueeze(0).expand(B, 4, 4).contiguous()
     target[:, :3, 3] = torch.tensor([0.35, 0.25, 0.25], device="cuda")
@@ -221,19 +225,20 @@ def test_gn_project_balanced_pins_per_row():
     # would chase a target half a metre away).
     from cutamp.gn_refresh import gn_project_balanced
     from cutamp.particle_initialization import _achieved_pose_errors
-    from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
 
     world = make_blocks_t1_world()
+    model = world.model
     q, T, arms = _four_dep_stack(world)
     q1 = gn_project_balanced(world, q, T, arms)
     per_dep = torch.cat([gn_project_balanced(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)])
     assert (q1 - per_dep).abs().max().item() <= 1e-5  # bitwise as measured; slack for batch-dependent GPU reductions
     left_only = gn_project_balanced(world, q[:16], T[:16], arms[:2])  # a stack with no right-arm rows
     assert (left_only - per_dep[:16]).abs().max().item() <= 1e-5
-    assert torch.equal(q1[:, BASE_INDICES], q[:, BASE_INDICES])
-    assert torch.equal(q1[:16, RIGHT_ARM_INDICES], q[:16, RIGHT_ARM_INDICES])
-    assert torch.equal(q1[16:, LEFT_ARM_INDICES], q[16:, LEFT_ARM_INDICES])
-    assert not torch.equal(q1[:16, LEFT_ARM_INDICES], q[:16, LEFT_ARM_INDICES])
+    if model.lock_base:  # the simplified model's planar base is out of GN's columns; the real legs' base is free
+        assert torch.equal(q1[:, model.base], q[:, model.base])
+    assert torch.equal(q1[:16, model.right_arm], q[:16, model.right_arm])
+    assert torch.equal(q1[16:, model.left_arm], q[16:, model.left_arm])
+    assert not torch.equal(q1[:16, model.left_arm], q[:16, model.left_arm])
     for rows, arm in ((slice(0, 8), "left"), (slice(16, 24), "right")):
         pos, rot = _achieved_pose_errors(world, q1[rows], T[rows], arm)
         assert bool((pos < 2e-3).all() & (rot < 2e-2).all()), (
@@ -248,15 +253,19 @@ def test_gn_project_balanced_pins_per_row():
 
 @needs_cuda
 def test_gn_gate_matches_checker_helpers():
-    # One FK over the whole stack gives the checker helpers' masks, each row on its own arm;
-    # the forward ankle lean puts every leaned row's CoM outside the polygon.
-    from cutamp.com_polygon_cost import compute_com_polygon_mask
-    from cutamp.gn_refresh import gn_gate
+    # One FK over the whole stack gives the checker helpers' masks, each row on its own arm (and on a model with
+    # soles, both soles against the stance). Every third row leans out of balance: GN without its CoM level
+    # (balance=False, which keeps the sole rows) toward a target 0.9 m ahead ends CoM-outside, as
+    # test_gn_project_balanced_keeps_com_in_and_closes_pose finds.
+    from cutamp.com_polygon_cost import _fk_state, compute_com_polygon_mask
+    from cutamp.gn_refresh import gn_gate, gn_project_balanced, soles_on_stance
     from cutamp.particle_initialization import _achieved_pose_errors
 
     world = make_blocks_t1_world()
     q, T, arms = _four_dep_stack(world)
-    q[::3, 3] -= 0.45  # lean the ankle on every third row
+    far = T.clone()
+    far[:, 0, 3] = 0.9
+    q[::3] = gn_project_balanced(world, q, far, arms, iters=30, balance=False)[::3]
     # Rows 1 and 2 get rotation errors between and beyond the tolerance; leaned row 0 aims
     # at its own tool pose, so it is pose-ok but CoM-out.
     for row, ang in ((1, 0.02), (2, 0.1)):
@@ -269,7 +278,10 @@ def test_gn_gate_matches_checker_helpers():
         pose_ok, com_ok = gn_gate(world, q, T, arms, 0.005, 0.05)
     assert fk.call_count == 1  # both masks from one FK
     ref = [_achieved_pose_errors(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)]
-    assert torch.equal(pose_ok, torch.cat([(p < 0.005) & (r < 0.05) for p, r in ref]))
+    want_pose = torch.cat([(p < 0.005) & (r < 0.05) for p, r in ref])
+    if world.model.sole_frames:
+        want_pose &= soles_on_stance(world, _fk_state(world, q), 0.005, 0.05)
+    assert torch.equal(pose_ok, want_pose)
     assert torch.equal(com_ok, compute_com_polygon_mask(world, q))
     assert torch.equal(com_ok, torch.cat([compute_com_polygon_mask(world, qi) for qi in q.split(8)]))
     assert pose_ok.any() and (~pose_ok).any() and com_ok.any() and (~com_ok).any()

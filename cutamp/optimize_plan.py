@@ -27,18 +27,19 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
-from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced
+from cutamp.gn_refresh import gn_gate, gn_project, gn_project_balanced, soles_on_stance, tilt_within_bound
 from cutamp.particle_initialization import (
     _achieved_pose_errors,
     _ik_for_pose,
     _ik_solution_to_full_q,
     _ik_success_mask,
 )
+from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
-from cutamp.task_planning.constraints import KinematicConstraint
+from cutamp.task_planning.constraints import KinematicConstraint, Motion
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -131,9 +132,8 @@ def _adam_param_groups(params: List[Tuple[torch.Tensor, bool]], conf_lr: float) 
 @dataclass
 class _StepBody:
     """One Adam step's device work, run eagerly or captured as G_step: the forward, the per-step scalars
-    stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost when
-    ``with_soft``), and the backward with the grad masks. Returns ``(packed, vis)``; ``vis`` is ``None``
-    unless ``keep_vis``."""
+    stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost), and the
+    backward with the grad masks. Returns ``(packed, vis)``; ``vis`` is ``None`` unless ``keep_vis``."""
     particles: dict
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
@@ -142,7 +142,6 @@ class _StepBody:
     consider_types: set
     params: List[torch.Tensor]
     grad_masks: Dict[int, torch.Tensor]
-    with_soft: bool
     keep_vis: bool
 
     def __call__(self) -> Tuple[torch.Tensor, Optional[tuple]]:
@@ -154,9 +153,8 @@ class _StepBody:
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
         scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-        if self.with_soft:
-            soft_costs = self.cost_reducer.soft_costs(cost_dict)
-            scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
+        soft_costs = self.cost_reducer.soft_costs(cost_dict)
+        scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
         packed = torch.stack(scalars).detach()
         # The backward runs before the loop's bookkeeping, so elapsed[s] and the first-solution times include
         # it. It writes only .grad, which the bookkeeping doesn't read.
@@ -580,12 +578,13 @@ class ParticleOptimizer:
             else:
                 # Final pre-check refresh: REPAIR-ONLY, on the full-strength
                 # main solver. Measure which rows actually fail the checker's
-                # kinematic tolerance or the CoM gate and only overwrite those
-                # — a blanket success-masked overwrite perturbs already-good
-                # rows' soft costs (measured best_soft 18.6 -> 22.8 on one
-                # run). Full batch always: cuRobo pads sub-capacity batches
-                # internally, so subsets save nothing.
-                from cutamp.com_polygon_cost import compute_com_polygon_mask
+                # kinematic tolerances (the hand's, and on a model with soles
+                # the soles' against the stance) or the CoM gate, and only
+                # overwrite those — a blanket success-masked overwrite perturbs
+                # already-good rows' soft costs (measured best_soft 18.6 -> 22.8
+                # on one run). Full batch always: cuRobo pads sub-capacity
+                # batches internally, so subsets save nothing.
+                from cutamp.com_polygon_cost import _fk_state, compute_com_polygon_mask
                 pos_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err")
                 rot_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err")
                 with torch.no_grad():
@@ -593,6 +592,12 @@ class ParticleOptimizer:
                         world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
                     )
                     ok_now = (pos_err < pos_tol) & (rot_err < rot_tol)
+                    if world.model.sole_frames:
+                        ok_now &= soles_on_stance(
+                            world, _fk_state(world, particles[dep.q_name].detach()),
+                            self.constraint_checker._get_tol(KinematicConstraint.type, "sole_pos_err"),
+                            self.constraint_checker._get_tol(KinematicConstraint.type, "sole_rot_err"),
+                        )
                     if self.config.enable_com_aware_ik:  # off in the no-CoM ablation
                         ok_now &= compute_com_polygon_mask(world, particles[dep.q_name])
                 if bool(ok_now.all()):
@@ -606,6 +611,12 @@ class ParticleOptimizer:
                 n_fail = int((~success).sum().item())
                 # Repair-only merge: already-good rows keep their q.
                 success = success & ~ok_now
+                if world.model.envelope is not None and world.model.envelope.trunk_tilt_max is not None:
+                    # cuRobo's IK does not see an envelope's tilt bound, which GN holds: on blocks_t1's floor scene,
+                    # under a 1.0 rad bound, it bowed 9 of 11 repaired rows past it, each trading a hand, sole or CoM
+                    # failure for a tilt one, so a repair past the bound is not taken.
+                    success &= tilt_within_bound(world, new_q,
+                                                 self.constraint_checker._get_tol(Motion.type, "trunk_tilt"))
                 with torch.no_grad():
                     merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
                     particles[dep.q_name].copy_(merged)
@@ -623,7 +634,8 @@ class ParticleOptimizer:
     def _capture_step(self, body: _StepBody, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
         """Capture ``body`` as G_step. Each warm-up drops every ``.grad``, so the captured AccumulateGrad
         gives each param a graph-owned ``.grad`` that every replay rewrites in place (never zero_grad it).
-        The guard covers the particles, those grads and the step's three FK sites."""
+        The guard covers the particles, those grads and the step's FK sites: three, and on the real legs the
+        retract confs' motion site (cost_function.motion_costs)."""
         body.clear_autograd()
 
         def warmup() -> None:
@@ -635,7 +647,8 @@ class ParticleOptimizer:
             "G_step", body, warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
                 [*body.particles.values(), *(p.grad for p in body.params)],
-                [world.site_kinematics(s) for s in ("rollout", "retract", "com")],
+                [world.site_kinematics(s) for s in ("rollout", "retract", "com")
+                 + (("retract_motion",) if world.model.sole_frames else ())],
             ),
         )
 
@@ -654,8 +667,8 @@ class ParticleOptimizer:
         visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
         q_last = rollout["confs"][best_idx, -1].tolist()
 
-        # v0.8: configs are full 21-DOF (T1) or single chain DOF (others).
-        # T1RerunRobot maps 21 → 28 URDF actuated joints internally.
+        # v0.8: configs are the model's full cspace (T1: 21 or 33 joints) or a
+        # single chain's DOF (others). T1RerunRobot maps them onto the URDF.
         visualizer.set_joint_positions(q_last)
         for obj in rollout["obj_to_pose"]:
             mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]
@@ -739,7 +752,7 @@ class ParticleOptimizer:
         # this operator (e.g., base + inactive arm during arm operations).
         # See cutamp/conf_locking.py for the policy.
         grad_masks = build_grad_masks(
-            plan_skeleton, particles, param_to_type, Conf,
+            plan_skeleton, particles, param_to_type, Conf, world.model,
         )
         num_total_params = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
         opt_metrics["optimizer"] = {
@@ -760,8 +773,7 @@ class ParticleOptimizer:
         # Setup some more metrics
         opt_metrics["num_satisfying"] = []
         opt_metrics["loss"] = []
-        if self.config.soft_cost is not None:
-            opt_metrics["best_soft_costs"] = []
+        opt_metrics["best_soft_costs"] = []
         opt_metrics["elapsed"] = []
 
         vis_every = self.config.opt_viz_interval
@@ -814,7 +826,6 @@ class ParticleOptimizer:
         body = _StepBody(
             particles, rollout_fn, cost_fn, self.cost_reducer, self.get_satisfying_mask, consider_types,
             params=[p for g in optimizer.param_groups for p in g["params"]], grad_masks=grad_masks,
-            with_soft=self.config.soft_cost is not None,
             # The no-op Visualizer skips the vis block, and with it the block's syncs.
             keep_vis=type(visualizer) is not Visualizer,
         )
@@ -839,7 +850,7 @@ class ParticleOptimizer:
                 else:
                     optimizer.zero_grad()
                     packed, vis = body()
-                num_satisfying, loss_val, min_cost, *best_soft = packed.tolist()
+                num_satisfying, loss_val, min_cost, best_soft = packed.tolist()
                 num_satisfying = int(num_satisfying)
                 opt_metrics["num_satisfying"].append(num_satisfying)
 
@@ -855,8 +866,7 @@ class ParticleOptimizer:
                 opt_metrics["loss"].append(loss_val)
 
                 # Soft costs are recorded even if we don't optimize them.
-                if self.config.soft_cost is not None:
-                    opt_metrics["best_soft_costs"].append(best_soft[0] if num_satisfying > 0 else None)
+                opt_metrics["best_soft_costs"].append(best_soft if num_satisfying > 0 else None)
 
                 torch.cuda.synchronize()
                 opt_metrics["elapsed"].append(time.perf_counter() - start_time)
@@ -932,8 +942,9 @@ class ParticleOptimizer:
         # moved poses since the last periodic refresh. Always FULL (no gate):
         # restore_if_better may have rewritten particles, making gate refs stale.
         if ik_deps:
-            self._refresh_ik_deps(particles, ik_deps, world)
-            reik_gate.flush()  # balance-first records sit on the device until here
+            with timer.time("final_repair"):  # a stage time of the speed gate (design section 8)
+                self._refresh_ik_deps(particles, ik_deps, world)
+                reik_gate.flush()  # balance-first records sit on the device until here
         if reik_gate is not None and reik_gate.stats:
             opt_metrics["reik_refresh"] = reik_gate.stats
             total_s = sum(r["solve_s"] for r in reik_gate.stats)
@@ -1025,21 +1036,28 @@ class ParticleOptimizer:
         # Log initial state
         timer.start("visualize_rollout")
         world = rollout_fn.world
+        # The robot's conf in the model's cspace, and each hand's gripper state on the rerun robot (when one is
+        # shown): a pick conf's hand closed, a place conf's open, the other hand as it was; both open at the start.
+        rr_robot = getattr(visualizer, "robot", None)
+        grippers = {"left": GRIPPER_OPEN, "right": GRIPPER_OPEN}
+
+        def show(q: torch.Tensor) -> None:
+            if hasattr(rr_robot, "set_grippers"):
+                rr_robot.set_grippers(**grippers)
+            visualizer.set_joint_positions(q.tolist())
+
         visualizer.set_time_sequence(f"rollout_{self.opt_counter}", 0)
-        visualizer.set_joint_positions(world.q_init.tolist())
+        show(world.q_init)
         for obj in world.movables:
             obj_pose = world.get_object_pose(obj).cpu()
             visualizer.log_mat4x4(f"world/{obj.name}", obj_pose)
 
         for ts in range(len(rollout["conf_params"])):
             visualizer.set_time_sequence(f"rollout_{self.opt_counter}", ts + 1)
-            q = rollout["confs"][best_idx, ts]
-
-            gripper_close = rollout["gripper_close"][ts]
-            # T1 gripper: 4-bar parallel linkage, 4 joints per hand.
-            # GRIPPER_OPEN = (0,0,0,0), GRIPPER_CLOSED = (1,-1,-1,1).
-            gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
-            visualizer.set_joint_positions(q.tolist() + gripper_joints)
+            arm = rollout_fn.conf_to_arm.get(rollout["conf_params"][ts])
+            if arm is not None:
+                grippers[arm] = GRIPPER_CLOSED if rollout["gripper_close"][ts] else GRIPPER_OPEN
+            show(rollout["confs"][best_idx, ts])
 
             world_from_ee = rollout["world_from_ee"][best_idx, ts].cpu()
             visualizer.log_mat4x4("rollout/ee_pose", world_from_ee)

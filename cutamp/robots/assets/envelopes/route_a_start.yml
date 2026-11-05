@@ -1,0 +1,22 @@
+# Route A's starting envelope (design 7.10, call 22): what the planner may send route A's policy. bfm_wm has no
+# envelope file yet, so cuTAMP writes this one; once route A's training writes its own, cuTAMP pins that copy here
+# instead. The planner enforces the joint ranges, and a Trunk floor and tilt bound when they are set; payload, stance
+# range and holds are stored only.
+name: route_a_start
+# No Trunk floor or tilt bound: route A's policy is trained on the motions this planner makes, so robot facts bound
+# them: the joints' soft limits (bfm_wm's 0.9 of each range) and the Waist range below, the vendor's speed limits
+# (the ankle pitch's at its motor's top speed) and efforts, the CoM and multibody ZMP inside the soles' hull shrunk
+# 2 cm where each foot can carry a tenth of the weight, collisions and planted soles. Trajopt's acceleration and jerk
+# caps and the base's speed limit (t1_29dof.yml), which are not robot facts, shape each path and its time profile:
+# the balance gate keeps that profile and sets only each segment's uniform time scale, the smallest at which speed,
+# effort and the ZMP pass (to 2%, at most 4x slower than trajopt's). A value here would be a guess that the training
+# then learns as a limit.
+trunk_height_min: null
+trunk_tilt_max: null
+joint_ranges: {Waist: [-0.911, 0.911]}       # the soft limit; arms free
+speed_caps: null                              # from route A's data, later
+acceleration_caps: null
+trunk_speed_caps: null
+payload_kg: {range: [0.0, 0.5], tail_max: 1.0}   # per hand; a small share to 1 kg
+stance_range: {xy_m: 2.0, yaw_rad: 3.141592653589793}   # call 7
+hold_s: {start_blend: 0.5, grasp: 0.5, end: 1.0}

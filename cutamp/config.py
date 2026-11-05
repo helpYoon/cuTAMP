@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 
@@ -20,9 +20,24 @@ SUPPORTED_SOFT_COSTS = (
     "minimize_body_movement", "joint_limit_margin",
 )
 
+# The planning models (cutamp.robots.t1.get_model); the CLI's --robot choices.
+SUPPORTED_ROBOTS = ("simplified", "real_legs")
+
+# The paper's ablation arms (design call 15), which only the simplified model runs: each of these must keep its
+# default on the real legs. They reproduce from the paper's tag.
+_REAL_LEGS_REQUIRED = {
+    "enable_com_polygon": True, "enable_com_aware_ik": True, "enable_com_init_gate": True,
+    "enable_com_hard_constraint": True, "coupled_reik": True, "force_adam": False, "reik_balance_first": True,
+}
+
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
+    # The planning model (SUPPORTED_ROBOTS): "real_legs" (the default since the speed gate passed at n 64,
+    # 2026-11-05), bfm_wm's 33-DOF T1 on the home stance (design 7.2), or "simplified", the 21-DOF CoM-fixed model,
+    # which the paper's ablation arms and the speed gate still need (design call 12). It also sets soft_cost's default.
+    robot: str = "real_legs"
+
     # Number of particles to initialize and optimize over. The IK solver's
     # buffers are sized to this (ik_max_batch_size), so it bounds GPU memory:
     # 1024 OOMs a 24 GB card at solver build, 512 peaks near ~17 GB, 256
@@ -53,9 +68,12 @@ class TAMPConfiguration:
     # without considering the other. joint_limit_margin (added 2026-06-11)
     # is independent of that pair.
     # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
-    soft_cost: Optional[List[str]] = field(
-        default_factory=lambda: ["place_close_to_base", "joint_limit_margin"]
-    )
+    # None (the default) resolves in __post_init__ to place_close_to_base and
+    # joint_limit_margin, plus minimize_body_movement on the real legs, whose
+    # legs move freely (design call 2). [] means no soft costs. A resolved list
+    # stays when the robot changes: dataclasses.replace(cfg, robot=...) needs
+    # soft_cost=None too, or build a fresh TAMPConfiguration(robot=...).
+    soft_cost: Optional[List[str]] = None
     # Re-IK-coupled Adam (bilevel): outer Adam optimizes Pose/Grasp/free-Conf;
     # covered Confs (q_pick/q_place/etc.) are dropped from the optimizer and
     # refreshed by an exact IK call every reik_interval steps. Makes pose-class
@@ -144,7 +162,8 @@ class TAMPConfiguration:
     # On RuntimeError from solve_curobo, retry on the next-best satisfying particle
     # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
-    motion_plan_max_retries: int = 5
+    # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first plans on its 6th candidate.
+    motion_plan_max_retries: int = 10
 
     ## Visualizer Args
     # Whether to use visualizer, if set to False a Mock is used
@@ -159,6 +178,13 @@ class TAMPConfiguration:
     # Root directory for logging experiments
     experiment_root: str = "/tmp/cutamp-experiments"
 
+    def __post_init__(self):
+        if self.soft_cost is None:
+            default = ["place_close_to_base", "joint_limit_margin"]
+            if self.robot == "real_legs":
+                default.append("minimize_body_movement")
+            object.__setattr__(self, "soft_cost", default)
+
 
 def uses_cuda_graphs(config: TAMPConfiguration) -> bool:
     """Whether this run captures CUDA graphs: they record the balance-first
@@ -171,6 +197,17 @@ def uses_cuda_graphs(config: TAMPConfiguration) -> bool:
 
 
 def validate_tamp_config(config: TAMPConfiguration):
+    if config.robot not in SUPPORTED_ROBOTS:
+        raise ValueError(f"Unknown robot {config.robot!r}; supported: {SUPPORTED_ROBOTS}")
+    if config.robot == "real_legs":
+        changed = [f"{name}={getattr(config, name)}" for name, value in _REAL_LEGS_REQUIRED.items()
+                   if getattr(config, name) != value]
+        if changed:
+            raise ValueError(
+                f"robot real_legs runs only the full system, not the paper's ablation paths ({', '.join(changed)}); "
+                "they reproduce on the simplified model (design call 15): add --robot simplified"
+            )
+
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
 

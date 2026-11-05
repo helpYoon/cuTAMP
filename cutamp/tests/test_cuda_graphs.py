@@ -25,19 +25,22 @@ from cutamp.utils.timer import TorchTimer
 def test_uses_cuda_graphs():
     # On by default; runs the graphs can't capture stay eager and still validate.
     assert uses_cuda_graphs(TAMPConfiguration())
-    for kw in ({"cuda_graphs": False}, {"reik_balance_first": False}, {"coupled_reik": False},
-               {"soft_cost": ["align_yaw"]}):
+    # The two ablation arms name the simplified model, the only one that runs them (design call 15).
+    for kw in ({"cuda_graphs": False}, {"reik_balance_first": False, "robot": "simplified"},
+               {"coupled_reik": False, "robot": "simplified"}, {"soft_cost": ["align_yaw"]}):
         validate_tamp_config(TAMPConfiguration(**kw))
         assert not uses_cuda_graphs(TAMPConfiguration(**kw)), kw
 
 
 def test_cli_defaults_on(monkeypatch):
-    # --reik_balance_first and --cuda_graphs restate the defaults; each --no_ flag turns its own off.
+    # --reik_balance_first and --cuda_graphs restate the defaults; each --no_ flag turns its own off. The pose-only
+    # refresh is an ablation arm, so its run names the simplified model (design call 15).
     import cutamp.scripts.run_cutamp as rc
     seen = []
     monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
     for argv, balance_first, graphs in (([], True, True), (["--reik_balance_first", "--cuda_graphs"], True, True),
-                                        (["--no_reik_balance_first"], False, True), (["--no_cuda_graphs"], True, False)):
+                                        (["--robot", "simplified", "--no_reik_balance_first"], False, True),
+                                        (["--no_cuda_graphs"], True, False)):
         monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
         rc.entrypoint()
         assert (seen[-1].reik_balance_first, seen[-1].cuda_graphs) == (balance_first, graphs), argv
@@ -71,8 +74,8 @@ def test_failed_capture_restores_default_stream():
 def test_guard_trips_on_resize():
     from curobo.types import JointState
     from cutamp.cuda_graphs import CapturedGraph, graph_ptrs
-    from cutamp.robots.t1 import get_t1_kinematics
-    kin = get_t1_kinematics()
+    from cutamp.robots.t1 import SIMPLIFIED, get_t1_kinematics
+    kin = get_t1_kinematics(SIMPLIFIED)
     q = (0.1 * torch.randn(4, len(kin.joint_names), device="cuda")).requires_grad_()
 
     def body():  # square(): cuRobo's FK backward needs a contiguous grad, and sum()'s is expanded
@@ -101,10 +104,11 @@ def _graph_config(**kw):
 
 
 @needs_cuda
-@pytest.mark.parametrize("sc", [None, *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
+@pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"),
+                                *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
 def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
     world, skeleton, base = blocks_t1_plan
-    config = _graph_config(num_opt_steps=2, soft_cost=None if sc is None else [sc])
+    config = _graph_config(num_opt_steps=2, soft_cost=[] if sc is None else [sc])
     replays = install_step_replay_spy(monkeypatch)
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
                          visualizer=SpyVis(config))
@@ -146,13 +150,20 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
     assert next(busy) == 8                           # consulted once per step, until the capture
 
 
+# On both models; None is the default model and shares the module's world. The leak check is the bytes the tensors
+# request, exact on both models. On the real legs the final check repairs with cuRobo's CUDA-graphed IK, whose line
+# search (line_search_strategy.py, jit_get_x_set) reuses cached blocks of one size class, about 1.2 MB each, held on
+# the C++ side. The caching allocator counts each request at the size of the block it lands in, so there
+# memory_allocated moves between calls (by 16 to 80 KiB, seen) with nothing new held; it is exact only on the
+# simplified model. (test_cuda_graphs_whole_call compares the calls' results bitwise, not their memory.)
 @needs_cuda
+@pytest.mark.parametrize("blocks_t1_plan", ["simplified", pytest.param(None, id="default")], indirect=True)
 def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
     world, skeleton, base = blocks_t1_plan
-    config = _graph_config(num_opt_steps=10)
+    config = _graph_config(num_opt_steps=10, robot=world.model.name)
     plan_info, mem, sites, released = make_plan_info(world, skeleton, clone_particles(base), config), [], [], []
-    orig = CapturedGraph.release
+    orig, req = CapturedGraph.release, []            # req: the bytes the tensors request, after each call
 
     def release(self):                               # what each release must free; no strong refs kept
         outs = [weakref.ref(t) for t in (self.outputs or ()) if isinstance(t, torch.Tensor)]
@@ -172,11 +183,14 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
         pools = {p for _, p, _ in released}
         assert not [s for s in torch.cuda.memory_snapshot() if s["segment_pool_id"] in pools]  # nor a pool block
         mem.append(torch.cuda.memory_allocated())
+        req.append(torch.cuda.memory_stats()["requested_bytes.all.current"])
         sites.append(_site_ptrs(world))
     # The FK sites outlive the call, sized by the batch they last ran. Same plan, so the same
     # buffers after both calls: they count the same in both readings and can't hide a leak.
     assert sites[1] == sites[0]
-    assert mem[1] == mem[0]                          # and nothing grows from call to call
+    assert req[1] == req[0], (req, mem)              # nothing a tensor holds grows from call to call
+    if world.model.name == "simplified":
+        assert mem[1] == mem[0]                      # nor the allocator's blocks (see above for the real legs)
 
 
 @needs_cuda

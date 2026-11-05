@@ -33,7 +33,11 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, reik_balance_fir
     spy("_refresh_balanced", 2)  # (particles, ik_deps, world, gate, step)
     spy("gn_project", 0)  # (world, q_full, world_from_ee, arm)
 
+    # The pose-only refresh (reik_balance_first=False) is a paper ablation arm, so it runs on the simplified model,
+    # the only one that takes it (design call 15); the balance-first modes run on the default model.
+    model_kw = {} if reik_balance_first else {"robot": "simplified"}
     config = TAMPConfiguration(
+        **model_kw,
         num_particles=8,
         num_opt_steps=5,
         coupled_reik=True,

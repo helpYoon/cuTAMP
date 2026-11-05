@@ -57,13 +57,16 @@ graph LR
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
    / configs (`samplers.py`) and runs cuRobo IK — with CoM-aware seed-IK — for
-   each pick / place conf, re-solving particles whose CoM leaves the keyframe
-   rectangle (`COM_HALF_EXTENTS`). Retract confs start at `t1_home`.
+   each pick / place conf, re-solving particles whose CoM leaves the model's
+   keyframe rectangle (`COM_HALF_EXTENTS` on the simplified model). Retract
+   confs start at the model's home (`t1_home` on the simplified model).
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic, motion, collision, stable-placement, and the `ComPolygon`
-   gate: every conf's CoM inside `COM_HALF_EXTENTS`, the real soles shrunk
-   2 cm and another 5 mm for the arrival's deceleration) plus soft costs. Pose-class soft costs use **re-IK-coupled
+   gate: every conf's CoM inside the model's keyframe rectangle, which sits
+   5 mm inside its support region for the arrival's deceleration; on the
+   simplified model that is `COM_HALF_EXTENTS`, the real soles shrunk 2 cm and
+   another 5 mm) plus soft costs. Pose-class soft costs use **re-IK-coupled
    Adam** — outer Adam moves poses while dependent confs are re-projected every
    `reik_interval` steps by balance-first Gauss-Newton (`gn_refresh.py`: CoM
    in the support polygon first, then the pose, then joint-limit margins), with
@@ -73,32 +76,48 @@ graph LR
    (`--no_reik_balance_first`: pose-only GN with a low-seed cuRobo fallback).
    Adam stops after `early_stop_patience` steps without progress and keeps the
    best-seen particles. `ConstraintChecker` decides which particles satisfy.
-4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives the
-   best satisfying particles (up to `motion_plan_max_retries`, first success
-   wins) through `motion_solver.py`: one 21-DOF `MotionPlanner`, built on a
-   background thread while the optimizer runs, re-pinned per operator
-   (`pin_for_arm_action`, a no-op), and planned to each particle conf with
-   `plan_cspace`. When `enable_com_polygon` is on (the default), each segment
-   then passes `_balance_gate`: every frame's CoM and multibody ZMP
-   (`com_zmp_in_support`) must stay inside `SUPPORT_HALF_EXTENTS`, the real
-   soles shrunk 2 cm. A CoM outside fails the candidate and the next one is
-   tried; a ZMP outside slows the segment down uniformly (`_retime`, up to
-   `RETIME_MAX` = 4×), and a ZMP still outside at 4× fails the candidate too.
+4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
+   the best satisfying particles (up to `motion_plan_max_retries`, first
+   success wins) through `motion_solver.py`: one `MotionPlanner` over the
+   model's cspace, built on a background thread while the optimizer runs,
+   re-pinned per operator (`pin_for_arm_action`, a no-op), and planned to each
+   particle conf with `plan_cspace`. When `enable_com_polygon` is on (the
+   default), each segment then passes `_balance_gate`: every frame's CoM and
+   multibody ZMP (`com_zmp_in_support`) must stay inside the model's support
+   rectangle (`world.model.support`): on the simplified model
+   `SUPPORT_HALF_EXTENTS`, the real soles shrunk 2 cm; on the real legs the
+   home stance's two soles, shrunk 2 cm and kept where each foot carries at
+   least a tenth of the weight. A CoM outside fails the candidate and the next
+   one is tried. On the simplified model a ZMP outside slows the segment down
+   uniformly (`_retime`, up to `RETIME_MAX` = 4×), and a ZMP still outside at
+   4× fails the candidate too. On the real legs every frame must also keep
+   both soles on the stance (and the Trunk's tilt within the envelope's bound,
+   where it sets one), and the gate sets every segment's pace (`_pace`): the
+   smallest uniform time scale, faster or slower than the planner's and up to
+   4×, at which every actuated joint's speed stays within cuRobo's limit,
+   every joint's torque, cuRobo's RNEA with the floor's push on the soles
+   (`SegmentTorques`), within its effort, and the ZMP inside. The frames it
+   returns are checked again, and a segment no scale up to 4× passes fails the
+   candidate, naming the check.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the processed plan
    (schema v3, `utils/plan_processor.py`) for the downstream MPC consumer
    ([`examples/load_motion_plan_for_mpc.py`](examples/load_motion_plan_for_mpc.py)
-   shows how to read it). A segment the gate slowed down also carries
-   `planner_timing`, the same segment at the motion planner's own timing
-   (`None` otherwise).
+   shows how to read it). A segment the gate retimed (slowed down, or on the
+   real legs sped up) also carries `planner_timing`, the same segment at the
+   motion planner's own timing
+   (`None` otherwise). A real-leg plan is saved raw (`stage3-raw`, in the
+   model's joint order), which the MPC example refuses.
 
 `run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
 the shared `TAMPWorld`.
 
 ## T1 Single-Planner Architecture (cuRobo v0.8)
 
-cuTAMP plans for the T1 humanoid through a **single 21-DOF
-MotionPlanner** built from `t1_planar_base.yml`. The cspace is:
+cuTAMP plans for the T1 humanoid through a **single MotionPlanner** on one
+of two planning models (`--robot`; `T1Model` in `robots/t1.py`). The default
+is `real_legs` (below). `simplified`, the model the paper's ablation arms run
+on (`--robot simplified`), is built from `t1_planar_base.yml`; its cspace is:
 
 ```
 3 base (planar: base_j_x, base_j_y, base_j_yaw)   ← locked at IK time
@@ -121,7 +140,7 @@ costs can read the base pose.
 
 ```mermaid
 graph TD
-    subgraph Planner [Single 21-DOF MotionPlanner]
+    subgraph Planner [Single MotionPlanner, simplified model]
         Base["Planar base (3, locked at IK)"]
         Body["Leg + Torso (4, always free)"]
         L["Left arm (7)"]
@@ -151,6 +170,16 @@ and torso carry it, and `plan_cspace` holds nothing between the endpoint
 confs (the pin is a no-op). The visualizer tracks both arms' held objects
 through every trajectory (see `T1State.compute_all_held_obj_poses`).
 
+`real_legs`, the default, is bfm_wm's T1 (`assets/t1_29dof/`) on a six-joint
+floating base, built from `t1_29dof.yml`. Its 33 planned joints are the base (x, y, z, then
+pitch, roll, yaw), both 7-joint arms, the Waist and the 12 leg joints; the
+head and the gripper joints are locked. Both soles stand on the home stance:
+the IK's sole goals, GN's sole rows and the kinematic constraint hold them
+there, and the `stance` tool frame, at the home mid-sole on the floor, is the
+support region's frame. The planner's dynamics include the floor's push on
+the soles. The real legs run only the full system: they refuse the ablation
+flags, which run with `--robot simplified`.
+
 ## Layout
 
 ### 📁 [`cutamp/robots/`](cutamp/robots/)
@@ -176,6 +205,12 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
     spheres used by grasp sampling.
   - `meshes/` — STL meshes referenced by `t1_simplified.urdf`;
     `actual_meshes/` — the mesh set `t1.urdf` uses.
+- **[`assets/t1_29dof/`](cutamp/robots/assets/t1_29dof/)** — the real-leg
+  model: a pinned copy of bfm_wm's T1 (`PROVENANCE.yml` gives each file's
+  source and sha1) and `build_planner_model.py`, which derives the planner's
+  `t1_planner.urdf` (the vendor URDF plus a `world` link and cuTAMP's gripper),
+  `t1_29dof.yml` and `t1_29dof_spheres.yml` from it; a rerun reproduces all
+  three byte for byte.
 - [`assets/README.md`](cutamp/robots/assets/README.md) — short index of the
   asset files.
 
@@ -184,12 +219,18 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   account for T1's +X-toward-fingertips EE convention.
 
 - [`t1.py`](cutamp/robots/t1.py) — T1 module:
+  - `T1Model`, the planning model as data, and its two instances `SIMPLIFIED`
+    and `REAL_LEGS` (`get_model(config.robot)`): the cspace and its joint
+    groups, home, limit margins, support rectangle, sole frames and envelope.
   - cuRobo loaders: `get_t1_kinematics` (always `compute_com=True`;
     `compute_jacobian=True` for the GN refresh), `get_t1_ik_solver(scene)` (a single
     multi-tool-frame IK over both arms; with `enable_com_aware_ik=True`, the
     default, its seed-IK LM stage carries a CoM residual — a cuRobo fork
-    edit — over the largest base-centred box inside `COM_HALF_EXTENTS`
-    (the fork's box has no centre, so it falls 2 cm short at the toe),
+    edit — over the largest frame-centred box inside the model's keyframe
+    rectangle (the fork's box has no centre: on the simplified model
+    `COM_HALF_EXTENTS` sits 1 cm ahead of the base, so the box falls 2 cm short
+    at the toe; on the real legs the rectangle is centred on the stance, so the
+    box is the rectangle),
     weighted by `T1_COM_IK_WEIGHT` and the
     pull-to-center `T1_COM_IK_CENTER_WEIGHT`; `num_seeds` / `lbfgs_iters` /
     `use_cuda_graph` configure the re-IK refresh solver), `get_t1_motion_planner`
@@ -198,28 +239,29 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
     `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
     masses and CoMs and the URDF's inertias, for the balance gate's
     multibody ZMP).
-  - Joint-name + index constants: `JOINT_NAMES_FULL`, `BASE_INDICES`,
-    `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`,
-    `t1_home`, the per-joint, per-side joint-limit bands
+  - The simplified model's joint-name + index constants: `JOINT_NAMES_FULL`,
+    `BASE_INDICES`, `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`,
+    `RIGHT_ARM_JOINT_NAMES`, `t1_home`, the per-joint, per-side joint-limit bands
     `T1_LIMIT_MARGIN_LOWER` / `T1_LIMIT_MARGIN_UPPER`, and the planner's
     ankle-pitch upper band `T1_TRAJOPT_ANKLE_UPPER_MARGIN` (0.02 rad).
-  - `T1RerunRobot` for visualization: maps a 21-DOF cspace vector into the
-    URDF's 28 joints (the planar base becomes a root transform), splices in
-    head + per-arm gripper state. Playback reprojects the planner's 18-DOF
-    trajectories to 21 first.
+  - `T1RerunRobot` for visualization: sets the URDF's joints from a conf in
+    the model's cspace (the base becomes a root transform) and the gripper
+    state from `set_grippers`. Playback reprojects the planner's trajectories
+    to the model's full cspace first.
 
 ### 📁 [`cutamp/`](cutamp/) — core
 
-- [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a TAMPEnvironment
-  with the collision Scene, the single `Kinematics` (built with
-  `compute_com=True`), a single multi-tool-frame
-  `InverseKinematics` solver, and a `MotionPlanner` factory. `q_init` is one
-  21-DOF tensor. Built lazily: `ik_refresh_solver` (the low-seed, warm-started
-  IK for re-IK refreshes when `reik_num_seeds > 0`), `kinematics_jac` (the
-  Jacobian twin for the GN refresh), `bodies` (`get_t1_bodies`: a second
-  `Kinematics` whose tool frames are every massive link, for the balance
-  gate's multibody ZMP), and one `site_kinematics(name)` per
-  Adam-loop FK site in `FK_SITES`.
+- [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a
+  TAMPEnvironment with the collision Scene, the single `Kinematics` (built
+  with `compute_com=True`), a single multi-tool-frame `InverseKinematics`
+  solver, and a `MotionPlanner` factory. `q_init` is the model's home. On the
+  real legs it also holds the stance (`stance_soles`, `sole_goals`) and
+  `segment_torques`. Built lazily: `ik_refresh_solver` (the low-seed,
+  warm-started IK for re-IK refreshes when `reik_num_seeds > 0`),
+  `kinematics_jac` (the Jacobian twin for the GN refresh), `bodies`
+  (`get_t1_bodies`: a second `Kinematics` whose tool frames are every massive
+  link, for the balance gate's multibody ZMP), and one `site_kinematics(name)`
+  per Adam-loop FK site in `FK_SITES`.
 
 - [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner, the
   per-tool-frame `tool_from_ee`, and per-arm `arm_holding` /
@@ -245,11 +287,13 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   residual lives inside the seed-IK fork instead).
 
 - [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
-  truth for the balance geometry: the real soles (`SOLE_HALF_EXTENTS`,
-  centred at `COM_CENTER`, 1 cm ahead of the ankle axis), the trajectory
-  gate's `SUPPORT_HALF_EXTENTS` (the soles shrunk by `COM_SAFETY_MARGIN` =
-  2 cm), the keyframes' `COM_HALF_EXTENTS` (a further `COM_DYNAMIC_RESERVE`
-  = 5 mm in), `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT` and `COM_TOL`. Its
+  truth for the balance geometry: the simplified model's real soles
+  (`SOLE_HALF_EXTENTS`, centred at `COM_CENTER`, 1 cm ahead of the ankle
+  axis), its trajectory gate's `SUPPORT_HALF_EXTENTS` (the soles shrunk by
+  `COM_SAFETY_MARGIN` = 2 cm) and its keyframes' `COM_HALF_EXTENTS` (a further
+  `COM_DYNAMIC_RESERVE` = 5 mm in); `support_rectangles`, which gives the real
+  legs' two rectangles from their sole geometry and the load guard with the
+  same margins; `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT` and `COM_TOL`. Its
   consumers: `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
   `ComOverBasePolygonCost` (the planner rollout cost),
   `compute_com_polygon_penalties` (the hard `ComPolygon` constraint),
@@ -274,12 +318,19 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   multibody ZMP must stay inside `SUPPORT_HALF_EXTENTS`; a ZMP excursion
   slows the segment uniformly (`_retime`, a C² cubic spline, up to
   `RETIME_MAX` = 4×), and a CoM excursion or a ZMP still out at 4× raises and
-  fails the candidate. Each segment is appended to `accum_plans` (with
-  `held_objs` for both arms; a slowed one also keeps `planner_timing`, the
-  same spline at the planner's own timing), then the object is
-  attached/detached via the AttachmentManager. Playback walks `accum_plans` and
-  hands each entry to the visualizer. The run metrics get the gate's
-  `retime_max`, `traj_com_min_margin` and `traj_zmp_min_margin`, plus
+  fails the candidate. On the real legs (`_pace`) the gate times each segment
+  at the smallest uniform scale its speed, torque and ZMP checks pass: the
+  speed's and the torque's exactly, the ZMP's by a batched search to within
+  `RETIME_TOL` = 2% above it, all on the planner's frames with the velocities
+  over s and the accelerations over s². Each segment is appended to
+  `accum_plans` (with `held_objs` for both arms; a retimed one also keeps
+  `planner_timing`, the same spline at the planner's own timing), then the
+  object is attached/detached via the AttachmentManager. Playback walks
+  `accum_plans` and hands each entry to the visualizer. The run metrics get
+  the gate's `retime_min`, `retime_max` (on the real legs the scales run below
+  1 too), on the real legs `retime_binding` (segments per binding check:
+  `velocity <joint>`, `torque <joint>`, `zmp`, or `none` for a still one),
+  `traj_com_min_margin` and `traj_zmp_min_margin`, plus
   `plan_duration_s` and the measure-only audit `traj_com_violation_frac` /
   `traj_com_frames` against the gate's rectangle.
 
@@ -353,7 +404,8 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
 
 - [`cost_function.py`](cutamp/cost_function.py) — hard constraints
   (kinematic, motion, collision, stable placement, and the `ComPolygon`
-  CoM-in-rectangle gate on `COM_HALF_EXTENTS` over every `q_*` conf) plus the soft costs listed in
+  CoM-in-rectangle gate on the model's keyframe rectangle, `COM_HALF_EXTENTS`
+  on the simplified model, over every `q_*` conf) plus the soft costs listed in
   `SUPPORTED_SOFT_COSTS` (`place_close_to_base`, `joint_limit_margin`,
   `retract_close_to_home`, `minimize_body_movement`, the multi-object
   placement costs, …). `_compute_soft_cost` hard-codes the names, so a new
@@ -374,7 +426,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   records per-run metrics and timings.
 
 - [`rollout.py`](cutamp/rollout.py) — FK rollout helpers used by the cost
-  graph (forward kinematics on the full 21-DOF cspace).
+  graph (forward kinematics on the model's full cspace).
 
 - [`conf_locking.py`](cutamp/conf_locking.py) — per-conf gradient masks
   (`build_grad_masks` / `apply_grad_masks`) that zero the base and
@@ -403,7 +455,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   `get_world_cfg`), `shapes.py` (`sample_greedy_surface_spheres`),
   `rerun_utils.py`, and `timer.py` (`TorchTimer`, GPU-synchronized timing).
 
-### 📁 [`cutamp/tests/`](cutamp/tests/) — 227 tests in 34 files
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 356 tests in 44 files
 
 Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 (`needs_cuda` marker, `make_blocks_t1_world` factory, the module-scoped
@@ -414,18 +466,20 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) — YAML
   schema, cspace, lock-joints, tool frames, kinematics smoke.
 - [`test_com_polygon_ik.py`](cutamp/tests/test_com_polygon_ik.py) — COM
-  penalty math, mask/gate parity, and a guard on cuRobo's batched-COM kernel
-  (fixed upstream in PR #678).
+  penalty math, mask/gate parity (on both models, with rows on either side of
+  the support edge), and a guard on cuRobo's batched-COM kernel (fixed upstream
+  in PR #678), on the default model.
 - [`test_com_aware_seed_ik.py`](cutamp/tests/test_com_aware_seed_ik.py) —
-  CoM-aware seed-IK: fork/cuTAMP penalty parity, FD-checked gradients,
-  centering A/B with joint-limit and pose-accuracy guards.
+  CoM-aware seed-IK: each model's CoM box, fork/cuTAMP penalty parity,
+  gradients FD-checked on every joint, centering A/B with joint-limit and
+  pose-accuracy guards, on the default model.
 - [`test_motion_anchor.py`](cutamp/tests/test_motion_anchor.py) — full
-  pipeline: cspace-anchored pick/place terminals, all arrivals
+  pipeline on the simplified model: cspace-anchored pick/place terminals, all arrivals
   CoM-in-rectangle, every exported frame's CoM and ZMP inside
   `SUPPORT_HALF_EXTENTS`, and slowed segments' `planner_timing`; the no-CoM
   arm is never gated.
 - [`test_balance_gate.py`](cutamp/tests/test_balance_gate.py) — the
-  trajectory balance gate: the multibody ZMP against a float64 reference,
+  simplified model's trajectory balance gate: the multibody ZMP against a float64 reference,
   CoM rejects, ZMP slowdowns up to the 4× cap, `_retime`'s endpoints, and
   the planner timing it keeps.
 - [`test_robot_com.py`](cutamp/tests/test_robot_com.py) — `t1_simplified`'s
@@ -433,36 +487,74 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   plane.
 - [`test_gn_refresh.py`](cutamp/tests/test_gn_refresh.py) /
   [`test_gn_balanced_step.py`](cutamp/tests/test_gn_balanced_step.py) — GN
-  refresh, including the Jacobian-convention guard, and the balance-first core.
+  refresh, including the Jacobian-convention guard, and the balance-first core
+  (`test_gn_refresh.py` on the default model, except the pose-only
+  `gn_project` and the margin bands, on the simplified one).
 - [`test_step_lockstep.py`](cutamp/tests/test_step_lockstep.py) and the
   `test_cuda_graphs*.py` files — every Adam step bitwise against its twin and
-  the reference math; every graph replay bitwise against eager.
+  the reference math; every graph replay bitwise against eager. The full
+  system runs on the default model; the ablation arms, and joint_limit_margin's
+  step body (the real legs' bands are zero), on the simplified one. The memory
+  check across two optimize calls runs on both: the bytes the tensors request
+  are exact on both models; the allocator's block count is exact only on the
+  simplified one (on the real legs cuRobo IK's line search reuses cached blocks).
+- [`test_t1_real_legs_model.py`](cutamp/tests/test_t1_real_legs_model.py),
+  [`test_t1_29dof_assets.py`](cutamp/tests/test_t1_29dof_assets.py), the
+  `test_real_legs_*.py` files and
+  [`test_floor_wrench.py`](cutamp/tests/test_floor_wrench.py) — the real-leg
+  model: the pinned assets and their byte-identical rebuild, the stance and
+  its support, IK and GN holding the soles, the gate's sole, tilt, torque and
+  speed checks and the pace they set, the floor's push, and `--robot
+  real_legs` end to end.
 - Plus pin lifecycle, arm-affinity priority, plan-processor derivatives,
-  joint-limit margins, motion attach / retry, the ablation runner and
-  analyzer, and a coupled-reIK smoke test.
+  joint-limit margins (the simplified model's bands), motion attach / retry,
+  the ablation runner and analyzer, and a coupled-reIK smoke test (its
+  pose-only arm on the simplified model).
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~5.5 min on an RTX 4090: 223
-passed, 4 skipped on 2026-11-03).
-`CUTAMP_SLOW=1` also runs the 4 live `--cuda_graphs` tests in
-[`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), and the
-MPC example has its own: `pytest examples/`.
+(GPU required for the integration tests; ~6.5 min on an RTX 4090: 348
+passed, 8 skipped on 2026-11-05).
+`CUTAMP_SLOW=1` also runs the 8 slow live tests: 6 `--cuda_graphs` runs in
+[`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), the floor
+hook on a live motion planner in
+[`test_floor_wrench.py`](cutamp/tests/test_floor_wrench.py) and the
+`--robot real_legs` run in
+[`test_real_legs_motion.py`](cutamp/tests/test_real_legs_motion.py). The MPC
+example has its own: `pytest examples/`.
 
 ### 📁 [`cutamp/scripts/`](cutamp/scripts/)
 
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
-  (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--robot` or `--env`
-  flag, no other envs in this branch); `--surface_height` raises the blocks
-  and goal pad, `--seed` seeds the sampling, and `--save_plan PATH` (or
-  `auto`, next to the run's metrics) saves the processed plan.
+  (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--env` flag, no
+  other envs in this branch); `--robot` picks the planning model
+  (`real_legs`, the default, or `simplified`), `--surface_height` raises the
+  blocks and goal pad, `--seed` seeds the sampling, and `--save_plan PATH` (or
+  `auto`, next to the run's metrics) saves the plan: processed into schema v3
+  on the simplified model, raw (`stage3-raw`, the model's joints) on the real
+  legs.
 - [`run_ablation.py`](cutamp/scripts/run_ablation.py) — the 2x2 CoM × re-IK
   ablation plus `default_reik` (cells `full`, `default_reik`, `no_com`,
-  `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`), one
+  `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`, all on
+  the simplified model), one
   `run_cutamp` subprocess per run that saves its plan (`--save_plan auto`),
   with a resumable manifest; `--smoke` / `--heights` / `--seeds` shrink it.
+  `--gate` runs the speed gate instead: both models at `-n` 64,
+  interleaved, over the same heights and seeds, each run replayable from its
+  seed.
 - [`analyze_ablation.py`](cutamp/scripts/analyze_ablation.py) — turns that
-  manifest into `results.csv`, `deltas.csv`, `results.md` and figures.
+  manifest into `results.csv`, `deltas.csv`, `results.md` and figures; with
+  `--gate`, a gate study into `gate.json` and `gate.md`: per model and `-n`
+  the runs, planning-time median and p90 and the stage times, and the verdict
+  at `-n` 64 (all 40 runs of each model timed, every real-leg run solved,
+  motion-planned and balanced, and median and p90 times at most 1.5× and 2×
+  the simplified model's).
+- [`real_legs_report.py`](cutamp/scripts/real_legs_report.py) — the real-leg
+  plans of a study: per joint, the peak torque against its effort and the peak
+  speed against the motor's knee speed and cuRobo's limit; per run, the
+  largest Trunk tilt and sole drift, the segments the gate slowed and sped
+  up, its margins, time scales and binding checks, and any planner-timed
+  segment past an effort (`PREFIX.json`, `PREFIX.md`).
 - [`check_plan_margins.py`](cutamp/scripts/check_plan_margins.py) — per-joint
   distances to limits in a saved plan; exits 1 if a protected side comes
   within `--threshold` (0.05 rad) or any waypoint violates a limit.
@@ -477,16 +569,21 @@ MPC example has its own: `pytest examples/`.
 
 ## Usage
 
-By default a run uses 256 particles and the validated pair —
+By default a run plans on the real legs (bfm_wm's T1 on its home stance)
+with 256 particles and the validated pair —
 `place_close_to_base` optimized under re-IK-coupled Adam — plus the
 balance-first GN refresh replayed as CUDA graphs, the `joint_limit_margin`
-soft cost and CoM-aware IK,
+and `minimize_body_movement` soft costs and CoM-aware IK,
 so placements stay near the
-base, endpoint confs keep off their joint limits, and every arrival lands with
-its CoM inside the keyframe rectangle. With `--motion_plan`, every trajectory
-frame also keeps its CoM and ZMP inside the soles shrunk 2 cm: a segment
-whose ZMP would leave them is slowed down, up to 4×, and a candidate that
-still fails is dropped (`motion_solver._balance_gate`).
+base, the body stays near its home, and every arrival lands with its CoM
+inside the keyframe rectangle (`joint_limit_margin`'s band is zero on the real
+legs, whose limits are already bfm_wm's soft limits; on the simplified model it
+keeps endpoint confs off their joint limits). With `--motion_plan`, every trajectory
+frame also keeps its CoM and ZMP inside the soles shrunk 2 cm: the gate sets
+each segment's pace (on the simplified model a segment whose ZMP would leave
+them is slowed down), up to 4×, and a candidate that still fails is dropped
+(`motion_solver._balance_gate`). `--robot simplified` plans on the 21-DOF
+model, which the ablation flags, schema v3 and `check_plan_margins` need.
 
 ```bash
 # Smoke test (no motion plan)
@@ -504,8 +601,8 @@ python -m cutamp.scripts.run_cutamp --motion_plan -n 64
 # balance-first: with --no_reik_balance_first the check failed on all 10 runs
 # at -n 64, seeds 0-9, --soft_cost joint_limit_margin, each on Torso_Pitch's
 # lower side, measured 2026-11-02, before the real-mass model and the
-# trajectory gate)
-python -m cutamp.scripts.run_cutamp --motion_plan -n 64 \
+# trajectory gate); schema v3 and the check are the simplified model's
+python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan -n 64 \
     --save_plan data/motion_plan.pkl
 python examples/load_motion_plan_for_mpc.py data/motion_plan.pkl
 python -m cutamp.scripts.check_plan_margins --plan data/motion_plan.pkl
@@ -515,17 +612,27 @@ python -m cutamp.scripts.run_cutamp --motion_plan \
     --soft_cost retract_close_to_home minimize_body_movement
 
 # Classic single-level optimization (no re-IK, so the soft costs stay out of
-# Adam and the run is eager)
-python -m cutamp.scripts.run_cutamp --motion_plan --no_coupled_reik
+# Adam and the run is eager), an ablation arm, so on the simplified model
+python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan --no_coupled_reik
 
 # Eager Adam steps and refreshes (no CUDA graphs)
 python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
 
-# 2x2 ablation study plus default_reik (200 runs at -n 512, each saving its
-# plan), then its table and figures
+# 2x2 ablation study plus default_reik (200 runs at -n 512 on the simplified
+# model, each saving its plan), then its table and figures
 python -m cutamp.scripts.run_ablation --out /tmp/ablation-study
 python -m cutamp.scripts.analyze_ablation \
     --manifest /tmp/ablation-study/manifest.json --out docs/ablation
+
+# The real legs (the default, named here), saving the raw plan
+python -m cutamp.scripts.run_cutamp --robot real_legs --motion_plan --save_plan auto
+
+# The speed gate (both models, 80 runs), its verdict, and the real-leg report
+python -m cutamp.scripts.run_ablation --out /tmp/gate-study --gate
+python -m cutamp.scripts.analyze_ablation --gate \
+    --manifest /tmp/gate-study/manifest.json --out /tmp/gate-study/gate
+python -m cutamp.scripts.real_legs_report --study /tmp/gate-study \
+    --out /tmp/gate-study/real_legs
 ```
 
 **Available soft costs** (see `SUPPORTED_SOFT_COSTS`; T1-only ones marked):
@@ -533,13 +640,17 @@ python -m cutamp.scripts.analyze_ablation \
   keeps placements inside the reach range where the CoM-aware IK can center
   the COM.
 - `joint_limit_margin` *(default, T1)* — keep segment-endpoint confs out of a
-  0.1 rad band inside each joint limit (no band on the home-side bounds the
-  standing pose sits on). Under coupled re-IK it moves only the retract confs:
+  band inside each joint limit: on the simplified model 0.1 rad (no band on the
+  home-side bounds the standing pose sits on); on the real legs the band is zero,
+  since their limits are already bfm_wm's soft limits, so the cost is a no-op
+  there. Under coupled re-IK it moves only the retract confs:
   pick/place confs are outside Adam, so the balance-first refresh's margin
   level keeps them out of the same bands, listed or not
   (`--no_reik_balance_first` leaves them unguarded).
-- `retract_close_to_home` *(T1)* — penalize retract configs far from `t1_home`.
-- `minimize_body_movement` *(T1)* — penalize body (leg/torso/waist) drift.
+- `retract_close_to_home` *(T1)* — penalize retract configs far from the
+  model's home (`t1_home` on the simplified model).
+- `minimize_body_movement` *(T1; default on the real legs)* — penalize body
+  (leg/torso/waist) drift.
 - `dist_from_origin`, `max_obj_dist` / `min_obj_dist`, `min_y` / `max_y`,
   `align_yaw` — multi-object placement costs.
 
@@ -550,8 +661,8 @@ steps (balance-first Gauss-Newton, no cuRobo during Adam; the final pre-check
 refresh still repairs with cuRobo IK; `--no_reik_balance_first` restores the
 pose-only Gauss-Newton with a cuRobo IK fallback).
 
-Peak VRAM with motion planning: about 3 GiB at `-n 64` and 8 GiB at the
-default 256 (the CUDA graphs add about 0.05 and 0.3 GiB);
+Peak VRAM on the simplified model with motion planning: about 3 GiB at `-n 64`
+and 8 GiB at the default 256 (the CUDA graphs add about 0.05 and 0.3 GiB);
 `--no_reik_balance_first` takes about 3.5 and 9.5 GiB (see
 `num_particles` in `config.py` for 512 and 1024). These figures and the
 commands above use PyTorch's default allocator. They were measured on
@@ -561,7 +672,7 @@ Adam).
 
 ## Key Design Decisions
 
-1. **Single 21-DOF MotionPlanner** — cuRobo v0.8's `GoalToolPose` takes a
+1. **Single MotionPlanner** — cuRobo v0.8's `GoalToolPose` takes a
    target for every tool frame of a kinematics that exposes both arms (the
    inactive frames get their current FK pose), and the planner then plans
    every segment in cspace, so we no longer need
@@ -588,9 +699,9 @@ Adam).
    planner's collision checks, with three gaps: GN checks no collision (the
    optimizer rescores every conf each step), a pick or place segment
    disables its block or support surface for the whole robot, and a segment
-   the balance gate slows down is resampled through the planner's frames
-   (`_retime`) without new collision or joint-limit checks on the in-between
-   frames.
+   the balance gate retimes (slows down, or on the real legs speeds up) is
+   resampled through the planner's frames (`_retime`) without new collision
+   or joint-limit checks on the in-between frames.
 
 4. **Both arms tracked through every trajectory** — body joints are unlocked
    during single-arm planning, so an inactive arm holding a block will still
@@ -599,9 +710,10 @@ Adam).
 
 5. **Retract after pick/place** — the per-arm `RetractHolding` (collision checks
    exclude held object) and `RetractFree` (empty gripper) operators move toward
-   `t1_home` after each manipulation. Retract confs start at `t1_home`; the
-   hard collision, joint-limit and `ComPolygon` constraints, the default
-   `joint_limit_margin` soft cost (under coupled re-IK) and the opt-in
+   the model's home (`t1_home` on the simplified model) after each
+   manipulation. Retract confs start at that home; the hard collision,
+   joint-limit and `ComPolygon` constraints, the default `joint_limit_margin`
+   soft cost (under coupled re-IK; zero on the real legs) and the opt-in
    `retract_close_to_home` shape the result.
 
 6. **cuRobo internals isolated** — every workaround that reaches into cuRobo's
@@ -618,15 +730,18 @@ Adam).
    all); those must travel with any cuRobo upgrade, or the link CoMs come
    back wrong.
 
-7. **Layered COM safety** — the COM is kept inside the real T1's soles,
-   shrunk 2 cm (`SUPPORT_HALF_EXTENTS`, every trajectory frame) and another
-   5 mm for keyframes (`COM_HALF_EXTENTS`), both centred on `COM_CENTER`,
-   1 cm ahead of the ankle axis (`com_polygon_cost.py`), by independent
-   layers, each guarding a different frontier:
+7. **Layered COM safety** — the COM is kept inside the model's support region
+   (every trajectory frame) and its keyframe rectangle, 5 mm further in: on the
+   simplified model the real T1's soles shrunk 2 cm (`SUPPORT_HALF_EXTENTS`)
+   and `COM_HALF_EXTENTS`, both centred on `COM_CENTER`, 1 cm ahead of the
+   ankle axis; on the real legs `support_rectangles`' two rectangles, centred
+   on the stance (`com_polygon_cost.py`). Independent layers each guard a
+   different frontier:
    - **CoM-aware seed-IK** (cuRobo fork residual, on by default): the IK
      itself trades hand pose vs COM, recruiting the knees/ankles within
-     joint limits, with a pull-to-center term on a base-centred box
-     (`get_t1_ik_solver`, 2 cm short of the keyframe rectangle at the toe) —
+     joint limits, with a pull-to-center term on a frame-centred box
+     (`get_t1_ik_solver`; on the simplified model 2 cm short of the keyframe
+     rectangle at the toe) —
      endpoint confs come out near the ankle axis, not edge-parked.
    - **Hard `ComPolygon` gate**: every optimizer conf must have COM penalty
      ≤ `COM_TOL`; a post-IK mask + retry backstops the IK.

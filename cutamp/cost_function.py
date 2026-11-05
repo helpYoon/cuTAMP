@@ -8,6 +8,7 @@
 # its affiliates is strictly prohibited.
 
 import itertools
+import math
 from collections import defaultdict
 from functools import lru_cache
 from typing import Dict, Optional, Tuple, Union
@@ -20,6 +21,7 @@ from curobo.types import JointState
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
+from cutamp.joint_limit_cost import trunk_tilt_excess
 from cutamp.rollout import Rollout, get_retract_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
@@ -113,6 +115,17 @@ class CostFunction:
             self_collision_kin_config=self.world.kinematics.get_self_collision_config(),
         )
         self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
+        # On the real legs the retract confs join the joint-limit and self-collision constraints (design 7.3), on a
+        # cost of their own: an instance rewrites its output and gradient buffers on every call of one shape.
+        self.retract_self_collision_cost_fn = (
+            SelfCollisionCost(self_collision_config) if world.model.sole_frames and self.retract_info else None
+        )
+        # The envelope's Trunk tilt bound (call 22), as trunk_tilt_excess's arguments after the confs: the base's pitch
+        # and roll columns, and the cosine of the maximum tilt. None without an envelope or when it sets no bound.
+        envelope, names = world.model.envelope, world.model.joint_names
+        self.trunk_tilt_args = None if envelope is None or envelope.trunk_tilt_max is None else (
+            names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(envelope.trunk_tilt_max)
+        )
 
         # Conf parameters for kinematic constraints, order in rollout should match
         self.kinematic_confs, self.kinematic_actions = zip(*(con.params for con in self.kinematic_constraints))
@@ -192,17 +205,26 @@ class CostFunction:
         self._rollout_validated = True
 
     def kinematic_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Kinematic constraints - i.e., pose error between actual and desired end-effector poses."""
+        """Kinematic constraints - i.e., pose error between actual and desired end-effector poses. On the real
+        legs also both soles' error against the stance at every conf, ``sole_pos_err`` and ``sole_rot_err``
+        ``[N, 2H]``: a conf whose feet drifted would pass the CoM gate on a support polygon it no longer stands
+        on (design 7.4)."""
         pos_errs, rot_errs = curobo_pose_error(rollout["world_from_ee"], rollout["world_from_ee_desired"])
+        values = {"pos_err": pos_errs, "rot_err": rot_errs}
+        if rollout["world_from_soles"] is not None:
+            sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.stance_soles)  # [N, H, 2]
+            values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
         kinematic_cost = {
             "type": "constraint",
             "constraints": self.kinematic_constraints,
-            "values": {"pos_err": pos_errs, "rot_err": rot_errs},
+            "values": values,
         }
         return kinematic_cost
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Motion constraints — joint-limit violation + self-collision cost."""
+        """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and, on the
+        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope
+        that bounds the tilt, also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 
@@ -214,12 +236,35 @@ class CostFunction:
         self.self_collision_cost_fn.setup_batch_tensors(b, h)
         self_coll_vals = self.self_collision_cost_fn.forward(robot_spheres).squeeze(-1)
 
+        values = {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals}
+        if self.retract_self_collision_cost_fn is not None and self._particles is not None:
+            values.update(self._retract_motion_values())
+        if self.trunk_tilt_args is not None:
+            # ponytail: the retract confs are left out: their base and body are locked at home, which stands upright.
+            values["trunk_tilt"] = trunk_tilt_excess(confs, *self.trunk_tilt_args)
         motion_cost = {
             "type": "constraint",
             "constraints": self.motion_constraints,
-            "values": {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals},
+            "values": values,
         }
         return motion_cost
+
+    def _retract_motion_values(self) -> Dict[str, torch.Tensor]:
+        """``retract_joint_limit`` and ``retract_self_collision``, each ``[N, R]`` over ``retract_info``'s confs,
+        from one FK of every retract conf on its own site (TAMPWorld.site_kinematics)."""
+        q = torch.stack([self._particles[name] for name, _, _ in self.retract_info], dim=1)  # [N, R, dof]
+        n, r = q.shape[0], q.shape[1]
+        kin_state = self.world.site_kinematics("retract_motion").compute_kinematics(
+            JointState.from_position(q.view(n * r, -1))
+        )
+        joint_limits = self.world.joint_limits
+        self.retract_self_collision_cost_fn.setup_batch_tensors(n, r)
+        return {
+            "retract_joint_limit": dist_from_bounds_jit(q, joint_limits[0], joint_limits[1]),
+            "retract_self_collision": self.retract_self_collision_cost_fn.forward(
+                kin_state.robot_spheres.view(n, r, -1, 4)
+            ).squeeze(-1),
+        }
 
     def stable_placement_costs(
         self, rollout: Rollout, obj_to_spheres: Dict[str, torch.Tensor]  # each [b, t, n, 4]
@@ -430,15 +475,15 @@ class CostFunction:
             return _pairwise_upper_sum(yaw_diffs)
         
         # Retract close to home — penalize body slice (post-base) deviation
-        # from the configured T1 home pose.
+        # from the model's home pose.
         elif cost_name == "retract_close_to_home":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for retract_close_to_home soft cost")
 
-            from cutamp.robots.t1 import BASE_DOF, t1_home
-            home_t = _device_const(t1_home, device)
-            # Penalize body (leg+torso+arms) deviation; ignore base x/y/yaw.
-            body_slice = slice(BASE_DOF, len(t1_home))
+            model = self.world.model
+            home_t = _device_const(model.home, device)
+            # Penalize body (leg+torso+arms) deviation; ignore the base, which comes first.
+            body_slice = slice(model.base.stop, len(model.home))
             home_body = home_t[body_slice]
 
             retract_param_names = [info[0] for info in self.retract_info]
@@ -453,34 +498,36 @@ class CostFunction:
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for minimize_body_movement soft cost")
 
-            from cutamp.robots.t1 import BODY_INDICES, t1_home
-            home_body = _device_const(t1_home[BODY_INDICES], device)
+            body = self.world.model.body
+            home_body = _device_const(self.world.model.home[body], device)
 
             config_params = [p for p in self._particles if p.startswith(("left_q", "right_q", "q"))]
             if config_params:
                 all_configs = torch.stack([self._particles[p] for p in config_params], dim=1)
-                return (all_configs[:, :, BODY_INDICES] - home_body).pow(2).sum(dim=(1, 2))
+                return (all_configs[:, :, body] - home_body).pow(2).sum(dim=(1, 2))
             return torch.zeros(num_particles, device=device)
 
         # Joint-limit margin — keep endpoint configurations a soft band away
-        # from position limits. Per-joint/per-side margins from robots/t1.py
+        # from position limits. Per-joint/per-side margins from the model
         # (zero on the home-side bounds the standing posture sits ON, so home
-        # costs exactly 0). q0s are excluded inside the helper: the initial
-        # robot state must never acquire margin gradients (Phase-2 LBFGS
-        # re-leafs every cloned particle).
+        # costs exactly 0; zero everywhere on the real legs, whose limits are
+        # already the policy's soft limits, so the cost is 0 there). q0s are
+        # excluded inside the helper: the initial robot state must never
+        # acquire margin gradients (Phase-2 LBFGS re-leafs every cloned
+        # particle).
         elif cost_name == "joint_limit_margin":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for joint_limit_margin soft cost")
 
             from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
-            from cutamp.robots.t1 import T1_LIMIT_MARGIN_LOWER, T1_LIMIT_MARGIN_UPPER
 
-            limits = self.world.joint_limits  # [2, 21], row 0 = lower
+            model = self.world.model
+            limits = self.world.joint_limits  # [2, dof], row 0 = lower
             return joint_limit_margin_soft_cost(
                 self._particles,
                 limits,
-                _device_const(T1_LIMIT_MARGIN_LOWER, device, limits.dtype),
-                _device_const(T1_LIMIT_MARGIN_UPPER, device, limits.dtype),
+                _device_const(model.margin_lower, device, limits.dtype),
+                _device_const(model.margin_upper, device, limits.dtype),
                 num_particles,
                 device,
             )

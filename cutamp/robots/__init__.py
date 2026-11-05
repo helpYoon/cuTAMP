@@ -1,7 +1,8 @@
 """Robot containers and loaders for cuTAMP (cuRobo v0.8 single-MotionPlanner).
 
-T1 humanoid is the only supported robot. The ``RobotContainer`` exposes its
-21-DOF kinematics + per-tool-frame gripper spheres / tool transforms.
+T1 humanoid is the only supported robot, on one of two planning models
+(:class:`~cutamp.robots.t1.T1Model`). The ``RobotContainer`` holds the model,
+its kinematics + per-tool-frame gripper spheres / tool transforms.
 """
 
 from dataclasses import dataclass
@@ -14,8 +15,12 @@ from curobo.types import DeviceCfg
 
 from .t1 import (
     LEFT_TOOL_FRAME,
+    REAL_LEGS,
     RIGHT_TOOL_FRAME,
+    SIMPLIFIED,
     TOOL_FRAMES as T1_TOOL_FRAMES,
+    T1Model,
+    get_model,
     get_t1_gripper_spheres,
     get_t1_kinematics,
     get_t1_tool_from_ee,
@@ -28,11 +33,14 @@ from .t1 import (
 class RobotContainer:
     """Container for robot kinematics, gripper data, and tool frames.
 
-    T1 has two tool frames (``left_base_link``, ``right_base_link``);
-    ``tool_from_ee`` and ``gripper_spheres`` are dicts keyed by tool-frame name.
+    T1 has two tool frames (``left_base_link``, ``right_base_link``) on both
+    models; ``tool_from_ee`` and ``gripper_spheres`` are dicts keyed by
+    tool-frame name. The kinematics may track more frames (the real legs'
+    soles and stance).
     """
 
     name: str
+    model: T1Model
     kinematics: Kinematics
     joint_limits: torch.Tensor  # [2, d]
     tool_frames: List[str]
@@ -40,11 +48,11 @@ class RobotContainer:
     gripper_spheres: Dict[str, torch.Tensor]  # each [n, 4]
 
 
-def load_t1_container(device_cfg: DeviceCfg = None) -> RobotContainer:
-    """T1 humanoid as a single 21-DOF robot with two tool frames."""
+def load_t1_container(model: T1Model, device_cfg: DeviceCfg = None) -> RobotContainer:
+    """T1 humanoid on ``model``, as a single robot with two tool frames."""
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    kin = get_t1_kinematics(device_cfg)
+    kin = get_t1_kinematics(model, device_cfg)
     joint_limits = kin.get_joint_limits().position
     assert joint_limits.shape[0] == 2
 
@@ -56,6 +64,7 @@ def load_t1_container(device_cfg: DeviceCfg = None) -> RobotContainer:
 
     return RobotContainer(
         name="t1",
+        model=model,
         kinematics=kin,
         joint_limits=joint_limits,
         tool_frames=list(T1_TOOL_FRAMES),

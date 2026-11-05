@@ -67,7 +67,7 @@ def _head_math(world):
         yield shared
 
 
-def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_types, with_soft,
+def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_types,
                params: List[str], masks: Dict[str, torch.Tensor]) -> dict:
     """One Adam step as HEAD's loop runs it, as :func:`step_outputs`; ``params`` names the optimized particles."""
     from cutamp.conf_locking import apply_grad_masks
@@ -78,9 +78,8 @@ def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_
     satisfying_mask = get_mask(cost_dict, verbose=False)
     loss = costs.mean()
     scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-    if with_soft:
-        soft_costs = cost_reducer.soft_costs(cost_dict)
-        scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
+    soft_costs = cost_reducer.soft_costs(cost_dict)
+    scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
     packed = torch.stack(scalars)
     loss.backward()
     apply_grad_masks([{"params": [particles[n] for n in params]}], {id(particles[n]): m for n, m in masks.items()})
@@ -133,7 +132,7 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
         with _head_math(world) as shared:
             ref, ref_sites = site_fk(lambda: _head_step(
                 clone_particles(self.particles), self.rollout_fn, self.cost_fn, self.cost_reducer, self.get_mask,
-                self.consider_types, self.with_soft, names, masks))
+                self.consider_types, names, masks))
         twin = twin_body(self)
         again, twin_sites = site_fk(lambda: step_outputs(*orig(twin), twin.params))
         (packed, vis), n_sites = site_fk(lambda: orig(self))
@@ -151,17 +150,25 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
     return steps
 
 
+# The pose-only refresh (reik_balance_first=False) and the eager-Adam arm (coupled_reik=False) are paper ablation arms,
+# so they run on the simplified model, the only one that takes them (design call 15); the rest on the default model
+# (None). Module scope lets pytest run each model's cases together here and in test_step_body_matches_head, so the
+# module builds three worlds, not one per case.
 @needs_cuda
-@pytest.mark.parametrize("reik_balance_first,coupled_reik", [(False, True), (True, True), (False, False)])
+@pytest.mark.parametrize("blocks_t1_plan,reik_balance_first,coupled_reik", [
+    pytest.param(None, True, True, id="True-True"),
+    pytest.param("simplified", False, True, id="False-True"),
+    pytest.param("simplified", False, False, id="False-False"),
+], indirect=["blocks_t1_plan"], scope="module")
 def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, coupled_reik):
     # Dedicated never-reset sites vs HEAD's one shared instance; the sites' buffers never move.
     # coupled_reik=False lets Adam optimize the FK-fed Confs, so one compared grad comes out of FK.
     from cutamp.t1_domain import Conf
 
     world, skeleton, base = blocks_t1_plan
-    # The cases share blocks_t1_plan's world, which keeps every site it builds.
+    # The cases on one model share its blocks_t1_plan world, which keeps every site it builds.
     monkeypatch.setattr(world, "_site_kinematics", {})
-    config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0,
+    config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=50, early_stop_patience=0,
                                reik_balance_first=reik_balance_first, coupled_reik=coupled_reik,
                                force_adam=not coupled_reik, cuda_graphs=False, enable_visualizer=False)
     confs = {v for op in skeleton for v, prm in zip(op.values, op.operator.parameters) if prm.type == Conf}
@@ -174,27 +181,33 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
         assert any(n in confs and g is not None and bool(g.ne(0).any()) for n, g in zip(names, got["grads"])), (
             f"no optimized Conf has a nonzero grad: {names}")
     ptrs = [p for _, _, p in steps]
+    # A model with soles adds the retract confs' motion site (cost_function.motion_costs).
+    every_step = {"rollout", "retract", "com"} | ({"retract_motion"} if world.model.sole_frames else set())
     for k, p in enumerate(ptrs):  # a site that is never built fails by name
-        want = {"rollout", "retract", "com"} | ({"gate"} if reik_balance_first and k >= 5 else set())
+        want = every_step | ({"gate"} if reik_balance_first and k >= 5 else set())
         assert p.keys() - {"config"} == want, f"step {k}: sites {sorted(p.keys() - {'config'})}, want {sorted(want)}"
-    for site in ("rollout", "retract", "com", "config"):
+    for site in (*sorted(every_step), "config"):
         assert all(p[site] == ptrs[0][site] for p in ptrs), site
     if reik_balance_first:  # refresh #1, at step 4, builds the gate site
         assert all(p["gate"] == ptrs[5]["gate"] for p in ptrs[5:]), "gate"
 
 
 @needs_cuda
-@pytest.mark.parametrize("sc,balance_first", [
-    (None, True), *((sc, True) for sc in SUPPORTED_SOFT_COSTS),
-    *((sc, False) for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
-])
+@pytest.mark.parametrize("blocks_t1_plan,sc,balance_first", [
+    *(pytest.param("simplified", sc, False, id=f"{sc}-False") for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
+    pytest.param("simplified", "joint_limit_margin", True, id="joint_limit_margin-True-simplified"),
+    pytest.param(None, None, True, id="no_soft_cost-True"),
+    *(pytest.param(None, sc, True, id=f"{sc}-True") for sc in SUPPORTED_SOFT_COSTS),
+], indirect=["blocks_t1_plan"], scope="module")
 def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
     # As test_step_lockstep_vs_head, for each soft cost alone and for none. max_obj_dist, min_obj_dist and align_yaw
-    # also run in pose-only mode: the default soft costs never reach their triu gathers.
+    # also run in pose-only mode, on the simplified model (the ablation arm, design call 15): the default soft costs
+    # never reach their triu gathers. joint_limit_margin also runs on the simplified model: the real legs' margin
+    # bands are zero (decision 6), so only there does JointLimitMarginCost's step-body math compute anything.
     world, skeleton, base = blocks_t1_plan
-    config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
+    config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=5, early_stop_patience=0,
                                reik_balance_first=balance_first, cuda_graphs=False, enable_visualizer=False,
-                               soft_cost=None if sc is None else [sc])
+                               soft_cost=[] if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
     assert len(steps) == 5
@@ -207,7 +220,8 @@ def test_frozen_sum_matches_production(blocks_t1_plan):
     from cutamp.cost_function import CostFunction, _per_object_sum
 
     world, skeleton, _ = blocks_t1_plan
-    layouts = CostFunction(skeleton, world, TAMPConfiguration(num_particles=64)).surface_to_sphere_counts.values()
+    layouts = CostFunction(skeleton, world, TAMPConfiguration(robot=world.model.name, num_particles=64)
+                           ).surface_to_sphere_counts.values()
     g = torch.Generator("cuda").manual_seed(0)
     for counts in [*layouts, (37, 50, 13), (200, 56)]:
         x = torch.rand(64, sum(counts), device="cuda", generator=g, requires_grad=True)

@@ -14,25 +14,29 @@ from curobo._src.geom.transform import torch_quaternion_to_matrix
 
 if TYPE_CHECKING:
     from curobo.motion_planner import MotionPlanner
+    from curobo.types import DeviceCfg, JointState
+
+    from cutamp.robots.t1 import T1Model
 
 
 def base_wrench(q_base: torch.Tensor, tau_base: torch.Tensor):
     """The wrench the six base joints apply, in the world frame: ``(F, M, P)``, each ``[..., 3]``.
 
-    The joints are x, y, z (prismatic along the world axes), then yaw (z), pitch (y), roll (x), all
+    The joints are x, y, z (prismatic along the world axes), then pitch (y), roll (x), yaw (z), all
     turning about the pelvis point ``P = q[..., :3]``. ``F`` is the force and ``M`` the moment about P.
     """
-    yaw, pitch = q_base[..., 3], q_base[..., 4]
-    cy, sy, cp, sp = yaw.cos(), yaw.sin(), pitch.cos(), pitch.sin()
-    zero = torch.zeros_like(yaw)
-    a = torch.stack([zero, zero, zero + 1], -1)       # the yaw, pitch and roll axes in the world
-    b = torch.stack([-sy, cy, zero], -1)
-    c = torch.stack([cy * cp, sy * cp, -sp], -1)
+    pitch, roll = q_base[..., 3], q_base[..., 4]
+    cp, sp, cr, sr = pitch.cos(), pitch.sin(), roll.cos(), roll.sin()
+    zero = torch.zeros_like(pitch)
+    a = torch.stack([zero, zero + 1, zero], -1)       # the pitch, roll and yaw axes in the world
+    b = torch.stack([cp, zero, -sp], -1)
+    c = torch.stack([cr * sp, -sr, cr * cp], -1)
     t = tau_base[..., 3:]
-    # Solves [a b c]^T M = tau_rot in closed form (no linalg call, so it captures in a CUDA graph).
-    # ponytail: singular at |pitch| = 90 deg, which a standing pelvis never reaches.
+    # Solves [a b c]^T M = tau_rot in closed form (no linalg call, so it captures in a CUDA graph): a . (b x c) is
+    # -cos(roll). Singular at |roll| = 90 deg, the Trunk on its side, which planted soles never reach (the base's
+    # roll limit stops 0.1 rad short of it).
     moment = (t[..., 0:1] * torch.cross(b, c, dim=-1) + t[..., 1:2] * torch.cross(c, a, dim=-1)
-              + t[..., 2:3] * torch.cross(a, b, dim=-1)) / -cp[..., None]
+              + t[..., 2:3] * torch.cross(a, b, dim=-1)) / -cr[..., None]
     return tau_base[..., :3], moment, q_base[..., :3]
 
 
@@ -60,6 +64,8 @@ def make_floor_wrench_fn(
     tool frames, and ``sole_links`` the soles in Dynamics' links. It returns ``f_ext``
     ``[B, H, n_links, 6]``, zero but for the sole rows, each ``[torque, force]`` in that sole's frame.
     """
+    from cutamp.rollout import _FKQuatGrad  # not at the top: rollout.py imports tamp_world.py, which imports this
+
     base_joints = list(base_joints)
 
     def floor_wrench(state, kin_state, tau_free: torch.Tensor) -> torch.Tensor:
@@ -72,7 +78,9 @@ def make_floor_wrench_fn(
         f_ext = q.new_zeros(*q.shape[:-1], n_links, 6)
         for i in range(2):
             f, m = wrenches[2 * i], wrenches[2 * i + 1]
-            r_t = torch_quaternion_to_matrix(quat[..., sole_tools[i], :]).transpose(-1, -2)
+            # _FKQuatGrad, so a gradient through this rotation is right. Trajopt's transition runs this hook under
+            # no_grad (the fork's robot_state_transition.py) and treats f_ext as fixed; other callers may not.
+            r_t = torch_quaternion_to_matrix(_FKQuatGrad.apply(quat[..., sole_tools[i], :])).transpose(-1, -2)
             f_ext[..., sole_links[i], :3] = (r_t @ m[..., None])[..., 0]
             f_ext[..., sole_links[i], 3:] = (r_t @ f[..., None])[..., 0]
         return f_ext
@@ -102,3 +110,51 @@ def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str]
                               tuple(kp.link_name_to_idx_map[f] for f in sole_frames), kp.num_links)
     for tm in transitions:
         tm.set_external_wrench_fn(fn)
+
+
+class SegmentTorques:
+    """cuRobo's two RNEA passes with the floor's push, as trajopt's transitions run them, on a plan's frames: the
+    balance gate's torque check, which with the speed limits sets each segment's pace, and the reason a trajopt
+    failed (design 7.4a).
+
+    Calling it on a ``plan_js`` (position, velocity and acceleration, by joint name) returns the second pass's
+    ``[T, dof]`` torques in ``model.joint_names`` order. Eager. ``effort`` ``[dof]`` is cuRobo's bound on each
+    joint's |torque|: the pinned URDF's effort, and 10,000 on the massless base joints (link_params.py:35).
+    ``velocity`` ``[dof]`` is cuRobo's bound on each joint's |velocity| (``get_joint_limits()``, never the URDF's
+    velocity times the YAML's velocity_scale: the fork applies that scale twice).
+    """
+
+    def __init__(self, model: T1Model, device_cfg: DeviceCfg):
+        from curobo._src.robot.dynamics.dynamics import Dynamics
+        from curobo._src.robot.dynamics.dynamics_cfg import DynamicsCfg
+
+        from cutamp.robots.t1 import get_t1_kinematics
+
+        if not model.sole_frames:
+            raise ValueError(f"SegmentTorques needs a model standing on soles; the {model.name} model has none")
+        self.joint_names = list(model.joint_names)
+        # The robot config's load_dynamics only makes RobotCfg build a DynamicsCfg like this one from the same
+        # kinematics (types/robot.py); KinematicsCfg reads the URDF's inertias either way.
+        self.kin = get_t1_kinematics(model, device_cfg)  # compute_com, and the joint order checked against model's
+        kp = self.kin.config.kinematics_config
+        self.dyn = Dynamics(DynamicsCfg(kinematics_config=kp, device_cfg=device_cfg))
+        tools = list(self.kin.tool_frames)
+        self.fn = make_floor_wrench_fn([self.joint_names.index(j) for j in model.joint_names[model.base]],
+                                       tuple(tools.index(f) for f in model.sole_frames),
+                                       tuple(kp.link_name_to_idx_map[f] for f in model.sole_frames), kp.num_links)
+        limits = self.kin.get_joint_limits()  # each [2, dof]: -bound, +bound (kinematics_loader.py:1090-1093)
+        self.effort, self.velocity = limits.effort[1].clone(), limits.velocity[1].clone()
+
+    def __call__(self, plan_js: JointState) -> torch.Tensor:
+        from curobo.types import JointState
+
+        if plan_js.joint_names is not None and list(plan_js.joint_names) != self.joint_names:
+            plan_js = plan_js.reorder(self.joint_names)  # a plan also carries the locked joints
+        n = len(self.joint_names)
+        p, v, a = (x.reshape(1, -1, n).contiguous() for x in (plan_js.position, plan_js.velocity, plan_js.acceleration))
+        js = JointState(position=p, velocity=v, acceleration=a, jerk=torch.zeros_like(p), joint_names=self.joint_names)
+        with torch.no_grad():
+            self.dyn.setup_batch_size(1, p.shape[1])
+            tau_free = self.dyn.compute_inverse_dynamics(js).clone()  # Dynamics and Kinematics hand back reused buffers
+            ks = self.kin.compute_kinematics(js).clone()
+            return self.dyn.compute_inverse_dynamics(js, f_ext=self.fn(js, ks, tau_free)).clone()[0]

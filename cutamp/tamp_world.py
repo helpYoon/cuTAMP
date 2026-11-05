@@ -11,11 +11,12 @@
 
 The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics, a
 single multi-tool-frame InverseKinematics solver, and a MotionPlanner
-factory. T1 exposes two tool frames in ``robot_container.tool_frames``.
+factory, all on the planning model ``world.model``. T1 exposes two tool
+frames in ``robot_container.tool_frames``.
 """
 
 import logging
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -23,11 +24,19 @@ from curobo.inverse_kinematics import InverseKinematics
 from curobo.kinematics import Kinematics
 from curobo.motion_planner import MotionPlanner
 from curobo.scene import Obstacle, Scene
-from curobo.types import DeviceCfg, GoalToolPose, JointState
+from curobo.types import DeviceCfg, GoalToolPose, JointState, Pose
 
 from cutamp.envs import TAMPEnvironment
+from cutamp.floor_wrench import SegmentTorques
 from cutamp.robots import RobotContainer
-from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, get_t1_ik_solver, get_t1_motion_planner
+from cutamp.robots.t1 import (
+    TOOL_FRAME_FOR_ARM,
+    T1Model,
+    get_t1_bodies,
+    get_t1_ik_solver,
+    get_t1_kinematics,
+    get_t1_motion_planner,
+)
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
 from cutamp.utils.collision import WorldCollisionCost
@@ -42,15 +51,17 @@ from cutamp.utils.shapes import sample_greedy_surface_spheres
 
 _log = logging.getLogger(__name__)
 
-#: The Adam loop's FK sites, each on its own Kinematics (TAMPWorld.site_kinematics).
-FK_SITES = ("rollout", "retract", "com", "gate")
+#: The Adam loop's FK sites, each on its own Kinematics (TAMPWorld.site_kinematics). "retract_motion" is the real
+#: legs' retract confs for the motion constraints (cost_function.motion_costs).
+FK_SITES = ("rollout", "retract", "com", "gate", "retract_motion")
 
 
 class TAMPWorld:
     """A TAMPEnvironment plus T1 kinematics, a Scene, and motion-planner factory.
 
     T1 exposes two tool frames (left + right base_link) via the
-    ``RobotContainer``. ``q_init`` is a single 21-DOF vector.
+    ``RobotContainer``. ``q_init`` is a single full-cspace vector of the
+    container's model (``world.model``).
     """
 
     def __init__(
@@ -88,12 +99,13 @@ class TAMPWorld:
         # (matches the planner). Particle init holds the inactive hand where
         # the IK's start conf puts it (home, or a CoM-gate retry's perturbed
         # seed), so that arm's joints counter-rotate as the body bends (the
-        # per-DOF cspace pin is a no-op). A conf whose IK fails starts at home
+        # per-DOF cspace pin is a no-op), and on the real legs both soles on
+        # the stance (sole_goals). A conf whose IK fails starts at home
         # instead (_store_ik_q). The balance-first refresh then moves the body
         # with the inactive arm's joints fixed, so that hand rides with the
         # trunk, most at those home confs (known-bugs B15).
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
-            self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
+            self.model, self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
             enable_com_aware_ik=enable_com_aware_ik,
         )
         self._reik_num_seeds = reik_num_seeds
@@ -103,6 +115,7 @@ class TAMPWorld:
         self._ik_refresh_solver = None
         self._kinematics_jac = None
         self._bodies = None
+        self._segment_torques = None
         self._site_kinematics: Dict[str, Kinematics] = {}
 
         # Pre-fit collision spheres for each movable (used by attachment_manager).
@@ -134,7 +147,29 @@ class TAMPWorld:
             ).position.flatten().detach().cpu(),
         }
 
+        # The planted soles' world poses at the model's home: every action stands on this one stance. The FK poses
+        # stay too, as the soles' IK goals (sole_goals), so those goals are the stance bit for bit.
+        self._stance_sole_poses: Dict[str, Pose] = {}
+        self._stance_soles: Optional[torch.Tensor] = None
+        if self.model.sole_frames:
+            stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
+            stance_ks = self.kinematics.compute_kinematics(stance_js)
+            for frame in self.model.sole_frames:
+                pose = stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True)
+                # Copies: a single conf's pose is a view of cuRobo's FK buffers, which the next FK call rewrites.
+                self._stance_sole_poses[frame] = Pose(
+                    position=pose.position.detach().clone(), quaternion=pose.quaternion.detach().clone(),
+                )
+            self._stance_soles = torch.stack([
+                pose.get_matrix().reshape(4, 4) for pose in self._stance_sole_poses.values()
+            ])
+
     # ---- Container delegates ------------------------------------------------
+
+    @property
+    def model(self) -> T1Model:
+        """The planning model: joint names, slices, home, margins and support region."""
+        return self.robot_container.model
 
     @property
     def kinematics(self) -> Kinematics:
@@ -174,6 +209,23 @@ class TAMPWorld:
     @property
     def q_init(self) -> torch.Tensor:
         return self._q_init
+
+    @property
+    def stance_soles(self) -> Optional[torch.Tensor]:
+        """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction);
+        ``None`` on a model without soles (the simplified one)."""
+        return self._stance_soles
+
+    def sole_goals(self, n: int) -> Optional[Dict[str, Pose]]:
+        """Each of ``model.sole_frames``' stance pose, repeated ``n`` times: the planted soles' IK goals
+        (design 7.3: from the stance, never from FK at the IK seed). ``None`` on a model without soles
+        (the simplified one)."""
+        if not self.model.sole_frames:
+            return None
+        return {
+            frame: Pose(position=pose.position.repeat(n, 1), quaternion=pose.quaternion.repeat(n, 1))
+            for frame, pose in self._stance_sole_poses.items()
+        }
 
     # ---- Movables and indexing ---------------------------------------------
 
@@ -232,15 +284,14 @@ class TAMPWorld:
     def kinematics_jac(self) -> Kinematics:
         """Jacobian-enabled twin of ``kinematics`` (lazily built).
 
-        Same 21-DOF model, but ``compute_jacobian=True`` so every FK call
+        Same model, but ``compute_jacobian=True`` so every FK call
         also fills ``tool_jacobians``. Separate instance because the flag is
         baked into the kernel buffers at construction. Used by the GN reIK
         refresh (``cutamp/gn_refresh.py``).
         """
         if self._kinematics_jac is None:
-            from cutamp.robots.t1 import get_t1_kinematics
             self._kinematics_jac = get_t1_kinematics(
-                device_cfg=self.device_cfg, compute_jacobian=True,
+                self.model, device_cfg=self.device_cfg, compute_jacobian=True,
             )
         return self._kinematics_jac
 
@@ -249,9 +300,17 @@ class TAMPWorld:
         """Every massive link of the robot (:func:`cutamp.robots.t1.get_t1_bodies`, lazily built): the
         balance gate's multibody ZMP."""
         if self._bodies is None:
-            from cutamp.robots.t1 import get_t1_bodies
-            self._bodies = get_t1_bodies(device_cfg=self.device_cfg)
+            self._bodies = get_t1_bodies(self.model, device_cfg=self.device_cfg)
         return self._bodies
+
+    @property
+    def segment_torques(self) -> SegmentTorques:
+        """cuRobo's two RNEA passes with the floor's push on a plan's frames
+        (:class:`cutamp.floor_wrench.SegmentTorques`, lazily built): the balance gate's torque and speed checks, which
+        set each segment's pace, and the reason a trajopt failed. A model standing on soles only (the real legs)."""
+        if self._segment_torques is None:
+            self._segment_torques = SegmentTorques(self.model, self.device_cfg)
+        return self._segment_torques
 
     def site_kinematics(self, name: str) -> Kinematics:
         """The Adam loop's FK site ``name``: a dedicated, lazily built, CoM-enabled Kinematics
@@ -282,7 +341,7 @@ class TAMPWorld:
             return self.ik_solver
         if self._ik_refresh_solver is None:
             self._ik_refresh_solver = get_t1_ik_solver(
-                self.world_cfg, device_cfg=self.device_cfg,
+                self.model, self.world_cfg, device_cfg=self.device_cfg,
                 max_batch_size=self._ik_max_batch_size,
                 enable_com_aware_ik=self._enable_com_aware_ik,
                 num_seeds=self._reik_num_seeds,
@@ -314,8 +373,10 @@ class TAMPWorld:
             from cutamp.particle_initialization import _ik_for_pose  # import cycle at module level
 
             refresh = self.ik_refresh_solver
-            # The seed here is already the answer; without this the LBFGS stage
-            # exits early, stays uncaptured, and captures mid-optimization.
+            # On the simplified model the seed here is already the answer; on
+            # the real legs the soles' goals are the stance while q is a random
+            # conf. Either way the LBFGS stage must not exit early: it would stay
+            # uncaptured, and capture later, mid-optimization.
             exit_early, refresh.config.exit_early = refresh.config.exit_early, False
             try:
                 ee = kin_state.tool_poses.get_link_pose(
@@ -338,6 +399,7 @@ class TAMPWorld:
         """
         scene_with_movables = get_world_cfg(self.env, include_movables=True)
         return get_t1_motion_planner(
+            self.model,
             scene_with_movables,
             use_cuda_graph=use_cuda_graph,
             collision_activation_distance=collision_activation_distance,

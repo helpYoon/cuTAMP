@@ -29,6 +29,42 @@ def test_noop_visualizer_skips_vis_block(blocks_t1_plan, cuda_graphs):
     assert vis.opt_steps == [0, 10, 11]
 
 
+@needs_cuda
+def test_rollout_viewer_takes_the_conf_and_the_gripper_state(blocks_t1_plan):
+    # The rollout_* timeline shows each conf in the model's cspace, with each hand's gripper set on the rerun robot:
+    # both open at the start, then a pick conf's hand closed and a place conf's open, the other hand as it was.
+    from types import SimpleNamespace
+
+    from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
+    world, skeleton, base = blocks_t1_plan
+    config = TAMPConfiguration(num_particles=64, num_opt_steps=2, early_stop_patience=0, enable_visualizer=False)
+
+    class Vis(SpyVis):
+        def __init__(self, config):
+            super().__init__(config)
+            self.timeline, self.grippers, self.shown = "", None, []
+            self.robot = SimpleNamespace(set_grippers=lambda left, right: setattr(self, "grippers", (left, right)))
+
+        def set_time_sequence(self, timeline: str, val: int) -> None:
+            super().set_time_sequence(timeline, val)
+            self.timeline = timeline
+
+        def set_joint_positions(self, q) -> None:
+            if self.timeline.startswith("rollout_"):
+                self.shown.append((len(q), self.grippers))
+
+    vis = Vis(config)
+    run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
+    dof, state = len(world.model.joint_names), {"left": GRIPPER_OPEN, "right": GRIPPER_OPEN}
+    want = [(dof, (GRIPPER_OPEN, GRIPPER_OPEN))]
+    for op in skeleton:
+        metadata = op.operator.metadata
+        if metadata.is_actionable:
+            state[metadata.arm] = GRIPPER_CLOSED if metadata.action_type == "pick" else GRIPPER_OPEN
+            want.append((dof, (state["left"], state["right"])))
+    assert len(want) > 2 and vis.shown == want
+
+
 # cfa7a46's sphere_to_sphere_overlap, frozen: the masked AABB form, which syncs on intersect.any().
 def _head_sphere_to_sphere_overlap(
     spheres_1: torch.Tensor,

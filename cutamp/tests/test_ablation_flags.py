@@ -1,4 +1,7 @@
-"""Flag plumbing for the standard-cuTAMP 2x2 ablation baseline."""
+"""Flag plumbing for the standard-cuTAMP 2x2 ablation baseline.
+
+Every config that sets an ablation flag names the simplified model: the paper's ablation arms run only on it, and the
+real legs, the default, refuse them (design call 15)."""
 import pytest
 
 from cutamp.config import TAMPConfiguration, validate_tamp_config
@@ -22,6 +25,7 @@ def test_soft_in_adam_rejects_unknown_value():
 def test_baseline_cell_config_validates():
     # The "standard cuTAMP" cell from the spec.
     c = TAMPConfiguration(
+        robot="simplified",
         enable_com_aware_ik=False,
         enable_com_init_gate=False,
         enable_com_hard_constraint=False,
@@ -46,8 +50,10 @@ def _tiny_cost_dict(enable_com_hard_constraint: bool):
     from cutamp.t1_domain import all_t1_operators
     from cutamp.task_planning import task_plan_generator
 
-    world = make_blocks_t1_world()
+    from cutamp.robots.t1 import SIMPLIFIED
+    world = make_blocks_t1_world(model=SIMPLIFIED)  # enable_com_hard_constraint=False is an ablation arm
     config = TAMPConfiguration(
+        robot="simplified",
         num_particles=8,
         enable_com_hard_constraint=enable_com_hard_constraint,
     )
@@ -87,7 +93,7 @@ def test_init_ik_selector_respects_gate():
     )
     assert _select_init_ik(TAMPConfiguration()) is _ik_for_pose_com_safe
     assert _select_init_ik(
-        TAMPConfiguration(enable_com_init_gate=False)
+        TAMPConfiguration(robot="simplified", enable_com_init_gate=False)
     ) is _ik_for_pose_no_gate
 
 
@@ -97,18 +103,18 @@ def test_should_skip_adam_logic():
     # Today's behavior at defaults (coupled_reik=True): never skip.
     assert not _should_skip_adam(10, TAMPConfiguration())
     # Uncoupled + init satisfied: skips today...
-    c = TAMPConfiguration(coupled_reik=False)
+    c = TAMPConfiguration(robot="simplified", coupled_reik=False)
     assert _should_skip_adam(10, c)
     assert not _should_skip_adam(0, c)
     # ...unless force_adam (the baseline fairness fix).
-    assert not _should_skip_adam(10, TAMPConfiguration(coupled_reik=False, force_adam=True))
+    assert not _should_skip_adam(10, TAMPConfiguration(robot="simplified", coupled_reik=False, force_adam=True))
 
 
 def test_adam_consider_types_soft_gate():
     from cutamp.config import TAMPConfiguration
     from cutamp.optimize_plan import _adam_consider_types
     assert _adam_consider_types(TAMPConfiguration()) == {"constraint", "cost"}
-    assert _adam_consider_types(TAMPConfiguration(coupled_reik=False)) == {"constraint"}
+    assert _adam_consider_types(TAMPConfiguration(robot="simplified", coupled_reik=False)) == {"constraint"}
     assert _adam_consider_types(
-        TAMPConfiguration(coupled_reik=False, soft_in_adam="always")
+        TAMPConfiguration(robot="simplified", coupled_reik=False, soft_in_adam="always")
     ) == {"constraint", "cost"}

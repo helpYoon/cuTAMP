@@ -13,15 +13,18 @@ from cutamp.tests.conftest import SpyVis, install_refresh_spy, install_step_repl
 needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
 
-def _run_demo(tmp_path, monkeypatch, n) -> list:
+def _run_demo(tmp_path, monkeypatch, n, robot="simplified") -> list:
     import cutamp.algorithm
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.scripts.run_cutamp import cutamp_demo
 
     monkeypatch.setattr(cutamp.algorithm, "Visualizer", lambda config, q_init: SpyVis(config))  # the vis block runs
-    config = TAMPConfiguration(num_particles=n, reik_balance_first=True, cuda_graphs=True,
-                               soft_cost=["joint_limit_margin"], enable_visualizer=False, curobo_plan=True,
-                               experiment_root=str(tmp_path))
+    # The real legs keep their default minimize_body_movement, as the speed gate's real-leg cell does. Both models plan
+    # motions, so every cell captures beside the planner-build thread.
+    real = robot == "real_legs"
+    config = TAMPConfiguration(robot=robot, num_particles=n, reik_balance_first=True, cuda_graphs=True,
+                               soft_cost=["joint_limit_margin"] + (["minimize_body_movement"] if real else []),
+                               enable_visualizer=False, curobo_plan=True, experiment_root=str(tmp_path))
     cutamp_demo(load_env(os.path.join(get_env_dir(), "blocks_t1.yml")), config)
     return [json.loads(p.read_text()) for p in sorted(tmp_path.glob("*/optimization/opt_*.json"))]
 
@@ -39,6 +42,28 @@ def test_live_lockstep_through_cutamp_demo(tmp_path, monkeypatch, n, step_spy):
     if step_spy:
         assert max(map(len, replays)) >= 20
     assert len(eager) >= 1
+
+
+@needs_cuda
+@needs_slow
+@pytest.mark.parametrize("n", [64, 512])
+def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
+    # The real legs' larger shapes, with the 12 sole rows and the closing step inside G_refresh and the retract
+    # confs' motion FK and self-collision cost inside G_step: every spied replay matches its eager twin (the spies
+    # raise), at the test batch and at the speed gate's 512 particles.
+    from cutamp.cost_function import CostFunction
+
+    retract_calls, retract_values = [], CostFunction._retract_motion_values
+
+    def count(self):
+        retract_calls.append(1)
+        return retract_values(self)
+
+    monkeypatch.setattr(CostFunction, "_retract_motion_values", count)
+    replays, eager = install_step_replay_spy(monkeypatch), install_refresh_spy(monkeypatch)
+    _run_demo(tmp_path, monkeypatch, n, robot="real_legs")
+    assert max(map(len, replays)) >= 20 and len(eager) >= 1
+    assert retract_calls  # the skeleton has retracts, so the replayed G_step holds their motion cost
 
 
 @needs_cuda

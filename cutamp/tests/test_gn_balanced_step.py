@@ -7,7 +7,7 @@ import torch
 
 from cutamp.com_polygon_cost import COM_HALF_EXTENTS
 from cutamp.gn_refresh import GN_MARGIN_DAMPING, _balanced_step, _rotmat_to_rotvec, _row_layout, _spd_solve
-from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES
+from cutamp.robots.t1 import BASE_INDICES, LEFT_ARM_INDICES, RIGHT_ARM_INDICES, SIMPLIFIED
 
 
 def _synthetic(seed, dof=21, B=64):
@@ -21,7 +21,8 @@ def _synthetic(seed, dof=21, B=64):
     margin[BASE_INDICES] = 0.0
     shared = (lower, upper, lower + margin, upper - margin)
     half = torch.tensor(COM_HALF_EXTENTS)
-    col_mask, _ = _row_layout(("left", "left", "right", "right"), 4 * B, dof, torch.device("cpu"), torch.float32)
+    col_mask, _ = _row_layout(SIMPLIFIED, ("left", "left", "right", "right"), 4 * B, dof, torch.device("cpu"),
+                              torch.float32)
 
     deps = []
     for c in col_mask.split(B):
@@ -79,7 +80,8 @@ def test_balanced_step_moves_no_pinned_column():
     assert torch.any(step[col_mask == 1] != 0)  # not vacuous: the free columns move
 
     # The pins on an interleaved arm order, against a layout built block by block.
-    layout, is_left = _row_layout(("left", "right", "left", "right"), 12, 21, torch.device("cpu"), torch.float32)
+    layout, is_left = _row_layout(SIMPLIFIED, ("left", "right", "left", "right"), 12, 21, torch.device("cpu"),
+                                  torch.float32)
     expected = torch.ones(12, 21)
     expected[:, BASE_INDICES] = 0
     expected[0:3, RIGHT_ARM_INDICES] = 0
@@ -89,6 +91,34 @@ def test_balanced_step_moves_no_pinned_column():
     assert torch.equal(layout, expected)
     assert torch.equal(is_left, torch.tensor([True, False, True, False]).repeat_interleave(3))
     with pytest.raises(ValueError):  # rows that don't split into equal dep blocks
-        _row_layout(("left", "right"), 5, 21, torch.device("cpu"), torch.float32)
+        _row_layout(SIMPLIFIED, ("left", "right"), 5, 21, torch.device("cpu"), torch.float32)
     with pytest.raises(ValueError):  # an arm that is neither left nor right
-        _row_layout(("left", "up"), 4, 21, torch.device("cpu"), torch.float32)
+        _row_layout(SIMPLIFIED, ("left", "up"), 4, 21, torch.device("cpu"), torch.float32)
+
+
+def test_tilt_row_is_the_tilt_cosine_and_its_gradient():
+    # The tilt row: the Motion value's cosine and its analytic Jacobian, autograd's gradient on the base's pitch and
+    # roll columns and zero elsewhere, masked by the column mask. The simplified model has no envelope and route A's
+    # sets no tilt bound, so neither has a row; an envelope that bounds the tilt at 1.0 rad has one.
+    import dataclasses
+    from cutamp.gn_refresh import GN_TILT_MARGIN, _tilt_bound, _tilt_row
+    from cutamp.joint_limit_cost import trunk_tilt_cosine
+    from cutamp.robots.t1 import REAL_LEGS
+
+    assert _tilt_bound(SIMPLIFIED) is None and _tilt_bound(REAL_LEGS) is None
+    names = list(REAL_LEGS.joint_names)
+    tilted = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
+    pitch, roll, cos_max, cos_target = _tilt_bound(tilted)
+    assert (pitch, roll) == (names.index("base_j_pitch"), names.index("base_j_roll"))
+    assert (cos_max, cos_target) == (math.cos(1.0), math.cos(1.0 - GN_TILT_MARGIN))
+    g = torch.Generator().manual_seed(0)
+    q = 2 * torch.rand(16, len(names), generator=g, dtype=torch.float64) - 1
+    col_mask = torch.ones_like(q)
+    col_mask[8:, roll] = 0.0
+    c, jac = _tilt_row(q, pitch, roll, col_mask)
+    qg = q.clone().requires_grad_(True)
+    grad = torch.autograd.grad(trunk_tilt_cosine(qg, pitch, roll).sum(), qg)[0]
+    assert c.shape == (16, 1) and jac.shape == (16, 1, len(names))
+    torch.testing.assert_close(c[:, 0], trunk_tilt_cosine(q, pitch, roll), rtol=0, atol=0)
+    torch.testing.assert_close(jac[:, 0], grad * col_mask, rtol=1e-12, atol=1e-12)
+    assert bool(jac[:8, 0, roll].abs().gt(0).all()) and not bool(jac[8:, 0, roll].any())

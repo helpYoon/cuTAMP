@@ -9,7 +9,10 @@ outright violates a limit. Home-side bounds (zero margin) are reported but
 never gated — the standing posture legitimately sits ON them.
 
 Reads schema-v3 plan pickles (see cutamp/utils/plan_processor.py). The 3
-virtual base DOFs are not stored in the plan and are not checked.
+virtual base DOFs are not stored in the plan and are not checked. Any other
+plan is refused with a non-zero exit, a real-leg plan (``"stage3-raw"``)
+included: the real legs' limits are already bfm_wm's soft limits, with no
+margin bands to gate (decision 6).
 
 Usage:
     python -m cutamp.scripts.check_plan_margins --plan data/motion_plan.pkl
@@ -82,7 +85,8 @@ def main(argv=None) -> int:
     with open(args.plan, "rb") as f:
         plan = pickle.load(f)
     if plan.get("schema_version") != 3:
-        sys.exit(f"Unsupported plan schema_version={plan.get('schema_version')!r} (need 3)")
+        sys.exit(f"Unsupported plan schema_version={plan.get('schema_version')!r}: check_plan_margins reads the "
+                 f"simplified model's schema 3 only")
 
     urdf_limits = parse_urdf_limits(T1_ASSETS_DIR / "t1_simplified.urdf")
     name_to_full_idx = {n: i for i, n in enumerate(JOINT_NAMES_FULL)}

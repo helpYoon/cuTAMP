@@ -1,5 +1,8 @@
 """The trajectory balance gate (motion_solver._balance_gate): every interpolated frame's CoM and
-multibody ZMP stay inside the support rectangle; a fast segment is slowed, an unbalanced one fails."""
+multibody ZMP stay inside the support rectangle; a fast segment is slowed, an unbalanced one fails.
+
+On the simplified model: the reference ZMP is t1_simplified.urdf's, and the bows, their margins and the support
+constants are that model's. The real legs' gate has its own tests (test_real_legs_motion.py)."""
 import functools
 import math
 
@@ -10,6 +13,7 @@ import torch
 from cutamp.com_polygon_cost import (
     COM_CENTER, SOLE_HALF_EXTENTS, SUPPORT_HALF_EXTENTS, com_margin_from_base, retime_factor,
 )
+from cutamp.robots.t1 import SIMPLIFIED
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 DT = 0.025
@@ -76,14 +80,14 @@ def test_retime_factor_scales_with_square():
     # Slowing by s divides the ZMP's offset from the CoM by s^2.
     hx = SUPPORT_HALF_EXTENTS[0]
     com = torch.tensor([[hx - 0.01, 0.0]])
-    assert retime_factor(com, com + torch.tensor([[0.04, 0.0]])) == pytest.approx(2.0)
-    assert retime_factor(com, com + torch.tensor([[0.005, 0.0]])) == 1.0
+    assert retime_factor(com, com + torch.tensor([[0.04, 0.0]]), SUPPORT_HALF_EXTENTS) == pytest.approx(2.0)
+    assert retime_factor(com, com + torch.tensor([[0.005, 0.0]]), SUPPORT_HALF_EXTENTS) == 1.0
 
 
 def test_retime_factor_zero_room_is_inf():
     hx = SUPPORT_HALF_EXTENTS[0]
     com = torch.tensor([[hx, 0.0]])
-    assert retime_factor(com, com + torch.tensor([[0.001, 0.0]])) == math.inf
+    assert retime_factor(com, com + torch.tensor([[0.001, 0.0]]), SUPPORT_HALF_EXTENTS) == math.inf
 
 
 def test_retime_preserves_endpoints():
@@ -162,9 +166,9 @@ def test_bodies_leave_the_robot_config_alone():
     # The bodies' kinematics is built from the cached robot config, whose tool frames every later IK solver
     # and motion planner reads: rewritten to the 36 links, the next run in the process found no IK solution.
     from cutamp.robots.t1 import get_t1_bodies, t1_curobo_cfg
-    before = list(t1_curobo_cfg()["robot_cfg"]["kinematics"]["tool_frames"])
-    get_t1_bodies()
-    assert t1_curobo_cfg()["robot_cfg"]["kinematics"]["tool_frames"] == before
+    before = list(t1_curobo_cfg(SIMPLIFIED)["robot_cfg"]["kinematics"]["tool_frames"])
+    get_t1_bodies(SIMPLIFIED)
+    assert t1_curobo_cfg(SIMPLIFIED)["robot_cfg"]["kinematics"]["tool_frames"] == before
 
 
 @needs_cuda
@@ -172,7 +176,7 @@ def test_zmp_matches_multibody_reference():
     # Torso, waist, both arms and the legs at once, so every link moves and spins: the gate's ZMP, from the
     # plan's own velocities and accelerations, matches the float64 first-principles one, at rest and at the
     # acceleration peaks.
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     moves = {"Torso_Pitch": -0.5, "Waist_Yaw": 0.4, "Left_Shoulder_Pitch": -1.0, "Right_Elbow_Pitch": -0.8,
              "knee_pitch": 0.3, "ankle_pitch": -0.15}
     com, zmp = _gate_view(world, _ramp(world, moves, 0.6))
@@ -186,7 +190,7 @@ def test_zmp_matches_multibody_reference():
 def test_gate_rejects_com_outside():
     # A deep bow puts the CoM past the toe (13.5 cm at Torso_Pitch -1.6, the front edge is 10.15 cm).
     from cutamp.motion_solver import _balance_gate
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     with pytest.raises(RuntimeError, match="CoM leaves"):
         _balance_gate(world, None, _torso_ramp(world, -1.6, 1.0), DT)
 
@@ -197,7 +201,7 @@ def test_gate_rejects_com_between_support_and_soles():
     from cutamp.motion_solver import _balance_gate
     ref = _reference_margins({"Torso_Pitch": -0.9}, 4.0)
     assert ref["com", "soles"] > 0 > ref["com", "support"]
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     with pytest.raises(RuntimeError, match="CoM leaves"):
         _balance_gate(world, None, _torso_ramp(world, -0.9, 4.0), DT)
 
@@ -211,7 +215,7 @@ def test_gate_slows_a_bow_start_by_the_bodies_zmp():
     moves = {"Torso_Pitch": -0.5}
     ref = _reference_margins(moves, 0.8)
     assert ref["com", "support"] > 0 and ref["zmp", "soles"] > 0 > ref["zmp", "support"]
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     out, stats, _ = _balance_gate(world, None, _torso_ramp(world, -0.5, 0.8), DT)
     assert stats["retime"] > 1.0 and stats["zmp_min_margin"] >= 0
     assert _reference_margins(moves, 0.8 * stats["retime"])["zmp", "support"] >= 0
@@ -222,7 +226,7 @@ def test_gate_tries_the_retime_cap():
     # A bow to -0.6 in 0.3 s fits at a 3.76x slowdown. The first try (1.05 x retime_factor, 3.60x) falls
     # short and the next step (x1.25) overshoots the 4x cap: the gate still tries 4x before giving up.
     from cutamp.motion_solver import RETIME_MAX, _balance_gate
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     out, stats, _ = _balance_gate(world, None, _torso_ramp(world, -0.6, 0.3), DT)
     assert 3.6 < stats["retime"] <= RETIME_MAX and stats["zmp_min_margin"] >= 0
 
@@ -231,7 +235,7 @@ def test_gate_tries_the_retime_cap():
 def test_gate_slows_fast_lean():
     # A bow to -0.6 is CoM-safe (8 cm), but in 0.5 s its ZMP swings far past the edges.
     from cutamp.motion_solver import _balance_gate, _retime
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     plan = _torso_ramp(world, -0.6, 0.5)
     com, zmp = _gate_view(world, plan)
     margin = lambda xy: com_margin_from_base(xy, SUPPORT_HALF_EXTENTS).min()  # noqa: E731
@@ -251,7 +255,23 @@ def test_gate_slows_fast_lean():
 @needs_cuda
 def test_gate_passes_slow_motion_untouched():
     from cutamp.motion_solver import _balance_gate
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     plan = _torso_ramp(world, -0.3, 2.0)
     out, stats, fast = _balance_gate(world, None, plan, DT)
     assert out is plan and stats["retime"] == 1.0 and fast is None
+
+
+@needs_cuda
+def test_simplified_gate_only_slows_and_names_no_binding():
+    # Only a model standing on soles has its pace set by the gate (velocity, torque, ZMP). The simplified model's gate
+    # is unchanged: a segment with ZMP room stays at the planner's timing however slow it is, a fast one is slowed
+    # for its ZMP, and the stats are the same three keys (no binding check), at s >= 1.
+    from cutamp.motion_solver import _balance_gate
+    world = make_blocks_t1_world(model=SIMPLIFIED)
+    slow = _torso_ramp(world, -0.3, 4.0)
+    out, stats, fast = _balance_gate(world, None, slow, DT)
+    assert out is slow and fast is None and set(stats) == {"retime", "com_min_margin", "zmp_min_margin"}
+    assert stats["retime"] == 1.0
+    out, stats, fast = _balance_gate(world, None, _torso_ramp(world, -0.6, 0.5), DT)
+    assert fast is not None and set(stats) == {"retime", "com_min_margin", "zmp_min_margin"}
+    assert stats["retime"] > 1.0
