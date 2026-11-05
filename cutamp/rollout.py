@@ -30,6 +30,36 @@ from cutamp.utils.common import (
 )
 
 
+class _FKQuatGrad(torch.autograd.Function):
+    """Identity on an FK quaternion ``[..., 4]`` (wxyz) whose backward re-encodes dL/dq for cuRobo v2's FK backward.
+
+    That backward decodes the quaternion gradient with the body-frame map (``quaternion_gradient_to_angular_velocity``
+    in quaternion_util.cuh) but dots the result with world-frame joint axes, which need
+    Omega = 0.5 (-g_w v + w g_v + v x g_v). Passing g' = 2 q (x) (0, Omega) makes its decode return Omega exactly
+    (for unit q, at any angle). cuRobo's own pose costs already encode this way; only PyTorch autograd needs it.
+    If the fork's decode is ever changed to the world-frame formula, drop this: test_fk_orientation_grad.py would
+    then fail on the double correction.
+    """
+
+    @staticmethod
+    def forward(ctx, quat: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(quat.detach().clone())  # cuRobo may reuse the FK output buffer before backward
+        return quat.clone()
+
+    @staticmethod
+    def backward(ctx, g: torch.Tensor) -> torch.Tensor:
+        (q,) = ctx.saved_tensors
+        w, v, g_v = q[..., :1], q[..., 1:], g[..., 1:]
+        omega = 0.5 * (w * g_v - g[..., :1] * v + torch.cross(v, g_v, dim=-1))
+        return 2.0 * torch.cat((-(v * omega).sum(-1, keepdim=True), w * omega + torch.cross(v, omega, dim=-1)), -1)
+
+
+def _link_matrix(pose) -> torch.Tensor:
+    """``pose.get_matrix()`` for a cuRobo FK link pose, with gradients correct w.r.t. the joint positions."""
+    pose.quaternion = _FKQuatGrad.apply(pose.quaternion)
+    return pose.get_matrix()
+
+
 def get_conf_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
     """Configuration parameter names appearing in actionable operators."""
     conf_params = []
@@ -135,8 +165,7 @@ class RolloutFunction:
                 for conf_name in self.conf_params
             ]
             frame_to_mat = {
-                frame: ee_pose.get_link_pose(frame, make_contiguous=True)
-                .get_matrix()
+                frame: _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True))
                 .view(num_particles, confs.shape[1], 4, 4)
                 for frame in dict.fromkeys(conf_frames)
             }
