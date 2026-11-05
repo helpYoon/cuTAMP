@@ -512,6 +512,20 @@ def test_gate_paces_a_velocity_bound_segment_at_its_limit(real_world, planner):
 
 
 @needs_cuda
+def test_gate_keeps_a_segments_ends(real_world, planner):
+    # The gate resamples a segment at its own pace (_retime's spline), and the segment still starts and ends on the
+    # planner's frames bit for bit: the next segment starts from its last frame, the anchored conf. The spline's own
+    # end value misses a joint that moves to 0 (here the left elbow, -1 -> 0 rad) by a rounding error, and the next
+    # trajopt would start there.
+    from cutamp.motion_solver import _balance_gate
+    plan = _ramp(real_world, {"Left_Elbow_Pitch": 1.0}, 2.0, start={"Left_Elbow_Pitch": -1.0})
+    assert float(plan.position[-1, real_world.model.joint_names.index("Left_Elbow_Pitch")]) == 0.0
+    out, stats, _ = _balance_gate(real_world, planner, plan, DT)
+    assert stats["retime"] != 1.0
+    assert torch.equal(out.position[[0, -1]], plan.position[[0, -1]])
+
+
+@needs_cuda
 def test_gate_reports_the_torque_or_the_zmp_that_binds(real_world, planner):
     # Two min-jerk moves of both shoulder pitches over 2 s. Swinging opposite ways (0.7 -> -0.7 and -0.7 -> 0.7 rad),
     # the arms cancel each other's ZMP shift, so a shoulder's torque binds first (0.112x, the ZMP 0.104x); both

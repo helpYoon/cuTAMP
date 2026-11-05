@@ -808,8 +808,8 @@ def _torque_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tup
     if not u >= max(float(lower.max()), hi**-2):  # no s in [lo, hi] passes, or a NaN
         excess = ((tau0 + d * hi**-2).abs() - e).nan_to_num(nan=math.inf).amax(0)
         j = int(excess.argmax())
-        raise _gate_error(f"torque {names[j]}", f"trajectory torque passes {names[j]}'s {float(e[j]):.1f} N m effort by "
-                                                f"{float(excess[j]):.2f} N m at the {hi}x slowdown cap")
+        raise _gate_error(f"torque {names[j]}", f"trajectory torque passes {names[j]}'s {float(e[j]):.1f} N m effort "
+                                                f"by {float(excess[j]):.2f} N m at the {hi}x slowdown cap")
     if u == lo**-2:
         return lo, None
     return u**-0.5, names[int(upper.argmin())]
@@ -880,10 +880,11 @@ def _pace(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     within RETIME_TOL above the smallest). Each is evaluated on the planner's own frames with the velocities over s and
     the accelerations over s^2. Below one step of ``dt`` for the whole segment, the shortest ``_retime`` makes, no check
     binds (``"none"``). The segment is resampled at s (``_retime``, whose whole steps give s_eff >= s; at s_eff 1 it is
-    the planner's own) and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP
-    fails is slowed by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when
-    no s passes, the gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets it: ``"velocity <joint>"``, ``"torque
-    <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last."""
+    the planner's own), its first and last frames kept the planner's bit for bit (the next segment starts from the
+    last), and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP fails is slowed
+    by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when no s passes, the
+    gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets it:
+    ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     with torch.no_grad():
@@ -905,6 +906,8 @@ def _pace(world: TAMPWorld, planner, plan_js: JointState, dt: float):
             s, binding = s_z, "zmp"
         while True:
             out = plan_js if math.ceil(s * (n - 1)) + 1 == n else _retime(plan_js, s, dt)
+            if out is not plan_js:  # the spline's end values miss a joint that moves to 0 by a rounding error
+                out.position[..., [0, -1], :] = plan_js.position[..., [0, -1], :]
             try:
                 com_m, zmp_m = _recheck(world, planner, out, planted=out is not plan_js)
                 break
