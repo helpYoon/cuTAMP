@@ -3,11 +3,27 @@ docs/superpowers/specs/2026-06-09-com-aware-ik-design.md"""
 import pytest
 import torch
 
+from cutamp.robots.t1 import get_model
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
+#: The fork's seed-IK CoM box per planning model, (its support link, its half-extents), worked out by hand. The box is
+#: centred on the support frame: the largest such box inside the model's keyframe rectangle about its support centre.
+#: - simplified: t1.urdf's soles, legs together, span x [-0.1015, +0.1215] about the ankle axis and y +-0.15625, so
+#:   half (0.1115, 0.15625) about (0.01, 0) in mobile_base_link. The 2 cm safety margin and the 5 mm dynamic reserve
+#:   leave the keyframe rectangle (0.0865, 0.13125) (this model has no load-guard cut). Its centre sits 1 cm ahead of
+#:   the frame, so the box's x half is 0.0865 - 0.01 = 0.0765.
+#: - real_legs: each sole is the vendor foot's collision box, 0.224868 x 0.1 m (T1_29dof.urdf), taken as
+#:   0.2249 x 0.100 to design 7.2's 0.1 mm (build_planner_model.SOLE_BOX), the sole centres 0.10625 m to either side
+#:   of the mid-sole at home (t1_29dof.yml's sole_y). The soles' hull is |x| <= 0.2249 / 2 = 0.11245 and
+#:   |y| <= 0.10625 + 0.1 / 2 = 0.15625. The load guard (a = 0.1) narrows y by 2 * 0.10625 * 0.1 = 0.02125, to
+#:   0.135. The 2 cm margin takes x to 0.09245 and leaves y at min(0.135, 0.15625 - 0.02) = 0.135, and the 5 mm
+#:   reserve gives (0.08745, 0.130). The stance frame sits at the home mid-sole, the rectangle's centre (0, 0), so the
+#:   box is the rectangle itself.
+SEED_COM_BOX = {"simplified": ("mobile_base_link", [0.0765, 0.13125]), "real_legs": ("stance", [0.08745, 0.130])}
 
-def _world(enable_com_aware_ik: bool):
-    return make_blocks_t1_world(enable_com_aware_ik=enable_com_aware_ik)
+
+def _world(enable_com_aware_ik: bool, model=None):
+    return make_blocks_t1_world(model, enable_com_aware_ik=enable_com_aware_ik)
 
 
 def _home_tool_matrix(world, arm="left"):
@@ -30,22 +46,20 @@ def test_flag_off_seed_cfg_weight_zero_by_default():
 
 
 @needs_cuda
-def test_flag_on_seed_cfg_carries_com_params():
+@pytest.mark.parametrize("robot", ["simplified", "real_legs"])
+def test_flag_on_seed_cfg_carries_com_params(robot):
     from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
     from cutamp.robots.t1 import T1_COM_IK_WEIGHT
-    world = _world(enable_com_aware_ik=True)
+    world = _world(enable_com_aware_ik=True, model=get_model(robot))
     cfg = world.ik_solver.seed_ik_solver.config
-    support = world.model.support
+    link, half = SEED_COM_BOX[robot]
     assert cfg.com_support_weight == T1_COM_IK_WEIGHT > 0.0
-    # The fork's box is centred on the support frame: the largest one inside the model's keyframe rectangle, which
-    # sits at support.center in that frame (the simplified model's 1 cm ahead of its base, the real legs' on it).
-    assert list(cfg.com_half_extents) == pytest.approx(
-        [h - abs(c) for h, c in zip(support.keyframe_half, support.center)])
+    assert list(cfg.com_half_extents) == pytest.approx(half)
     assert cfg.com_inside_margin == COM_INSIDE_MARGIN
     assert cfg.com_inside_weight == COM_INSIDE_WEIGHT
     from cutamp.robots.t1 import T1_COM_IK_CENTER_WEIGHT
     assert cfg.com_center_weight == T1_COM_IK_CENTER_WEIGHT
-    assert cfg.com_base_link_name == support.link
+    assert cfg.com_base_link_name == link
 
 
 @needs_cuda
@@ -155,7 +169,8 @@ def test_residual_fires_iff_enabled():
 def test_robot_com_gradient_flows_to_joints_with_fd_check():
     # The residual's core chain: joint_position -> fused-FK robot_com -> penalty
     # -> backward -> joint_position.grad. Verify against finite differences on
-    # the leg and trunk joints the residual is meant to recruit (the model's body).
+    # every joint the solver moves: the arms, the legs and trunk the residual is
+    # meant to recruit (the model's body) and, where the model frees it, the base.
     from curobo._src.solver.seed_ik.seed_ik_error_calculator import com_support_penalty
     from curobo.types import JointState
     from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
@@ -190,16 +205,20 @@ def test_robot_com_gradient_flows_to_joints_with_fd_check():
     assert torch.isfinite(grad).all()
 
     eps = 1e-3
-    body = [names.index(n) for n in world.model.joint_names[world.model.body]]
-    for j in body:
+    for j in range(len(names)):  # every column of the solver's model
         qp = q0.clone(); qp[0, j] += eps
         qm = q0.clone(); qm[0, j] -= eps
         with torch.no_grad():
             fd = (penalty_at(qp) - penalty_at(qm)) / (2 * eps)
         assert grad[j].item() == pytest.approx(fd.item(), rel=0.05, abs=1e-4), \
             f"{names[j]}: autograd {grad[j].item():.6f} vs FD {fd.item():.6f}"
-    # The chain must actually recruit the body: a leg or trunk gradient clearly nonzero.
+    # The chain must actually recruit the body: a leg or trunk gradient clearly nonzero. Where the solver moves the
+    # base (the real legs, lock_base False), the base is the main CoM lever: a base gradient clearly nonzero too.
+    body = [names.index(n) for n in world.model.joint_names[world.model.body]]
     assert grad[body].abs().max().item() > 1e-3
+    if not world.model.lock_base:
+        base = [names.index(n) for n in world.model.joint_names[world.model.base]]
+        assert grad[base].abs().max().item() > 1e-3
 
 
 def _forward_reach_solutions(world, n_fwd=4, n_lat=3, unreachable=False):
@@ -250,15 +269,15 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     assert float(absx_on.mean()) < 0.5 * float(absx_off.mean()), \
         f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
 
-    # (2) joint limits: every SUCCESSFUL solution's leg and trunk joints (the
-    #     model's body) within the solver's bounds (+1e-3 slack). Limits are a
-    #     soft residual + success filter in the seed-IK solver — failed rows
-    #     may legitimately sit slightly out of bounds and are masked out
+    # (2) joint limits: every SUCCESSFUL solution's joints (the base, the arms,
+    #     the legs and trunk) within the solver's bounds (+1e-3 slack). Limits
+    #     are a soft residual + success filter in the seed-IK solver — failed
+    #     rows may legitimately sit slightly out of bounds and are masked out
     #     downstream, but a successful out-of-limit solution would be a fork bug.
     body = world_on.model.body
-    lower, upper = (b[body] for b in world_on.kinematics.get_joint_limits().position)
-    for jn, col, lo, hi in zip(world_on.model.joint_names[body], q_on[s_on][:, body].T, lower.tolist(),
-                               upper.tolist()):
+    lower, upper = world_on.kinematics.get_joint_limits().position
+    assert len(world_on.model.joint_names) == q_on.shape[1] == lower.numel() == upper.numel()
+    for jn, col, lo, hi in zip(world_on.model.joint_names, q_on[s_on].T, lower.tolist(), upper.tolist()):
         assert float(col.min()) >= lo - 1e-3 and float(col.max()) <= hi + 1e-3, \
             f"{jn} out of [{lo:.3f},{hi:.3f}]: [{float(col.min()):.3f},{float(col.max()):.3f}]"
 

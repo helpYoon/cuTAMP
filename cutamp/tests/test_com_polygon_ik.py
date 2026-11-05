@@ -1,6 +1,7 @@
 """Tests for the COM polygon penalty math, hard gate, and post-IK mask."""
 import pytest
 
+from cutamp.robots.t1 import SIMPLIFIED, get_model
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 #: A lean from home that carries the CoM far past the support's front edge, per planning model ({joint: delta}): the
@@ -8,6 +9,12 @@ from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 #: floating base carries the whole body 30 cm ahead of the stance its support region stays on.
 EXTREME_LEAN = {"simplified": {"Torso_Pitch": -1.7, "ankle_pitch": -0.5, "knee_pitch": 0.8},
                 "real_legs": {"base_j_x": 0.3}}
+
+#: The spread test_mask_matches_penalty_gate adds to home, per planning model ({joint: sigma}, rad or m), so that its
+#: rows straddle the keyframe rectangle's edge: the simplified model's CoM moves with its legs and trunk; the real
+#: legs' trunk rides the floating base, whose x and y carry the CoM across the stance's edges.
+EDGE_SPREAD = {"simplified": dict.fromkeys(SIMPLIFIED.joint_names[SIMPLIFIED.body], 0.3),
+               "real_legs": {"base_j_x": 0.1, "base_j_y": 0.1}}
 
 
 def _moved(world, moves: dict):
@@ -347,25 +354,34 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
 
 
 @needs_cuda
-def test_mask_matches_penalty_gate():
+@pytest.mark.parametrize("robot", ["simplified", "real_legs"])
+def test_mask_matches_penalty_gate(robot):
     # The post-IK mask must equal (penalty <= COM_TOL) elementwise, so the IK
     # COM-safe retry loop and the ConstraintChecker can never disagree.
     # COM_TOL is inside_weight * inside_margin^2 = 4e-4, calibrating the hard
     # constraint's tolerance against the mask's definition of 'inside'.
     import torch
     from cutamp.com_polygon_cost import (
-        COM_TOL, compute_com_polygon_mask, compute_com_polygon_penalties,
+        COM_TOL, compute_com_margin, compute_com_polygon_mask, compute_com_polygon_penalties,
     )
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(get_model(robot))
     home = world.q_init.detach().clone()
     bent = _moved(world, EXTREME_LEAN[world.model.name])  # genuinely out-of-hull
-    # Spread a batch of configs around home so some land near the polygon
-    # edge, then append the deterministic [home, bent] pair so both
-    # classifications are guaranteed present in the batch.
+    # Spread a batch of configs around home by the model's EDGE_SPREAD, so its
+    # rows straddle the polygon edge, then append the deterministic [home, bent]
+    # pair so both classifications are guaranteed present in the batch.
     torch.manual_seed(0)
-    body = world.model.body
+    names = list(world.kinematics.joint_names)
+    spread = EDGE_SPREAD[world.model.name]
     q = home.unsqueeze(0).repeat(32, 1).clone()
-    q[:, body] += 0.3 * torch.randn(32, body.stop - body.start, device=q.device)   # perturb the leg and trunk DOFs
+    sigma = torch.tensor(list(spread.values()), device=q.device)
+    q[:, [names.index(n) for n in spread]] += sigma * torch.randn(32, len(spread), device=q.device)
+    # The premise: the spread rows hold zero and positive penalties, and rows
+    # within 1 cm of the edge on either side of it, where the two FK paths
+    # (world.kinematics for the mask, the "com" site for the penalty) must agree.
+    margin, spread_pens = compute_com_margin(world, q), compute_com_polygon_penalties(world, {"q": q})["q"]
+    assert bool((spread_pens > 0).any() & (spread_pens == 0).any()), spread_pens.tolist()
+    assert bool(((margin > 0) & (margin < 0.01)).any() & ((margin < 0) & (margin > -0.01)).any()), margin.tolist()
     q = torch.cat([q, torch.stack([home, bent], dim=0)], dim=0)  # [34, full_dof]
     mask = compute_com_polygon_mask(world, q)
     pens = compute_com_polygon_penalties(world, {"q": q})["q"]

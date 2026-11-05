@@ -195,13 +195,15 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
 @needs_cuda
 @pytest.mark.parametrize("blocks_t1_plan,sc,balance_first", [
     *(pytest.param("simplified", sc, False, id=f"{sc}-False") for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
+    pytest.param("simplified", "joint_limit_margin", True, id="joint_limit_margin-True-simplified"),
     pytest.param(None, None, True, id="no_soft_cost-True"),
     *(pytest.param(None, sc, True, id=f"{sc}-True") for sc in SUPPORTED_SOFT_COSTS),
 ], indirect=["blocks_t1_plan"], scope="module")
 def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
     # As test_step_lockstep_vs_head, for each soft cost alone and for none. max_obj_dist, min_obj_dist and align_yaw
     # also run in pose-only mode, on the simplified model (the ablation arm, design call 15): the default soft costs
-    # never reach their triu gathers.
+    # never reach their triu gathers. joint_limit_margin also runs on the simplified model: the real legs' margin
+    # bands are zero (decision 6), so only there does JointLimitMarginCost's step-body math compute anything.
     world, skeleton, base = blocks_t1_plan
     config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=5, early_stop_patience=0,
                                reik_balance_first=balance_first, cuda_graphs=False, enable_visualizer=False,

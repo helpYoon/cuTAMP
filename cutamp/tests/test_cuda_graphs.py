@@ -150,13 +150,15 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
     assert next(busy) == 8                           # consulted once per step, until the capture
 
 
-# On the simplified model, the one whose byte-exact reading holds. On the real legs the final check repairs with
-# cuRobo's CUDA-graphed IK, which keeps a line search's points (about 1.2 MB, held outside Python): from the same
-# particles, RNG states and IK seeds every call returns the same plan, yet the reading moves 16 KiB up or down from
-# call to call, bounded (6 calls, 2026-11-05). test_cuda_graphs_whole_call checks, bitwise, that the real legs'
-# graph calls leave no state behind.
+# On both models; None is the default model and shares the module's world. The memory reading is byte-exact on the
+# simplified model. On the real legs the final check repairs with cuRobo's CUDA-graphed IK, whose line search
+# (line_search_strategy.py, jit_get_x_set) alternates two blocks of one size class, about 1.2 MB each, held on the
+# C++ side. The bytes requested stay the same from call to call, but the caching allocator counts a block at the
+# size of the cached block it lands in, so the reading moves (by 16 KiB between this test's two calls), bounded.
+# The real legs get that 16 KiB bound, which a real leak still fails. (test_cuda_graphs_whole_call compares the
+# calls' results bitwise, not their memory.)
 @needs_cuda
-@pytest.mark.parametrize("blocks_t1_plan", ["simplified"], indirect=True)
+@pytest.mark.parametrize("blocks_t1_plan", ["simplified", pytest.param(None, id="default")], indirect=True)
 def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
     world, skeleton, base = blocks_t1_plan
@@ -186,7 +188,10 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
     # The FK sites outlive the call, sized by the batch they last ran. Same plan, so the same
     # buffers after both calls: they count the same in both readings and can't hide a leak.
     assert sites[1] == sites[0]
-    assert mem[1] == mem[0]                          # and nothing grows from call to call
+    if world.model.name == "simplified":
+        assert mem[1] == mem[0]                      # and nothing grows from call to call
+    else:                                            # cuRobo IK's line-search blocks, see above
+        assert abs(mem[1] - mem[0]) <= 16 * 1024, mem
 
 
 @needs_cuda
