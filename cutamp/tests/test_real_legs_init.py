@@ -232,4 +232,6 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
     at_home = torch.ones_like(joint_limit, dtype=torch.bool)
     at_home[:2, 0] = False
     assert not bool(joint_limit[at_home].any()) and not bool(self_collision[at_home].any())
-    assert {k: default_constraint_to_tol[Motion.type][k] for k in values} == dict.fromkeys(values, 0.0)
+    # Exact, as the other Motion values; the Trunk tilt's 1e-6 (in cosine) is test_envelope's.
+    tols = {k: default_constraint_to_tol[Motion.type][k] for k in values if k != "trunk_tilt"}
+    assert tols == dict.fromkeys(tols, 0.0)

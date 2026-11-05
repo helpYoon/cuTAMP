@@ -322,7 +322,11 @@ def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
     height floor raises ``base_j_z``'s lower limit, and each listed joint's range raises its ``position_limit_clip``,
     which cuRobo takes off both ends of the URDF range (kinematics_loader.py:1119-1120). Raises if a range leaves
     nothing of the soft range."""
-    base_z = next(link for link in kinematics["extra_links"].values() if link.get("joint_name") == "base_j_z")
+    base_z = next((link for link in kinematics.get("extra_links", {}).values() if link.get("joint_name") == "base_j_z"),
+                  None)
+    if base_z is None:
+        raise ValueError(f"envelope {envelope.name!r}: no extra link carries base_j_z, whose lower limit is the Trunk "
+                         "floor")
     lower, upper = base_z["joint_limits"]
     if envelope.trunk_height_min >= upper:
         raise ValueError(f"envelope {envelope.name!r}: Trunk floor {envelope.trunk_height_min} m >= base_j_z's {upper}")
