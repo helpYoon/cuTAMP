@@ -518,14 +518,14 @@ example has its own: `pytest examples/`.
   `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`), one
   `run_cutamp` subprocess per run that saves its plan (`--save_plan auto`),
   with a resumable manifest; `--smoke` / `--heights` / `--seeds` shrink it.
-  `--gate` runs the speed gate instead: both models at `-n` 256 and 512,
+  `--gate` runs the speed gate instead: both models at `-n` 64,
   interleaved, over the same heights and seeds, each run replayable from its
   seed.
 - [`analyze_ablation.py`](cutamp/scripts/analyze_ablation.py) — turns that
   manifest into `results.csv`, `deltas.csv`, `results.md` and figures; with
   `--gate`, a gate study into `gate.json` and `gate.md`: per model and `-n`
   the runs, planning-time median and p90 and the stage times, and the verdict
-  at `-n` 256 (all 40 runs of each model timed, every real-leg run solved,
+  at `-n` 64 (all 40 runs of each model timed, every real-leg run solved,
   motion-planned and balanced, and median and p90 times at most 1.5× and 2×
   the simplified model's).
 - [`real_legs_report.py`](cutamp/scripts/real_legs_report.py) — the real-leg

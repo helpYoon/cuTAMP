@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cutamp.scripts.run_ablation import HEIGHTS, SEEDS
+from cutamp.scripts.run_ablation import GATE_N, HEIGHTS, SEEDS
 
 METRICS = [
     "num_satisfying_final",
@@ -54,13 +54,13 @@ TOP_TIMERS = ("load_tamp_world", "warmup_ik_solver", "get_plan_generator", "samp
 # repair, and the world's load (the timing check's).
 STAGE_TIMERS = {"seed_ik_s": "initialize_particles", "trajopt_s": "curobo_planning", "final_repair_s": "final_repair",
                 "load_tamp_world_s": "load_tamp_world"}
-# The speed gate (design section 8), on run_ablation's GATE_CELLS: decided at n = 256, the real-leg model passes if
+# The speed gate (design section 8), on run_ablation's GATE_CELLS: decided at its one n (64), the real-leg model passes if
 # all GATE_RUNS of its runs find a solution, a motion plan and a balanced plan, and its median and p90 planning times
 # are at most GATE_MEDIAN_MAX and GATE_P90_MAX times the same-session simplified model's. Both models need all
 # GATE_RUNS runs, each with a planning time: a missing run of either would move the ratios.
 GATE_BASELINE, GATE_MODEL = "simplified", "real_legs"
 GATE_RUNS = len(HEIGHTS) * len(SEEDS)  # 40 per model and n
-GATE_DECIDED_AT = 256
+GATE_DECIDED_AT = GATE_N[0]
 GATE_MEDIAN_MAX, GATE_P90_MAX = 1.5, 2.0
 GATE_COUNTS = ("found_solution", "motion_plan_success", "stable_plan")
 GATE_STAGES = ("seed_ik_s", "ms_per_step", "trajopt_s", "final_repair_s", "load_tamp_world_s")

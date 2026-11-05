@@ -371,7 +371,7 @@ def test_torque_failures_count_every_torque_form(tmp_path):
     assert [r["torque_failures"] for r in load_study(tmp_path / "manifest.json")] == [3, None]
 
 
-def _gate_records(ratio=1.4, n=256, balanced=40, slow_tail=1.0):
+def _gate_records(ratio=1.4, n=64, balanced=40, slow_tail=1.0):
     """40 runs per model at ``n``: simplified planning times 10 s + k / 4, the real legs ``ratio`` times as long, with
     their top five ``slow_tail`` times longer again, and ``balanced`` of their 40 plans balanced."""
     records = []
@@ -388,13 +388,13 @@ def _gate_records(ratio=1.4, n=256, balanced=40, slow_tail=1.0):
 
 
 def test_gate_summary_flags():
-    # Design section 8: decided at n = 256, the real legs pass with 40/40 on all three counts, a median planning-time
+    # Design section 8, at the user's n 64: decided there, the real legs pass with 40/40 on all three counts, a median planning-time
     # ratio of at most 1.5 and a p90 ratio of at most 2.0 (numpy's linear percentile).
     import numpy as np
 
-    s = gate_summary(_gate_records(1.4) + _gate_records(1.6, n=512))
-    assert s["decided_at"] == 256 and s["pass"] == {"success": True, "median": True, "p90": True, "pass": True}
-    at = s["by_n"][256]
+    s = gate_summary(_gate_records(1.4) + _gate_records(1.6, n=256))
+    assert s["decided_at"] == 64 and s["pass"] == {"success": True, "median": True, "p90": True, "pass": True}
+    at = s["by_n"][64]
     simplified, real = at["cells"]["simplified"], at["cells"]["real_legs"]
     times = [10.0 + 0.25 * k for k in range(40)]
     assert simplified["planning_s"] == pytest.approx({"median": float(np.percentile(times, 50)),
@@ -407,13 +407,13 @@ def test_gate_summary_flags():
     assert real["stage_medians"] == pytest.approx({"seed_ik_s": 5.6, "ms_per_step": 12.25, "trajopt_s": 2.8,
                                                    "final_repair_s": 0.45, "load_tamp_world_s": 0.4})
     assert simplified["torque_failures"] == 0
-    # n = 512 is reported, but it does not decide.
-    assert s["by_n"][512]["flags"]["median"] is False and s["by_n"][512]["ratio"]["median"] == pytest.approx(1.6)
+    # Another n is reported, but it does not decide.
+    assert s["by_n"][256]["flags"]["median"] is False and s["by_n"][256]["ratio"]["median"] == pytest.approx(1.6)
 
     assert gate_summary(_gate_records(1.6))["pass"] == {"success": True, "median": False, "p90": True, "pass": False}
     assert gate_summary(_gate_records(1.4, balanced=39))["pass"] == {
         "success": False, "median": True, "p90": True, "pass": False}
-    slow = gate_summary(_gate_records(1.4, slow_tail=2.0))["by_n"][256]
+    slow = gate_summary(_gate_records(1.4, slow_tail=2.0))["by_n"][64]
     assert slow["ratio"]["median"] == pytest.approx(1.4) and slow["ratio"]["p90"] == pytest.approx(2.8)
     assert slow["flags"] == {"success": True, "median": True, "p90": False, "pass": False}
     # A run that never finished drops out of load_study, so a cell short of its 40 runs cannot pass, the baseline's
@@ -425,8 +425,8 @@ def test_gate_summary_flags():
         untimed = [{**r, "planning_s": None} if r["cell"] == cell and r["seed"] == 0 else r for r in _gate_records(1.4)]
         summary = gate_summary(untimed)
         assert summary["pass"]["success"] is False, cell
-        assert (summary["by_n"][256]["cells"][cell]["runs"], summary["by_n"][256]["cells"][cell]["timed"]) == (40, 39)
-    assert gate_summary(_gate_records(1.4, n=512))["pass"] is None
+        assert (summary["by_n"][64]["cells"][cell]["runs"], summary["by_n"][64]["cells"][cell]["timed"]) == (40, 39)
+    assert gate_summary(_gate_records(1.4, n=256))["pass"] is None
 
 
 def test_gate_md_tells_a_short_study_from_a_failed_one(tmp_path):
@@ -447,7 +447,7 @@ def test_main_gate_writes_gate_outputs(tmp_path, monkeypatch):
 
     runs = []
     for cell in ("simplified", "real_legs"):
-        run = {**_fake_run(tmp_path, cell, 0.5, 0), "n": 256}
+        run = {**_fake_run(tmp_path, cell, 0.5, 0), "n": 64}
         (Path(run["experiment_path"]) / "timer_metrics.json").write_text(json.dumps(_timers(**TOP_TIMERS)))
         runs.append(run)
     (tmp_path / "manifest.json").write_text(json.dumps(runs))
@@ -455,10 +455,10 @@ def test_main_gate_writes_gate_outputs(tmp_path, monkeypatch):
                                       "--out", str(tmp_path / "out"), "--gate"])
     analyze_ablation.main()
     summary = json.loads((tmp_path / "out" / "gate.json").read_text())
-    assert summary["by_n"]["256"]["ratio"]["median"] == pytest.approx(1.0)
+    assert summary["by_n"]["64"]["ratio"]["median"] == pytest.approx(1.0)
     assert summary["pass"]["success"] is False  # one run per model, not the gate's 40
     md = (tmp_path / "out" / "gate.md").read_text()
-    assert "## n = 256" in md and "| real_legs | 1 | 1 |" in md  # runs, and runs with a planning time
+    assert "## n = 64" in md and "| real_legs | 1 | 1 |" in md  # runs, and runs with a planning time
     assert "**FAIL** (not 40 runs: simplified 1, real_legs 1)." in md
     assert "| failed past an effort |" in md and "Failed past an effort counts the motion-plan candidates" in md
 

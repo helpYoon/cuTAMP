@@ -9,7 +9,7 @@ and CUDA graphs are run_cutamp's defaults, so ``default_reik`` turns both
 off explicitly; with no flags it would be a second ``full`` arm.
 
 ``--gate`` runs the speed gate instead (design section 8): the real-leg
-model against the simplified one at n 256 and 512, interleaved, every run
+model against the simplified one at n 64, interleaved, every run
 replayable from its seed.
 
 Usage:
@@ -43,7 +43,7 @@ SMOKE_ARGS = ["-n", "64", "--num_opt_steps", "30", "--disable_visualizer"] + SOF
 # minimize_body_movement (call 2), at HEAD's n and G1's.
 GATE_CELLS = {"simplified": ["--robot", "simplified", "--soft_cost", "joint_limit_margin"],
               "real_legs": ["--robot", "real_legs", "--soft_cost", "joint_limit_margin", "minimize_body_movement"]}
-GATE_N = (256, 512)
+GATE_N = (64,)  # the user, 2026-11-05: no n 512, and 64 rather than 256
 
 
 def build_run_plan(heights=HEIGHTS, seeds=SEEDS, smoke=False):
@@ -143,7 +143,7 @@ def main():
     mode.add_argument("--smoke", action="store_true",
                       help="tiny pilot: 64 particles, 30 steps, 1 height, 1 seed, no motion plan")
     mode.add_argument("--gate", action="store_true",
-                      help="the speed gate (design section 8): the simplified and real-leg models at n 256 and 512, "
+                      help="the speed gate (design section 8): the simplified and real-leg models at n 64, "
                            "interleaved, each run replayable (--seed and PYTHONHASHSEED)")
     ap.add_argument("--heights", type=float, nargs="+", help="override the heights")
     ap.add_argument("--seeds", type=int, nargs="+", help="override the seeds")

@@ -178,26 +178,26 @@ def test_run_study_default_execute_forwards_experiment_root(monkeypatch, tmp_pat
 
 
 def test_gate_plan_interleaves(tmp_path):
-    # Design section 8's speed gate: 4 heights x 10 seeds x n (256, 512) x both models, in that loop order, so the
+    # Design section 8's speed gate: 4 heights x 10 seeds x n 64 x both models, in that loop order, so the
     # two models alternate through one session; --seed and PYTHONHASHSEED make every run replayable.
     plan = build_gate_plan()
-    assert len(plan) == 160
+    assert len(plan) == 80
     assert [(r["height"], r["seed"], r["n"], r["cell"]) for r in plan[:4]] == [
-        (0.0, 0, 256, "simplified"), (0.0, 0, 256, "real_legs"),
-        (0.0, 0, 512, "simplified"), (0.0, 0, 512, "real_legs"),
+        (0.0, 0, 64, "simplified"), (0.0, 0, 64, "real_legs"),
+        (0.0, 1, 64, "simplified"), (0.0, 1, 64, "real_legs"),
     ]
-    assert len({r["experiment_id"] for r in plan}) == 160
+    assert len({r["experiment_id"] for r in plan}) == 80
     for r in plan:
         assert r["env"] == {"PYTHONHASHSEED": str(r["seed"])}
         assert r["experiment_id"] == f"gate_{r['cell']}_n{r['n']}_h{int(r['height'] * 100):03d}_s{r['seed']}"
         assert r["args"] == ["-n", str(r["n"]), "--disable_visualizer", "--motion_plan", "--save_plan", "auto",
                              "--surface_height", str(r["height"]), "--seed", str(r["seed"]),
                              "--experiment_id", r["experiment_id"], *GATE_CELLS[r["cell"]]]
-    assert [(r["height"], r["seed"]) for r in build_gate_plan(heights=[0.5], seeds=[3])] == [(0.5, 3)] * 4
+    assert [(r["height"], r["seed"]) for r in build_gate_plan(heights=[0.5], seeds=[3])] == [(0.5, 3)] * 2
     # Each manifest row gains n, for the per-n gate.
     manifest = run_study(plan[:4], out_dir=tmp_path, execute=lambda run: 0)
     assert [(row["cell"], row["n"]) for row in manifest] == [
-        ("simplified", 256), ("real_legs", 256), ("simplified", 512), ("real_legs", 512),
+        ("simplified", 64), ("real_legs", 64), ("simplified", 64), ("real_legs", 64),
     ]
 
 
