@@ -3,7 +3,9 @@
 # lists cuRobo's own joint order for these tool frames, because cuRobo adds position_limit_clip (the soft limits,
 # call 17) after reordering the cspace and never reorders the clip itself: tool frames that change that order put
 # the soft limits on the wrong joints. cuRobo applies velocity_scale twice, so the Ankle_Pitch scale is the square
-# root of the cap over the URDF velocity: read velocity limits from cuRobo, not from this file.
+# root of the cap over the URDF velocity: read velocity limits from cuRobo, not from this file. max_acceleration,
+# max_jerk and the base joints' velocity limits are trajopt's internal timing; the balance gate sets the exported
+# pace.
 # cuRobo never reads the cutamp: block.
 robot_cfg:
   kinematics:
@@ -28,6 +30,7 @@ robot_cfg:
         joint_type: X_PRISM
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-0.517, 0.57]
+        joint_velocity_limits: [-2.0, 2.0]
         link_mass: 0.0
       base_link_y:
         parent_link_name: base_link_x
@@ -36,6 +39,7 @@ robot_cfg:
         joint_type: Y_PRISM
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-0.31, 0.31]
+        joint_velocity_limits: [-2.0, 2.0]
         link_mass: 0.0
       base_link_z:
         parent_link_name: base_link_y
@@ -44,6 +48,7 @@ robot_cfg:
         joint_type: Z_PRISM
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-0.046, 0.772]
+        joint_velocity_limits: [-2.0, 2.0]
         link_mass: 0.0
       base_link_pitch:
         parent_link_name: base_link_z
@@ -52,6 +57,7 @@ robot_cfg:
         joint_type: Y_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-3.141592653589793, 3.141592653589793]
+        joint_velocity_limits: [-2.0, 2.0]
         link_mass: 0.0
       base_link_roll:
         parent_link_name: base_link_pitch
@@ -60,6 +66,7 @@ robot_cfg:
         joint_type: X_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-1.4707963267948965, 1.4707963267948965]
+        joint_velocity_limits: [-2.0, 2.0]
         link_mass: 0.0
       base_link_yaw:
         parent_link_name: base_link_roll
@@ -69,6 +76,7 @@ robot_cfg:
         joint_type: Z_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
         joint_limits: [-3.141592653589793, 3.141592653589793]
+        joint_velocity_limits: [-2.0, 2.0]
         link_mass: 0.0
       left_sole_link:
         parent_link_name: left_foot_link

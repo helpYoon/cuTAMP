@@ -87,6 +87,15 @@ ROLL_MARGIN = 0.1  # rad
 
 SOFT_LIMIT_FACTOR = 0.9  # bfm_wm robot/t1.py:118, T1_CFG.soft_joint_pos_limit_factor (call 17)
 ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's top speed, npz v_max (7.4a)
+# Trajopt's internal timing. Trajopt times each segment against these and its success test checks the torques at
+# that timing, so they shape the path it finds; the balance gate then sets the exported pace from the robot's own
+# limits (speed, effort, ZMP: motion_solver._pace). They are not robot facts: the acceleration and jerk caps are
+# the simplified model's (t1_planar_base.yml), and the base's velocity limit is cuRobo's default for extra links
+# (link_params.py:32), written out. With non-binding caps in their place (1e4, 1e6, 1e3) both seed-0 runs of P2's
+# check set failed every candidate's first trajopt on its torque check, so trajopt keeps these.
+TRAJOPT_MAX_ACCELERATION = 15.0  # rad/s^2 (m/s^2 on the base's x, y, z)
+TRAJOPT_MAX_JERK = 100.0  # rad/s^3
+BASE_VELOCITY_LIMIT = 2.0  # rad/s, m/s: each of the six virtual base joints
 
 # Design 7.2's sole frame and sole box, which _check_soles finds at the foot collision box's bottom centre and its x
 # and y, to the 0.1 mm the design gives them in.
@@ -108,7 +117,11 @@ ROBOT_HEADER = HEADER + (
     "that order put\n"
     "# the soft limits on the wrong joints. cuRobo applies velocity_scale twice, so the Ankle_Pitch scale "
     "is the square\n"
-    "# root of the cap over the URDF velocity: read velocity limits from cuRobo, not from this file.\n"
+    "# root of the cap over the URDF velocity: read velocity limits from cuRobo, not from this file. "
+    "max_acceleration,\n"
+    "# max_jerk and the base joints' velocity limits are trajopt's internal timing; the balance gate sets "
+    "the exported\n"
+    "# pace.\n"
     "# cuRobo never reads the cutamp: block.\n")
 
 
@@ -298,7 +311,8 @@ def _extra_links(mid_sole: list, base_limits: dict) -> dict:
         if i == len(BASE) - 1:
             link["child_link_name"] = "Trunk"
         link.update(link_name=f"base_link_{n}", joint_name=f"base_j_{n}", joint_type=joint_type,
-                    fixed_transform=list(identity), joint_limits=list(base_limits[n]), link_mass=0.0)
+                    fixed_transform=list(identity), joint_limits=list(base_limits[n]),
+                    joint_velocity_limits=[-BASE_VELOCITY_LIMIT, BASE_VELOCITY_LIMIT], link_mass=0.0)
         extra[f"base_link_{n}"] = link
         parent = f"base_link_{n}"
     for (side, _), sole in zip(SIDES, SOLE_FRAMES):
@@ -419,8 +433,8 @@ def main(argv=None) -> None:
         "acceleration_scale": [1.0] * len(order),
         "velocity_scale": [velocity_scale[j] for j in order],
         "position_limit_clip": [clip[j] for j in order],
-        "max_acceleration": 15.0,
-        "max_jerk": 100.0,
+        "max_acceleration": TRAJOPT_MAX_ACCELERATION,
+        "max_jerk": TRAJOPT_MAX_JERK,
     }
     config = {
         "robot_cfg": {"kinematics": kinematics},
