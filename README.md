@@ -73,32 +73,42 @@ graph LR
    (`--no_reik_balance_first`: pose-only GN with a low-seed cuRobo fallback).
    Adam stops after `early_stop_patience` steps without progress and keeps the
    best-seen particles. `ConstraintChecker` decides which particles satisfy.
-4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives the
-   best satisfying particles (up to `motion_plan_max_retries`, first success
-   wins) through `motion_solver.py`: one 21-DOF `MotionPlanner`, built on a
-   background thread while the optimizer runs, re-pinned per operator
-   (`pin_for_arm_action`, a no-op), and planned to each particle conf with
-   `plan_cspace`. When `enable_com_polygon` is on (the default), each segment
-   then passes `_balance_gate`: every frame's CoM and multibody ZMP
-   (`com_zmp_in_support`) must stay inside `SUPPORT_HALF_EXTENTS`, the real
-   soles shrunk 2 cm. A CoM outside fails the candidate and the next one is
-   tried; a ZMP outside slows the segment down uniformly (`_retime`, up to
-   `RETIME_MAX` = 4×), and a ZMP still outside at 4× fails the candidate too.
+4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
+   the best satisfying particles (up to `motion_plan_max_retries`, first
+   success wins) through `motion_solver.py`: one `MotionPlanner` over the
+   model's cspace, built on a background thread while the optimizer runs,
+   re-pinned per operator (`pin_for_arm_action`, a no-op), and planned to each
+   particle conf with `plan_cspace`. When `enable_com_polygon` is on (the
+   default), each segment then passes `_balance_gate`: every frame's CoM and
+   multibody ZMP (`com_zmp_in_support`) must stay inside the model's support
+   rectangle (`world.model.support`): on the simplified model
+   `SUPPORT_HALF_EXTENTS`, the real soles shrunk 2 cm; on the real legs the
+   home stance's two soles, shrunk 2 cm and kept where each foot carries at
+   least a tenth of the weight. A CoM outside fails the candidate and the next
+   one is tried; a ZMP outside slows the segment down uniformly (`_retime`, up
+   to `RETIME_MAX` = 4×), and a ZMP still outside at 4× fails the candidate
+   too. On the real legs every frame must also keep both soles on the stance
+   (and the Trunk's tilt within the envelope's bound, where it sets one); a
+   slowed segment's frames are checked again, and its joint torques, cuRobo's
+   RNEA with the floor's push on the soles (`SegmentTorques`), must stay within
+   their efforts.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the processed plan
    (schema v3, `utils/plan_processor.py`) for the downstream MPC consumer
    ([`examples/load_motion_plan_for_mpc.py`](examples/load_motion_plan_for_mpc.py)
    shows how to read it). A segment the gate slowed down also carries
    `planner_timing`, the same segment at the motion planner's own timing
-   (`None` otherwise).
+   (`None` otherwise). A real-leg plan is saved raw (`stage3-raw`, in the
+   model's joint order), which the MPC example refuses.
 
 `run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
 the shared `TAMPWorld`.
 
 ## T1 Single-Planner Architecture (cuRobo v0.8)
 
-cuTAMP plans for the T1 humanoid through a **single 21-DOF
-MotionPlanner** built from `t1_planar_base.yml`. The cspace is:
+cuTAMP plans for the T1 humanoid through a **single MotionPlanner** on one
+of two planning models (`--robot`; `T1Model` in `robots/t1.py`). The default,
+`simplified`, is built from `t1_planar_base.yml`; its cspace is:
 
 ```
 3 base (planar: base_j_x, base_j_y, base_j_yaw)   ← locked at IK time
@@ -121,7 +131,7 @@ costs can read the base pose.
 
 ```mermaid
 graph TD
-    subgraph Planner [Single 21-DOF MotionPlanner]
+    subgraph Planner [Single MotionPlanner, simplified model]
         Base["Planar base (3, locked at IK)"]
         Body["Leg + Torso (4, always free)"]
         L["Left arm (7)"]
@@ -151,6 +161,16 @@ and torso carry it, and `plan_cspace` holds nothing between the endpoint
 confs (the pin is a no-op). The visualizer tracks both arms' held objects
 through every trajectory (see `T1State.compute_all_held_obj_poses`).
 
+`real_legs` is bfm_wm's T1 (`assets/t1_29dof/`) on a six-joint floating base,
+built from `t1_29dof.yml`. Its 33 planned joints are the base (x, y, z, then
+pitch, roll, yaw), both 7-joint arms, the Waist and the 12 leg joints; the
+head and the gripper joints are locked. Both soles stand on the home stance:
+the IK's sole goals, GN's sole rows and the kinematic constraint hold them
+there, and the `stance` tool frame, at the home mid-sole on the floor, is the
+support region's frame. The planner's dynamics include the floor's push on
+the soles. The real legs run only the full system: they refuse the ablation
+flags.
+
 ## Layout
 
 ### 📁 [`cutamp/robots/`](cutamp/robots/)
@@ -176,6 +196,12 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
     spheres used by grasp sampling.
   - `meshes/` — STL meshes referenced by `t1_simplified.urdf`;
     `actual_meshes/` — the mesh set `t1.urdf` uses.
+- **[`assets/t1_29dof/`](cutamp/robots/assets/t1_29dof/)** — the real-leg
+  model: a pinned copy of bfm_wm's T1 (`PROVENANCE.yml` gives each file's
+  source and sha1) and `build_planner_model.py`, which derives the planner's
+  `t1_planner.urdf` (the vendor URDF plus a `world` link and cuTAMP's gripper),
+  `t1_29dof.yml` and `t1_29dof_spheres.yml` from it; a rerun reproduces all
+  three byte for byte.
 - [`assets/README.md`](cutamp/robots/assets/README.md) — short index of the
   asset files.
 
@@ -184,6 +210,9 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   account for T1's +X-toward-fingertips EE convention.
 
 - [`t1.py`](cutamp/robots/t1.py) — T1 module:
+  - `T1Model`, the planning model as data, and its two instances `SIMPLIFIED`
+    and `REAL_LEGS` (`get_model(config.robot)`): the cspace and its joint
+    groups, home, limit margins, support rectangle, sole frames and envelope.
   - cuRobo loaders: `get_t1_kinematics` (always `compute_com=True`;
     `compute_jacobian=True` for the GN refresh), `get_t1_ik_solver(scene)` (a single
     multi-tool-frame IK over both arms; with `enable_com_aware_ik=True`, the
@@ -198,28 +227,29 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
     `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
     masses and CoMs and the URDF's inertias, for the balance gate's
     multibody ZMP).
-  - Joint-name + index constants: `JOINT_NAMES_FULL`, `BASE_INDICES`,
-    `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`,
-    `t1_home`, the per-joint, per-side joint-limit bands
+  - The simplified model's joint-name + index constants: `JOINT_NAMES_FULL`,
+    `BASE_INDICES`, `BODY_INDICES`, `LEFT_ARM_JOINT_NAMES`,
+    `RIGHT_ARM_JOINT_NAMES`, `t1_home`, the per-joint, per-side joint-limit bands
     `T1_LIMIT_MARGIN_LOWER` / `T1_LIMIT_MARGIN_UPPER`, and the planner's
     ankle-pitch upper band `T1_TRAJOPT_ANKLE_UPPER_MARGIN` (0.02 rad).
-  - `T1RerunRobot` for visualization: maps a 21-DOF cspace vector into the
-    URDF's 28 joints (the planar base becomes a root transform), splices in
-    head + per-arm gripper state. Playback reprojects the planner's 18-DOF
-    trajectories to 21 first.
+  - `T1RerunRobot` for visualization: sets the URDF's joints from a conf in
+    the model's cspace (the base becomes a root transform) and the gripper
+    state from `set_grippers`. Playback reprojects the planner's trajectories
+    to the model's full cspace first.
 
 ### 📁 [`cutamp/`](cutamp/) — core
 
-- [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a TAMPEnvironment
-  with the collision Scene, the single `Kinematics` (built with
-  `compute_com=True`), a single multi-tool-frame
-  `InverseKinematics` solver, and a `MotionPlanner` factory. `q_init` is one
-  21-DOF tensor. Built lazily: `ik_refresh_solver` (the low-seed, warm-started
-  IK for re-IK refreshes when `reik_num_seeds > 0`), `kinematics_jac` (the
-  Jacobian twin for the GN refresh), `bodies` (`get_t1_bodies`: a second
-  `Kinematics` whose tool frames are every massive link, for the balance
-  gate's multibody ZMP), and one `site_kinematics(name)` per
-  Adam-loop FK site in `FK_SITES`.
+- [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a
+  TAMPEnvironment with the collision Scene, the single `Kinematics` (built
+  with `compute_com=True`), a single multi-tool-frame `InverseKinematics`
+  solver, and a `MotionPlanner` factory. `q_init` is the model's home. On the
+  real legs it also holds the stance (`stance_soles`, `sole_goals`) and
+  `segment_torques`. Built lazily: `ik_refresh_solver` (the low-seed,
+  warm-started IK for re-IK refreshes when `reik_num_seeds > 0`),
+  `kinematics_jac` (the Jacobian twin for the GN refresh), `bodies`
+  (`get_t1_bodies`: a second `Kinematics` whose tool frames are every massive
+  link, for the balance gate's multibody ZMP), and one `site_kinematics(name)`
+  per Adam-loop FK site in `FK_SITES`.
 
 - [`t1_state.py`](cutamp/t1_state.py) — `T1State` carries the planner, the
   per-tool-frame `tool_from_ee`, and per-arm `arm_holding` /
@@ -374,7 +404,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   records per-run metrics and timings.
 
 - [`rollout.py`](cutamp/rollout.py) — FK rollout helpers used by the cost
-  graph (forward kinematics on the full 21-DOF cspace).
+  graph (forward kinematics on the model's full cspace).
 
 - [`conf_locking.py`](cutamp/conf_locking.py) — per-conf gradient masks
   (`build_grad_masks` / `apply_grad_masks`) that zero the base and
@@ -403,7 +433,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   `get_world_cfg`), `shapes.py` (`sample_greedy_surface_spheres`),
   `rerun_utils.py`, and `timer.py` (`TorchTimer`, GPU-synchronized timing).
 
-### 📁 [`cutamp/tests/`](cutamp/tests/) — 227 tests in 34 files
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 335 tests in 42 files
 
 Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 (`needs_cuda` marker, `make_blocks_t1_world` factory, the module-scoped
@@ -437,32 +467,59 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 - [`test_step_lockstep.py`](cutamp/tests/test_step_lockstep.py) and the
   `test_cuda_graphs*.py` files — every Adam step bitwise against its twin and
   the reference math; every graph replay bitwise against eager.
+- [`test_t1_real_legs_model.py`](cutamp/tests/test_t1_real_legs_model.py),
+  [`test_t1_29dof_assets.py`](cutamp/tests/test_t1_29dof_assets.py), the
+  `test_real_legs_*.py` files and
+  [`test_floor_wrench.py`](cutamp/tests/test_floor_wrench.py) — the real-leg
+  model: the pinned assets and their byte-identical rebuild, the stance and
+  its support, IK and GN holding the soles, the gate's sole, tilt and torque
+  checks, the floor's push, and `--robot real_legs` end to end.
 - Plus pin lifecycle, arm-affinity priority, plan-processor derivatives,
   joint-limit margins, motion attach / retry, the ablation runner and
   analyzer, and a coupled-reIK smoke test.
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~5.5 min on an RTX 4090: 223
-passed, 4 skipped on 2026-11-03).
-`CUTAMP_SLOW=1` also runs the 4 live `--cuda_graphs` tests in
-[`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), and the
-MPC example has its own: `pytest examples/`.
+(GPU required for the integration tests; ~6 min on an RTX 4090: 327
+passed, 8 skipped on 2026-11-04).
+`CUTAMP_SLOW=1` also runs the 8 slow live tests: 6 `--cuda_graphs` runs in
+[`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), the floor
+hook on a live motion planner in
+[`test_floor_wrench.py`](cutamp/tests/test_floor_wrench.py) and the
+`--robot real_legs` run in
+[`test_real_legs_motion.py`](cutamp/tests/test_real_legs_motion.py). The MPC
+example has its own: `pytest examples/`.
 
 ### 📁 [`cutamp/scripts/`](cutamp/scripts/)
 
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
-  (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--robot` or `--env`
-  flag, no other envs in this branch); `--surface_height` raises the blocks
-  and goal pad, `--seed` seeds the sampling, and `--save_plan PATH` (or
-  `auto`, next to the run's metrics) saves the processed plan.
+  (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--env` flag, no
+  other envs in this branch); `--robot` picks the planning model
+  (`simplified`, the default, or `real_legs`), `--surface_height` raises the
+  blocks and goal pad, `--seed` seeds the sampling, and `--save_plan PATH` (or
+  `auto`, next to the run's metrics) saves the plan: processed into schema v3
+  on the simplified model, raw (`stage3-raw`, the model's joints) on the real
+  legs.
 - [`run_ablation.py`](cutamp/scripts/run_ablation.py) — the 2x2 CoM × re-IK
   ablation plus `default_reik` (cells `full`, `default_reik`, `no_com`,
   `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`), one
   `run_cutamp` subprocess per run that saves its plan (`--save_plan auto`),
   with a resumable manifest; `--smoke` / `--heights` / `--seeds` shrink it.
+  `--gate` runs the speed gate instead: both models at `-n` 256 and 512,
+  interleaved, over the same heights and seeds, each run replayable from its
+  seed.
 - [`analyze_ablation.py`](cutamp/scripts/analyze_ablation.py) — turns that
-  manifest into `results.csv`, `deltas.csv`, `results.md` and figures.
+  manifest into `results.csv`, `deltas.csv`, `results.md` and figures; with
+  `--gate`, a gate study into `gate.json` and `gate.md`: per model and `-n`
+  the runs, planning-time median and p90 and the stage times, and the verdict
+  at `-n` 256 (all 40 runs of each model timed, every real-leg run solved,
+  motion-planned and balanced, and median and p90 times at most 1.5× and 2×
+  the simplified model's).
+- [`real_legs_report.py`](cutamp/scripts/real_legs_report.py) — the real-leg
+  plans of a study: per joint, the peak torque against its effort and the peak
+  speed against the motor's knee speed and cuRobo's limit; per run, the
+  largest Trunk tilt and sole drift, the gate's margins and slowdown, and any
+  planner-timed segment past an effort (`PREFIX.json`, `PREFIX.md`).
 - [`check_plan_margins.py`](cutamp/scripts/check_plan_margins.py) — per-joint
   distances to limits in a saved plan; exits 1 if a protected side comes
   within `--threshold` (0.05 rad) or any waypoint violates a limit.
@@ -526,6 +583,16 @@ python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
 python -m cutamp.scripts.run_ablation --out /tmp/ablation-study
 python -m cutamp.scripts.analyze_ablation \
     --manifest /tmp/ablation-study/manifest.json --out docs/ablation
+
+# The real legs (bfm_wm's T1 on its home stance), saving the raw plan
+python -m cutamp.scripts.run_cutamp --robot real_legs --motion_plan --save_plan auto
+
+# The speed gate (both models, 160 runs), its verdict, and the real-leg report
+python -m cutamp.scripts.run_ablation --out /tmp/gate-study --gate
+python -m cutamp.scripts.analyze_ablation --gate \
+    --manifest /tmp/gate-study/manifest.json --out /tmp/gate-study/gate
+python -m cutamp.scripts.real_legs_report --study /tmp/gate-study \
+    --out /tmp/gate-study/real_legs
 ```
 
 **Available soft costs** (see `SUPPORTED_SOFT_COSTS`; T1-only ones marked):
@@ -561,7 +628,7 @@ Adam).
 
 ## Key Design Decisions
 
-1. **Single 21-DOF MotionPlanner** — cuRobo v0.8's `GoalToolPose` takes a
+1. **Single MotionPlanner** — cuRobo v0.8's `GoalToolPose` takes a
    target for every tool frame of a kinematics that exposes both arms (the
    inactive frames get their current FK pose), and the planner then plans
    every segment in cspace, so we no longer need
