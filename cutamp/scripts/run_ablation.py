@@ -4,7 +4,8 @@ Sweeps the cells x heights x seeds, one sequential GPU run each, writing
 standard experiment dirs plus a resumable manifest. See
 docs/superpowers/specs/2026-08-05-standard-cutamp-baseline-design.md.
 The 2x2 is balance (CoM) x re-IK on the balance-first refresh, plus
-``default_reik``, the full system on the default refresh. Balance-first
+``default_reik``, the full system on the default refresh; every arm runs on
+the simplified model (``--robot simplified``). Balance-first
 and CUDA graphs are run_cutamp's defaults, so ``default_reik`` turns both
 off explicitly; with no flags it would be a second ``full`` arm.
 
@@ -37,8 +38,11 @@ CELLS = {
 HEIGHTS = [0.0, 0.25, 0.50, 0.65]
 SEEDS = list(range(10))
 SOFT_ARGS = ["--soft_cost", "joint_limit_margin"]  # one soft-cost setting for every arm
-BASE_ARGS = ["-n", "512", "--disable_visualizer", "--motion_plan", "--save_plan", "auto"] + SOFT_ARGS
-SMOKE_ARGS = ["-n", "64", "--num_opt_steps", "30", "--disable_visualizer"] + SOFT_ARGS
+# The paper's study runs on the simplified model: the real legs, the default, refuse every arm but full
+# (design call 15).
+PAPER_ROBOT = ["--robot", "simplified"]
+BASE_ARGS = PAPER_ROBOT + ["-n", "512", "--disable_visualizer", "--motion_plan", "--save_plan", "auto"] + SOFT_ARGS
+SMOKE_ARGS = PAPER_ROBOT + ["-n", "64", "--num_opt_steps", "30", "--disable_visualizer"] + SOFT_ARGS
 # The speed gate (design section 8): section 8's soft-cost list on both models, plus the real legs' own default,
 # minimize_body_movement (call 2), at HEAD's n and G1's.
 GATE_CELLS = {"simplified": ["--robot", "simplified", "--soft_cost", "joint_limit_margin"],

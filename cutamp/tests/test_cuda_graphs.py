@@ -25,19 +25,22 @@ from cutamp.utils.timer import TorchTimer
 def test_uses_cuda_graphs():
     # On by default; runs the graphs can't capture stay eager and still validate.
     assert uses_cuda_graphs(TAMPConfiguration())
-    for kw in ({"cuda_graphs": False}, {"reik_balance_first": False}, {"coupled_reik": False},
-               {"soft_cost": ["align_yaw"]}):
+    # The two ablation arms name the simplified model, the only one that runs them (design call 15).
+    for kw in ({"cuda_graphs": False}, {"reik_balance_first": False, "robot": "simplified"},
+               {"coupled_reik": False, "robot": "simplified"}, {"soft_cost": ["align_yaw"]}):
         validate_tamp_config(TAMPConfiguration(**kw))
         assert not uses_cuda_graphs(TAMPConfiguration(**kw)), kw
 
 
 def test_cli_defaults_on(monkeypatch):
-    # --reik_balance_first and --cuda_graphs restate the defaults; each --no_ flag turns its own off.
+    # --reik_balance_first and --cuda_graphs restate the defaults; each --no_ flag turns its own off. The pose-only
+    # refresh is an ablation arm, so its run names the simplified model (design call 15).
     import cutamp.scripts.run_cutamp as rc
     seen = []
     monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
     for argv, balance_first, graphs in (([], True, True), (["--reik_balance_first", "--cuda_graphs"], True, True),
-                                        (["--no_reik_balance_first"], False, True), (["--no_cuda_graphs"], True, False)):
+                                        (["--robot", "simplified", "--no_reik_balance_first"], False, True),
+                                        (["--no_cuda_graphs"], True, False)):
         monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
         rc.entrypoint()
         assert (seen[-1].reik_balance_first, seen[-1].cuda_graphs) == (balance_first, graphs), argv
@@ -147,11 +150,17 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
     assert next(busy) == 8                           # consulted once per step, until the capture
 
 
+# On the simplified model, the one whose byte-exact reading holds. On the real legs the final check repairs with
+# cuRobo's CUDA-graphed IK, which keeps a line search's points (about 1.2 MB, held outside Python): from the same
+# particles, RNG states and IK seeds every call returns the same plan, yet the reading moves 16 KiB up or down from
+# call to call, bounded (6 calls, 2026-11-05). test_cuda_graphs_whole_call checks, bitwise, that the real legs'
+# graph calls leave no state behind.
 @needs_cuda
+@pytest.mark.parametrize("blocks_t1_plan", ["simplified"], indirect=True)
 def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
     world, skeleton, base = blocks_t1_plan
-    config = _graph_config(num_opt_steps=10)
+    config = _graph_config(num_opt_steps=10, robot=world.model.name)
     plan_info, mem, sites, released = make_plan_info(world, skeleton, clone_particles(base), config), [], [], []
     orig = CapturedGraph.release
 

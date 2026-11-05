@@ -101,8 +101,8 @@ def entrypoint():
 
     parser.add_argument(
         "--robot", choices=SUPPORTED_ROBOTS, default=_defaults.robot,
-        help="Planning model: the 21-DOF simplified T1, or bfm_wm's 33-DOF T1 standing on its home stance "
-             "(real_legs, which runs only the full system: no ablation flags).",
+        help="Planning model: real_legs (the default), bfm_wm's 33-DOF T1 standing on its home stance, which runs "
+             "only the full system (no ablation flags), or simplified, the 21-DOF T1 the paper's ablation arms run on.",
     )
     parser.add_argument(
         "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"

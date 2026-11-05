@@ -3,25 +3,32 @@ import pytest
 
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
+#: A lean from home that carries the CoM far past the support's front edge, per planning model ({joint: delta}): the
+#: simplified model bows at its Torso_Pitch, ankle and knee (the teetering pose seen before the CoM fix); the real legs'
+#: floating base carries the whole body 30 cm ahead of the stance its support region stays on.
+EXTREME_LEAN = {"simplified": {"Torso_Pitch": -1.7, "ankle_pitch": -0.5, "knee_pitch": 0.8},
+                "real_legs": {"base_j_x": 0.3}}
+
+
+def _moved(world, moves: dict):
+    """``world``'s home with each joint in ``moves`` ({name: delta}) moved."""
+    names = list(world.kinematics.joint_names)
+    q = world.q_init.detach().clone()
+    for name, delta in moves.items():
+        q[names.index(name)] += delta
+    return q
+
 
 @needs_cuda
 def test_compute_com_polygon_mask_excludes_extreme_lean():
     """Batched COM-in-polygon check returns the expected shape, classifies
-    home poses as inside (all DOFs 0 → COM directly above the wheelbase
-    center) and a bent-far-forward configuration as OUTSIDE the polygon.
-    The bent config has deeply-bent Torso_Pitch + ankle_pitch + knee_pitch
-    (mimicking the teetering pose we observed pre-fix)."""
+    home poses as inside (the CoM over the support's centre) and the
+    model's EXTREME_LEAN as OUTSIDE the polygon."""
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     world = make_blocks_t1_world()
-    full_names = list(world.kinematics.joint_names)
     home = world.q_init.detach().clone()
-    # Build a configuration with deep forward bend.
-    name_to_idx = {n: i for i, n in enumerate(full_names)}
-    bent = home.clone()
-    bent[name_to_idx["Torso_Pitch"]]  = -1.7
-    bent[name_to_idx["ankle_pitch"]]  = -0.5
-    bent[name_to_idx["knee_pitch"]]   = +0.8
+    bent = _moved(world, EXTREME_LEAN[world.model.name])
     q_batch = torch.stack([home, home, home, bent], dim=0)  # [4, full_dof]
     mask = compute_com_polygon_mask(world, q_batch)
     assert mask.shape == (4,), f"expected shape (4,), got {mask.shape}"
@@ -103,19 +110,16 @@ def test_curobo_batched_com_kernel_returns_per_batch_distinct():
     world = make_blocks_t1_world()
     kin = world.kinematics
     full_names = list(world.kinematics.joint_names)
-    name_to_idx = {n: i for i, n in enumerate(full_names)}
 
-    # Build four distinct configurations spanning the COM excursion range.
+    # Build four distinct configurations spanning the COM excursion range: home, the lean, every leg and trunk
+    # joint bent, and a left-arm reach.
     home = world.q_init.detach().clone()
-    bent_forward = home.clone()
-    bent_forward[name_to_idx["Torso_Pitch"]] = -1.5
-    bent_forward[name_to_idx["knee_pitch"]] = +0.6
-    twisted = home.clone()
-    twisted[name_to_idx["Waist_Yaw"]] = +0.8
-    reach = home.clone()
-    reach[name_to_idx["Left_Shoulder_Pitch"]] = -1.2
+    bent_forward = _moved(world, EXTREME_LEAN[world.model.name])
+    bent_body = home.clone()
+    bent_body[world.model.body] += 0.3
+    reach = _moved(world, {world.model.joint_names[world.model.left_arm][0]: -1.2})
 
-    configs = [home, bent_forward, twisted, reach]
+    configs = [home, bent_forward, bent_body, reach]
 
     # Reference: per-sample B=1 COMs (always correct).
     ref_coms = []
@@ -153,18 +157,10 @@ def test_compute_com_polygon_penalties_is_differentiable():
     from cutamp.com_polygon_cost import COM_TOL, compute_com_polygon_penalties
 
     world = make_blocks_t1_world()
-    full_names = list(world.kinematics.joint_names)
-    name_to_idx = {n: i for i, n in enumerate(full_names)}
-    home = world.q_init.detach().clone()
 
     # Use a configuration with the COM outside the support polygon so the
-    # penalty is non-zero and the gradient is non-trivially non-zero. A pure
-    # bow tops out near com_base[x] = 0.0995 (Torso_Pitch -1.6), inside
-    # half_extents[x] = 0.1115, so lean at the ankle too: Torso_Pitch -1.2
-    # with ankle_pitch -0.15 puts com_base[x] at 0.1369 (measured).
-    leaning = home.clone()
-    leaning[name_to_idx["Torso_Pitch"]] = -1.2
-    leaning[name_to_idx["ankle_pitch"]] = -0.15
+    # penalty is non-zero and the gradient is non-trivially non-zero.
+    leaning = _moved(world, EXTREME_LEAN[world.model.name])
 
     B = 4
     q = leaning.unsqueeze(0).expand(B, -1).contiguous().clone().requires_grad_(True)
@@ -361,22 +357,15 @@ def test_mask_matches_penalty_gate():
         COM_TOL, compute_com_polygon_mask, compute_com_polygon_penalties,
     )
     world = make_blocks_t1_world()
-    full_names = list(world.kinematics.joint_names)
-    name_to_idx = {n: i for i, n in enumerate(full_names)}
     home = world.q_init.detach().clone()
-    # Deep forward lean that is genuinely out-of-hull: forward torso AND
-    # forward ankle. (Torso_Pitch=-1.5 with knee=+0.6 is NOT outside — knee
-    # bend re-centers the COM, which is the whole point of the CoM-aware IK.)
-    bent = home.clone()
-    bent[name_to_idx["Torso_Pitch"]] = -1.7
-    bent[name_to_idx["ankle_pitch"]] = -0.5
-    bent[name_to_idx["knee_pitch"]] = +0.8
+    bent = _moved(world, EXTREME_LEAN[world.model.name])  # genuinely out-of-hull
     # Spread a batch of configs around home so some land near the polygon
     # edge, then append the deterministic [home, bent] pair so both
     # classifications are guaranteed present in the batch.
     torch.manual_seed(0)
+    body = world.model.body
     q = home.unsqueeze(0).repeat(32, 1).clone()
-    q[:, 3:7] += 0.3 * torch.randn(32, 4, device=q.device)   # perturb body DOFs
+    q[:, body] += 0.3 * torch.randn(32, body.stop - body.start, device=q.device)   # perturb the leg and trunk DOFs
     q = torch.cat([q, torch.stack([home, bent], dim=0)], dim=0)  # [34, full_dof]
     mask = compute_com_polygon_mask(world, q)
     pens = compute_com_polygon_penalties(world, {"q": q})["q"]

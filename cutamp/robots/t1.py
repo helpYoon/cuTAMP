@@ -5,12 +5,13 @@ T1 Robot Module — Single-MotionPlanner Humanoid Support for cuTAMP (cuRobo v0.
 Two planning models of the Booster T1, each a :class:`T1Model`, chosen by
 ``TAMPConfiguration.robot`` (``--robot``):
 
-- ``SIMPLIFIED`` (the default): the 21-DOF model described below, its planar
-  base locked;
-- ``REAL_LEGS``: bfm_wm's pinned 33-DOF T1 (``assets/t1_29dof``, design 7.2),
-  its legs on six massless base joints whose limits are the legs' reach,
-  standing on the home stance, its limits cut to route A's envelope
-  (``assets/envelopes``, call 22).
+- ``REAL_LEGS`` (the default): bfm_wm's pinned 33-DOF T1 (``assets/t1_29dof``,
+  design 7.2), its legs on six massless base joints whose limits are the legs'
+  reach, standing on the home stance, its limits cut to route A's envelope
+  (``assets/envelopes``, call 22);
+- ``SIMPLIFIED``: the 21-DOF model described below, its planar base locked.
+  The paper's ablation arms run only on it, and it stays until stage 7's speed
+  gate (design call 12).
 
 Consumers read names, slices, home, margins and the support region from
 ``world.model``. The simplified model's module constants below remain for its

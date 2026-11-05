@@ -103,11 +103,12 @@ def test_curobo_link_inertias_match_the_urdf():
 @needs_cuda
 def test_whole_robot_com_matches_yourdfpy():
     # The planner's CoM (cuRobo FK, base at 0) at home, the zero conf, two bows and 20 random confs.
-    # The YAML's five 0.01 kg base links, absent from the URDF, move it by under 0.2 mm.
+    # The YAML's five 0.01 kg base links, absent from the URDF, move it by under 0.2 mm. On the simplified model:
+    # the reference is t1_simplified.urdf, and the bows bend its Torso_Pitch.
     import torch
 
     from cutamp.com_polygon_cost import _fk_com_and_base
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED_MODEL)
     names = list(world.kinematics.joint_names)
     home = world.q_init.view(1, -1)
     bows = home.repeat(2, 1)

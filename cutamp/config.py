@@ -33,9 +33,10 @@ _REAL_LEGS_REQUIRED = {
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
-    # The planning model (SUPPORTED_ROBOTS): "simplified", the 21-DOF CoM-fixed model, or "real_legs", bfm_wm's
-    # 33-DOF T1 on the home stance (design 7.2). It also sets soft_cost's default.
-    robot: str = "simplified"
+    # The planning model (SUPPORTED_ROBOTS): "real_legs" (the default since the speed gate passed at n 64,
+    # 2026-11-05), bfm_wm's 33-DOF T1 on the home stance (design 7.2), or "simplified", the 21-DOF CoM-fixed model,
+    # which the paper's ablation arms and the speed gate still need (design call 12). It also sets soft_cost's default.
+    robot: str = "real_legs"
 
     # Number of particles to initialize and optimize over. The IK solver's
     # buffers are sized to this (ik_max_batch_size), so it bounds GPU memory:
@@ -204,7 +205,7 @@ def validate_tamp_config(config: TAMPConfiguration):
         if changed:
             raise ValueError(
                 f"robot real_legs runs only the full system, not the paper's ablation paths ({', '.join(changed)}); "
-                "they reproduce on the simplified model (design call 15)"
+                "they reproduce on the simplified model (design call 15): add --robot simplified"
             )
 
     if config.num_particles <= 0:

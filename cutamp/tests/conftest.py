@@ -11,7 +11,8 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from cutamp.robots.t1 import REAL_LEGS, SIMPLIFIED
+from cutamp.config import TAMPConfiguration
+from cutamp.robots.t1 import REAL_LEGS, get_model
 
 _cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
 #: Skips unless a GPU is visible; reads no CUDA state, so collection initializes none.
@@ -21,12 +22,19 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-def make_blocks_t1_world(model=SIMPLIFIED, **tamp_world_kwargs):
-    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``model``, starting at its home."""
+#: The model conftest's worlds stand on unless a test names one: TAMPConfiguration's default robot, so a world built
+#: here and a TAMPConfiguration() plan on the same model.
+DEFAULT_MODEL = get_model(TAMPConfiguration.robot)
+
+
+def make_blocks_t1_world(model=None, **tamp_world_kwargs):
+    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``model`` (default
+    :data:`DEFAULT_MODEL`), starting at its home."""
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.robots import load_t1_container
     from cutamp.tamp_world import TAMPWorld
+    model = DEFAULT_MODEL if model is None else model
     dc = DeviceCfg()
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     robot = load_t1_container(model, dc)
@@ -59,20 +67,25 @@ def _free_cuda_between_tests():
 
 
 @pytest.fixture(scope="module")
-def blocks_t1_plan():
-    """``[world, skeleton, particles]``: the 64-particle blocks_t1 world as algorithm.py builds it, its first task
-    plan (which follows PYTHONHASHSEED) and its seeded init. Read-only: tests run on ``clone_particles(particles)``,
-    and a module using it must not build a second world (two OOM a 24 GiB card). A list, so teardown can free the
-    world while pytest still holds the yielded object."""
-    from cutamp.config import TAMPConfiguration
+def blocks_t1_plan(request):
+    """``[world, skeleton, particles]``: the 64-particle blocks_t1 world as algorithm.py builds it, on
+    :data:`DEFAULT_MODEL`, its first task plan (which follows PYTHONHASHSEED) and its seeded init. A test names another
+    model by its robot name, ``@pytest.mark.parametrize("blocks_t1_plan", ["simplified"], indirect=True)``, and
+    ``None`` names the default model, sharing the world of the tests that pass no parameter; pytest tears one model's
+    world down before it builds the next, so a module keeps each model's cases together. Read-only: tests run on
+    ``clone_particles(particles)``, and a module using it must not build a second world (two OOM a 24 GiB card). A
+    list, so teardown can free the world while pytest still holds the yielded object."""
     from cutamp.particle_initialization import ParticleInitializer
     from cutamp.t1_domain import all_t1_operators
     from cutamp.task_planning import task_plan_generator
 
-    world = make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)
+    name = getattr(request, "param", None)  # pytest's cache key too: None and no parameter share one world
+    model = DEFAULT_MODEL if name is None else get_model(name)
+    world = make_blocks_t1_world(model, collision_activation_distance=0.0, ik_max_batch_size=64)
     skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
     torch.manual_seed(0)
-    particles = ParticleInitializer(world, TAMPConfiguration(num_particles=64))(skeleton)
+    # robot= here, not dataclasses.replace: __post_init__ resolves the model's default soft costs
+    particles = ParticleInitializer(world, TAMPConfiguration(robot=model.name, num_particles=64))(skeleton)
     plan = [world, skeleton, particles]
     del world, skeleton, particles  # the list holds the only references
     yield plan
@@ -107,7 +120,6 @@ def real_plan(real_world):
     """``[skeleton, particles]``: blocks_t1's first task plan (which follows PYTHONHASHSEED) and its seeded 64-particle
     init on ``real_world``. Read-only: tests run on ``clone_particles(particles)``. A list, so teardown can free the
     particles while pytest still holds the yielded object; ``real_world``'s slot then empties the cache."""
-    from cutamp.config import TAMPConfiguration
     from cutamp.particle_initialization import ParticleInitializer
     from cutamp.t1_domain import all_t1_operators
     from cutamp.task_planning import task_plan_generator

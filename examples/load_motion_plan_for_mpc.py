@@ -183,7 +183,7 @@ def load_for_mpc(path: Path) -> List[Dict[str, Any]]:
     except FileNotFoundError:
         raise FileNotFoundError(
             f"motion_plan.pkl not found at {path}. Generate one with:\n"
-            f"  python -m cutamp.scripts.run_cutamp --motion_plan --save_plan {path}"
+            f"  python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan --save_plan {path}"
         )
     except (EOFError, pickle.UnpicklingError) as e:
         raise RuntimeError(
@@ -206,7 +206,7 @@ def load_for_mpc(path: Path) -> List[Dict[str, Any]]:
             f"motion_plan.pkl at {path} has no 'schema_version' key — it is a "
             f"legacy/unversioned or corrupt plan, not a versioned one. "
             f"Regenerate with the current code:\n"
-            f"  python -m cutamp.scripts.run_cutamp --motion_plan --save_plan {path}"
+            f"  python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan --save_plan {path}"
         )
     if schema_version == "stage3-raw":
         raise RuntimeError(
@@ -218,7 +218,7 @@ def load_for_mpc(path: Path) -> List[Dict[str, Any]]:
         raise RuntimeError(
             f"This example expects schema_version=3, got {schema_version}. "
             f"Regenerate the plan with the current code:\n"
-            f"  python -m cutamp.scripts.run_cutamp --motion_plan --save_plan {path}"
+            f"  python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan --save_plan {path}"
         )
     return [segment_to_mpc_commands(seg) for seg in plan["segments"]]
 

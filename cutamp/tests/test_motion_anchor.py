@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import cutamp.motion_solver as ms
+from cutamp.robots.t1 import SIMPLIFIED
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
@@ -81,6 +82,9 @@ def _generate_plan_segments(seed: int, enable_com_polygon: bool = True):
     then processed to schema v3 with ``process_motion_plan``. The TAMPWorld
     used for the COM checks is built separately from the same env — its
     kinematics depend only on the robot/env, so it matches the planner's.
+
+    On the simplified model: schema v3, its support rectangle, ``coupled_reik=False`` and the no-CoM arm are that
+    model's (design call 15). The real legs' plans have their own tests (test_real_legs_motion.py).
     """
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.config import TAMPConfiguration
@@ -96,6 +100,7 @@ def _generate_plan_segments(seed: int, enable_com_polygon: bool = True):
     torch.manual_seed(seed)
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     config = TAMPConfiguration(
+        robot="simplified",
         num_particles=64,
         num_opt_steps=50,
         curobo_plan=True,
@@ -124,7 +129,7 @@ def _generate_plan_segments(seed: int, enable_com_polygon: bool = True):
     processed = process_motion_plan(curobo_plan)
 
     # Separate TAMPWorld for COM checks (kinematics depend only on env/robot).
-    world = make_blocks_t1_world()
+    world = make_blocks_t1_world(model=SIMPLIFIED)
     return world, processed["segments"], overall_metrics
 
 

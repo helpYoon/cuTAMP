@@ -25,6 +25,15 @@ def test_cells_run_their_refresh(monkeypatch):
             assert c.coupled_reik and (c.reik_balance_first, uses_cuda_graphs(c)) == want[run["cell"]], run["cell"]
 
 
+def test_paper_runs_name_the_simplified_model():
+    # The paper's study runs every arm on the simplified model: the real legs, the default, refuse every arm but full
+    # (design call 15). So every run, the smoke runs too, passes --robot simplified, once.
+    for smoke in (False, True):
+        for run in build_run_plan(smoke=smoke):
+            args = run["args"]
+            assert args.count("--robot") == 1 and args[args.index("--robot") + 1] == "simplified", (smoke, run["cell"])
+
+
 def test_cells_match_spec():
     assert set(CELLS) == {"full", "default_reik", "no_com", "no_reik", "standard"}
     for cell in ("full", "no_com"):

@@ -137,14 +137,28 @@ def test_unknown_robot():
         validate_tamp_config(TAMPConfiguration(robot="t2"))
 
 
+def test_real_legs_are_the_default(monkeypatch):
+    # The user, 2026-11-05, once the speed gate passed at n 64: the config, run_cutamp's CLI and conftest's worlds
+    # plan on the real legs unless told otherwise.
+    import sys
+
+    import cutamp.scripts.run_cutamp as rc
+    from cutamp.tests.conftest import DEFAULT_MODEL
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
+    monkeypatch.setattr(sys, "argv", ["run_cutamp"])
+    rc.entrypoint()
+    assert TAMPConfiguration().robot == seen[0].robot == "real_legs" and DEFAULT_MODEL is REAL_LEGS
+
+
 def test_soft_cost_default_by_robot():
     real_default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
-    assert TAMPConfiguration().soft_cost == ["place_close_to_base", "joint_limit_margin"]
-    assert TAMPConfiguration(robot="real_legs").soft_cost == real_default
+    assert TAMPConfiguration().soft_cost == TAMPConfiguration(robot="real_legs").soft_cost == real_default
+    assert TAMPConfiguration(robot="simplified").soft_cost == ["place_close_to_base", "joint_limit_margin"]
     assert TAMPConfiguration(robot="real_legs", soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
     # As config.py's soft_cost comment says: replace() keeps the resolved list unless soft_cost=None is passed.
-    simplified = TAMPConfiguration()
+    simplified = TAMPConfiguration(robot="simplified")
     assert dataclasses.replace(simplified, robot="real_legs").soft_cost == simplified.soft_cost
     assert dataclasses.replace(simplified, robot="real_legs", soft_cost=None).soft_cost == real_default
 

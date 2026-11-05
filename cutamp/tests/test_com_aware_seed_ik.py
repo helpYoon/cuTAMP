@@ -31,18 +31,21 @@ def test_flag_off_seed_cfg_weight_zero_by_default():
 
 @needs_cuda
 def test_flag_on_seed_cfg_carries_com_params():
-    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
+    from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
     from cutamp.robots.t1 import T1_COM_IK_WEIGHT
     world = _world(enable_com_aware_ik=True)
     cfg = world.ik_solver.seed_ik_solver.config
+    support = world.model.support
     assert cfg.com_support_weight == T1_COM_IK_WEIGHT > 0.0
-    # The fork's box is centred on the base: the largest one inside the shifted support rectangle.
-    assert list(cfg.com_half_extents) == pytest.approx([0.0765, 0.13125])
+    # The fork's box is centred on the support frame: the largest one inside the model's keyframe rectangle, which
+    # sits at support.center in that frame (the simplified model's 1 cm ahead of its base, the real legs' on it).
+    assert list(cfg.com_half_extents) == pytest.approx(
+        [h - abs(c) for h, c in zip(support.keyframe_half, support.center)])
     assert cfg.com_inside_margin == COM_INSIDE_MARGIN
     assert cfg.com_inside_weight == COM_INSIDE_WEIGHT
     from cutamp.robots.t1 import T1_COM_IK_CENTER_WEIGHT
     assert cfg.com_center_weight == T1_COM_IK_CENTER_WEIGHT
-    assert cfg.com_base_link_name == "mobile_base_link"
+    assert cfg.com_base_link_name == support.link
 
 
 @needs_cuda
@@ -152,53 +155,55 @@ def test_residual_fires_iff_enabled():
 def test_robot_com_gradient_flows_to_joints_with_fd_check():
     # The residual's core chain: joint_position -> fused-FK robot_com -> penalty
     # -> backward -> joint_position.grad. Verify against finite differences on
-    # the leg/torso joints the residual is meant to recruit.
+    # the leg and trunk joints the residual is meant to recruit (the model's body).
     from curobo._src.solver.seed_ik.seed_ik_error_calculator import com_support_penalty
     from curobo.types import JointState
-    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
+    from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
 
     world = _world(enable_com_aware_ik=True)
-    model = world.ik_solver.seed_ik_solver._robot_model
+    solver = world.ik_solver.seed_ik_solver
+    model = solver._robot_model
     device = model.device_cfg.device
     names = list(model.joint_names)
-    half = torch.tensor(list(COM_HALF_EXTENTS), device=device)
-    base_idx = list(model.tool_frames).index("mobile_base_link")
+    half = torch.tensor(list(solver.config.com_half_extents), device=device)
+    base_idx = list(model.tool_frames).index(world.model.support.link)
+    # At home with the box moved 15 cm behind its frame, the CoM is past the box's front edge on either model, so
+    # the penalty is active (both support frames are unrotated at home).
+    behind = torch.tensor([0.15, 0.0, 0.0], device=device)
 
     def penalty_at(q):
         ks = model.compute_kinematics(
             JointState.from_position(q, joint_names=names))
         com = ks.robot_com.view(1, -1)[:, :3]
-        pos = ks.tool_poses.position.view(1, len(model.tool_frames), 3)[:, base_idx, :]
+        pos = ks.tool_poses.position.view(1, len(model.tool_frames), 3)[:, base_idx, :] - behind
         quat = ks.tool_poses.quaternion.view(1, len(model.tool_frames), 4)[:, base_idx, :]
         return com_support_penalty(com, pos, quat, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, 0.0).sum()
 
-    # A forward lean so the penalty is active: Torso_Pitch -1.2 with ankle_pitch -0.15 (all else 0)
-    # puts the CoM at x 0.230, past the 0.0915 edge (measured). A deep bow alone (Torso_Pitch -1.5)
-    # barely moves the CoM's x with the torso: d penalty / d Torso_Pitch is only -0.0008 there.
-    q0 = torch.zeros(1, model.get_dof(), device=device)
-    q0[0, names.index("Torso_Pitch")] = -1.2
-    q0[0, names.index("ankle_pitch")] = -0.15
+    home = dict(zip(world.model.joint_names, world.model.home))
+    q0 = torch.tensor([[home[n] for n in names]], device=device)
 
     q = q0.clone().requires_grad_(True)
-    penalty_at(q).backward()
+    pen = penalty_at(q)
+    assert pen.item() > 0, "premise: the CoM must be outside the moved box"
+    pen.backward()
     grad = q.grad[0]
     assert torch.isfinite(grad).all()
 
     eps = 1e-3
-    for jn in ("Torso_Pitch", "knee_pitch", "ankle_pitch"):
-        j = names.index(jn)
+    body = [names.index(n) for n in world.model.joint_names[world.model.body]]
+    for j in body:
         qp = q0.clone(); qp[0, j] += eps
         qm = q0.clone(); qm[0, j] -= eps
         with torch.no_grad():
             fd = (penalty_at(qp) - penalty_at(qm)) / (2 * eps)
         assert grad[j].item() == pytest.approx(fd.item(), rel=0.05, abs=1e-4), \
-            f"{jn}: autograd {grad[j].item():.6f} vs FD {fd.item():.6f}"
-    # The chain must actually recruit the legs: torso gradient clearly nonzero.
-    assert abs(grad[names.index("Torso_Pitch")].item()) > 1e-3
+            f"{names[j]}: autograd {grad[j].item():.6f} vs FD {fd.item():.6f}"
+    # The chain must actually recruit the body: a leg or trunk gradient clearly nonzero.
+    assert grad[body].abs().max().item() > 1e-3
 
 
 def _forward_reach_solutions(world, n_fwd=4, n_lat=3, unreachable=False):
-    """IK a forward-reach grid for the left arm; return (q_full[B,21], success[B], result).
+    """IK a forward-reach grid for the left arm; return (q_full[B, dof], success[B], result).
     ``unreachable`` appends a pose 3 m ahead, which no IK stage can solve."""
     from cutamp.particle_initialization import (
         _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask,
@@ -226,7 +231,6 @@ def _com_abs_x(world, q_full):
 @needs_cuda
 def test_centering_ab_legs_within_limits_pose_preserved():
     import gc
-    from cutamp.com_polygon_cost import COM_HALF_EXTENTS, COM_INSIDE_MARGIN
     # OFF baseline
     world_off = _world(enable_com_aware_ik=False)
     q_off, s_off, _ = _forward_reach_solutions(world_off)
@@ -246,28 +250,26 @@ def test_centering_ab_legs_within_limits_pose_preserved():
     assert float(absx_on.mean()) < 0.5 * float(absx_off.mean()), \
         f"on={float(absx_on.mean()):.4f} off={float(absx_off.mean()):.4f}"
 
-    # (2) joint limits: every SUCCESSFUL solution within URDF bounds (+1e-3
-    #     slack). Limits are a soft residual + success filter in the seed-IK
-    #     solver — failed rows may legitimately sit slightly out of bounds and
-    #     are masked out downstream, but a successful out-of-limit solution
-    #     would be a fork bug.
-    names = list(world_on.kinematics.joint_names)
-    idx = {n: i for i, n in enumerate(names)}
-    bounds = {"ankle_pitch": (-0.87, 0.0), "knee_pitch": (0.0, 2.34),
-              "Torso_Pitch": (-1.7, 0.0)}
-    for jn, (lo, hi) in bounds.items():
-        col = q_on[s_on][:, idx[jn]]
+    # (2) joint limits: every SUCCESSFUL solution's leg and trunk joints (the
+    #     model's body) within the solver's bounds (+1e-3 slack). Limits are a
+    #     soft residual + success filter in the seed-IK solver — failed rows
+    #     may legitimately sit slightly out of bounds and are masked out
+    #     downstream, but a successful out-of-limit solution would be a fork bug.
+    body = world_on.model.body
+    lower, upper = (b[body] for b in world_on.kinematics.get_joint_limits().position)
+    for jn, col, lo, hi in zip(world_on.model.joint_names[body], q_on[s_on][:, body].T, lower.tolist(),
+                               upper.tolist()):
         assert float(col.min()) >= lo - 1e-3 and float(col.max()) <= hi + 1e-3, \
-            f"{jn} out of [{lo},{hi}]: [{float(col.min()):.3f},{float(col.max()):.3f}]"
+            f"{jn} out of [{lo:.3f},{hi:.3f}]: [{float(col.min()):.3f},{float(col.max()):.3f}]"
 
     # (3) pose accuracy on successes: solver tolerances (5mm / 0.05rad)
     pe = res_on.position_error
     pe = (pe.reshape(pe.shape[0], -1)[:, 0] if pe.ndim > 1 else pe)[s_on]
     assert float(pe.max()) <= 0.005 + 1e-4, f"pose err {float(pe.max()):.4f}"
 
-    # (4) soft recruitment signal (informational; generous threshold)
-    knee_delta = float((q_on[s_on][:, idx["knee_pitch"]]).abs().max())
-    print(f"recruitment: max knee_pitch={knee_delta:.3f} rad; "
+    # (4) soft recruitment signal (informational)
+    body_delta = float((q_on[s_on][:, body] - world_on.q_init[body]).abs().max())
+    print(f"recruitment: max body-joint move from home {body_delta:.3f} rad; "
           f"absx on/off mean {float(absx_on.mean()):.4f}/{float(absx_off.mean()):.4f}")
 
 

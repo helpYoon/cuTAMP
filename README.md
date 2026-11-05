@@ -112,8 +112,9 @@ the shared `TAMPWorld`.
 ## T1 Single-Planner Architecture (cuRobo v0.8)
 
 cuTAMP plans for the T1 humanoid through a **single MotionPlanner** on one
-of two planning models (`--robot`; `T1Model` in `robots/t1.py`). The default,
-`simplified`, is built from `t1_planar_base.yml`; its cspace is:
+of two planning models (`--robot`; `T1Model` in `robots/t1.py`). The default
+is `real_legs` (below). `simplified`, the model the paper's ablation arms run
+on (`--robot simplified`), is built from `t1_planar_base.yml`; its cspace is:
 
 ```
 3 base (planar: base_j_x, base_j_y, base_j_yaw)   ← locked at IK time
@@ -166,15 +167,15 @@ and torso carry it, and `plan_cspace` holds nothing between the endpoint
 confs (the pin is a no-op). The visualizer tracks both arms' held objects
 through every trajectory (see `T1State.compute_all_held_obj_poses`).
 
-`real_legs` is bfm_wm's T1 (`assets/t1_29dof/`) on a six-joint floating base,
-built from `t1_29dof.yml`. Its 33 planned joints are the base (x, y, z, then
+`real_legs`, the default, is bfm_wm's T1 (`assets/t1_29dof/`) on a six-joint
+floating base, built from `t1_29dof.yml`. Its 33 planned joints are the base (x, y, z, then
 pitch, roll, yaw), both 7-joint arms, the Waist and the 12 leg joints; the
 head and the gripper joints are locked. Both soles stand on the home stance:
 the IK's sole goals, GN's sole rows and the kinematic constraint hold them
 there, and the `stance` tool frame, at the home mid-sole on the floor, is the
 support region's frame. The planner's dynamics include the floor's push on
 the soles. The real legs run only the full system: they refuse the ablation
-flags.
+flags, which run with `--robot simplified`.
 
 ## Layout
 
@@ -457,17 +458,18 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   schema, cspace, lock-joints, tool frames, kinematics smoke.
 - [`test_com_polygon_ik.py`](cutamp/tests/test_com_polygon_ik.py) — COM
   penalty math, mask/gate parity, and a guard on cuRobo's batched-COM kernel
-  (fixed upstream in PR #678).
+  (fixed upstream in PR #678), on the default model.
 - [`test_com_aware_seed_ik.py`](cutamp/tests/test_com_aware_seed_ik.py) —
   CoM-aware seed-IK: fork/cuTAMP penalty parity, FD-checked gradients,
-  centering A/B with joint-limit and pose-accuracy guards.
+  centering A/B with joint-limit and pose-accuracy guards, on the default
+  model.
 - [`test_motion_anchor.py`](cutamp/tests/test_motion_anchor.py) — full
-  pipeline: cspace-anchored pick/place terminals, all arrivals
+  pipeline on the simplified model: cspace-anchored pick/place terminals, all arrivals
   CoM-in-rectangle, every exported frame's CoM and ZMP inside
   `SUPPORT_HALF_EXTENTS`, and slowed segments' `planner_timing`; the no-CoM
   arm is never gated.
 - [`test_balance_gate.py`](cutamp/tests/test_balance_gate.py) — the
-  trajectory balance gate: the multibody ZMP against a float64 reference,
+  simplified model's trajectory balance gate: the multibody ZMP against a float64 reference,
   CoM rejects, ZMP slowdowns up to the 4× cap, `_retime`'s endpoints, and
   the planner timing it keeps.
 - [`test_robot_com.py`](cutamp/tests/test_robot_com.py) — `t1_simplified`'s
@@ -475,10 +477,14 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   plane.
 - [`test_gn_refresh.py`](cutamp/tests/test_gn_refresh.py) /
   [`test_gn_balanced_step.py`](cutamp/tests/test_gn_balanced_step.py) — GN
-  refresh, including the Jacobian-convention guard, and the balance-first core.
+  refresh, including the Jacobian-convention guard, and the balance-first core
+  (`test_gn_refresh.py` on the default model, except the pose-only
+  `gn_project` and the margin bands, on the simplified one).
 - [`test_step_lockstep.py`](cutamp/tests/test_step_lockstep.py) and the
   `test_cuda_graphs*.py` files — every Adam step bitwise against its twin and
-  the reference math; every graph replay bitwise against eager.
+  the reference math; every graph replay bitwise against eager. The full
+  system runs on the default model; the ablation arms, and the byte-exact
+  memory reading across two optimize calls, on the simplified one.
 - [`test_t1_real_legs_model.py`](cutamp/tests/test_t1_real_legs_model.py),
   [`test_t1_29dof_assets.py`](cutamp/tests/test_t1_29dof_assets.py), the
   `test_real_legs_*.py` files and
@@ -488,12 +494,13 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   speed checks and the pace they set, the floor's push, and `--robot
   real_legs` end to end.
 - Plus pin lifecycle, arm-affinity priority, plan-processor derivatives,
-  joint-limit margins, motion attach / retry, the ablation runner and
-  analyzer, and a coupled-reIK smoke test.
+  joint-limit margins (the simplified model's bands), motion attach / retry,
+  the ablation runner and analyzer, and a coupled-reIK smoke test (its
+  pose-only arm on the simplified model).
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~6 min on an RTX 4090: 342
+(GPU required for the integration tests; ~6 min on an RTX 4090: 344
 passed, 8 skipped on 2026-11-05).
 `CUTAMP_SLOW=1` also runs the 8 slow live tests: 6 `--cuda_graphs` runs in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), the floor
@@ -508,14 +515,15 @@ example has its own: `pytest examples/`.
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
   (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--env` flag, no
   other envs in this branch); `--robot` picks the planning model
-  (`simplified`, the default, or `real_legs`), `--surface_height` raises the
+  (`real_legs`, the default, or `simplified`), `--surface_height` raises the
   blocks and goal pad, `--seed` seeds the sampling, and `--save_plan PATH` (or
   `auto`, next to the run's metrics) saves the plan: processed into schema v3
   on the simplified model, raw (`stage3-raw`, the model's joints) on the real
   legs.
 - [`run_ablation.py`](cutamp/scripts/run_ablation.py) — the 2x2 CoM × re-IK
   ablation plus `default_reik` (cells `full`, `default_reik`, `no_com`,
-  `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`), one
+  `no_reik`, `standard` × 4 heights × 10 seeds, 200 runs at `-n 512`, all on
+  the simplified model), one
   `run_cutamp` subprocess per run that saves its plan (`--save_plan auto`),
   with a resumable manifest; `--smoke` / `--heights` / `--seeds` shrink it.
   `--gate` runs the speed gate instead: both models at `-n` 64,
@@ -548,16 +556,19 @@ example has its own: `pytest examples/`.
 
 ## Usage
 
-By default a run uses 256 particles and the validated pair —
+By default a run plans on the real legs (bfm_wm's T1 on its home stance)
+with 256 particles and the validated pair —
 `place_close_to_base` optimized under re-IK-coupled Adam — plus the
 balance-first GN refresh replayed as CUDA graphs, the `joint_limit_margin`
-soft cost and CoM-aware IK,
+and `minimize_body_movement` soft costs and CoM-aware IK,
 so placements stay near the
 base, endpoint confs keep off their joint limits, and every arrival lands with
 its CoM inside the keyframe rectangle. With `--motion_plan`, every trajectory
-frame also keeps its CoM and ZMP inside the soles shrunk 2 cm: a segment
-whose ZMP would leave them is slowed down, up to 4×, and a candidate that
-still fails is dropped (`motion_solver._balance_gate`).
+frame also keeps its CoM and ZMP inside the soles shrunk 2 cm: the gate sets
+each segment's pace (on the simplified model a segment whose ZMP would leave
+them is slowed down), up to 4×, and a candidate that still fails is dropped
+(`motion_solver._balance_gate`). `--robot simplified` plans on the 21-DOF
+model, which the ablation flags, schema v3 and `check_plan_margins` need.
 
 ```bash
 # Smoke test (no motion plan)
@@ -575,8 +586,8 @@ python -m cutamp.scripts.run_cutamp --motion_plan -n 64
 # balance-first: with --no_reik_balance_first the check failed on all 10 runs
 # at -n 64, seeds 0-9, --soft_cost joint_limit_margin, each on Torso_Pitch's
 # lower side, measured 2026-11-02, before the real-mass model and the
-# trajectory gate)
-python -m cutamp.scripts.run_cutamp --motion_plan -n 64 \
+# trajectory gate); schema v3 and the check are the simplified model's
+python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan -n 64 \
     --save_plan data/motion_plan.pkl
 python examples/load_motion_plan_for_mpc.py data/motion_plan.pkl
 python -m cutamp.scripts.check_plan_margins --plan data/motion_plan.pkl
@@ -586,22 +597,22 @@ python -m cutamp.scripts.run_cutamp --motion_plan \
     --soft_cost retract_close_to_home minimize_body_movement
 
 # Classic single-level optimization (no re-IK, so the soft costs stay out of
-# Adam and the run is eager)
-python -m cutamp.scripts.run_cutamp --motion_plan --no_coupled_reik
+# Adam and the run is eager), an ablation arm, so on the simplified model
+python -m cutamp.scripts.run_cutamp --robot simplified --motion_plan --no_coupled_reik
 
 # Eager Adam steps and refreshes (no CUDA graphs)
 python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
 
-# 2x2 ablation study plus default_reik (200 runs at -n 512, each saving its
-# plan), then its table and figures
+# 2x2 ablation study plus default_reik (200 runs at -n 512 on the simplified
+# model, each saving its plan), then its table and figures
 python -m cutamp.scripts.run_ablation --out /tmp/ablation-study
 python -m cutamp.scripts.analyze_ablation \
     --manifest /tmp/ablation-study/manifest.json --out docs/ablation
 
-# The real legs (bfm_wm's T1 on its home stance), saving the raw plan
+# The real legs (the default, named here), saving the raw plan
 python -m cutamp.scripts.run_cutamp --robot real_legs --motion_plan --save_plan auto
 
-# The speed gate (both models, 160 runs), its verdict, and the real-leg report
+# The speed gate (both models, 80 runs), its verdict, and the real-leg report
 python -m cutamp.scripts.run_ablation --out /tmp/gate-study --gate
 python -m cutamp.scripts.analyze_ablation --gate \
     --manifest /tmp/gate-study/manifest.json --out /tmp/gate-study/gate
@@ -620,7 +631,8 @@ python -m cutamp.scripts.real_legs_report --study /tmp/gate-study \
   level keeps them out of the same bands, listed or not
   (`--no_reik_balance_first` leaves them unguarded).
 - `retract_close_to_home` *(T1)* — penalize retract configs far from `t1_home`.
-- `minimize_body_movement` *(T1)* — penalize body (leg/torso/waist) drift.
+- `minimize_body_movement` *(T1; default on the real legs)* — penalize body
+  (leg/torso/waist) drift.
 - `dist_from_origin`, `max_obj_dist` / `min_obj_dist`, `min_y` / `max_y`,
   `align_yaw` — multi-object placement costs.
 
@@ -631,8 +643,8 @@ steps (balance-first Gauss-Newton, no cuRobo during Adam; the final pre-check
 refresh still repairs with cuRobo IK; `--no_reik_balance_first` restores the
 pose-only Gauss-Newton with a cuRobo IK fallback).
 
-Peak VRAM with motion planning: about 3 GiB at `-n 64` and 8 GiB at the
-default 256 (the CUDA graphs add about 0.05 and 0.3 GiB);
+Peak VRAM on the simplified model with motion planning: about 3 GiB at `-n 64`
+and 8 GiB at the default 256 (the CUDA graphs add about 0.05 and 0.3 GiB);
 `--no_reik_balance_first` takes about 3.5 and 9.5 GiB (see
 `num_particles` in `config.py` for 512 and 1024). These figures and the
 commands above use PyTorch's default allocator. They were measured on
