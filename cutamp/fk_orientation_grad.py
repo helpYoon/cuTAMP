@@ -2,11 +2,11 @@
 
 cuRobo v2's FK backward decodes dL/dquaternion with a body-frame map but dots the result with world-frame joint
 axes, so the gradient of a link's rotation to the joint positions comes out wrong while positions are exact. The
-error grows with the link's rotation from the world's axes. The FK rotations whose gradients autograd needs pass
+error grows with the link's rotation from the world's axes. The FK rotations that autograd can differentiate pass
 through ``_FKQuatGrad`` (``_link_matrix`` for a link pose's matrix): the rollout's hands and soles (rollout.py) and
-each sole's rotation in the floor wrench, inside trajopt's torque cost (floor_wrench.py). The CoM costs' support
-frame needs neither: it is constant in q on the real legs and a pure yaw on the simplified model
-(com_polygon_cost.py).
+each sole's rotation in the floor wrench (floor_wrench.py; trajopt's transition calls that hook under no_grad, so
+only a caller that differentiates the hook relies on it). The CoM costs' support frame needs neither: it is
+constant in q on the real legs and a pure yaw on the simplified model (com_polygon_cost.py).
 
 A module of its own because rollout.py imports tamp_world.py, which imports floor_wrench.py; rollout.py re-exports
 both names.

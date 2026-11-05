@@ -4,11 +4,12 @@ cuRobo v2's FK backward decodes dL/dquaternion with a body-frame formula but dot
 joint axes, so orientation gradients reaching PyTorch come out wrong (sign right on about half the particles) while
 position gradients are exact. That made Adam alone unable to optimize the pick and place configurations.
 
-The real legs send two more rotations to autograd: the rollout's soles (``sole_rot_err``, which Adam differentiates)
-and each sole's in the floor wrench (trajopt's torque cost). Their CoM, a position, is a sanity check. The error
-grows with the link's rotation from the world's axes, and planted soles have none (the stance's soles sit at the
-identity), so those checks run on tilted confs (``_tilt``). This module holds two worlds (``blocks_t1_plan``'s and
-``real_world``), about 4 GiB together: only FK runs on them.
+On the real legs two more rotations can reach autograd: the rollout's soles (``sole_rot_err``, in Adam's loss) and
+each sole's in the floor wrench (trajopt's transition calls that hook under no_grad; the test differentiates it
+directly). Their CoM, a position, is a sanity check. The error grows with the link's rotation from the world's
+axes, and planted soles have none (the stance's soles sit at the identity), so those checks run on tilted confs
+(``_tilt``). This module holds two worlds (``blocks_t1_plan``'s and ``real_world``), about 4 GiB together: only FK
+runs on them.
 """
 
 import torch
