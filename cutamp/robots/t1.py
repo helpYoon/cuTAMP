@@ -872,8 +872,7 @@ class T1RerunRobot:
     On the real legs it accepts the model's 33-DOF conf, in ``model.joint_names`` order. The six base joints, also
     cuRobo ``extra_links``, give the Trunk's world pose (:func:`trunk_pose_from_q`). Every URDF joint is set by name:
     the model's from the conf, the fingers from the gripper state (:meth:`set_grippers`), and the others the
-    planner locks (the head) at their locked values, 0. The optimizer's rollout appends a 4-joint gripper command
-    to its confs, which is ignored: the fingers follow the gripper state.
+    planner locks (the head) at their locked values, 0.
     """
 
     def __init__(self, name: str, urdf: URDF, model: T1Model, q_neutral=None, load_mesh: bool = True):
@@ -906,13 +905,11 @@ class T1RerunRobot:
         rr.log(self.name, rr.Transform3D(translation=m[:3, 3], mat3x3=m[:3, :3]))
 
     def _real_legs_conf(self, joint_positions: list) -> list:
-        """The real legs' conf in ``joint_positions``, without the gripper command the optimizer's rollout
-        appends."""
+        """``joint_positions``, checked to be a real-leg conf: the model's joints, in ``model.joint_names`` order."""
         n = len(self.model.joint_names)
-        if len(joint_positions) not in (n, n + len(GRIPPER_OPEN)):
-            raise ValueError(f"Expected the {self.model.name} model's {n} joints, optionally followed by a "
-                             f"{len(GRIPPER_OPEN)}-joint gripper command, got {len(joint_positions)} values")
-        return joint_positions[:n]
+        if len(joint_positions) != n:
+            raise ValueError(f"Expected the {self.model.name} model's {n} joints, got {len(joint_positions)} values")
+        return joint_positions
 
     def _real_legs_urdf_cfg(self, q: list) -> list:
         """The URDF's actuated joints, by name, at the real-leg conf ``q``."""

@@ -13,7 +13,9 @@ If the path is omitted, defaults to ``data/motion_plan.pkl`` in this repo.
 
 This example expects ``schema_version=3`` pickles. Older plans (v1 with
 Trunk-frame hand poses, v2 with a -0.0625 X compensation on trunk_xyz)
-will be rejected with a regenerate-with-current-code message.
+will be rejected with a regenerate-with-current-code message. Real-leg plans
+(``--robot real_legs``) are saved raw, ``schema_version="stage3-raw"``, and
+are refused too: they await stage 6's export.
 
 v3 saves ``trunk_xyz`` as the raw sim FK output (sim
 ``t1_simplified.urdf`` Trunk world pose). The on-robot ``actual_robot.urdf``
@@ -205,6 +207,12 @@ def load_for_mpc(path: Path) -> List[Dict[str, Any]]:
             f"legacy/unversioned or corrupt plan, not a versioned one. "
             f"Regenerate with the current code:\n"
             f"  python -m cutamp.scripts.run_cutamp --motion_plan --save_plan {path}"
+        )
+    if schema_version == "stage3-raw":
+        raise RuntimeError(
+            f"motion_plan.pkl at {path} is a raw real-leg plan (schema_version 'stage3-raw', the "
+            f"{plan.get('model')} model's joints). This example reads the simplified model's schema 3; "
+            f"real-leg plans await stage 6's export."
         )
     if schema_version != 3:
         raise RuntimeError(

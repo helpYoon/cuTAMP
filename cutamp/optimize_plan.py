@@ -34,6 +34,7 @@ from cutamp.particle_initialization import (
     _ik_solution_to_full_q,
     _ik_success_mask,
 )
+from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
@@ -1041,21 +1042,28 @@ class ParticleOptimizer:
         # Log initial state
         timer.start("visualize_rollout")
         world = rollout_fn.world
+        # The robot's conf in the model's cspace, and each hand's gripper state on the rerun robot (when one is
+        # shown): a pick conf's hand closed, a place conf's open, the other hand as it was; both open at the start.
+        rr_robot = getattr(visualizer, "robot", None)
+        grippers = {"left": GRIPPER_OPEN, "right": GRIPPER_OPEN}
+
+        def show(q: torch.Tensor) -> None:
+            if hasattr(rr_robot, "set_grippers"):
+                rr_robot.set_grippers(**grippers)
+            visualizer.set_joint_positions(q.tolist())
+
         visualizer.set_time_sequence(f"rollout_{self.opt_counter}", 0)
-        visualizer.set_joint_positions(world.q_init.tolist())
+        show(world.q_init)
         for obj in world.movables:
             obj_pose = world.get_object_pose(obj).cpu()
             visualizer.log_mat4x4(f"world/{obj.name}", obj_pose)
 
         for ts in range(len(rollout["conf_params"])):
             visualizer.set_time_sequence(f"rollout_{self.opt_counter}", ts + 1)
-            q = rollout["confs"][best_idx, ts]
-
-            gripper_close = rollout["gripper_close"][ts]
-            # T1 gripper: 4-bar parallel linkage, 4 joints per hand.
-            # GRIPPER_OPEN = (0,0,0,0), GRIPPER_CLOSED = (1,-1,-1,1).
-            gripper_joints = [1.0, -1.0, -1.0, 1.0] if gripper_close else [0.0, 0.0, 0.0, 0.0]
-            visualizer.set_joint_positions(q.tolist() + gripper_joints)
+            arm = rollout_fn.conf_to_arm.get(rollout["conf_params"][ts])
+            if arm is not None:
+                grippers[arm] = GRIPPER_CLOSED if rollout["gripper_close"][ts] else GRIPPER_OPEN
+            show(rollout["confs"][best_idx, ts])
 
             world_from_ee = rollout["world_from_ee"][best_idx, ts].cpu()
             visualizer.log_mat4x4("rollout/ee_pose", world_from_ee)

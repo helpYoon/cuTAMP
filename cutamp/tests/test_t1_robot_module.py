@@ -100,6 +100,26 @@ def test_raw_motion_plan_in_model_order():
                 np.testing.assert_array_equal(out[key], getattr(js, key)[0][:, cols].numpy())
 
 
+def test_mpc_example_refuses_a_raw_plan_until_the_export(tmp_path):
+    # The MPC example reads schema 3, the simplified model's. Regenerating a raw real-leg plan saves the same schema,
+    # so for one the example says real-leg plans await stage 6's export, not "regenerate".
+    import importlib.util
+    import pickle
+    from pathlib import Path
+
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.utils.plan_processor import raw_motion_plan
+    path = Path(__file__).resolve().parents[2] / "examples" / "load_motion_plan_for_mpc.py"
+    spec = importlib.util.spec_from_file_location("load_motion_plan_for_mpc", path)
+    example = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(example)
+    with open(tmp_path / "motion_plan.pkl", "wb") as f:
+        pickle.dump(raw_motion_plan(_raw_plan_input(), REAL_LEGS), f)
+    with pytest.raises(RuntimeError, match="real-leg plans await stage 6's export") as refused:
+        example.load_for_mpc(tmp_path / "motion_plan.pkl")
+    assert "egenerate" not in str(refused.value)
+
+
 def test_check_plan_margins_refuses_raw(tmp_path):
     # check_plan_margins gates the simplified model's margin bands: the real legs have none (decision 6), and a raw
     # plan has no schema-3 keys. It refuses one by name, with a non-zero exit.
@@ -161,9 +181,8 @@ def test_rerun_robot_real_legs(tmp_path):
     # The real-leg viewer (decision 9). The root's Transform3D is the base pose, the Trunk's world pose: at a tilt
     # with pitch, roll and yaw all non-zero, cuRobo's FK of the Trunk, so a wrong order of the base's YXZ angles
     # fails (each other order is checked to differ). Every actuated URDF joint gets a value by name: the model's
-    # from q, the fingers from the gripper state (not from the gripper command the optimizer's rollout appends),
-    # the head 0; both hands then land where cuRobo puts them. The trajectory path (get_rr_columns) logs the same
-    # root.
+    # from q, the fingers from the gripper state, the head 0; both hands then land where cuRobo puts them. A conf
+    # takes exactly the model's joints. The trajectory path (get_rr_columns) logs the same root.
     import roma
     from curobo.kinematics import Kinematics, KinematicsCfg
     from curobo.types import DeviceCfg, JointState
@@ -182,10 +201,10 @@ def test_rerun_robot_real_legs(tmp_path):
     path = tmp_path / "viewer.rrd"
     robot = _record(path, lambda: load_t1_rerun(REAL_LEGS, load_mesh=False),
                     lambda r: r.set_grippers(left=GRIPPER_CLOSED, right=GRIPPER_OPEN),
-                    lambda r: r.set_joint_positions(q.tolist()),
-                    lambda r: r.set_joint_positions(q.tolist() + list(GRIPPER_CLOSED)))
-    with pytest.raises(ValueError, match="33 joints"):
-        robot.set_joint_positions(q.tolist()[:-1])
+                    lambda r: r.set_joint_positions(q.tolist()))
+    for wrong in (q.tolist()[:-1], q.tolist() + list(GRIPPER_CLOSED)):
+        with pytest.raises(ValueError, match="33 joints"):
+            robot.set_joint_positions(wrong)
 
     frames = ["Trunk", "left_base_link", "right_base_link"]
     kin = Kinematics(KinematicsCfg.from_robot_yaml_file(copy.deepcopy(t1_curobo_cfg(REAL_LEGS)), tool_frames=frames,
