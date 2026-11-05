@@ -306,8 +306,8 @@ class TAMPWorld:
     @property
     def segment_torques(self) -> SegmentTorques:
         """cuRobo's two RNEA passes with the floor's push on a plan's frames
-        (:class:`cutamp.floor_wrench.SegmentTorques`, lazily built): the balance gate's torque check on the segments
-        it slows, and the reason a trajopt failed. A model standing on soles only (the real legs)."""
+        (:class:`cutamp.floor_wrench.SegmentTorques`, lazily built): the balance gate's torque and speed checks, which
+        set each segment's pace, and the reason a trajopt failed. A model standing on soles only (the real legs)."""
         if self._segment_torques is None:
             self._segment_torques = SegmentTorques(self.model, self.device_cfg)
         return self._segment_torques

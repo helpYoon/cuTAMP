@@ -114,11 +114,14 @@ def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str]
 
 class SegmentTorques:
     """cuRobo's two RNEA passes with the floor's push, as trajopt's transitions run them, on a plan's frames: the
-    balance gate's check of the segments it slows, and the reason a trajopt failed (design 7.4a).
+    balance gate's torque check, which with the speed limits sets each segment's pace, and the reason a trajopt
+    failed (design 7.4a).
 
     Calling it on a ``plan_js`` (position, velocity and acceleration, by joint name) returns the second pass's
     ``[T, dof]`` torques in ``model.joint_names`` order. Eager. ``effort`` ``[dof]`` is cuRobo's bound on each
     joint's |torque|: the pinned URDF's effort, and 10,000 on the massless base joints (link_params.py:35).
+    ``velocity`` ``[dof]`` is cuRobo's bound on each joint's |velocity| (``get_joint_limits()``, never the URDF's
+    velocity times the YAML's velocity_scale: the fork applies that scale twice).
     """
 
     def __init__(self, model: T1Model, device_cfg: DeviceCfg):
@@ -139,8 +142,8 @@ class SegmentTorques:
         self.fn = make_floor_wrench_fn([self.joint_names.index(j) for j in model.joint_names[model.base]],
                                        tuple(tools.index(f) for f in model.sole_frames),
                                        tuple(kp.link_name_to_idx_map[f] for f in model.sole_frames), kp.num_links)
-        limits = self.kin.get_joint_limits().effort  # [2, dof]: -effort, +effort (kinematics_loader.py:1092-1093)
-        self.effort = limits[1].clone()
+        limits = self.kin.get_joint_limits()  # each [2, dof]: -bound, +bound (kinematics_loader.py:1090-1093)
+        self.effort, self.velocity = limits.effort[1].clone(), limits.velocity[1].clone()
 
     def __call__(self, plan_js: JointState) -> torch.Tensor:
         from curobo.types import JointState

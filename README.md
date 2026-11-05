@@ -85,19 +85,24 @@ graph LR
    `SUPPORT_HALF_EXTENTS`, the real soles shrunk 2 cm; on the real legs the
    home stance's two soles, shrunk 2 cm and kept where each foot carries at
    least a tenth of the weight. A CoM outside fails the candidate and the next
-   one is tried; a ZMP outside slows the segment down uniformly (`_retime`, up
-   to `RETIME_MAX` = 4×), and a ZMP still outside at 4× fails the candidate
-   too. On the real legs every frame must also keep both soles on the stance
-   (and the Trunk's tilt within the envelope's bound, where it sets one); a
-   slowed segment's frames are checked again, and its joint torques, cuRobo's
-   RNEA with the floor's push on the soles (`SegmentTorques`), must stay within
-   their efforts.
+   one is tried. On the simplified model a ZMP outside slows the segment down
+   uniformly (`_retime`, up to `RETIME_MAX` = 4×), and a ZMP still outside at
+   4× fails the candidate too. On the real legs every frame must also keep
+   both soles on the stance (and the Trunk's tilt within the envelope's bound,
+   where it sets one), and the gate sets every segment's pace (`_pace`): the
+   smallest uniform time scale, faster or slower than the planner's and up to
+   4×, at which every actuated joint's speed stays within cuRobo's limit,
+   every joint's torque, cuRobo's RNEA with the floor's push on the soles
+   (`SegmentTorques`), within its effort, and the ZMP inside. The frames it
+   returns are checked again, and a segment no scale up to 4× passes fails the
+   candidate, naming the check.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the processed plan
    (schema v3, `utils/plan_processor.py`) for the downstream MPC consumer
    ([`examples/load_motion_plan_for_mpc.py`](examples/load_motion_plan_for_mpc.py)
-   shows how to read it). A segment the gate slowed down also carries
-   `planner_timing`, the same segment at the motion planner's own timing
+   shows how to read it). A segment the gate retimed (slowed down, or on the
+   real legs sped up) also carries `planner_timing`, the same segment at the
+   motion planner's own timing
    (`None` otherwise). A real-leg plan is saved raw (`stage3-raw`, in the
    model's joint order), which the MPC example refuses.
 
@@ -304,12 +309,19 @@ flags.
   multibody ZMP must stay inside `SUPPORT_HALF_EXTENTS`; a ZMP excursion
   slows the segment uniformly (`_retime`, a C² cubic spline, up to
   `RETIME_MAX` = 4×), and a CoM excursion or a ZMP still out at 4× raises and
-  fails the candidate. Each segment is appended to `accum_plans` (with
-  `held_objs` for both arms; a slowed one also keeps `planner_timing`, the
-  same spline at the planner's own timing), then the object is
-  attached/detached via the AttachmentManager. Playback walks `accum_plans` and
-  hands each entry to the visualizer. The run metrics get the gate's
-  `retime_max`, `traj_com_min_margin` and `traj_zmp_min_margin`, plus
+  fails the candidate. On the real legs (`_pace`) the gate times each segment
+  at the smallest uniform scale its speed, torque and ZMP checks pass: the
+  speed's and the torque's exactly, the ZMP's by a batched search to within
+  `RETIME_TOL` = 2% above it, all on the planner's frames with the velocities
+  over s and the accelerations over s². Each segment is appended to
+  `accum_plans` (with `held_objs` for both arms; a retimed one also keeps
+  `planner_timing`, the same spline at the planner's own timing), then the
+  object is attached/detached via the AttachmentManager. Playback walks
+  `accum_plans` and hands each entry to the visualizer. The run metrics get
+  the gate's `retime_min`, `retime_max` (on the real legs the scales run below
+  1 too), on the real legs `retime_binding` (segments per binding check:
+  `velocity <joint>`, `torque <joint>`, `zmp`, or `none` for a still one),
+  `traj_com_min_margin` and `traj_zmp_min_margin`, plus
   `plan_duration_s` and the measure-only audit `traj_com_violation_frac` /
   `traj_com_frames` against the gate's rectangle.
 
@@ -472,16 +484,17 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   `test_real_legs_*.py` files and
   [`test_floor_wrench.py`](cutamp/tests/test_floor_wrench.py) — the real-leg
   model: the pinned assets and their byte-identical rebuild, the stance and
-  its support, IK and GN holding the soles, the gate's sole, tilt and torque
-  checks, the floor's push, and `--robot real_legs` end to end.
+  its support, IK and GN holding the soles, the gate's sole, tilt, torque and
+  speed checks and the pace they set, the floor's push, and `--robot
+  real_legs` end to end.
 - Plus pin lifecycle, arm-affinity priority, plan-processor derivatives,
   joint-limit margins, motion attach / retry, the ablation runner and
   analyzer, and a coupled-reIK smoke test.
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~6 min on an RTX 4090: 327
-passed, 8 skipped on 2026-11-04).
+(GPU required for the integration tests; ~6 min on an RTX 4090: 339
+passed, 8 skipped on 2026-11-05).
 `CUTAMP_SLOW=1` also runs the 8 slow live tests: 6 `--cuda_graphs` runs in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), the floor
 hook on a live motion planner in
@@ -518,8 +531,9 @@ example has its own: `pytest examples/`.
 - [`real_legs_report.py`](cutamp/scripts/real_legs_report.py) — the real-leg
   plans of a study: per joint, the peak torque against its effort and the peak
   speed against the motor's knee speed and cuRobo's limit; per run, the
-  largest Trunk tilt and sole drift, the gate's margins and slowdown, and any
-  planner-timed segment past an effort (`PREFIX.json`, `PREFIX.md`).
+  largest Trunk tilt and sole drift, the segments the gate slowed and sped
+  up, its margins, time scales and binding checks, and any planner-timed
+  segment past an effort (`PREFIX.json`, `PREFIX.md`).
 - [`check_plan_margins.py`](cutamp/scripts/check_plan_margins.py) — per-joint
   distances to limits in a saved plan; exits 1 if a protected side comes
   within `--threshold` (0.05 rad) or any waypoint violates a limit.
@@ -655,9 +669,9 @@ Adam).
    planner's collision checks, with three gaps: GN checks no collision (the
    optimizer rescores every conf each step), a pick or place segment
    disables its block or support surface for the whole robot, and a segment
-   the balance gate slows down is resampled through the planner's frames
-   (`_retime`) without new collision or joint-limit checks on the in-between
-   frames.
+   the balance gate retimes (slows down, or on the real legs speeds up) is
+   resampled through the planner's frames (`_retime`) without new collision
+   or joint-limit checks on the in-between frames.
 
 4. **Both arms tracked through every trajectory** — body joints are unlocked
    during single-arm planning, so an inactive arm holding a block will still

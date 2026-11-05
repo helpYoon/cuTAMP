@@ -327,37 +327,48 @@ def test_planning_s_sums_the_top_timers(tmp_path):
     assert all(none[k] is None for k in ("planning_s", "seed_ik_s", "trajopt_s", "final_repair_s", "load_tamp_world_s"))
 
 
-def test_torque_failures_count_both_forms(tmp_path):
-    # A failed candidate's message names torque in trajopt's reason (": torque") and in the balance gate's raise on a
-    # slowed segment. Trajopt's ": other" and the gate's ZMP raise don't count.
+def test_torque_failures_count_every_torque_form(tmp_path):
+    # A failed candidate's message names torque in trajopt's reason (": torque") and in each of the balance gate's
+    # torque raises: no time scale up to the cap keeps every effort (_torque_scale), or the frames it returns pass one
+    # (_check_torques). Trajopt's ": other" and the gate's velocity and ZMP raises don't count.
     from types import SimpleNamespace
 
     import torch
 
-    from cutamp.motion_solver import RETIME_MAX, _check_torques, _plan_failed
+    from cutamp.motion_solver import RETIME_MAX, _check_torques, _check_velocity, _plan_failed, _torque_scale
     from cutamp.robots.t1 import REAL_LEGS
 
-    class Torques:  # world.segment_torques's interface: [T, dof] torques and an effort per joint
+    n = len(REAL_LEGS.joint_names)
+
+    class Torques:  # world.segment_torques's interface: [T, dof] torques, and an effort and a speed limit per joint
         def __init__(self, tau):
-            self.tau, self.effort = tau, torch.ones(len(REAL_LEGS.joint_names))
+            self.tau, self.effort, self.velocity = tau, torch.ones(n), torch.ones(n)
 
         def __call__(self, js):
-            return torch.full((3, len(REAL_LEGS.joint_names)), self.tau)
+            return torch.full((getattr(js, "position", torch.zeros(3, n)).shape[0], n), self.tau)
 
     def world(tau):
         return SimpleNamespace(model=REAL_LEGS, segment_torques=Torques(tau))
 
+    rest = torch.zeros(3, n)
+    js = SimpleNamespace(position=rest, velocity=rest + 2 * RETIME_MAX, acceleration=rest,
+                         joint_names=list(REAL_LEGS.joint_names))  # twice the speed limit at the slowdown cap
+    raised = []
+    for check, args in ((_check_torques, (world(2.0), None)), (_torque_scale, (world(2.0), js, 0.5, RETIME_MAX)),
+                        (_check_velocity, (world(0.5), js, RETIME_MAX))):
+        with pytest.raises(RuntimeError) as e:
+            check(*args)
+        raised.append(str(e.value))
     result = SimpleNamespace(js_solution=object(), get_interpolated_plan=lambda: None)  # a trajopt result
-    with pytest.raises(RuntimeError) as gate:
-        _check_torques(world(2.0), None)
-    messages = [str(_plan_failed(world(2.0), result, "Retract plan failed for op")), str(gate.value),
+    messages = [str(_plan_failed(world(2.0), result, "Retract plan failed for op")), *raised,
                 str(_plan_failed(world(0.5), result, "Retract plan failed for op")),
                 f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
-    assert messages[0].endswith(": torque") and messages[2].endswith(": other")
+    assert messages[0].endswith(": torque") and messages[4].endswith(": other")
+    assert f"at the {RETIME_MAX}x slowdown cap" in messages[2] and "velocity passes" in messages[3]
     runs = [_fake_run(tmp_path, "real_legs", 0.5, s) for s in (0, 1)]
     _patch(runs[0], {"motion_plan_failures": messages})
     (tmp_path / "manifest.json").write_text(json.dumps(runs))
-    assert [r["torque_failures"] for r in load_study(tmp_path / "manifest.json")] == [2, None]
+    assert [r["torque_failures"] for r in load_study(tmp_path / "manifest.json")] == [3, None]
 
 
 def _gate_records(ratio=1.4, n=256, balanced=40, slow_tail=1.0):
@@ -504,3 +515,46 @@ def test_real_legs_report_on_a_still_home_plan(tmp_path):
     assert run["unslowed_over_effort"] == []
     md = prefix.with_suffix(".md").read_text()
     assert "| Left_Knee_Pitch |" in md and "| gate_real_legs_n256_h050_s0 |" in md
+
+
+@needs_cuda
+def test_real_legs_report_counts_sped_up_and_slowed_segments(tmp_path):
+    # On the real legs the gate can speed a segment up (s < 1) as well as slow it: each retimed segment keeps the
+    # planner's timing, so its s is its frames over the planner's. The report counts both, takes the gate's time
+    # scales and binding checks (by check) from overall_metrics, and writes them in its tables.
+    import pickle
+
+    import numpy as np
+
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.scripts import real_legs_report
+
+    names = list(REAL_LEGS.joint_names)
+
+    def still(n):
+        position = np.tile(np.asarray(REAL_LEGS.home, dtype=np.float32), (n, 1))
+        return {"position": position, "velocity": np.zeros_like(position), "acceleration": np.zeros_like(position)}
+
+    segments = [{"arm": "left", "dt": 0.025, **still(3), "planner_timing": still(5)},   # sped up, s = 0.5
+                {"arm": "left", "dt": 0.025, **still(5), "planner_timing": still(3)},   # slowed, s = 2
+                {"arm": "right", "dt": 0.025, **still(3), "planner_timing": None}]       # s = 1
+    run = tmp_path / "study" / "gate_real_legs_n256_h000_s0"
+    run.mkdir(parents=True)
+    with open(run / "motion_plan.pkl", "wb") as f:
+        pickle.dump({"schema_version": "stage3-raw", "model": "real_legs", "joint_names": names,
+                     "segments": segments}, f)
+    (run / "overall_metrics.json").write_text(json.dumps({
+        "traj_com_min_margin": 0.03, "traj_zmp_min_margin": 0.02, "retime_min": 0.5, "retime_max": 2.0,
+        "retime_binding": {"velocity Waist": 1, "zmp": 1, "torque Left_Knee_Pitch": 1}}))
+
+    prefix = tmp_path / "out" / "report"
+    real_legs_report.main(["--study", str(tmp_path / "study"), "--out", str(prefix)])
+    report = json.loads(prefix.with_suffix(".json").read_text())
+    (r,) = report["runs"]
+    assert (r["segments"], r["slowed"], r["sped_up"], r["retime_min"], r["retime_max"]) == (3, 1, 1, 0.5, 2.0)
+    assert r["binding"] == {"torque": 1, "velocity": 1, "zmp": 1}
+    assert (report["summary"]["retime_min"], report["summary"]["retime_max"]) == (0.5, 2.0)
+    assert r["unslowed_over_effort"] == []  # only the segment at the planner's timing is read for it
+    md = prefix.with_suffix(".md").read_text()
+    assert "| gate_real_legs_n256_h000_s0 | 3 | 1 | 1 | 0.50 | 2.00 | torque 1, velocity 1, zmp 1 |" in md
+    assert "time scales from 0.50x to 2.00x" in md

@@ -255,3 +255,19 @@ def test_gate_passes_slow_motion_untouched():
     plan = _torso_ramp(world, -0.3, 2.0)
     out, stats, fast = _balance_gate(world, None, plan, DT)
     assert out is plan and stats["retime"] == 1.0 and fast is None
+
+
+@needs_cuda
+def test_simplified_gate_only_slows_and_names_no_binding():
+    # Only a model standing on soles has its pace set by the gate (velocity, torque, ZMP). The simplified model's gate
+    # is unchanged: a segment with ZMP room stays at the planner's timing however slow it is, a fast one is slowed
+    # for its ZMP, and the stats are the same three keys (no binding check), at s >= 1.
+    from cutamp.motion_solver import _balance_gate
+    world = make_blocks_t1_world()
+    slow = _torso_ramp(world, -0.3, 4.0)
+    out, stats, fast = _balance_gate(world, None, slow, DT)
+    assert out is slow and fast is None and set(stats) == {"retime", "com_min_margin", "zmp_min_margin"}
+    assert stats["retime"] == 1.0
+    out, stats, fast = _balance_gate(world, None, _torso_ramp(world, -0.6, 0.5), DT)
+    assert fast is not None and set(stats) == {"retime", "com_min_margin", "zmp_min_margin"}
+    assert stats["retime"] > 1.0

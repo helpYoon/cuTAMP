@@ -131,8 +131,8 @@ def load_study(manifest_path):
             "planning_s": planning_s,
             **{k: timers.get(timer) for k, timer in STAGE_TIMERS.items()},
             # Failed motion-plan candidates whose trajectory passed a joint's effort (design 7.4a): trajopt's last
-            # result, on its horizon or between its frames (the reason ": torque"), or a segment the balance gate
-            # slowed (its raise names the torque).
+            # result, on its horizon or between its frames (the reason ": torque"), or a segment the balance gate's
+            # torque check failed at every time scale or on the frames it returns (its raise names the torque).
             "torque_failures": None if failures is None else sum("torque" in m for m in failures),
             "num_satisfying_final": opt.get("num_satisfying_final"),
             "num_satisfying_com_feasible": opt.get("num_satisfying_com_feasible"),
@@ -257,7 +257,8 @@ def _write_gate_md(summary, path):
                   "timer has none). Each stage time is the median over a model's runs of the run's timer total; "
                   "ms/step is the wall-clock per Adam step. Failed past an effort counts the motion-plan candidates "
                   "that failed with a trajectory past a joint's effort: trajopt's last result, on its horizon or "
-                  "between its frames, or a segment the balance gate slowed."]
+                  "between its frames, or a segment the balance gate's torque check failed at every time scale up "
+                  "to its cap or on the frames it returns."]
     Path(path).write_text("\n".join(lines) + "\n")
 
 

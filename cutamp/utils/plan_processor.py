@@ -457,8 +457,9 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
                 "position": [T, n],                  # float32, in joint_names order
                 "velocity": [T, n],
                 "acceleration": [T, n],
-                # A segment the balance gate slowed: the same segment at the motion planner's own timing, as the
-                # same three arrays ([T', n] at the same dt); else None.
+                # A segment the balance gate retimed (slowed down or sped up: on the real legs it sets the pace):
+                # the same segment at the motion planner's own timing, as the same three arrays ([T', n] at the
+                # same dt); else None.
                 "planner_timing": {"position", "velocity", "acceleration"} | None,
             }],
         }

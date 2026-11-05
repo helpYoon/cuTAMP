@@ -6,10 +6,10 @@ timing, FKs every frame, and writes ``PREFIX.json`` and ``PREFIX.md``:
 
 - per joint, the peak |torque| against its effort, and the peak |velocity| against its motor's knee speed (bfm_wm's
   ``t1_actuators.npz``, ``v_knee``: above it the motor's torque falls) and cuRobo's velocity limit;
-- per run, the largest Trunk tilt and sole drift from the stance, by FK; the balance gate's smallest CoM and ZMP
-  margins and its largest slowdown (``overall_metrics.json``); and every segment the gate left at the planner's timing
-  whose torque passes an effort. Trajopt bounds those segments' torques, so one here means its constraint missed the
-  floor's push.
+- per run, the largest Trunk tilt and sole drift from the stance, by FK; how many segments the balance gate slowed and
+  sped up (a retimed segment keeps the planner's timing), its smallest CoM and ZMP margins, its time scales and the
+  checks that bound them (``overall_metrics.json``); and every segment the gate left at the planner's timing whose
+  torque passes an effort. The gate checks those segments' torques too, so one here means a check missed it.
 
 Usage:
     python -m cutamp.scripts.real_legs_report --study /home/yoonwoo/cutamp-runs/<study> --out <prefix>
@@ -54,9 +54,7 @@ class _RealLegs:
         self.torques = SegmentTorques(REAL_LEGS, device_cfg)
         self.trunk_kin = get_t1_bodies(REAL_LEGS, device_cfg).kinematics  # the gate's Trunk FK (_check_planted)
         self.effort = self.torques.effort.cpu().numpy()
-        # cuRobo's own limit, never the URDF's velocity times the YAML's velocity_scale: the fork applies that scale
-        # twice.
-        self.velocity_limit = self.torques.kin.get_joint_limits().velocity[1].cpu().numpy()
+        self.velocity_limit = self.torques.velocity.cpu().numpy()  # cuRobo's own, as the gate reads it
         with torch.no_grad():
             self.stance = self._soles(device_cfg.to_device(REAL_LEGS.home).unsqueeze(0)).clone()  # [1, 2, 4, 4]
         # t1_actuators.npz's arrays follow bfm_wm's T1_JOINT_NAMES, which the MuJoCo fixture stores (as the asset tests
@@ -109,15 +107,22 @@ class _RealLegs:
                 pos, rot, tl = self.planted(p)
             torque, speed = np.maximum(torque, peak), np.maximum(speed, np.abs(seg["velocity"]).max(0))
             drift_m, drift_rad, tilt = max(drift_m, pos), max(drift_rad, rot), max(tilt, tl)
-            if seg["planner_timing"] is None:  # at the planner's timing, where trajopt's torque constraint applies
+            if seg["planner_timing"] is None:  # at the planner's timing
                 unslowed_over += [{"segment": k, "joint": self.names[j], "torque": float(peak[j]),
                                    "effort": float(self.effort[j])} for j in np.flatnonzero(peak > self.effort)]
         metrics_path = run_dir / "overall_metrics.json"
         metrics = json.loads(metrics_path.read_text()) if metrics_path.exists() else {}
+        frames = [(len(seg["position"]), len(seg["planner_timing"]["position"]))
+                  for seg in plan["segments"] if seg["planner_timing"] is not None]  # both at the same dt
+        binding = None if metrics.get("retime_binding") is None else {}  # segments per check, joints summed
+        for label, count in (metrics.get("retime_binding") or {}).items():  # "velocity <joint>", "torque <joint>", ...
+            check = label.split()[0]
+            binding[check] = binding.get(check, 0) + count
         return {
             "run": run_dir.name, "path": str(run_dir), "segments": len(plan["segments"]),
-            "slowed": sum(seg["planner_timing"] is not None for seg in plan["segments"]),
-            "retime_max": metrics.get("retime_max"),
+            "slowed": sum(n > n_planner for n, n_planner in frames),
+            "sped_up": sum(n < n_planner for n, n_planner in frames),
+            "retime_min": metrics.get("retime_min"), "retime_max": metrics.get("retime_max"), "binding": binding,
             "com_min_margin": metrics.get("traj_com_min_margin"), "zmp_min_margin": metrics.get("traj_zmp_min_margin"),
             "max_tilt": tilt, "max_sole_drift_m": drift_m, "max_sole_drift_rad": drift_rad,
             "peak_torque": {j: float(torque[c]) for j, c in zip(self.actuated, self.cols)},
@@ -150,7 +155,8 @@ def build_report(study: Path) -> dict:
             "runs": len(runs), "max_tilt": extreme(max, "max_tilt"),
             "max_sole_drift_m": extreme(max, "max_sole_drift_m"),
             "max_sole_drift_rad": extreme(max, "max_sole_drift_rad"), "min_com_margin": extreme(min, "com_min_margin"),
-            "min_zmp_margin": extreme(min, "zmp_min_margin"), "retime_max": extreme(max, "retime_max"),
+            "min_zmp_margin": extreme(min, "zmp_min_margin"), "retime_min": extreme(min, "retime_min"),
+            "retime_max": extreme(max, "retime_max"),
             "unslowed_over_effort": sum(len(r["unslowed_over_effort"]) for r in runs),
         },
     }
@@ -186,15 +192,17 @@ def _markdown(report: dict) -> str:
         f"Joints past their knee speed: {', '.join(past_knee) or 'none'}.",
         f"Segments at the planner's timing past an effort: {'; '.join(over) or 'none'}.",
         "", "## Runs", "",
-        "| run | segments | slowed | retime max | CoM margin [cm] | ZMP margin [cm] | max tilt [rad] "
-        "| sole drift [mm] | sole drift [rad] | top torque / effort |",
-        "|" + "---|" * 10,
+        "| run | segments | slowed | sped up | time scale min | time scale max | binding | CoM margin [cm] "
+        "| ZMP margin [cm] | max tilt [rad] | sole drift [mm] | sole drift [rad] | top torque / effort |",
+        "|" + "---|" * 13,
     ]
     effort = {j["joint"]: j["effort"] for j in joints}
     for r in report["runs"]:
         top = max(effort, key=lambda j: r["peak_torque"][j] / effort[j])
+        binding = "—" if r["binding"] is None else ", ".join(f"{k} {v}" for k, v in sorted(r["binding"].items()))
         lines.append(
-            f"| {r['run']} | {r['segments']} | {r['slowed']} | {num(r['retime_max'])} "
+            f"| {r['run']} | {r['segments']} | {r['slowed']} | {r['sped_up']} | {num(r['retime_min'])} "
+            f"| {num(r['retime_max'])} | {binding} "
             f"| {num(r['com_min_margin'], scale=100)} | {num(r['zmp_min_margin'], 3, 100)} | {num(r['max_tilt'], 3)} "
             f"| {num(r['max_sole_drift_m'], 2, 1000)} | {num(r['max_sole_drift_rad'], 4)} "
             f"| {r['peak_torque'][top] / effort[top]:.2f} ({top}) |"
@@ -204,7 +212,8 @@ def _markdown(report: dict) -> str:
         f"Over every run: max tilt {num(s['max_tilt'], 3)} rad; "
         f"max sole drift {num(s['max_sole_drift_m'], 2, 1000)} mm "
         f"and {num(s['max_sole_drift_rad'], 4)} rad; min CoM margin {num(s['min_com_margin'], scale=100)} cm; min ZMP "
-        f"margin {num(s['min_zmp_margin'], 3, 100)} cm; largest slowdown {num(s['retime_max'])}x.",
+        f"margin {num(s['min_zmp_margin'], 3, 100)} cm; time scales from {num(s['retime_min'])}x to "
+        f"{num(s['retime_max'])}x.",
     ]
     return "\n".join(lines) + "\n"
 
