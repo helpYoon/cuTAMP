@@ -890,16 +890,19 @@ def _pace(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     last), and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP fails is slowed
     by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when no s passes, the
     gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets it:
-    ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last."""
+    ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last. Their
+    ``"com_min_margin"`` and ``"zmp_min_margin"`` are the smaller of the returned frames' and the planner's frames' at
+    s_eff (the returned spline at its knots): a sped-up segment returns fewer frames than the planner's, which the
+    search ran on."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     with torch.no_grad():
         _check_planted(world, _full_positions(world, planner, plan_js))
         js = _model_frames(world, planner, plan_js)
         com, _ = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
-        com_m = com_margin_from_base(com, world.model.support.gate_half).min().item()
-        if not com_m >= 0:
-            raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
+        com_planner = com_margin_from_base(com, world.model.support.gate_half).min().item()
+        if not com_planner >= 0:
+            raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_planner:.1f} cm")
         n = js.position.shape[0]
         step = 1.0 / (n - 1) if n > 1 else 1.0
         s_v, joint = _check_velocity(world, js, RETIME_MAX)
@@ -922,9 +925,11 @@ def _pace(world: TAMPWorld, planner, plan_js: JointState, dt: float):
                 if check.split(" ")[0] not in ("velocity", "torque", "zmp") or s >= RETIME_MAX:
                     raise  # the soles, the tilt and the CoM follow the path, which no time scale changes
                 s, binding = min(RETIME_RECHECK_STEP * s, RETIME_MAX), check
-    n_out = out.position.shape[-2]
-    stats = {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0, "binding": binding, "com_min_margin": com_m,
-             "zmp_min_margin": zmp_m}
+        n_out = out.position.shape[-2]
+        s_eff = (n_out - 1) / (n - 1) if n_out != n else 1.0
+        zmp_planner = float(_zmp_margins(world, planner, js, torch.tensor([s_eff]))[0])
+    stats = {"retime": s_eff, "binding": binding, "com_min_margin": min(com_m, com_planner),
+             "zmp_min_margin": min(zmp_m, zmp_planner)}
     return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)
 
 

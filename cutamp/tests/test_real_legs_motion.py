@@ -688,6 +688,30 @@ def test_gate_finds_no_zmp_where_the_floor_would_have_to_pull(real_world, planne
     assert e.value.check == "zmp"
 
 
+@needs_cuda
+def test_gate_reports_the_smaller_margin_of_its_frames_and_the_planners(real_world, planner):
+    # A sped-up segment returns fewer frames than the planner's, which the search ran on, and they can miss its
+    # tightest instant: the opposite shoulder swings, sped up to 0.11x by a shoulder's torque, return 10 frames, whose
+    # ZMP margin is 2.00 cm, against 1.62 cm on the planner's 81 at the same scale. The stats report the smaller, and
+    # the CoM's margin likewise.
+    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
+    from cutamp.motion_solver import ZMP_STEP, _balance_gate, _model_frames, _recheck, _taylor_positions, _zmp_margins
+    world = real_world
+    opposite = _ramp(world, {"Left_Shoulder_Pitch": -1.4, "Right_Shoulder_Pitch": 1.4}, 2.0,
+                     start={"Left_Shoulder_Pitch": 0.7, "Right_Shoulder_Pitch": -0.7})
+    out, stats, _ = _balance_gate(world, planner, opposite, DT)
+    s, n_out = stats["retime"], out.position.shape[0]
+    assert s < 0.2 and n_out == round(s * (opposite.position.shape[0] - 1)) + 1
+    com_out, zmp_out = _recheck(world, planner, out)
+    js = _model_frames(world, planner, opposite)
+    zmp_planner = float(_zmp_margins(world, planner, js, torch.tensor([s]))[0])
+    assert 0 <= zmp_planner < zmp_out - 0.002
+    assert stats["zmp_min_margin"] == zmp_planner
+    com, _ = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
+    com_planner = com_margin_from_base(com, world.model.support.gate_half).min().item()
+    assert stats["com_min_margin"] == min(com_out, com_planner)
+
+
 def _result(js_solution, interpolated=None):
     """A trajopt result's two trajectories: the horizon's (``js_solution``) and the interpolated one."""
     return SimpleNamespace(js_solution=js_solution, get_interpolated_plan=lambda: interpolated)
