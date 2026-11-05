@@ -202,6 +202,7 @@ class ComOverBasePolygonCost(BaseCost):
         b, h = state.joint_state.position.shape[:2]
         n = b * h
         com_world = state.cuda_robot_model_state.robot_com[..., :3].reshape(n, 3)
+        # Not through _link_matrix: the support frame is constant in q (stance) or a pure yaw, where FK's grad is exact.
         base_T = (
             state.tool_poses.get_link_pose(cfg.base_link_name, make_contiguous=True)
             .get_matrix()
@@ -234,6 +235,7 @@ def _com_and_base_from_state(ks, link: str):
     state, ``base_T`` the world pose of the support frame ``link``: the inputs
     every COM-polygon helper needs."""
     com_world = ks.robot_com[..., :3].reshape(-1, 3)
+    # Not through _link_matrix: the support frame is constant in q (stance) or a pure yaw, where FK's grad is exact.
     base_T = (
         ks.tool_poses.get_link_pose(link, make_contiguous=True)
         .get_matrix()

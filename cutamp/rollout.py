@@ -21,6 +21,7 @@ import torch
 from curobo.types import JointState
 
 from cutamp.config import TAMPConfiguration
+from cutamp.fk_orientation_grad import _FKQuatGrad, _link_matrix  # noqa: F401 (also re-exports _FKQuatGrad)
 from cutamp.t1_domain import Conf
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
@@ -28,36 +29,6 @@ from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
 )
-
-
-class _FKQuatGrad(torch.autograd.Function):
-    """Identity on an FK quaternion ``[..., 4]`` (wxyz) whose backward re-encodes dL/dq for cuRobo v2's FK backward.
-
-    That backward decodes the quaternion gradient with the body-frame map (``quaternion_gradient_to_angular_velocity``
-    in quaternion_util.cuh) but dots the result with world-frame joint axes, which need
-    Omega = 0.5 (-g_w v + w g_v + v x g_v). Passing g' = 2 q (x) (0, Omega) makes its decode return Omega exactly
-    (for unit q, at any angle). cuRobo's own pose costs already encode this way; only PyTorch autograd needs it.
-    If the fork's decode is ever changed to the world-frame formula, drop this: test_fk_orientation_grad.py would
-    then fail on the double correction.
-    """
-
-    @staticmethod
-    def forward(ctx, quat: torch.Tensor) -> torch.Tensor:
-        ctx.save_for_backward(quat.detach().clone())  # cuRobo may reuse the FK output buffer before backward
-        return quat.clone()
-
-    @staticmethod
-    def backward(ctx, g: torch.Tensor) -> torch.Tensor:
-        (q,) = ctx.saved_tensors
-        w, v, g_v = q[..., :1], q[..., 1:], g[..., 1:]
-        omega = 0.5 * (w * g_v - g[..., :1] * v + torch.cross(v, g_v, dim=-1))
-        return 2.0 * torch.cat((-(v * omega).sum(-1, keepdim=True), w * omega + torch.cross(v, omega, dim=-1)), -1)
-
-
-def _link_matrix(pose) -> torch.Tensor:
-    """``pose.get_matrix()`` for a cuRobo FK link pose, with gradients correct w.r.t. the joint positions."""
-    pose.quaternion = _FKQuatGrad.apply(pose.quaternion)
-    return pose.get_matrix()
 
 
 def get_conf_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
@@ -174,9 +145,10 @@ class RolloutFunction:
             world_from_ee = torch.stack(
                 [frame_to_mat[frame][:, t] for t, frame in enumerate(conf_frames)], dim=1
             )
-            # Both soles at every conf, for the kinematic constraint's check against the stance (design 7.4).
+            # Both soles at every conf, for the kinematic constraint's check against the stance (design 7.4). Adam
+            # differentiates its sole_rot_err, so they go through _link_matrix like the hands.
             world_from_soles = torch.stack([
-                ee_pose.get_link_pose(frame, make_contiguous=True).get_matrix().view(*confs.shape[:2], 4, 4)
+                _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True)).view(*confs.shape[:2], 4, 4)
                 for frame in sole_frames
             ], dim=2) if sole_frames else None
 
