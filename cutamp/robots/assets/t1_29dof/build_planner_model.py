@@ -8,8 +8,9 @@ model's gripper, spheres and robot config in ``../t1_description``, and are writ
   included.
 - ``t1_29dof_spheres.yml``: the simplified model's spheres without its legs, Trunk's moved into the vendor frame, plus
   4 per thigh and 4 per shank.
-- ``t1_29dof.yml``: the cuRobo robot config, with paths relative to its folder, and a ``cutamp:`` block (joint order,
-  home, sole box, sole y, home mid-sole) that cuRobo never reads.
+- ``t1_29dof.yml``: the cuRobo robot config, with paths relative to its folder, its six base joints' limits the legs'
+  reach (``_base_limits``), and a ``cutamp:`` block (joint order, home, sole box, sole y, home mid-sole) that cuRobo
+  never reads.
 
 Run with the tamp env's python: ``SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0 python build_planner_model.py [--out DIR]``.
 """
@@ -23,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 import yourdfpy
+from scipy.optimize import minimize
 
 HERE = Path(__file__).resolve().parent
 T1_DESC = HERE.parent / "t1_description"
@@ -65,10 +67,20 @@ GRIPPER_LINKS = tuple(f"{s}_{n}" for s, _ in SIDES for n in ("base_link", "Link1
 BODY_JOINTS = [j for j in T1_JOINT_NAMES if j not in HEAD]
 
 # The floating base: six massless single-axis joints from world to Trunk, x, y, z, then ZYX Euler (stage 2, REPORT.md
-# section 5): floor_wrench.base_wrench assumes this order and is singular only at |pitch| = 90 deg.
-BASE = (("x", "X_PRISM", (-0.3, 0.3)), ("y", "Y_PRISM", (-0.3, 0.3)), ("z", "Z_PRISM", (0.45, 0.70)),
-        ("yaw", "Z_ROT", (-math.pi, math.pi)), ("pitch", "Y_ROT", (-1.0, 1.0)), ("roll", "X_ROT", (-1.0, 1.0)))
-BASE_JOINTS = [f"base_j_{n}" for n, _, _ in BASE]
+# section 5): floor_wrench.base_wrench assumes this order and is singular only at |pitch| = 90 deg. They exist only
+# because cuRobo needs a fixed root, so their limits are the legs' reach (_base_limits), never a bound of their own.
+BASE = (("x", "X_PRISM"), ("y", "Y_PRISM"), ("z", "Z_PRISM"), ("yaw", "Z_ROT"), ("pitch", "Y_ROT"), ("roll", "X_ROT"))
+BASE_JOINTS = [f"base_j_{n}" for n, _ in BASE]
+# _base_limits samples the Trunk's pose over each leg: Trunk to the sole, Waist included, since it turns the pelvis both
+# hips hang from. LEG_GRID values per joint span its soft range, ends included; the REFINE_STARTS best samples of each
+# x, y and z extreme start a bounded L-BFGS-B. x, y and z then get BASE_MARGIN on each side, rounded out to the mm.
+# Pitch stops PITCH_MARGIN short of ZYX's singularity at |pitch| = pi/2, where base_wrench divides by cos(pitch) and
+# the yaw and roll axes line up: there 1/cos(pitch) is 10.0.
+LEG_CHAIN = ("Waist", "Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll")
+LEG_GRID = 7
+REFINE_STARTS = 8
+BASE_MARGIN = 0.01  # m
+PITCH_MARGIN = 0.1  # rad
 
 SOFT_LIMIT_FACTOR = 0.9  # bfm_wm robot/t1.py:118, T1_CFG.soft_joint_pos_limit_factor (call 17)
 ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's top speed, npz v_max (7.4a)
@@ -186,16 +198,101 @@ def _home(urdf: Path, default_q: dict) -> tuple[dict, list, float]:
     return home, [float(mid_sole[0]) + 0.0, float(mid_sole[1]) + 0.0, 0.0], sole_y
 
 
-def _extra_links(mid_sole: list) -> dict:
+def _soft_limits(joint: ET.Element) -> tuple[float, float]:
+    """bfm_wm's soft limits of ``joint`` (call 17): its URDF range's midpoint ± SOFT_LIMIT_FACTOR × half the range."""
+    limit = joint.find("limit")
+    lower, upper = float(limit.get("lower")), float(limit.get("upper"))
+    mid, half = (lower + upper) / 2, (upper - lower) / 2
+    return mid - SOFT_LIMIT_FACTOR * half, mid + SOFT_LIMIT_FACTOR * half
+
+
+def _rotations(axis: list, angle: np.ndarray) -> np.ndarray:
+    """``[N, 3, 3]``: rotations by ``angle`` ``[N]`` about the unit ``axis`` (Rodrigues)."""
+    k = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    s, c = np.sin(angle)[:, None, None], np.cos(angle)[:, None, None]
+    return np.eye(3) + s * k + (1.0 - c) * (k @ k)
+
+
+def _trunk_on_sole(joints: dict, leg: tuple, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The Trunk's position ``[N, 3]`` and rotation ``[N, 3, 3]`` in the frame of the sole at the end of ``leg``'s
+    joints, at their angles ``q`` ``[N, len(leg)]``."""
+    rot, pos = np.broadcast_to(np.eye(3), (len(q), 3, 3)), np.zeros((len(q), 3))
+    for name, angle in zip(leg, q.T):
+        origin = joints[name].find("origin")
+        roll, pitch, yaw = _floats(origin.get("rpy", "0 0 0"))
+        fixed = _rotations([0.0, 0.0, 1.0], np.array([yaw])) @ _rotations([0.0, 1.0, 0.0], np.array([pitch])) @ (
+            _rotations([1.0, 0.0, 0.0], np.array([roll])))  # URDF rpy: about the fixed x, then y, then z
+        pos = pos + rot @ np.array(_floats(origin.get("xyz")))
+        rot = rot @ fixed @ _rotations(_floats(joints[name].find("axis").get("xyz")), angle)
+    pos = pos + rot @ np.array(SOLE_OFFSET)
+    rot_t = rot.transpose(0, 2, 1)
+    return -(rot_t @ pos[..., None])[..., 0], rot_t
+
+
+def _leg_reach(joints: dict, home: dict, side: str, Side: str) -> dict:
+    """``{coordinate: (min, max)}``: the extremes of the Trunk's base coordinates (x, y, z and ZYX's yaw, pitch and
+    roll) over the ``side`` leg's soft limits, with its sole on its home pose. x, y and z are refined; the angles are
+    the grid's."""
+    leg = ("Waist", *(f"{Side}_{joint}" for joint in LEG_CHAIN[1:]))
+    chain = [joints[name] for name in leg]
+    assert chain[0].find("parent").get("link") == "Trunk" and chain[-1].find("child").get("link") == f"{side}_foot_link"
+    assert all(a.find("child").get("link") == b.find("parent").get("link") for a, b in zip(chain, chain[1:]))
+    lower, upper = np.array([_soft_limits(joint) for joint in chain]).T
+    grid = np.stack(np.meshgrid(*np.linspace(lower, upper, LEG_GRID, axis=1), indexing="ij"), -1).reshape(-1, len(leg))
+    trunk, rot = _trunk_on_sole(joints, leg, np.array([[home[name] for name in leg]]))
+    assert np.abs(rot[0] - np.eye(3)).max() < 1e-12  # the sole stands flat under the unrotated home base
+    sole = np.array([home[f"base_j_{n}"] for n in "xyz"]) - trunk[0]  # the sole's home position in the world
+
+    def reach(q):
+        p, r = _trunk_on_sole(joints, leg, np.atleast_2d(q))
+        return p + sole, r
+
+    pos, rot = reach(grid)
+    extremes = {}
+    for k, n in enumerate("xyz"):
+        ends = []
+        for sign in (-1.0, 1.0):
+            starts = grid[np.argsort(-sign * pos[:, k])[:REFINE_STARTS]]
+            best = min(minimize(lambda q: -sign * reach(q)[0][0, k], start, method="L-BFGS-B",
+                                bounds=list(zip(lower, upper))).fun for start in starts)
+            ends.append(-sign * float(best))
+        extremes[n] = tuple(ends)
+    yaw, roll = np.arctan2(rot[:, 1, 0], rot[:, 0, 0]), np.arctan2(rot[:, 2, 1], rot[:, 2, 2])
+    pitch = np.arctan2(-rot[:, 2, 0], np.hypot(rot[:, 2, 1], rot[:, 2, 2]))
+    extremes.update({n: (float(a.min()), float(a.max())) for n, a in (("yaw", yaw), ("pitch", pitch), ("roll", roll))})
+    return extremes
+
+
+def _base_limits(joints: dict, home: dict) -> dict:
+    """Each base joint's limits, by name, from the legs' reach (``_leg_reach``). Each leg's reach, its sole on its home
+    pose, holds every Trunk pose that both planted soles allow, so the overlap of the two never binds before the legs
+    do: x, y and z take it, BASE_MARGIN wider.
+
+    In ZYX a bow past 90 degrees flips yaw and roll by pi, so each leg reaches every yaw and roll, and pitch up to the
+    singularity: those three end at the chart's edges, pitch PITCH_MARGIN short of it."""
+    reach = [_leg_reach(joints, home, side, Side) for side, Side in SIDES]
+    lo = {n: max(r[n][0] for r in reach) for n in reach[0]}
+    hi = {n: min(r[n][1] for r in reach) for n in reach[0]}
+    limits = {n: (math.floor((lo[n] - BASE_MARGIN) * 1000) / 1000, math.ceil((hi[n] + BASE_MARGIN) * 1000) / 1000)
+              for n in "xyz"}
+    cap = math.pi / 2 - PITCH_MARGIN
+    assert lo["pitch"] < -cap and hi["pitch"] > cap, (lo["pitch"], hi["pitch"])
+    for n in ("yaw", "roll"):
+        assert lo[n] < 0.01 - math.pi and hi[n] > math.pi - 0.01, (n, lo[n], hi[n])
+    limits.update(yaw=(-math.pi, math.pi), pitch=(-cap, cap), roll=(-math.pi, math.pi))
+    return limits
+
+
+def _extra_links(mid_sole: list, base_limits: dict) -> dict:
     """The YAML's extra links, every one massless: the base chain, the sole frames, the attach links and stance."""
     identity = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     extra, parent = {}, "world"
-    for i, (n, joint_type, limits) in enumerate(BASE):
+    for i, (n, joint_type) in enumerate(BASE):
         link = {"parent_link_name": parent}
         if i == len(BASE) - 1:
             link["child_link_name"] = "Trunk"
         link.update(link_name=f"base_link_{n}", joint_name=f"base_j_{n}", joint_type=joint_type,
-                    fixed_transform=list(identity), joint_limits=list(limits), link_mass=0.0)
+                    fixed_transform=list(identity), joint_limits=list(base_limits[n]), link_mass=0.0)
         extra[f"base_link_{n}"] = link
         parent = f"base_link_{n}"
     for (side, _), sole in zip(SIDES, SOLE_FRAMES):
@@ -214,7 +311,7 @@ def _extra_links(mid_sole: list) -> dict:
 def _self_collision_ignore(today: dict) -> dict:
     """The base chain; the simplified model's pairs without its legs; each leg chain, and Trunk and Waist against the
     hips and thighs. Left leg against right leg, and legs against arms, stay checked (design 7.2)."""
-    chain = [f"base_link_{n}" for n, _, _ in BASE] + ["Trunk"]
+    chain = [f"base_link_{n}" for n, _ in BASE] + ["Trunk"]
     ignore = {link: chain[max(i - 1, 0):i] + chain[i + 1:i + 2] for i, link in enumerate(chain[:-1])}
     ignore.update({k: [x for x in v if x not in OLD_LEG_LINKS]
                    for k, v in today["self_collision_ignore"].items() if k not in OLD_LEG_LINKS})
@@ -227,7 +324,7 @@ def _self_collision_ignore(today: dict) -> dict:
     return ignore
 
 
-def _kinematics(mid_sole: list) -> dict:
+def _kinematics(mid_sole: list, base_limits: dict) -> dict:
     """The robot config's kinematics, except its cspace."""
     today = yaml.safe_load((T1_DESC / "t1_planar_base.yml").read_text())["robot_cfg"]["kinematics"]
     legs = [f"{key}_{Side}" for _, Side in SIDES for key in LEG_SPHERE_RADIUS]
@@ -242,7 +339,7 @@ def _kinematics(mid_sole: list) -> dict:
         "collision_spheres": SPHERES_YML,
         "collision_sphere_buffer": {},
         "extra_collision_spheres": today["extra_collision_spheres"],
-        "extra_links": _extra_links(mid_sole),
+        "extra_links": _extra_links(mid_sole, base_limits),
         "lock_joints": {j: 0.0 for j in (*HEAD, *FINGERS)},
         "use_global_cumul": True,
         "mesh_link_names": None,
@@ -292,7 +389,7 @@ def main(argv=None) -> None:
     actuators = np.load(ACTUATORS)
     default_q = dict(zip(T1_JOINT_NAMES, actuators["default_q"].astype(np.float64).tolist()))
     home, mid_sole, sole_y = _home(out / PLANNER_URDF, default_q)
-    kinematics = _kinematics(mid_sole)
+    kinematics = _kinematics(mid_sole, _base_limits(joints, home))
     order = _curobo_joint_order(kinematics, out)
     assert order[:6] == BASE_JOINTS and sorted(order) == sorted(BASE_JOINTS + BODY_JOINTS), order
 

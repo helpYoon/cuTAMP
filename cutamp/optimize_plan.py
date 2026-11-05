@@ -613,10 +613,10 @@ class ParticleOptimizer:
                 n_fail = int((~success).sum().item())
                 # Repair-only merge: already-good rows keep their q.
                 success = success & ~ok_now
-                if world.model.envelope is not None:
-                    # cuRobo's IK does not see the envelope's tilt bound, which GN holds: on blocks_t1's floor scene
-                    # it bowed 9 of 11 repaired rows past it, each trading a hand, sole or CoM failure for a tilt one,
-                    # so a repair past the bound is not taken.
+                if world.model.envelope is not None and world.model.envelope.trunk_tilt_max is not None:
+                    # cuRobo's IK does not see an envelope's tilt bound, which GN holds: on blocks_t1's floor scene,
+                    # under a 1.0 rad bound, it bowed 9 of 11 repaired rows past it, each trading a hand, sole or CoM
+                    # failure for a tilt one, so a repair past the bound is not taken.
                     success &= tilt_within_bound(world, new_q,
                                                  self.constraint_checker._get_tol(Motion.type, "trunk_tilt"))
                 with torch.no_grad():

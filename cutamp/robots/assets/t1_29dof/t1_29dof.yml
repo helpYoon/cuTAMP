@@ -27,7 +27,7 @@ robot_cfg:
         joint_name: base_j_x
         joint_type: X_PRISM
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [-0.3, 0.3]
+        joint_limits: [-0.517, 0.57]
         link_mass: 0.0
       base_link_y:
         parent_link_name: base_link_x
@@ -35,7 +35,7 @@ robot_cfg:
         joint_name: base_j_y
         joint_type: Y_PRISM
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [-0.3, 0.3]
+        joint_limits: [-0.31, 0.31]
         link_mass: 0.0
       base_link_z:
         parent_link_name: base_link_y
@@ -43,7 +43,7 @@ robot_cfg:
         joint_name: base_j_z
         joint_type: Z_PRISM
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [0.45, 0.7]
+        joint_limits: [-0.046, 0.772]
         link_mass: 0.0
       base_link_yaw:
         parent_link_name: base_link_z
@@ -59,7 +59,7 @@ robot_cfg:
         joint_name: base_j_pitch
         joint_type: Y_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [-1.0, 1.0]
+        joint_limits: [-1.4707963267948965, 1.4707963267948965]
         link_mass: 0.0
       base_link_roll:
         parent_link_name: base_link_pitch
@@ -68,7 +68,7 @@ robot_cfg:
         joint_name: base_j_roll
         joint_type: X_ROT
         fixed_transform: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-        joint_limits: [-1.0, 1.0]
+        joint_limits: [-3.141592653589793, 3.141592653589793]
         link_mass: 0.0
       left_sole_link:
         parent_link_name: left_foot_link

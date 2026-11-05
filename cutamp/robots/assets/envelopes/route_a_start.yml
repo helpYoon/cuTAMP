@@ -1,10 +1,13 @@
-# Route A's starting envelope (design 7.10, call 22): what the planner may send route A's policy. Its values are
-# starting points and knobs (design section 12). bfm_wm has no envelope file yet, so cuTAMP writes this one; once
-# route A's training writes its own, cuTAMP pins that copy here instead. The planner enforces the Trunk floor, the
-# tilt and the joint ranges; payload, stance range and holds are stored only.
+# Route A's starting envelope (design 7.10, call 22): what the planner may send route A's policy. bfm_wm has no
+# envelope file yet, so cuTAMP writes this one; once route A's training writes its own, cuTAMP pins that copy here
+# instead. The planner enforces the joint ranges, and a Trunk floor and tilt bound when they are set; payload, stance
+# range and holds are stored only.
 name: route_a_start
-trunk_height_min: 0.45
-trunk_tilt_max: 1.0
+# No Trunk floor or tilt bound: route A's policy is trained on the motions this planner makes, so the robot alone
+# bounds them (its joint limits, torques, balance, collisions and planted soles). A value here would be a guess that
+# the training then learns as a limit.
+trunk_height_min: null
+trunk_tilt_max: null
 joint_ranges: {Waist: [-0.911, 0.911]}       # the soft limit; arms free
 speed_caps: null                              # from route A's data, later
 acceleration_caps: null

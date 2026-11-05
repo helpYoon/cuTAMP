@@ -121,9 +121,9 @@ class CostFunction:
             SelfCollisionCost(self_collision_config) if world.model.sole_frames and self.retract_info else None
         )
         # The envelope's Trunk tilt bound (call 22), as trunk_tilt_excess's arguments after the confs: the base's pitch
-        # and roll columns, and the cosine of the maximum tilt.
+        # and roll columns, and the cosine of the maximum tilt. None without an envelope or when it sets no bound.
         envelope, names = world.model.envelope, world.model.joint_names
-        self.trunk_tilt_args = None if envelope is None else (
+        self.trunk_tilt_args = None if envelope is None or envelope.trunk_tilt_max is None else (
             names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(envelope.trunk_tilt_max)
         )
 
@@ -223,8 +223,8 @@ class CostFunction:
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
         """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and, on the
-        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope,
-        also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
+        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope
+        that bounds the tilt, also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 

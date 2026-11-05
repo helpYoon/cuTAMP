@@ -1,7 +1,8 @@
-"""Route A's envelope (design 7.10, call 22): the pinned file, the cut of the real legs' limits to it (the Trunk floor
+"""Route A's envelope (design 7.10, call 22): the pinned file, the cut of the real legs' limits to it (a Trunk floor
 on ``base_j_z``, the joint ranges through ``position_limit_clip``, never widening one), and the Trunk tilt bound, as a
-Motion value over the confs and as a trajopt cost. The GPU tests share conftest's module-scoped ``real_world``: one
-world per module."""
+Motion value over the confs and as a trajopt cost. Route A's envelope sets no Trunk floor or tilt bound, so the floor
+and tilt tests replace it with one that does. The GPU tests share conftest's module-scoped ``real_world``: one world
+per module."""
 
 import dataclasses
 import hashlib
@@ -19,6 +20,10 @@ from cutamp.tests.conftest import needs_cuda
 
 ENVELOPES = Path(__file__).resolve().parents[1] / "robots" / "assets" / "envelopes"
 PITCH, ROLL = REAL_LEGS.joint_names.index("base_j_pitch"), REAL_LEGS.joint_names.index("base_j_roll")
+#: The tilt tests' bound, rad, in an envelope that replaces route A's.
+TILT_MAX = 1.0
+#: base_j_z's limits on the real legs, the legs' reach (build_planner_model.py), m: no envelope cut.
+BASE_Z = (-0.046, 0.772)
 
 
 def _with_envelope(**fields):
@@ -40,8 +45,8 @@ def test_route_a_start_values():
     assert envelope == Envelope(
         name="route_a_start",
         sha1=hashlib.sha1(path.read_bytes()).hexdigest(),
-        trunk_height_min=0.45,
-        trunk_tilt_max=1.0,
+        trunk_height_min=None,
+        trunk_tilt_max=None,
         joint_ranges={"Waist": (-0.911, 0.911)},
         speed_caps=None,
         acceleration_caps=None,
@@ -68,20 +73,44 @@ def test_load_envelope_refuses_a_misnamed_file_or_another_field(tmp_path, monkey
         load_envelope("route_a_start")
 
 
+def test_load_envelope_reads_a_set_floor_and_tilt(tmp_path, monkeypatch):
+    # Route A's null floor and tilt load as None (test_route_a_start_values); an envelope that sets them loads floats.
+    from cutamp.robots import envelope as envelope_module
+    text = (ENVELOPES / "route_a_start.yml").read_text()
+    assert text.count("trunk_height_min: null") == text.count("trunk_tilt_max: null") == 1
+    monkeypatch.setattr(envelope_module, "ENVELOPES_DIR", tmp_path)
+    text = text.replace("trunk_height_min: null", "trunk_height_min: 0.45")
+    (tmp_path / "route_a_start.yml").write_text(text.replace("trunk_tilt_max: null", "trunk_tilt_max: 1"))
+    envelope = load_envelope("route_a_start")
+    assert (envelope.trunk_height_min, envelope.trunk_tilt_max) == (0.45, 1.0)
+    assert type(envelope.trunk_tilt_max) is float
+
+
 @needs_cuda
 def test_envelope_cuts_never_widen():
     from cutamp.robots.t1 import t1_curobo_cfg
     real = _limits(REAL_LEGS)
-    # The Trunk floor is base_j_z's lower limit; Waist keeps its soft limit, which lies inside route A's +-0.911.
-    np.testing.assert_allclose(real["base_j_z"], (0.45, 0.70), atol=1e-6)
+    # Route A sets no Trunk floor, so the base keeps the legs' reach, as the robot YAML gives it; Waist keeps its soft
+    # limit, which lies inside route A's +-0.911.
+    import yaml
+    extra = yaml.safe_load(REAL_LEGS.cfg_path.read_text())["robot_cfg"]["kinematics"]["extra_links"].values()
+    base = {link["joint_name"]: tuple(link["joint_limits"]) for link in extra if "joint_limits" in link}
+    assert sorted(base) == sorted(n for n in REAL_LEGS.joint_names if n.startswith("base_j_"))
+    for joint, limits in base.items():
+        np.testing.assert_allclose(real[joint], limits, atol=1e-6, err_msg=joint)
+    np.testing.assert_allclose(real["base_j_z"], BASE_Z, atol=1e-6)
     np.testing.assert_allclose(real["Waist"], (-0.9108, 0.9108), atol=1e-6)
     for waist, want in (((-0.5, 0.5), (-0.5, 0.5)), ((-2.0, 2.0), (-0.9108, 0.9108))):
         got = _limits(_with_envelope(joint_ranges={"Waist": waist}))
         np.testing.assert_allclose(got["Waist"], want, atol=1e-6, err_msg=str(waist))
         assert {n: v for n, v in got.items() if n != "Waist"} == {n: v for n, v in real.items() if n != "Waist"}
-    for floor, want in ((0.5, 0.5), (0.3, 0.45)):  # a higher floor raises the limit; a lower one leaves it
+    # A floor above the base's lower limit raises it, alone; one below leaves it; one at or above its upper raises.
+    for floor, want in ((0.5, 0.5), (BASE_Z[0] - 0.2, BASE_Z[0])):
         got = _limits(_with_envelope(trunk_height_min=floor))
-        np.testing.assert_allclose(got["base_j_z"], (want, 0.70), atol=1e-6, err_msg=str(floor))
+        np.testing.assert_allclose(got["base_j_z"], (want, BASE_Z[1]), atol=1e-6, err_msg=str(floor))
+        assert {n: v for n, v in got.items() if n != "base_j_z"} == {n: v for n, v in real.items() if n != "base_j_z"}
+    with pytest.raises(ValueError, match="base_j_z"):
+        t1_curobo_cfg(_with_envelope(trunk_height_min=BASE_Z[1]))
     with pytest.raises(ValueError, match="Waist"):
         t1_curobo_cfg(_with_envelope(joint_ranges={"Waist": (2.0, 3.0)}))
 
@@ -100,9 +129,14 @@ def test_envelope_cut_moves_only_its_joint():
 
 
 def test_cut_names_a_missing_trunk_floor_joint():
-    from cutamp.robots.t1 import _cut_to_envelope
+    # A floor needs base_j_z; without a floor (route A) the cut never looks for it.
+    import copy
+    from cutamp.robots.t1 import _cut_to_envelope, t1_curobo_cfg
     with pytest.raises(ValueError, match="base_j_z"):
-        _cut_to_envelope({"extra_links": {}}, REAL_LEGS.envelope)
+        _cut_to_envelope({"extra_links": {}}, REAL_LEGS.envelope._replace(trunk_height_min=0.5))
+    kinematics = copy.deepcopy(t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"])
+    kinematics["extra_links"] = {}
+    _cut_to_envelope(kinematics, REAL_LEGS.envelope)
 
 
 def test_trunk_tilt_value():
@@ -112,7 +146,7 @@ def test_trunk_tilt_value():
     confs = torch.tensor(REAL_LEGS.home).repeat(2, 4, 1)  # [N, H, dof]
     for t, (pitch, roll) in enumerate(((0.0, 0.0), (1.0, 0.0), (0.7, 0.7), (0.75, 0.75))):
         confs[1, t, PITCH], confs[1, t, ROLL] = pitch, roll
-    value = trunk_tilt_excess(confs, PITCH, ROLL, math.cos(REAL_LEGS.envelope.trunk_tilt_max))
+    value = trunk_tilt_excess(confs, PITCH, ROLL, math.cos(TILT_MAX))
     assert value.shape == (2, 4)
     assert not bool(value[0].any()) and not bool(value[1, :3].any())
     assert math.isclose(float(value[1, 3]), math.cos(1.0) - math.cos(0.75) ** 2, rel_tol=1e-4)
@@ -139,9 +173,10 @@ def test_trunk_tilt_cost():
 
 
 @needs_cuda
-def test_motion_values_bound_the_tilt_on_the_real_legs(real_world, real_plan):
-    # The Motion value at every rollout conf, on the tolerance 1e-6: a conf tilted 1.006 rad fails the check, and one
-    # on the bound (base roll at its 1.0 rad limit) passes, whatever the rounding of cos(1.0).
+def test_motion_values_bound_the_tilt_on_the_real_legs(real_world, real_plan, monkeypatch):
+    # Route A sets no tilt bound, so its Motion values have no trunk_tilt. Under an envelope that bounds the tilt at
+    # 1.0 rad, the Motion value at every rollout conf, on the tolerance 1e-6: a conf tilted 1.006 rad fails the check,
+    # and one on the bound (roll 1.0 rad) passes, whatever the rounding of cos(1.0).
     from cutamp.config import TAMPConfiguration
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_function import CostFunction
@@ -155,6 +190,11 @@ def test_motion_values_bound_the_tilt_on_the_real_legs(real_world, real_plan):
     rollout_fn = RolloutFunction(skeleton, real_world, config)
     particles = clone_particles(particles)
     with torch.no_grad():
+        route_a = CostFunction(skeleton, real_world, config)(rollout_fn(particles), particles)
+    assert "trunk_tilt" not in route_a[Motion.type]["values"]
+    model = _with_envelope(trunk_tilt_max=TILT_MAX)
+    monkeypatch.setattr(real_world, "robot_container", dataclasses.replace(real_world.robot_container, model=model))
+    with torch.no_grad():
         particles[rollout_fn.conf_params[0]][0, [PITCH, ROLL]] = 0.75
         particles[rollout_fn.conf_params[0]][1, PITCH] = 0.0
         particles[rollout_fn.conf_params[0]][1, ROLL] = 1.0
@@ -162,7 +202,7 @@ def test_motion_values_bound_the_tilt_on_the_real_legs(real_world, real_plan):
         cost_dict = CostFunction(skeleton, real_world, config)(rollout, particles)
     tilt = cost_dict[Motion.type]["values"]["trunk_tilt"]
     assert tilt.shape == rollout["confs"].shape[:2] and float(tilt[0, 0]) > 0.0
-    assert torch.equal(tilt, trunk_tilt_excess(rollout["confs"], PITCH, ROLL, math.cos(1.0)))
+    assert torch.equal(tilt, trunk_tilt_excess(rollout["confs"], PITCH, ROLL, math.cos(TILT_MAX)))
     assert default_constraint_to_tol[Motion.type]["trunk_tilt"] == 1e-6
     assert float(tilt[1, 0]) <= 1e-6
     mask = ConstraintChecker(default_constraint_to_tol).get_full_mask(cost_dict)[Motion.type]["trunk_tilt"]

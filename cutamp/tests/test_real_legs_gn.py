@@ -2,15 +2,19 @@
 - 12 sole rows in GN's level 1 hold both soles on the stance, beside the active CoM rows, and the base columns are
   free (``_row_layout`` freezes them only where ``model.lock_base``);
 - level 1 holds the CoM in the real legs' keyframe rectangle (ruling R22);
-- level 1 holds the Trunk tilt within the envelope's maximum: one row, active where the tilt is past the bound or a
-  step would push it past, as a CoM axis is;
-- each call ends with a closing step, so the soles hold after every call, out-of-reach targets included, and the
-  tilt is within the bound after it;
+- level 1 holds the Trunk tilt within an envelope's maximum: one row, active where the tilt is past the bound or a
+  step would push it past, as a CoM axis is. Route A's envelope sets no tilt bound, so the tilt tests plan on the
+  real legs under an envelope that bounds it at 1.0 rad (``_with_tilt_bound``);
+- each call ends with a closing step, so the soles hold after every call, out-of-reach targets included, and a
+  row that starts within one step clamp of a tilt bound is within it after the call;
 - the merge gate (``gn_gate``), the final repair and the kinematic constraint all check the soles against the
   stance.
 The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module. Each takes its
 confs from ``real_plan``, so no test solves the world's 64-row IK at another batch size (ruling R25)."""
 
+import dataclasses
+
+import pytest
 import torch
 
 from cutamp.robots.t1 import REAL_LEGS
@@ -21,8 +25,27 @@ from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _poses, _s
 MOVE = (0.03, 0.0, 0.0)
 #: A move no balanced conf standing on the stance can follow: 30 cm forward and 20 cm down.
 FAR = (0.30, 0.0, -0.20)
-#: Route A's maximum Trunk tilt, rad.
-TILT_MAX = REAL_LEGS.envelope.trunk_tilt_max
+#: The tilt tests' maximum Trunk tilt, rad, in an envelope that replaces route A's, which sets none.
+TILT_MAX = 1.0
+#: The real legs under that envelope.
+TILTED = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=TILT_MAX))
+
+
+def _with_tilt_bound(world, monkeypatch, tilt_max=TILT_MAX):
+    """``world`` on TILTED until the test ends (``tilt_max`` None: left on REAL_LEGS). GN, the cost function and the
+    final repair read the bound from ``world.model``."""
+    if tilt_max is not None:
+        assert tilt_max == TILT_MAX
+        monkeypatch.setattr(world, "robot_container", dataclasses.replace(world.robot_container, model=TILTED))
+    return world
+
+
+def _in_reach(q):
+    """The rows of ``q`` whose Trunk tilt starts at most ``GN_STEP_CLAMP`` (0.15 rad) past TILT_MAX: one call
+    brings them inside it. On blocks_t1's first pick that is 36 of 64 rows on one init and 5 of 60 on the other,
+    whose other rows the init's IK bows mostly 0.15-0.4 rad past it."""
+    from cutamp.gn_refresh import GN_STEP_CLAMP
+    return q[_tilt(q) <= TILT_MAX + GN_STEP_CLAMP]
 
 
 def _tilt(q):
@@ -36,7 +59,7 @@ def _tilt(q):
 def _first_pick(world, plan):
     """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the init's IK solved
     (a row whose IK failed holds home). The first skeleton follows PYTHONHASHSEED: on blocks_t1 its first pick has
-    64 solved rows, every CoM inside the keyframe rectangle, on one init, and 46, 27 of them outside, on the other."""
+    64 solved rows, every CoM inside the keyframe rectangle, on one init, and 60, 9 of them outside, on the other."""
     skeleton, particles = plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     conf = op.values[-1]
@@ -121,24 +144,22 @@ def test_gn_holds_the_soles(real_world, real_plan):
     _assert_soles_held(real_world, q)
     assert bool(compute_com_polygon_mask(real_world, q).all())
     after = _hand_error(real_world, q, targets, arm)
-    # The reach is measured on the rows that start inside the envelope's tilt bound: the tilt row stands the rest
-    # upright, which costs them reach (on one init, where 39 of the 46 rows start past the bound, the median over
-    # every row rises from 3.0 to 3.4 cm, while the rows inside fall to 2.1 cm).
-    inside = _tilt(q0) <= TILT_MAX
-    assert bool(inside.any())
-    assert float(after[inside].median()) < float(before[inside].median()), (
-        float(before[inside].median()), float(after[inside].median()))
+    assert float(after.median()) < float(before.median()), (float(before.median()), float(after.median()))
 
 
 @needs_cuda
-def test_gn_brings_the_trunk_tilt_inside_the_bound(real_world, real_plan):
-    # On the floor scene the init's IK bows and leans many first-pick rows past the envelope's 1.0 rad (base roll
-    # near its 1.0 rad limit). One call, the hand targets moved 3 cm, brings every row within the bound, with both
-    # soles on the stance and the CoM in the keyframe rectangle on every row.
+def test_gn_brings_the_trunk_tilt_inside_the_bound(real_world, real_plan, monkeypatch):
+    # On the floor scene the init's IK bows most first-pick rows past 1.0 rad. Under a 1.0 rad bound, one call, the
+    # hand targets moved 3 cm, brings every row that starts within one step clamp of it (``_in_reach``) inside it,
+    # with both soles on the stance and the CoM in the keyframe rectangle on every row. Rows further past take more
+    # calls, and one bowed past horizontal can stay past: the base's ZYX angles hold that bow as roll near pi, where
+    # the tilt row's roll derivative vanishes, with pitch at its cap.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_project_balanced
     arm, _, q0 = _first_pick(real_world, real_plan)
-    assert int((_tilt(q0) > TILT_MAX).sum()) >= 10
+    _with_tilt_bound(real_world, monkeypatch)
+    q0 = _in_reach(q0)
+    assert int((_tilt(q0) > TILT_MAX).sum()) >= 3
     targets, _ = _moved_targets(real_world, q0, arm)
     q = gn_project_balanced(real_world, q0, targets, arm)
     assert float(_tilt(q).max()) <= TILT_MAX + 1e-6, float(_tilt(q).max())
@@ -155,6 +176,7 @@ def test_tilt_row_leaves_rows_inside_the_bound_alone(real_world, real_plan, monk
     import cutamp.gn_refresh as gn_refresh
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     arm, _, q_pick = _first_pick(real_world, real_plan)
+    _with_tilt_bound(real_world, monkeypatch)
     home = _home(real_world).repeat(8, 1)
     q0 = torch.cat([home, q_pick])
     targets = torch.cat([_moved_targets(real_world, home, arm)[0],
@@ -179,18 +201,24 @@ def test_tilt_row_leaves_rows_inside_the_bound_alone(real_world, real_plan, monk
 
 
 @needs_cuda
-def test_gn_holds_the_soles_out_of_reach(real_world, real_plan):
+@pytest.mark.parametrize("tilt_max", [None, TILT_MAX])
+def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, monkeypatch, tilt_max):
     # Hand targets no balanced conf on the stance can reach: four calls, each from the last result as successive
-    # refreshes run, keep both soles on the stance and the Trunk tilt within the bound after every call, and every
-    # hand stays over 2 cm off, so the feet did not slide to fake the reach. Reaching for them drives joints into
-    # their limits on every call, where a clamped step or the drift of a saturated last step would move the soles.
+    # refreshes run, keep both soles on the stance after every call, and under a tilt bound the Trunk tilt of the rows
+    # in reach of it (``_in_reach``) within it, and every hand stays over 2 cm off, so the feet did not slide to fake
+    # the reach. Reaching for them drives joints into their limits on every call, where a clamped step or the drift
+    # of a saturated last step would move the soles.
     from cutamp.gn_refresh import gn_project_balanced
     arm, _, q = _first_pick(real_world, real_plan)
+    _with_tilt_bound(real_world, monkeypatch, tilt_max)
+    if tilt_max is not None:
+        q = _in_reach(q)
     targets, _ = _moved_targets(real_world, q, arm, FAR)
     for _ in range(4):
         q = gn_project_balanced(real_world, q, targets, arm)
         _assert_soles_held(real_world, q)
-        assert float(_tilt(q).max()) <= TILT_MAX + 1e-6, float(_tilt(q).max())
+        if tilt_max is not None:
+            assert float(_tilt(q).max()) <= tilt_max + 1e-6, float(_tilt(q).max())
         hand = _hand_error(real_world, q, targets, arm)
         assert float(hand.min()) > 0.02, float(hand.min())
 
@@ -260,33 +288,40 @@ def test_soles_on_stance_at_the_checker_tolerances(real_world):
 
 
 def test_tilt_within_bound_on_the_motion_values_metric():
-    # The final repair's tilt test, on the Motion value's metric and tolerance: upright and on the bound (base roll
-    # at its 1.0 rad limit) pass, 0.01 rad past it fails; a model without an envelope passes every conf.
+    # The final repair's tilt test, on the Motion value's metric and tolerance: under a 1.0 rad bound, upright and on
+    # the bound (roll 1.0 rad) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, and a model
+    # without an envelope pass every conf.
     from types import SimpleNamespace
     from cutamp.gn_refresh import tilt_within_bound
     from cutamp.robots.t1 import SIMPLIFIED
     names = list(REAL_LEGS.joint_names)
     q = torch.tensor(REAL_LEGS.home).repeat(3, 1)
     q[1:, names.index("base_j_roll")] = torch.tensor([1.0, 1.01])
-    assert tilt_within_bound(SimpleNamespace(model=REAL_LEGS), q, 1e-6).tolist() == [True, True, False]
+    assert tilt_within_bound(SimpleNamespace(model=TILTED), q, 1e-6).tolist() == [True, True, False]
+    assert tilt_within_bound(SimpleNamespace(model=REAL_LEGS), q, 1e-6).all()
     assert tilt_within_bound(SimpleNamespace(model=SIMPLIFIED), q[:, :len(SIMPLIFIED.joint_names)], 1e-6).all()
 
 
 @needs_cuda
-def test_final_repair_takes_no_conf_past_the_tilt_bound(real_world, real_plan, monkeypatch):
+@pytest.mark.parametrize("tilt_max", [None, TILT_MAX])
+def test_final_repair_takes_no_conf_past_the_tilt_bound(real_world, real_plan, monkeypatch, tilt_max):
     # The final pre-check refresh re-solves the rows that miss the hand, the soles or the CoM on cuRobo's IK, which
-    # does not see the tilt bound. Two first-pick rows miss their hand (a shoulder moved 0.3 rad), and the stubbed
-    # IK returns their own confs, one of them tilted 1.03 rad: the row within the bound takes its repair, and the
-    # tilted one keeps its conf.
+    # does not see a tilt bound. Two first-pick rows miss their hand (a shoulder moved 0.3 rad), and the stubbed IK
+    # returns their own confs, one of them tilted 1.03 rad: under a 1.0 rad bound the row within it takes its repair
+    # and the tilted one keeps its conf; route A sets no bound, so both take their repairs.
     import cutamp.optimize_plan as op
     from cutamp.config import TAMPConfiguration
     from cutamp.tests.conftest import make_optimizer
     skeleton, particles = real_plan
     particles = clone_particles(particles)
     arm, conf, _ = _first_pick(real_world, real_plan)
+    _with_tilt_bound(real_world, monkeypatch, tilt_max)
     names = list(REAL_LEGS.joint_names)
     q = particles[conf].detach()
-    a, b = ((q != _home(real_world)).any(-1) & (_tilt(q) <= TILT_MAX - 0.05)).nonzero().flatten()[:2].tolist()
+    solved = (q != _home(real_world)).any(-1).nonzero().flatten()
+    b = int(solved[_tilt(q[solved]).argmin()])  # its own conf, its repair, is within the bound
+    a = int(solved[solved != b][0])
+    assert float(_tilt(q[b:b + 1])) <= TILT_MAX - 0.01
     repaired = q.clone()
     repaired[a, names.index("base_j_pitch")], repaired[a, names.index("base_j_roll")] = 0.6, 0.9
     assert float(_tilt(repaired[a:a + 1])) > TILT_MAX + 0.01
@@ -299,7 +334,7 @@ def test_final_repair_takes_no_conf_past_the_tilt_bound(real_world, real_plan, m
                                                                             device=repaired.device))
     deps = [dep for dep in op._build_ik_deps(skeleton, real_world) if dep.q_name == conf]
     make_optimizer(TAMPConfiguration(robot="real_legs", num_particles=64))._refresh_ik_deps(particles, deps, real_world)
-    assert torch.equal(particles[conf][a], moved[a])
+    assert torch.equal(particles[conf][a], moved[a] if tilt_max is not None else repaired[a])
     assert torch.equal(particles[conf][b], repaired[b])
 
 

@@ -117,8 +117,10 @@ def test_retry_keeps_sole_goals_on_the_stance(real_world):
 @needs_cuda
 def test_retry_seeds_stand_on_the_stance(real_world):
     # Ruling R21: the legs draw their pitch once per pair and hold their roll and yaw, and the base puts the left sole
-    # on the stance; the right sole follows. A row whose base would leave its box keeps home's base and body.
-    from cutamp.particle_initialization import _retry_seed
+    # on the stance; the right sole follows. Standing on the stance, a seed's Trunk is in the legs' reach, so its base
+    # leaves the box only on a bow within 0.1 rad of horizontal (the pitch cap): none of these do. Under a box cut
+    # lower, a row whose base would leave it keeps home's base and body.
+    from cutamp.particle_initialization import _retry_seed, _stand_on_the_stance
     world, m, n = real_world, real_world.model, 256
     names, home = list(m.joint_names), _home(real_world)
     torch.manual_seed(0)
@@ -135,9 +137,14 @@ def test_retry_seeds_stand_on_the_stance(real_world):
     idle = world.tool_frame_for_arm("right")
     moved = (_poses(world, q, idle)[:, :3, 3] - _poses(world, home.view(1, -1), idle)[:, :3, 3]).norm(dim=-1)
     assert float(moved.median()) >= 0.05, float(moved.median())
-    fell_back = (q[:, m.base] == home[m.base]).all(-1)  # sigma 0.3 sends 131 of 1024 rows' bases out (R21)
-    assert 0 < int(fell_back.sum()) < n // 2, int(fell_back.sum())
-    assert torch.equal(q[fell_back][:, m.body], home[m.body].expand(int(fell_back.sum()), -1))
+    assert not bool((q[:, m.base] == home[m.base]).all(-1).any())
+    z = names.index("base_j_z")
+    cut = hi.clone()
+    cut[z] = q[:, z].median()
+    out = _stand_on_the_stance(world, q, lo, cut)
+    fell_back = (out[:, m.base] == home[m.base]).all(-1)
+    assert 0 < int(fell_back.sum()) < n, int(fell_back.sum())
+    assert torch.equal(out[fell_back][:, m.body], home[m.body].expand(int(fell_back.sum()), -1))
 
 
 def _inline_seed(world, batch_size, arm, noise_std):
@@ -220,9 +227,10 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
     config = TAMPConfiguration(robot="real_legs", num_particles=64)
     names = list(real_world.model.joint_names)
     particles = clone_particles(particles)
+    z = names.index("base_j_z")
     with torch.no_grad():
         particles[retracts[0]][0] = hips_crossed(real_world)
-        particles[retracts[0]][1, names.index("base_j_z")] = 0.40  # the base box's floor is 0.45
+        particles[retracts[0]][1, z] = real_world.joint_limits[0][z] - 0.05  # under the base's floor, the legs' reach
         cost_dict = CostFunction(skeleton, real_world, config)(
             RolloutFunction(skeleton, real_world, config)(particles), particles)
     values = cost_dict[Motion.type]["values"]
@@ -232,6 +240,6 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
     at_home = torch.ones_like(joint_limit, dtype=torch.bool)
     at_home[:2, 0] = False
     assert not bool(joint_limit[at_home].any()) and not bool(self_collision[at_home].any())
-    # Exact, as the other Motion values; the Trunk tilt's 1e-6 (in cosine) is test_envelope's.
-    tols = {k: default_constraint_to_tol[Motion.type][k] for k in values if k != "trunk_tilt"}
+    # Exact, as the other Motion values (route A's envelope sets no tilt bound, so there is no trunk_tilt value).
+    tols = {k: default_constraint_to_tol[Motion.type][k] for k in values}
     assert tols == dict.fromkeys(tols, 0.0)

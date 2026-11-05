@@ -119,6 +119,59 @@ def test_planner_model_regenerates_byte_identical(tmp_path):
         assert str(tmp_path).encode() not in data and str(REPO).encode() not in data, name  # no absolute path
 
 
+def test_base_limits_are_the_legs_reach():
+    # The six base joints exist only because cuRobo needs a fixed root, so their limits are the legs' reach over the
+    # soft limits (build_planner_model._base_limits), never a bound of their own: x, y and z 1 cm past it, yaw and
+    # roll the whole turn, pitch 0.1 rad short of ZYX's singularity. The top admits the straight-knee stand (0.687 m).
+    # Then planted soles: confs that bend both legs alike in pitch alone, Waist anywhere, keep both soles on their home
+    # poses, so every Trunk pose they reach lies inside the box but for a pitch past the cap. yourdfpy's FK finds the
+    # base that stands the left sole on its home pose.
+    import math
+    import yourdfpy
+    extra = _robot_yaml()["robot_cfg"]["kinematics"]["extra_links"].values()
+    box = {link["joint_name"]: tuple(link["joint_limits"]) for link in extra if "joint_limits" in link}
+    cap = math.pi / 2 - 0.1
+    assert box == {"base_j_x": (-0.517, 0.57), "base_j_y": (-0.31, 0.31), "base_j_z": (-0.046, 0.772),
+                   "base_j_yaw": (-math.pi, math.pi), "base_j_pitch": (-cap, cap), "base_j_roll": (-math.pi, math.pi)}
+    assert box["base_j_z"][1] > 0.687
+    home = dict(zip(_robot_yaml()["cutamp"]["joint_order"], _robot_yaml()["cutamp"]["home"]))
+    assert all(lo <= home[joint] <= hi for joint, (lo, hi) in box.items())
+
+    u = yourdfpy.URDF.load(str(T1_29DOF / "t1_planner.urdf"), load_meshes=False, build_scene_graph=True,
+                           build_collision_scene_graph=False, load_collision_meshes=False)
+    limits = {j.get("name"): j.find("limit") for j in ET.parse(T1_29DOF / "t1_planner.urdf").getroot().findall("joint")}
+
+    def soft(name):
+        lo, hi = float(limits[name].get("lower")), float(limits[name].get("upper"))
+        return (lo + hi) / 2 - 0.9 * (hi - lo) / 2, (lo + hi) / 2 + 0.9 * (hi - lo) / 2
+
+    sole = np.eye(4)
+    sole[:3, 3] = (0.0101, 0.0, -0.0433)
+
+    def trunk_on_sole(q):
+        u.update_cfg({j: q.get(j, 0.0) for j in u.actuated_joint_names})
+        return np.linalg.inv(u.get_transform("left_foot_link", "Trunk") @ sole)
+
+    base_home = np.eye(4)
+    base_home[:3, 3] = (home["base_j_x"], home["base_j_y"], home["base_j_z"])  # home's base: a pure translation
+    left_sole_home = base_home @ np.linalg.inv(trunk_on_sole(home))
+    rng = np.random.default_rng(0)
+    pitched = ("Hip_Pitch", "Knee_Pitch", "Ankle_Pitch")
+    ranges = [soft(f"Left_{joint}") for joint in pitched] + [soft("Waist")]
+    samples = np.concatenate([np.stack(np.meshgrid(*[np.linspace(lo, hi, 5) for lo, hi in ranges]), -1).reshape(-1, 4),
+                              rng.uniform(*np.array(ranges).T, size=(400, 4))])
+    past_cap = 0
+    for hip, knee, ankle, waist in samples:
+        q = {"Waist": waist, **{f"{side}_{joint}": v for side in ("Left", "Right")
+                                for joint, v in zip(pitched, (hip, knee, ankle))}}
+        trunk = left_sole_home @ trunk_on_sole(q)
+        yaw, pitch, roll = Rotation.from_matrix(trunk[:3, :3]).as_euler("ZYX")
+        base = dict(zip(("base_j_x", "base_j_y", "base_j_z"), trunk[:3, 3]), base_j_yaw=yaw, base_j_roll=roll)
+        assert all(box[joint][0] <= v <= box[joint][1] for joint, v in base.items()), (q, base)
+        past_cap += abs(pitch) > cap
+    assert 0 < past_cap < len(samples) / 2, past_cap  # deep bows reach the cap; most confs do not
+
+
 def test_planner_urdf_adds_only_world_and_gripper():
     build = _build_module()
     vendor = ET.parse(T1_29DOF / "urdf" / "T1_29dof.urdf").getroot()

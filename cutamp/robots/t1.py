@@ -8,9 +8,10 @@ Two planning models of the Booster T1, each a :class:`T1Model`, chosen by
 - ``SIMPLIFIED`` (the default): the 21-DOF model described below, its planar
   base locked;
 - ``REAL_LEGS``: bfm_wm's pinned 33-DOF T1 (``assets/t1_29dof``, design 7.2),
-  its legs on six massless base joints, standing on the home stance, its
-  limits cut to route A's envelope (``assets/envelopes``, call 22). Its
-  motion planner is not built yet (``get_t1_motion_planner`` raises).
+  its legs on six massless base joints whose limits are the legs' reach,
+  standing on the home stance, its limits cut to route A's envelope
+  (``assets/envelopes``, call 22). Its motion planner is not built yet
+  (``get_t1_motion_planner`` raises).
 
 Consumers read names, slices, home, margins and the support region from
 ``world.model``. The simplified model's module constants below remain for its
@@ -318,19 +319,21 @@ def t1_curobo_cfg(model: T1Model) -> dict:
 
 
 def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
-    """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: the Trunk
-    height floor raises ``base_j_z``'s lower limit, and each listed joint's range raises its ``position_limit_clip``,
-    which cuRobo takes off both ends of the URDF range (kinematics_loader.py:1119-1120). Raises if a range leaves
-    nothing of the soft range."""
-    base_z = next((link for link in kinematics.get("extra_links", {}).values() if link.get("joint_name") == "base_j_z"),
-                  None)
-    if base_z is None:
-        raise ValueError(f"envelope {envelope.name!r}: no extra link carries base_j_z, whose lower limit is the Trunk "
-                         "floor")
-    lower, upper = base_z["joint_limits"]
-    if envelope.trunk_height_min >= upper:
-        raise ValueError(f"envelope {envelope.name!r}: Trunk floor {envelope.trunk_height_min} m >= base_j_z's {upper}")
-    base_z["joint_limits"] = [max(lower, envelope.trunk_height_min), upper]
+    """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: a Trunk
+    height floor, where the envelope sets one, raises ``base_j_z``'s lower limit, and each listed joint's range raises
+    its ``position_limit_clip``, which cuRobo takes off both ends of the URDF range (kinematics_loader.py:1119-1120).
+    Raises if a range leaves nothing of the soft range."""
+    if envelope.trunk_height_min is not None:
+        base_z = next((link for link in kinematics.get("extra_links", {}).values()
+                       if link.get("joint_name") == "base_j_z"), None)
+        if base_z is None:
+            raise ValueError(f"envelope {envelope.name!r}: no extra link carries base_j_z, whose lower limit is the "
+                             "Trunk floor")
+        lower, upper = base_z["joint_limits"]
+        if envelope.trunk_height_min >= upper:
+            raise ValueError(f"envelope {envelope.name!r}: Trunk floor {envelope.trunk_height_min} m >= base_j_z's "
+                             f"{upper}")
+        base_z["joint_limits"] = [max(lower, envelope.trunk_height_min), upper]
 
     urdf = ET.parse(kinematics["urdf_path"]).getroot()
     urdf_limits = {joint.get("name"): joint.find("limit") for joint in urdf.findall("joint")}

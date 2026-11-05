@@ -20,10 +20,10 @@ those sides carry zero margin (a symmetric margin would penalize standing).
 
 Spec: docs/superpowers/specs/2026-06-11-joint-limit-margin-design.md
 
-The Trunk tilt bound (design call 22) has three consumers of :func:`trunk_tilt_cosine`: the Motion value
-``trunk_tilt`` over the real legs' confs (cutamp/cost_function.py) and :class:`TrunkTiltCost` on the motion
-planner, both through :func:`trunk_tilt_excess`, and GN's tilt row (cutamp/gn_refresh.py), which projects the
-covered confs onto the bound. A box on the base's pitch and roll would cut a pure bow to the bound over sqrt(2),
+The Trunk tilt bound (design call 22), which an envelope may set (route A's sets none), has three consumers of
+:func:`trunk_tilt_cosine`: the Motion value ``trunk_tilt`` over the real legs' confs (cutamp/cost_function.py) and
+:class:`TrunkTiltCost` on the motion planner, both through :func:`trunk_tilt_excess`, and GN's tilt row
+(cutamp/gn_refresh.py), which projects the covered confs onto the bound. A box on the base's pitch and roll would cut a pure bow to the bound over sqrt(2),
 so the tilt is a cost.
 """
 

@@ -98,14 +98,17 @@ def test_balanced_step_moves_no_pinned_column():
 
 def test_tilt_row_is_the_tilt_cosine_and_its_gradient():
     # The tilt row: the Motion value's cosine and its analytic Jacobian, autograd's gradient on the base's pitch and
-    # roll columns and zero elsewhere, masked by the column mask. The simplified model has no envelope, so no row.
+    # roll columns and zero elsewhere, masked by the column mask. The simplified model has no envelope and route A's
+    # sets no tilt bound, so neither has a row; an envelope that bounds the tilt at 1.0 rad has one.
+    import dataclasses
     from cutamp.gn_refresh import GN_TILT_MARGIN, _tilt_bound, _tilt_row
     from cutamp.joint_limit_cost import trunk_tilt_cosine
     from cutamp.robots.t1 import REAL_LEGS
 
-    assert _tilt_bound(SIMPLIFIED) is None
+    assert _tilt_bound(SIMPLIFIED) is None and _tilt_bound(REAL_LEGS) is None
     names = list(REAL_LEGS.joint_names)
-    pitch, roll, cos_max, cos_target = _tilt_bound(REAL_LEGS)
+    tilted = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
+    pitch, roll, cos_max, cos_target = _tilt_bound(tilted)
     assert (pitch, roll) == (names.index("base_j_pitch"), names.index("base_j_roll"))
     assert (cos_max, cos_target) == (math.cos(1.0), math.cos(1.0 - GN_TILT_MARGIN))
     g = torch.Generator().manual_seed(0)

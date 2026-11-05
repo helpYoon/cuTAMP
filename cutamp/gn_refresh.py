@@ -47,8 +47,8 @@ per-refresh fallback):
 pose is least squares inside it, and joint-limit margins use what is left.
 On the real legs, whose base columns are free, level 1 also holds both soles
 on the stance (12 rows, design 7.4), and ``gn_gate`` checks them; on a model
-with an envelope it holds the Trunk tilt inside the envelope's bound too (one
-row, call 22).
+whose envelope bounds the Trunk tilt it holds the tilt inside that bound too
+(one row, call 22).
 """
 
 import math
@@ -90,9 +90,9 @@ GN_MARGIN_DAMPING = 1e-2
 # their pose per refresh; 0-2 at this cap). Margins need ~0.1 rad and get a
 # refresh every 5 Adam steps, so small steps cost little.
 GN_MARGIN_STEP = 0.03
-# On a model with an envelope, a Trunk tilt past the bound (or that a step
-# would push past it) is driven this far inside it, as the CoM is driven
-# GN_COM_MARGIN inside its edge (5 mm is 0.01 rad at the CoM's height). It
+# On a model whose envelope bounds the tilt, a Trunk tilt past the bound (or
+# that a step would push past it) is driven this far inside it, as the CoM is
+# driven GN_COM_MARGIN inside its edge (5 mm is 0.01 rad at the CoM's height). It
 # covers the bend that a 0.15 rad box-scaled step toward upright leaves
 # (cos(tilt) d^2 / 2 of cosine, 0.007 rad of tilt at the bound). The bend of a
 # step along the bound, up to 0.017 rad on blocks_t1's floor picks, the rounds
@@ -221,10 +221,11 @@ def _sole_residual_and_jacobian(state, sole_idx: Tuple[int, int], goals: torch.T
 
 
 def _tilt_bound(model) -> Optional[Tuple[int, int, float, float]]:
-    """``(pitch, roll, cos_max, cos_target)`` for ``model``'s envelope, ``None`` without one, as
-    :func:`_balanced_step` takes it: the base's pitch and roll columns, the cosine of the envelope's maximum Trunk
-    tilt, and the cosine of the tilt an active tilt row drives to, ``GN_TILT_MARGIN`` inside the maximum."""
-    if model.envelope is None:
+    """``(pitch, roll, cos_max, cos_target)`` for ``model``'s envelope, ``None`` without one or when it sets no
+    tilt bound, as :func:`_balanced_step` takes it: the base's pitch and roll columns, the cosine of the envelope's
+    maximum Trunk tilt, and the cosine of the tilt an active tilt row drives to, ``GN_TILT_MARGIN`` inside the
+    maximum."""
+    if model.envelope is None or model.envelope.trunk_tilt_max is None:
         return None
     names = list(model.joint_names)
     tilt_max = model.envelope.trunk_tilt_max
@@ -560,8 +561,8 @@ def gn_project_balanced(
     ``world.model.support``, inside its keyframe rectangle shrunk by
     ``GN_COM_MARGIN``, on the real legs both soles on the stance
     (``world.stance_soles``), since their free base and leg columns would
-    otherwise slide them, and on a model with an envelope the Trunk tilt
-    within the envelope's maximum (one row on the base's pitch and roll, active
+    otherwise slide them, and on a model whose envelope bounds the Trunk tilt
+    the tilt within that maximum (one row on the base's pitch and roll, active
     like a CoM axis and driven ``GN_TILT_MARGIN`` inside the bound), since the
     covered confs are outside Adam, which alone sees the Motion value
     ``trunk_tilt``; (2) least squares on the pose residual in
@@ -611,7 +612,7 @@ def gn_project_balanced(
     band_lo = lower + _device_const(world.model.margin_lower, q.device, q.dtype)
     band_hi = upper - _device_const(world.model.margin_upper, q.device, q.dtype)
     sole_idx = tuple(list(kin.tool_frames).index(frame) for frame in world.model.sole_frames)  # () when simplified
-    bound = _tilt_bound(world.model)  # None when simplified
+    bound = _tilt_bound(world.model)  # None when simplified, or without a tilt bound
 
     for _ in range(iters):
         if balance:
@@ -691,7 +692,7 @@ def gn_gate(
 def tilt_within_bound(world, q: torch.Tensor, tol: float) -> torch.Tensor:
     """``[N]`` bool: the Trunk tilt at ``q`` ``[N, dof]`` within ``world.model.envelope``'s maximum on the Motion
     value's metric (:func:`~cutamp.joint_limit_cost.trunk_tilt_excess` at most ``tol``); all True without an
-    envelope."""
+    envelope or a tilt bound."""
     from cutamp.joint_limit_cost import trunk_tilt_excess
     bound = _tilt_bound(world.model)
     if bound is None:
