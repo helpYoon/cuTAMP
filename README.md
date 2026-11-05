@@ -455,7 +455,7 @@ flags, which run with `--robot simplified`.
   `get_world_cfg`), `shapes.py` (`sample_greedy_surface_spheres`),
   `rerun_utils.py`, and `timer.py` (`TorchTimer`, GPU-synchronized timing).
 
-### 📁 [`cutamp/tests/`](cutamp/tests/) — 335 tests in 42 files
+### 📁 [`cutamp/tests/`](cutamp/tests/) — 356 tests in 44 files
 
 Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 (`needs_cuda` marker, `make_blocks_t1_world` factory, the module-scoped
@@ -512,7 +512,7 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 
 Run with:
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest cutamp/tests/ -q`
-(GPU required for the integration tests; ~6 min on an RTX 4090: 344
+(GPU required for the integration tests; ~6.5 min on an RTX 4090: 348
 passed, 8 skipped on 2026-11-05).
 `CUTAMP_SLOW=1` also runs the 8 slow live tests: 6 `--cuda_graphs` runs in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py), the floor
