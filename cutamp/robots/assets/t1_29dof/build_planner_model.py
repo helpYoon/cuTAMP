@@ -88,8 +88,9 @@ ROLL_MARGIN = 0.1  # rad
 SOFT_LIMIT_FACTOR = 0.9  # bfm_wm robot/t1.py:118, T1_CFG.soft_joint_pos_limit_factor (call 17)
 ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's top speed, npz v_max (7.4a)
 # Trajopt's internal timing. Trajopt times each segment against these and its success test checks the torques at
-# that timing, so they shape the path it finds; the balance gate then sets the exported pace from the robot's own
-# limits (speed, effort, ZMP: motion_solver._pace). They are not robot facts: the acceleration and jerk caps are
+# that timing, so they shape each path and its time profile. The balance gate keeps that profile and sets only each
+# segment's uniform time scale, from the robot's speed limits, efforts and the ZMP (motion_solver._pace), so their
+# shape reaches every exported motion. They are not robot facts: the acceleration and jerk caps are
 # the simplified model's (t1_planar_base.yml), and the base's velocity limit is cuRobo's default for extra links
 # (link_params.py:32), written out. With non-binding caps in their place (1e4, 1e6, 1e3) both seed-0 runs of P2's
 # check set failed every candidate's first trajopt on its torque check, so trajopt keeps these.
@@ -119,9 +120,9 @@ ROBOT_HEADER = HEADER + (
     "is the square\n"
     "# root of the cap over the URDF velocity: read velocity limits from cuRobo, not from this file. "
     "max_acceleration,\n"
-    "# max_jerk and the base joints' velocity limits are trajopt's internal timing; the balance gate sets "
-    "the exported\n"
-    "# pace.\n"
+    "# max_jerk and the base joints' velocity limits are trajopt's internal timing: they shape each path and its "
+    "time\n"
+    "# profile, and the balance gate sets only each segment's uniform time scale, from speed, effort and the ZMP.\n"
     "# cuRobo never reads the cutamp: block.\n")
 
 

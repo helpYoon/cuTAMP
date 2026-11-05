@@ -666,10 +666,10 @@ def _taylor_positions(world: TAMPWorld, planner, plan_js, h: float = ZMP_STEP) -
 
 
 def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
-    """``plan_js`` slowed down uniformly by about ``s``, resampled every ``dt`` s.
+    """``plan_js`` retimed uniformly by about ``s`` (above 1 slower, below 1 faster), resampled every ``dt`` s.
 
     A C2 cubic spline through the frames, with the native end velocities as boundary conditions,
-    is sampled at ``N' = ceil(s (N - 1)) + 1`` frames, so the slowdown is ``s_eff = (N' - 1) / (N - 1)
+    is sampled at ``N' = ceil(s (N - 1)) + 1`` frames, so the time scale is ``s_eff = (N' - 1) / (N - 1)
     >= s`` and the last frame is the original's. Velocities scale by ``1 / s_eff``, accelerations by
     ``1 / s_eff**2``, jerks by ``1 / s_eff**3``."""
     from scipy.interpolate import CubicSpline

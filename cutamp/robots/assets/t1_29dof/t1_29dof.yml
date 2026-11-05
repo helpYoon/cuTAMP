@@ -4,8 +4,8 @@
 # call 17) after reordering the cspace and never reorders the clip itself: tool frames that change that order put
 # the soft limits on the wrong joints. cuRobo applies velocity_scale twice, so the Ankle_Pitch scale is the square
 # root of the cap over the URDF velocity: read velocity limits from cuRobo, not from this file. max_acceleration,
-# max_jerk and the base joints' velocity limits are trajopt's internal timing; the balance gate sets the exported
-# pace.
+# max_jerk and the base joints' velocity limits are trajopt's internal timing: they shape each path and its time
+# profile, and the balance gate sets only each segment's uniform time scale, from speed, effort and the ZMP.
 # cuRobo never reads the cutamp: block.
 robot_cfg:
   kinematics:
