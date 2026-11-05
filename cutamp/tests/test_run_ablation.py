@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 from cutamp.scripts import run_ablation
-from cutamp.scripts.run_ablation import CELLS, build_run_plan, run_study
+from cutamp.scripts.run_ablation import CELLS, GATE_CELLS, build_gate_plan, build_run_plan, run_study
 
 
 def test_cells_run_their_refresh(monkeypatch):
@@ -175,3 +175,57 @@ def test_run_study_default_execute_forwards_experiment_root(monkeypatch, tmp_pat
         assert cmd[idx + 1] == expected_root
     for r in manifest:
         assert r["experiment_path"].startswith(expected_root)
+
+
+def test_gate_plan_interleaves(tmp_path):
+    # Design section 8's speed gate: 4 heights x 10 seeds x n (256, 512) x both models, in that loop order, so the
+    # two models alternate through one session; --seed and PYTHONHASHSEED make every run replayable.
+    plan = build_gate_plan()
+    assert len(plan) == 160
+    assert [(r["height"], r["seed"], r["n"], r["cell"]) for r in plan[:4]] == [
+        (0.0, 0, 256, "simplified"), (0.0, 0, 256, "real_legs"), (0.0, 0, 512, "simplified"), (0.0, 0, 512, "real_legs"),
+    ]
+    assert len({r["experiment_id"] for r in plan}) == 160
+    for r in plan:
+        assert r["env"] == {"PYTHONHASHSEED": str(r["seed"])}
+        assert r["experiment_id"] == f"gate_{r['cell']}_n{r['n']}_h{int(r['height'] * 100):03d}_s{r['seed']}"
+        assert r["args"] == ["-n", str(r["n"]), "--disable_visualizer", "--motion_plan", "--save_plan", "auto",
+                             "--surface_height", str(r["height"]), "--seed", str(r["seed"]),
+                             "--experiment_id", r["experiment_id"], *GATE_CELLS[r["cell"]]]
+    assert [(r["height"], r["seed"]) for r in build_gate_plan(heights=[0.5], seeds=[3])] == [(0.5, 3)] * 4
+    # Each manifest row gains n, for the per-n gate.
+    manifest = run_study(plan[:4], out_dir=tmp_path, execute=lambda run: 0)
+    assert [(row["cell"], row["n"]) for row in manifest] == [
+        ("simplified", 256), ("real_legs", 256), ("simplified", 512), ("real_legs", 512),
+    ]
+
+
+def test_gate_runs_reach_run_cutamp(monkeypatch, tmp_path):
+    # Each gate run's argv through run_cutamp's own CLI: its model, n and the section's soft costs (the real legs add
+    # their own default, minimize_body_movement), a motion plan saved per run; the subprocess sets its hash seed.
+    import sys
+
+    import cutamp.scripts.run_cutamp as rc
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append((config, kw)))
+    soft = {"simplified": ["joint_limit_margin"], "real_legs": ["joint_limit_margin", "minimize_body_movement"]}
+    # Seed 0: --seed sets torch's global seed, and test_cells_run_their_refresh already leaves it at 0.
+    for run in build_gate_plan(heights=[0.5], seeds=[0]):
+        monkeypatch.setattr(sys, "argv", ["run_cutamp", *run["args"]])
+        rc.entrypoint()
+        config, kw = seen[-1]
+        assert (config.robot, config.num_particles, config.curobo_plan, config.enable_visualizer) == (
+            run["cell"], run["n"], True, False)
+        assert config.soft_cost == soft[run["cell"]]
+        assert kw == {"experiment_id": run["experiment_id"], "save_plan": "auto"}
+
+    captured = {}
+
+    def fake_call(cmd, env=None):
+        captured.update(cmd=cmd, env=env)
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", fake_call)
+    assert run_ablation._subprocess_exec(build_gate_plan(heights=[0.5], seeds=[3])[1], tmp_path) == 0
+    assert captured["env"]["PYTHONHASHSEED"] == "3" and captured["env"]["PYTHONPATH"] == ""
+    assert captured["cmd"][-2:] == ["--experiment_root", str(tmp_path)]

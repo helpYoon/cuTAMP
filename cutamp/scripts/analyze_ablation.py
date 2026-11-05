@@ -1,8 +1,12 @@
 """Turn an ablation-study manifest into the paper table and figures.
 
+With ``--gate``, a ``run_ablation --gate`` study's manifest becomes the speed
+gate's gate.json and gate.md instead (design section 8).
+
 Usage:
     python -m cutamp.scripts.analyze_ablation \
         --manifest /tmp/ablation-study/manifest.json --out docs/ablation
+    python -m cutamp.scripts.analyze_ablation --manifest /tmp/gate/manifest.json --out /tmp/gate --gate
 """
 import argparse
 import csv
@@ -12,6 +16,10 @@ import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
+
+from cutamp.scripts.run_ablation import HEIGHTS, SEEDS
 
 METRICS = [
     "num_satisfying_final",
@@ -38,6 +46,23 @@ CELL_LABEL = {
     "no_reik": "CoM only (no re-IK)",
     "standard": "Standard cuTAMP (neither)",
 }
+# The top-level timers of algorithm.run_cutamp: their totals sum to a run's planning time (design section 8). Every
+# other timer nests inside one of them, and first_solution overlaps start_optimization.
+TOP_TIMERS = ("load_tamp_world", "warmup_ik_solver", "get_plan_generator", "sample_initial_plans", "sort_plans",
+              "start_optimization")
+# The stage times (design section 8) beside ms_per_step, each a timer's total: seed IK, trajopt, the final re-IK
+# repair, and the world's load (the timing check's).
+STAGE_TIMERS = {"seed_ik_s": "initialize_particles", "trajopt_s": "curobo_planning", "final_repair_s": "final_repair",
+                "load_tamp_world_s": "load_tamp_world"}
+# The speed gate (design section 8), on run_ablation's GATE_CELLS: decided at n = 256, the real-leg model passes if
+# all GATE_RUNS of its runs find a solution, a motion plan and a balanced plan, and its median and p90 planning times
+# are at most GATE_MEDIAN_MAX and GATE_P90_MAX times the same-session simplified model's.
+GATE_BASELINE, GATE_MODEL = "simplified", "real_legs"
+GATE_RUNS = len(HEIGHTS) * len(SEEDS)  # 40 per model and n
+GATE_DECIDED_AT = 256
+GATE_MEDIAN_MAX, GATE_P90_MAX = 1.5, 2.0
+GATE_COUNTS = ("found_solution", "motion_plan_success", "stable_plan")
+GATE_STAGES = ("seed_ik_s", "ms_per_step", "trajopt_s", "final_repair_s", "load_tamp_world_s")
 
 
 def _total_opt_steps(opt_data):
@@ -84,6 +109,12 @@ def load_study(manifest_path):
         overall = {}
         if (exp / "overall_metrics.json").exists():
             overall = json.load(open(exp / "overall_metrics.json"))
+        timers = {}
+        if (exp / "timer_metrics.json").exists():
+            timers = {name: t["total"] for name, t in json.load(open(exp / "timer_metrics.json")).items()}
+        # A sum missing a top-level timer would understate the run, so it has none.
+        planning_s = sum(timers[k] for k in TOP_TIMERS) if all(k in timers for k in TOP_TIMERS) else None
+        failures = overall.get("motion_plan_failures")
         # A balanced plan: a motion plan whose every audited trajectory frame
         # keeps the CoM in the polygon. None when the audit is missing.
         mps, viol = overall.get("motion_plan_success"), overall.get("traj_com_violation_frac")
@@ -94,6 +125,13 @@ def load_study(manifest_path):
         curobo_calls = sum(bool(r.get("fallback")) for r in refreshes) if refreshes else None
         records.append({
             "cell": run["cell"], "height": run["height"], "seed": run["seed"],
+            # The manifest's n (gate studies), else the run's own.
+            "n": run.get("n", overall.get("num_particles")),
+            "planning_s": planning_s,
+            **{k: timers.get(timer) for k, timer in STAGE_TIMERS.items()},
+            # Failed motion-plan candidates lost to torque: trajopt's ": torque" reason and the balance gate's raise on
+            # a slowed segment both name it (design 7.4a).
+            "torque_failures": None if failures is None else sum("torque" in m for m in failures),
             "num_satisfying_final": opt.get("num_satisfying_final"),
             "num_satisfying_com_feasible": opt.get("num_satisfying_com_feasible"),
             "best_soft_cost_com_feasible": opt.get("best_soft_cost_com_feasible"),
@@ -119,6 +157,92 @@ def load_study(manifest_path):
             "restored": None if opt.get("restored") is None else float(opt["restored"]),
         })
     return records
+
+
+def _percentiles(values, qs):
+    """numpy's linear percentiles ``qs`` of ``values``, as floats; Nones when there are no values."""
+    return [float(x) for x in np.percentile(values, qs, method="linear")] if values else [None] * len(qs)
+
+
+def gate_summary(records) -> dict:
+    """The speed gate (design section 8) over a ``run_ablation --gate`` study's records.
+
+    ``by_n[n]``, for each particle count n: ``cells``, per model, its runs, its counts of found_solution,
+    motion_plan_success and stable_plan, its total torque_failures, its planning time's median and p90 and its median
+    stage times; ``ratio``, the real-leg / simplified ratios of the median and the p90; and ``flags``: ``success``
+    (all GATE_RUNS real-leg runs count on all three), ``median`` (ratio at most GATE_MEDIAN_MAX), ``p90`` (at most
+    GATE_P90_MAX) and ``pass`` (all three). The gate is decided at n = ``decided_at``: ``pass`` is that n's flags, or
+    None without runs there."""
+    by_n = {}
+    for n in sorted({r["n"] for r in records if r["cell"] in (GATE_BASELINE, GATE_MODEL) and r.get("n") is not None}):
+        cells = {}
+        for cell in (GATE_BASELINE, GATE_MODEL):
+            runs = [r for r in records if r["cell"] == cell and r.get("n") == n]
+            median, p90 = _percentiles([r["planning_s"] for r in runs if r.get("planning_s") is not None], [50, 90])
+            cells[cell] = {
+                "runs": len(runs),
+                **{k: sum(r.get(k) == 1.0 for r in runs) for k in GATE_COUNTS},
+                "torque_failures": sum(r.get("torque_failures") or 0 for r in runs),
+                "planning_s": {"median": median, "p90": p90},
+                "stage_medians": {k: _percentiles([r[k] for r in runs if r.get(k) is not None], [50])[0]
+                                  for k in GATE_STAGES},
+            }
+        base, model = cells[GATE_BASELINE]["planning_s"], cells[GATE_MODEL]["planning_s"]
+        ratio = {q: model[q] / base[q] if model[q] is not None and base[q] else None for q in ("median", "p90")}
+        real = cells[GATE_MODEL]
+        flags = {
+            "success": all(real[k] == real["runs"] == GATE_RUNS for k in GATE_COUNTS),
+            "median": ratio["median"] is not None and ratio["median"] <= GATE_MEDIAN_MAX,
+            "p90": ratio["p90"] is not None and ratio["p90"] <= GATE_P90_MAX,
+        }
+        flags["pass"] = all(flags.values())
+        by_n[n] = {"cells": cells, "ratio": ratio, "flags": flags}
+    decided = by_n.get(GATE_DECIDED_AT)
+    return {"decided_at": GATE_DECIDED_AT, "pass": decided["flags"] if decided else None, "by_n": by_n}
+
+
+def _write_gate_md(summary, path):
+    def num(x, digits=2):
+        return "—" if x is None else f"{x:.{digits}f}"
+
+    def yes(flag):
+        return "yes" if flag else "no"
+
+    decided, at = summary["pass"], summary["decided_at"]
+    lines = ["# Speed gate (design section 8)", ""]
+    if decided is None:
+        lines.append(f"Not decided: no runs at n = {at}.")
+    else:
+        lines.append(
+            f"Decided at n = {at}: **{'PASS' if decided['pass'] else 'FAIL'}**. All {GATE_RUNS} {GATE_MODEL} runs "
+            f"solved, motion-planned and balanced: {yes(decided['success'])}; median ratio at most {GATE_MEDIAN_MAX}: "
+            f"{yes(decided['median'])}; p90 ratio at most {GATE_P90_MAX}: {yes(decided['p90'])}."
+        )
+    for n, entry in summary["by_n"].items():
+        lines += [
+            "", f"## n = {n}", "",
+            "| model | runs | solved | motion plan | balanced | torque failures | planning median [s] | planning p90 [s] "
+            "| seed IK [s] | ms/step | trajopt [s] | final repair [s] | load world [s] |",
+            "|" + "---|" * 13,
+        ]
+        for cell, c in entry["cells"].items():
+            stage = c["stage_medians"]
+            lines.append(
+                f"| {cell} | {c['runs']} | {c['found_solution']} | {c['motion_plan_success']} | {c['stable_plan']} "
+                f"| {c['torque_failures']} | {num(c['planning_s']['median'])} | {num(c['planning_s']['p90'])} "
+                f"| {num(stage['seed_ik_s'])} | {num(stage['ms_per_step'], 1)} | {num(stage['trajopt_s'])} "
+                f"| {num(stage['final_repair_s'])} | {num(stage['load_tamp_world_s'])} |"
+            )
+        ratio, flags = entry["ratio"], entry["flags"]
+        lines += [
+            "",
+            f"{GATE_MODEL} / {GATE_BASELINE}: median {num(ratio['median'])} (at most {GATE_MEDIAN_MAX}: "
+            f"{yes(flags['median'])}), p90 {num(ratio['p90'])} (at most {GATE_P90_MAX}: {yes(flags['p90'])}); all "
+            f"{GATE_RUNS} {GATE_MODEL} runs on all three counts: {yes(flags['success'])}.",
+        ]
+    lines += ["", "Planning time is the sum of the top-level timers. Each stage time is the median over a model's runs "
+                  "of the run's timer total; ms/step is the wall-clock per Adam step."]
+    Path(path).write_text("\n".join(lines) + "\n")
 
 
 def wilson(k, n, z=1.96):
@@ -312,10 +436,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--gate", action="store_true",
+                    help="a run_ablation --gate study: write the speed gate's gate.json and gate.md instead")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     records = load_study(a.manifest)
+    if a.gate:
+        summary = gate_summary(records)
+        (out / "gate.json").write_text(json.dumps(summary, indent=1))
+        _write_gate_md(summary, out / "gate.md")
+        print(f"{len(records)} runs -> {out}/gate.json, gate.md")
+        return
     agg = aggregate(records)
     delta_rows = compute_deltas(records)
     delta_agg = aggregate_deltas(delta_rows)

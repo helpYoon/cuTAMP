@@ -947,8 +947,9 @@ class ParticleOptimizer:
         # moved poses since the last periodic refresh. Always FULL (no gate):
         # restore_if_better may have rewritten particles, making gate refs stale.
         if ik_deps:
-            self._refresh_ik_deps(particles, ik_deps, world)
-            reik_gate.flush()  # balance-first records sit on the device until here
+            with timer.time("final_repair"):  # a stage time of the speed gate (design section 8)
+                self._refresh_ik_deps(particles, ik_deps, world)
+                reik_gate.flush()  # balance-first records sit on the device until here
         if reik_gate is not None and reik_gate.stats:
             opt_metrics["reik_refresh"] = reik_gate.stats
             total_s = sum(r["solve_s"] for r in reik_gate.stats)
