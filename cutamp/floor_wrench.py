@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Callable, Sequence
 import torch
 from curobo._src.geom.transform import torch_quaternion_to_matrix
 
-from cutamp.fk_orientation_grad import _FKQuatGrad
-
 if TYPE_CHECKING:
     from curobo.motion_planner import MotionPlanner
     from curobo.types import DeviceCfg, JointState
@@ -66,6 +64,8 @@ def make_floor_wrench_fn(
     tool frames, and ``sole_links`` the soles in Dynamics' links. It returns ``f_ext``
     ``[B, H, n_links, 6]``, zero but for the sole rows, each ``[torque, force]`` in that sole's frame.
     """
+    from cutamp.rollout import _FKQuatGrad  # not at the top: rollout.py imports tamp_world.py, which imports this
+
     base_joints = list(base_joints)
 
     def floor_wrench(state, kin_state, tau_free: torch.Tensor) -> torch.Tensor:
