@@ -56,7 +56,8 @@ STAGE_TIMERS = {"seed_ik_s": "initialize_particles", "trajopt_s": "curobo_planni
                 "load_tamp_world_s": "load_tamp_world"}
 # The speed gate (design section 8), on run_ablation's GATE_CELLS: decided at n = 256, the real-leg model passes if
 # all GATE_RUNS of its runs find a solution, a motion plan and a balanced plan, and its median and p90 planning times
-# are at most GATE_MEDIAN_MAX and GATE_P90_MAX times the same-session simplified model's.
+# are at most GATE_MEDIAN_MAX and GATE_P90_MAX times the same-session simplified model's. Both models need all
+# GATE_RUNS runs, each with a planning time: a missing run of either would move the ratios.
 GATE_BASELINE, GATE_MODEL = "simplified", "real_legs"
 GATE_RUNS = len(HEIGHTS) * len(SEEDS)  # 40 per model and n
 GATE_DECIDED_AT = 256
@@ -129,8 +130,9 @@ def load_study(manifest_path):
             "n": run.get("n", overall.get("num_particles")),
             "planning_s": planning_s,
             **{k: timers.get(timer) for k, timer in STAGE_TIMERS.items()},
-            # Failed motion-plan candidates lost to torque: trajopt's ": torque" reason and the balance gate's raise on
-            # a slowed segment both name it (design 7.4a).
+            # Failed motion-plan candidates whose trajectory passed a joint's effort (design 7.4a): trajopt's last
+            # result, on its horizon or between its frames (the reason ": torque"), or a segment the balance gate
+            # slowed (its raise names the torque).
             "torque_failures": None if failures is None else sum("torque" in m for m in failures),
             "num_satisfying_final": opt.get("num_satisfying_final"),
             "num_satisfying_com_feasible": opt.get("num_satisfying_com_feasible"),
@@ -167,20 +169,23 @@ def _percentiles(values, qs):
 def gate_summary(records) -> dict:
     """The speed gate (design section 8) over a ``run_ablation --gate`` study's records.
 
-    ``by_n[n]``, for each particle count n: ``cells``, per model, its runs, its counts of found_solution,
-    motion_plan_success and stable_plan, its total torque_failures, its planning time's median and p90 and its median
-    stage times; ``ratio``, the real-leg / simplified ratios of the median and the p90; and ``flags``: ``success``
-    (all GATE_RUNS real-leg runs count on all three), ``median`` (ratio at most GATE_MEDIAN_MAX), ``p90`` (at most
-    GATE_P90_MAX) and ``pass`` (all three). The gate is decided at n = ``decided_at``: ``pass`` is that n's flags, or
-    None without runs there."""
+    ``by_n[n]``, for each particle count n: ``cells``, per model, its runs, how many of them have a planning time
+    (``timed``), its counts of found_solution, motion_plan_success and stable_plan, its total torque_failures (failed
+    candidates whose trajectory passed an effort), its planning time's median and p90 over the timed runs and its
+    median stage times; ``ratio``, the real-leg / simplified ratios of the median and the p90; and ``flags``:
+    ``success`` (both models ran GATE_RUNS runs, every one timed, and every real-leg run counts on all three),
+    ``median`` (ratio at most GATE_MEDIAN_MAX), ``p90`` (at most GATE_P90_MAX) and ``pass`` (all three). The gate is
+    decided at n = ``decided_at``: ``pass`` is that n's flags, or None without runs there."""
     by_n = {}
     for n in sorted({r["n"] for r in records if r["cell"] in (GATE_BASELINE, GATE_MODEL) and r.get("n") is not None}):
         cells = {}
         for cell in (GATE_BASELINE, GATE_MODEL):
             runs = [r for r in records if r["cell"] == cell and r.get("n") == n]
-            median, p90 = _percentiles([r["planning_s"] for r in runs if r.get("planning_s") is not None], [50, 90])
+            times = [r["planning_s"] for r in runs if r.get("planning_s") is not None]
+            median, p90 = _percentiles(times, [50, 90])
             cells[cell] = {
                 "runs": len(runs),
+                "timed": len(times),
                 **{k: sum(r.get(k) == 1.0 for r in runs) for k in GATE_COUNTS},
                 "torque_failures": sum(r.get("torque_failures") or 0 for r in runs),
                 "planning_s": {"median": median, "p90": p90},
@@ -191,7 +196,8 @@ def gate_summary(records) -> dict:
         ratio = {q: model[q] / base[q] if model[q] is not None and base[q] else None for q in ("median", "p90")}
         real = cells[GATE_MODEL]
         flags = {
-            "success": all(real[k] == real["runs"] == GATE_RUNS for k in GATE_COUNTS),
+            "success": (all(c["runs"] == c["timed"] == GATE_RUNS for c in cells.values())
+                        and all(real[k] == GATE_RUNS for k in GATE_COUNTS)),
             "median": ratio["median"] is not None and ratio["median"] <= GATE_MEDIAN_MAX,
             "p90": ratio["p90"] is not None and ratio["p90"] <= GATE_P90_MAX,
         }
@@ -208,40 +214,50 @@ def _write_gate_md(summary, path):
     def yes(flag):
         return "yes" if flag else "no"
 
+    def short(cells):
+        """``" (not 40 runs: ...)"`` naming each model whose run count is not GATE_RUNS, else ``""``."""
+        counts = [f"{cell} {c['runs']}" for cell, c in cells.items() if c["runs"] != GATE_RUNS]
+        return f" (not {GATE_RUNS} runs: {', '.join(counts)})" if counts else ""
+
     decided, at = summary["pass"], summary["decided_at"]
     lines = ["# Speed gate (design section 8)", ""]
     if decided is None:
         lines.append(f"Not decided: no runs at n = {at}.")
     else:
         lines.append(
-            f"Decided at n = {at}: **{'PASS' if decided['pass'] else 'FAIL'}**. All {GATE_RUNS} {GATE_MODEL} runs "
-            f"solved, motion-planned and balanced: {yes(decided['success'])}; median ratio at most {GATE_MEDIAN_MAX}: "
-            f"{yes(decided['median'])}; p90 ratio at most {GATE_P90_MAX}: {yes(decided['p90'])}."
+            f"Decided at n = {at}: **{'PASS' if decided['pass'] else 'FAIL'}**{short(summary['by_n'][at]['cells'])}. "
+            f"All {GATE_RUNS} runs of each model timed, and every {GATE_MODEL} run solved, motion-planned and "
+            f"balanced: {yes(decided['success'])}; median ratio at most {GATE_MEDIAN_MAX}: {yes(decided['median'])}; "
+            f"p90 ratio at most {GATE_P90_MAX}: {yes(decided['p90'])}."
         )
     for n, entry in summary["by_n"].items():
         lines += [
             "", f"## n = {n}", "",
-            "| model | runs | solved | motion plan | balanced | torque failures | planning median [s] | planning p90 [s] "
-            "| seed IK [s] | ms/step | trajopt [s] | final repair [s] | load world [s] |",
-            "|" + "---|" * 13,
+            "| model | runs | timed | solved | motion plan | balanced | failed past an effort | planning median [s] "
+            "| planning p90 [s] | seed IK [s] | ms/step | trajopt [s] | final repair [s] | load world [s] |",
+            "|" + "---|" * 14,
         ]
         for cell, c in entry["cells"].items():
             stage = c["stage_medians"]
             lines.append(
-                f"| {cell} | {c['runs']} | {c['found_solution']} | {c['motion_plan_success']} | {c['stable_plan']} "
-                f"| {c['torque_failures']} | {num(c['planning_s']['median'])} | {num(c['planning_s']['p90'])} "
-                f"| {num(stage['seed_ik_s'])} | {num(stage['ms_per_step'], 1)} | {num(stage['trajopt_s'])} "
-                f"| {num(stage['final_repair_s'])} | {num(stage['load_tamp_world_s'])} |"
+                f"| {cell} | {c['runs']} | {c['timed']} | {c['found_solution']} | {c['motion_plan_success']} "
+                f"| {c['stable_plan']} | {c['torque_failures']} | {num(c['planning_s']['median'])} "
+                f"| {num(c['planning_s']['p90'])} | {num(stage['seed_ik_s'])} | {num(stage['ms_per_step'], 1)} "
+                f"| {num(stage['trajopt_s'])} | {num(stage['final_repair_s'])} | {num(stage['load_tamp_world_s'])} |"
             )
         ratio, flags = entry["ratio"], entry["flags"]
         lines += [
             "",
             f"{GATE_MODEL} / {GATE_BASELINE}: median {num(ratio['median'])} (at most {GATE_MEDIAN_MAX}: "
             f"{yes(flags['median'])}), p90 {num(ratio['p90'])} (at most {GATE_P90_MAX}: {yes(flags['p90'])}); all "
-            f"{GATE_RUNS} {GATE_MODEL} runs on all three counts: {yes(flags['success'])}.",
+            f"{GATE_RUNS} runs of each model timed and every {GATE_MODEL} run on all three counts: "
+            f"{yes(flags['success'])}{short(entry['cells'])}.",
         ]
-    lines += ["", "Planning time is the sum of the top-level timers. Each stage time is the median over a model's runs "
-                  "of the run's timer total; ms/step is the wall-clock per Adam step."]
+    lines += ["", "Planning time is the sum of the top-level timers, over the timed runs (a run missing a top-level "
+                  "timer has none). Each stage time is the median over a model's runs of the run's timer total; "
+                  "ms/step is the wall-clock per Adam step. Failed past an effort counts the motion-plan candidates "
+                  "that failed with a trajectory past a joint's effort: trajopt's last result, on its horizon or "
+                  "between its frames, or a segment the balance gate slowed."]
     Path(path).write_text("\n".join(lines) + "\n")
 
 

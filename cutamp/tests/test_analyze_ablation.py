@@ -390,8 +390,9 @@ def test_gate_summary_flags():
                                                       "p90": float(np.percentile(times, 90))})
     assert simplified["planning_s"]["p90"] == pytest.approx(18.775)  # 35.1 of 39 places in: 18.75 + 0.1 * 0.25
     assert at["ratio"]["median"] == pytest.approx(1.4) and at["ratio"]["p90"] == pytest.approx(1.4)
-    assert {k: real[k] for k in ("runs", "found_solution", "motion_plan_success", "stable_plan", "torque_failures")} == {
-        "runs": 40, "found_solution": 40, "motion_plan_success": 40, "stable_plan": 40, "torque_failures": 3}
+    counts = ("runs", "timed", "found_solution", "motion_plan_success", "stable_plan", "torque_failures")
+    assert {k: real[k] for k in counts} == {"runs": 40, "timed": 40, "found_solution": 40, "motion_plan_success": 40,
+                                            "stable_plan": 40, "torque_failures": 3}
     assert real["stage_medians"] == pytest.approx({"seed_ik_s": 5.6, "ms_per_step": 12.25, "trajopt_s": 2.8,
                                                    "final_repair_s": 0.45, "load_tamp_world_s": 0.4})
     assert simplified["torque_failures"] == 0
@@ -404,10 +405,28 @@ def test_gate_summary_flags():
     slow = gate_summary(_gate_records(1.4, slow_tail=2.0))["by_n"][256]
     assert slow["ratio"]["median"] == pytest.approx(1.4) and slow["ratio"]["p90"] == pytest.approx(2.8)
     assert slow["flags"] == {"success": True, "median": True, "p90": False, "pass": False}
-    # A run that never finished drops out of load_study, so a cell short of its 40 runs cannot pass.
-    short = [r for r in _gate_records(1.4) if not (r["cell"] == "real_legs" and r["seed"] == 0)]
-    assert gate_summary(short)["pass"]["success"] is False
+    # A run that never finished drops out of load_study, so a cell short of its 40 runs cannot pass, the baseline's
+    # included: a missing simplified run would move the ratios as much.
+    for cell in ("real_legs", "simplified"):
+        short = [r for r in _gate_records(1.4) if not (r["cell"] == cell and r["seed"] == 0)]
+        assert gate_summary(short)["pass"]["success"] is False, cell
+        # A run missing a top-level timer has no planning time: it drops out of the median and p90, so it fails too.
+        untimed = [{**r, "planning_s": None} if r["cell"] == cell and r["seed"] == 0 else r for r in _gate_records(1.4)]
+        summary = gate_summary(untimed)
+        assert summary["pass"]["success"] is False, cell
+        assert (summary["by_n"][256]["cells"][cell]["runs"], summary["by_n"][256]["cells"][cell]["timed"]) == (40, 39)
     assert gate_summary(_gate_records(1.4, n=512))["pass"] is None
+
+
+def test_gate_md_tells_a_short_study_from_a_failed_one(tmp_path):
+    # A study short of the gate's 40 runs per model says so beside its FAIL; one with all 40 runs that fails does not.
+    from cutamp.scripts.analyze_ablation import _write_gate_md
+    _write_gate_md(gate_summary(_gate_records(1.6)), tmp_path / "failed.md")
+    failed = (tmp_path / "failed.md").read_text()
+    assert "**FAIL**." in failed and "not 40 runs" not in failed
+    short = [r for r in _gate_records(1.4) if not (r["cell"] == "real_legs" and r["seed"] < 3)]
+    _write_gate_md(gate_summary(short), tmp_path / "short.md")
+    assert "**FAIL** (not 40 runs: real_legs 37)." in (tmp_path / "short.md").read_text()
 
 
 def test_main_gate_writes_gate_outputs(tmp_path, monkeypatch):
@@ -428,7 +447,9 @@ def test_main_gate_writes_gate_outputs(tmp_path, monkeypatch):
     assert summary["by_n"]["256"]["ratio"]["median"] == pytest.approx(1.0)
     assert summary["pass"]["success"] is False  # one run per model, not the gate's 40
     md = (tmp_path / "out" / "gate.md").read_text()
-    assert "## n = 256" in md and "| real_legs | 1 |" in md and "FAIL" in md
+    assert "## n = 256" in md and "| real_legs | 1 | 1 |" in md  # runs, and runs with a planning time
+    assert "**FAIL** (not 40 runs: simplified 1, real_legs 1)." in md
+    assert "| failed past an effort |" in md and "Failed past an effort counts the motion-plan candidates" in md
 
 
 @needs_cuda
