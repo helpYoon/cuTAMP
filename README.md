@@ -57,13 +57,16 @@ graph LR
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
    / configs (`samplers.py`) and runs cuRobo IK — with CoM-aware seed-IK — for
-   each pick / place conf, re-solving particles whose CoM leaves the keyframe
-   rectangle (`COM_HALF_EXTENTS`). Retract confs start at `t1_home`.
+   each pick / place conf, re-solving particles whose CoM leaves the model's
+   keyframe rectangle (`COM_HALF_EXTENTS` on the simplified model). Retract
+   confs start at the model's home (`t1_home` on the simplified model).
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic, motion, collision, stable-placement, and the `ComPolygon`
-   gate: every conf's CoM inside `COM_HALF_EXTENTS`, the real soles shrunk
-   2 cm and another 5 mm for the arrival's deceleration) plus soft costs. Pose-class soft costs use **re-IK-coupled
+   gate: every conf's CoM inside the model's keyframe rectangle, which sits
+   5 mm inside its support region for the arrival's deceleration; on the
+   simplified model that is `COM_HALF_EXTENTS`, the real soles shrunk 2 cm and
+   another 5 mm) plus soft costs. Pose-class soft costs use **re-IK-coupled
    Adam** — outer Adam moves poses while dependent confs are re-projected every
    `reik_interval` steps by balance-first Gauss-Newton (`gn_refresh.py`: CoM
    in the support polygon first, then the pose, then joint-limit margins), with
@@ -223,8 +226,11 @@ flags, which run with `--robot simplified`.
     `compute_jacobian=True` for the GN refresh), `get_t1_ik_solver(scene)` (a single
     multi-tool-frame IK over both arms; with `enable_com_aware_ik=True`, the
     default, its seed-IK LM stage carries a CoM residual — a cuRobo fork
-    edit — over the largest base-centred box inside `COM_HALF_EXTENTS`
-    (the fork's box has no centre, so it falls 2 cm short at the toe),
+    edit — over the largest frame-centred box inside the model's keyframe
+    rectangle (the fork's box has no centre: on the simplified model
+    `COM_HALF_EXTENTS` sits 1 cm ahead of the base, so the box falls 2 cm short
+    at the toe; on the real legs the rectangle is centred on the stance, so the
+    box is the rectangle),
     weighted by `T1_COM_IK_WEIGHT` and the
     pull-to-center `T1_COM_IK_CENTER_WEIGHT`; `num_seeds` / `lbfgs_iters` /
     `use_cuda_graph` configure the re-IK refresh solver), `get_t1_motion_planner`
@@ -281,11 +287,13 @@ flags, which run with `--robot simplified`.
   residual lives inside the seed-IK fork instead).
 
 - [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
-  truth for the balance geometry: the real soles (`SOLE_HALF_EXTENTS`,
-  centred at `COM_CENTER`, 1 cm ahead of the ankle axis), the trajectory
-  gate's `SUPPORT_HALF_EXTENTS` (the soles shrunk by `COM_SAFETY_MARGIN` =
-  2 cm), the keyframes' `COM_HALF_EXTENTS` (a further `COM_DYNAMIC_RESERVE`
-  = 5 mm in), `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT` and `COM_TOL`. Its
+  truth for the balance geometry: the simplified model's real soles
+  (`SOLE_HALF_EXTENTS`, centred at `COM_CENTER`, 1 cm ahead of the ankle
+  axis), its trajectory gate's `SUPPORT_HALF_EXTENTS` (the soles shrunk by
+  `COM_SAFETY_MARGIN` = 2 cm) and its keyframes' `COM_HALF_EXTENTS` (a further
+  `COM_DYNAMIC_RESERVE` = 5 mm in); `support_rectangles`, which gives the real
+  legs' two rectangles from their sole geometry and the load guard with the
+  same margins; `COM_INSIDE_MARGIN` / `COM_INSIDE_WEIGHT` and `COM_TOL`. Its
   consumers: `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
   `ComOverBasePolygonCost` (the planner rollout cost),
   `compute_com_polygon_penalties` (the hard `ComPolygon` constraint),
@@ -396,7 +404,8 @@ flags, which run with `--robot simplified`.
 
 - [`cost_function.py`](cutamp/cost_function.py) — hard constraints
   (kinematic, motion, collision, stable placement, and the `ComPolygon`
-  CoM-in-rectangle gate on `COM_HALF_EXTENTS` over every `q_*` conf) plus the soft costs listed in
+  CoM-in-rectangle gate on the model's keyframe rectangle, `COM_HALF_EXTENTS`
+  on the simplified model, over every `q_*` conf) plus the soft costs listed in
   `SUPPORTED_SOFT_COSTS` (`place_close_to_base`, `joint_limit_margin`,
   `retract_close_to_home`, `minimize_body_movement`, the multi-object
   placement costs, …). `_compute_soft_cost` hard-codes the names, so a new
@@ -457,12 +466,13 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
   [`test_t1_robot_module.py`](cutamp/tests/test_t1_robot_module.py) — YAML
   schema, cspace, lock-joints, tool frames, kinematics smoke.
 - [`test_com_polygon_ik.py`](cutamp/tests/test_com_polygon_ik.py) — COM
-  penalty math, mask/gate parity, and a guard on cuRobo's batched-COM kernel
-  (fixed upstream in PR #678), on the default model.
+  penalty math, mask/gate parity (on both models, with rows on either side of
+  the support edge), and a guard on cuRobo's batched-COM kernel (fixed upstream
+  in PR #678), on the default model.
 - [`test_com_aware_seed_ik.py`](cutamp/tests/test_com_aware_seed_ik.py) —
-  CoM-aware seed-IK: fork/cuTAMP penalty parity, FD-checked gradients,
-  centering A/B with joint-limit and pose-accuracy guards, on the default
-  model.
+  CoM-aware seed-IK: each model's CoM box, fork/cuTAMP penalty parity,
+  gradients FD-checked on every joint, centering A/B with joint-limit and
+  pose-accuracy guards, on the default model.
 - [`test_motion_anchor.py`](cutamp/tests/test_motion_anchor.py) — full
   pipeline on the simplified model: cspace-anchored pick/place terminals, all arrivals
   CoM-in-rectangle, every exported frame's CoM and ZMP inside
@@ -483,8 +493,10 @@ Shared fixtures live in [`conftest.py`](cutamp/tests/conftest.py)
 - [`test_step_lockstep.py`](cutamp/tests/test_step_lockstep.py) and the
   `test_cuda_graphs*.py` files — every Adam step bitwise against its twin and
   the reference math; every graph replay bitwise against eager. The full
-  system runs on the default model; the ablation arms, and the byte-exact
-  memory reading across two optimize calls, on the simplified one.
+  system runs on the default model; the ablation arms, and joint_limit_margin's
+  step body (the real legs' bands are zero), on the simplified one. The memory
+  reading across two optimize calls runs on both: byte-exact on the simplified
+  model, within 16 KiB on the real legs (cuRobo IK's line-search blocks).
 - [`test_t1_real_legs_model.py`](cutamp/tests/test_t1_real_legs_model.py),
   [`test_t1_29dof_assets.py`](cutamp/tests/test_t1_29dof_assets.py), the
   `test_real_legs_*.py` files and
@@ -562,8 +574,10 @@ with 256 particles and the validated pair —
 balance-first GN refresh replayed as CUDA graphs, the `joint_limit_margin`
 and `minimize_body_movement` soft costs and CoM-aware IK,
 so placements stay near the
-base, endpoint confs keep off their joint limits, and every arrival lands with
-its CoM inside the keyframe rectangle. With `--motion_plan`, every trajectory
+base, the body stays near its home, and every arrival lands with its CoM
+inside the keyframe rectangle (`joint_limit_margin`'s band is zero on the real
+legs, whose limits are already bfm_wm's soft limits; on the simplified model it
+keeps endpoint confs off their joint limits). With `--motion_plan`, every trajectory
 frame also keeps its CoM and ZMP inside the soles shrunk 2 cm: the gate sets
 each segment's pace (on the simplified model a segment whose ZMP would leave
 them is slowed down), up to 4×, and a candidate that still fails is dropped
@@ -625,12 +639,15 @@ python -m cutamp.scripts.real_legs_report --study /tmp/gate-study \
   keeps placements inside the reach range where the CoM-aware IK can center
   the COM.
 - `joint_limit_margin` *(default, T1)* — keep segment-endpoint confs out of a
-  0.1 rad band inside each joint limit (no band on the home-side bounds the
-  standing pose sits on). Under coupled re-IK it moves only the retract confs:
+  band inside each joint limit: on the simplified model 0.1 rad (no band on the
+  home-side bounds the standing pose sits on); on the real legs the band is zero,
+  since their limits are already bfm_wm's soft limits, so the cost is a no-op
+  there. Under coupled re-IK it moves only the retract confs:
   pick/place confs are outside Adam, so the balance-first refresh's margin
   level keeps them out of the same bands, listed or not
   (`--no_reik_balance_first` leaves them unguarded).
-- `retract_close_to_home` *(T1)* — penalize retract configs far from `t1_home`.
+- `retract_close_to_home` *(T1)* — penalize retract configs far from the
+  model's home (`t1_home` on the simplified model).
 - `minimize_body_movement` *(T1; default on the real legs)* — penalize body
   (leg/torso/waist) drift.
 - `dist_from_origin`, `max_obj_dist` / `min_obj_dist`, `min_y` / `max_y`,
@@ -692,9 +709,10 @@ Adam).
 
 5. **Retract after pick/place** — the per-arm `RetractHolding` (collision checks
    exclude held object) and `RetractFree` (empty gripper) operators move toward
-   `t1_home` after each manipulation. Retract confs start at `t1_home`; the
-   hard collision, joint-limit and `ComPolygon` constraints, the default
-   `joint_limit_margin` soft cost (under coupled re-IK) and the opt-in
+   the model's home (`t1_home` on the simplified model) after each
+   manipulation. Retract confs start at that home; the hard collision,
+   joint-limit and `ComPolygon` constraints, the default `joint_limit_margin`
+   soft cost (under coupled re-IK; zero on the real legs) and the opt-in
    `retract_close_to_home` shape the result.
 
 6. **cuRobo internals isolated** — every workaround that reaches into cuRobo's
@@ -711,15 +729,18 @@ Adam).
    all); those must travel with any cuRobo upgrade, or the link CoMs come
    back wrong.
 
-7. **Layered COM safety** — the COM is kept inside the real T1's soles,
-   shrunk 2 cm (`SUPPORT_HALF_EXTENTS`, every trajectory frame) and another
-   5 mm for keyframes (`COM_HALF_EXTENTS`), both centred on `COM_CENTER`,
-   1 cm ahead of the ankle axis (`com_polygon_cost.py`), by independent
-   layers, each guarding a different frontier:
+7. **Layered COM safety** — the COM is kept inside the model's support region
+   (every trajectory frame) and its keyframe rectangle, 5 mm further in: on the
+   simplified model the real T1's soles shrunk 2 cm (`SUPPORT_HALF_EXTENTS`)
+   and `COM_HALF_EXTENTS`, both centred on `COM_CENTER`, 1 cm ahead of the
+   ankle axis; on the real legs `support_rectangles`' two rectangles, centred
+   on the stance (`com_polygon_cost.py`). Independent layers each guard a
+   different frontier:
    - **CoM-aware seed-IK** (cuRobo fork residual, on by default): the IK
      itself trades hand pose vs COM, recruiting the knees/ankles within
-     joint limits, with a pull-to-center term on a base-centred box
-     (`get_t1_ik_solver`, 2 cm short of the keyframe rectangle at the toe) —
+     joint limits, with a pull-to-center term on a frame-centred box
+     (`get_t1_ik_solver`; on the simplified model 2 cm short of the keyframe
+     rectangle at the toe) —
      endpoint confs come out near the ankle axis, not edge-parked.
    - **Hard `ComPolygon` gate**: every optimizer conf must have COM penalty
      ≤ `COM_TOL`; a post-IK mask + retry backstops the IK.
