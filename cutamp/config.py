@@ -161,7 +161,8 @@ class TAMPConfiguration:
     # On RuntimeError from solve_curobo, retry on the next-best satisfying particle
     # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
-    motion_plan_max_retries: int = 5
+    # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first plans on its 6th candidate.
+    motion_plan_max_retries: int = 10
 
     ## Visualizer Args
     # Whether to use visualizer, if set to False a Mock is used
