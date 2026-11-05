@@ -288,7 +288,7 @@ def com_margin_from_base(com_in_base: torch.Tensor, half_extents: Tuple[float, f
     ``h - |c|`` for CoM points ``[N, >=2]`` about a support's centre, in its
     frame, against its ``half_extents``. Positive inside the support
     rectangle, zero on an edge, negative outside. Metres."""
-    half = _half_extents(half_extents, com_in_base.device, com_in_base.dtype)
+    half = _half_extents(tuple(map(float, half_extents)), com_in_base.device, com_in_base.dtype)
     return (half - com_in_base[..., :2].abs()).min(dim=-1).values
 
 

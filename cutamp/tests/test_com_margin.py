@@ -58,3 +58,16 @@ def test_support_mask_uses_the_gate_rectangle(monkeypatch):
     monkeypatch.setattr(cpc, "_fk_com_and_base", lambda world, q: (com, torch.eye(4).expand(3, 4, 4)))
     world = SimpleNamespace(model=SIMPLIFIED)
     assert cpc.compute_support_mask(world, torch.zeros(3, 1)).tolist() == [True, False, False]
+
+
+def test_margin_takes_any_half_extents_sequence():
+    # A list or a tensor gives the tuple's margin, and the same values again add no cached device tensor.
+    import cutamp.com_polygon_cost as cpc
+    pts = torch.tensor([[0.01, 0.02], [0.2, 0.0]])
+    want = com_margin_from_base(pts, COM_HALF_EXTENTS)
+    for half in (list(COM_HALF_EXTENTS), torch.tensor(COM_HALF_EXTENTS)):
+        assert torch.equal(com_margin_from_base(pts, half), want)
+    cached = cpc._half_extents.cache_info().currsize
+    for half in (list(COM_HALF_EXTENTS), torch.tensor(COM_HALF_EXTENTS)):
+        com_margin_from_base(pts, half)
+    assert cpc._half_extents.cache_info().currsize == cached

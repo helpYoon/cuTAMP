@@ -67,7 +67,7 @@ def _head_math(world):
         yield shared
 
 
-def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_types, with_soft,
+def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_types,
                params: List[str], masks: Dict[str, torch.Tensor]) -> dict:
     """One Adam step as HEAD's loop runs it, as :func:`step_outputs`; ``params`` names the optimized particles."""
     from cutamp.conf_locking import apply_grad_masks
@@ -78,9 +78,8 @@ def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_
     satisfying_mask = get_mask(cost_dict, verbose=False)
     loss = costs.mean()
     scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-    if with_soft:
-        soft_costs = cost_reducer.soft_costs(cost_dict)
-        scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
+    soft_costs = cost_reducer.soft_costs(cost_dict)
+    scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
     packed = torch.stack(scalars)
     loss.backward()
     apply_grad_masks([{"params": [particles[n] for n in params]}], {id(particles[n]): m for n, m in masks.items()})
@@ -133,7 +132,7 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
         with _head_math(world) as shared:
             ref, ref_sites = site_fk(lambda: _head_step(
                 clone_particles(self.particles), self.rollout_fn, self.cost_fn, self.cost_reducer, self.get_mask,
-                self.consider_types, self.with_soft, names, masks))
+                self.consider_types, names, masks))
         twin = twin_body(self)
         again, twin_sites = site_fk(lambda: step_outputs(*orig(twin), twin.params))
         (packed, vis), n_sites = site_fk(lambda: orig(self))
@@ -185,7 +184,7 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, 
 
 @needs_cuda
 @pytest.mark.parametrize("sc,balance_first", [
-    (None, True), *((sc, True) for sc in SUPPORTED_SOFT_COSTS),
+    pytest.param(None, True, id="no_soft_cost-True"), *((sc, True) for sc in SUPPORTED_SOFT_COSTS),
     *((sc, False) for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
 ])
 def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):

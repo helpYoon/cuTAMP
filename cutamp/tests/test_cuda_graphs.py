@@ -101,7 +101,8 @@ def _graph_config(**kw):
 
 
 @needs_cuda
-@pytest.mark.parametrize("sc", [None, *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
+@pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"),
+                                *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
 def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=2, soft_cost=[] if sc is None else [sc])

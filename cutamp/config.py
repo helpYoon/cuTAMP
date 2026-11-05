@@ -69,7 +69,9 @@ class TAMPConfiguration:
     # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
     # None (the default) resolves in __post_init__ to place_close_to_base and
     # joint_limit_margin, plus minimize_body_movement on the real legs, whose
-    # legs move freely (design call 2). [] means no soft costs.
+    # legs move freely (design call 2). [] means no soft costs. A resolved list
+    # stays when the robot changes: dataclasses.replace(cfg, robot=...) needs
+    # soft_cost=None too, or build a fresh TAMPConfiguration(robot=...).
     soft_cost: Optional[List[str]] = None
     # Re-IK-coupled Adam (bilevel): outer Adam optimizes Pose/Grasp/free-Conf;
     # covered Confs (q_pick/q_place/etc.) are dropped from the optimizer and

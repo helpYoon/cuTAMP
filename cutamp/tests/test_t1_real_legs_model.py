@@ -2,6 +2,7 @@
 switch and its refusals, the support rectangles, and the blocks_t1 world on the real legs, standing on the home
 stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
 
+import dataclasses
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -137,10 +138,15 @@ def test_unknown_robot():
 
 
 def test_soft_cost_default_by_robot():
+    real_default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
     assert TAMPConfiguration().soft_cost == ["place_close_to_base", "joint_limit_margin"]
-    assert TAMPConfiguration(robot="real_legs").soft_cost == ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
+    assert TAMPConfiguration(robot="real_legs").soft_cost == real_default
     assert TAMPConfiguration(robot="real_legs", soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
+    # As config.py's soft_cost comment says: replace() keeps the resolved list unless soft_cost=None is passed.
+    simplified = TAMPConfiguration()
+    assert dataclasses.replace(simplified, robot="real_legs").soft_cost == simplified.soft_cost
+    assert dataclasses.replace(simplified, robot="real_legs", soft_cost=None).soft_cost == real_default
 
 
 @pytest.mark.parametrize("kw", [dict(enable_com_polygon=False), dict(enable_com_aware_ik=False),

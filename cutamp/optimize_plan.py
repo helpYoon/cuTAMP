@@ -132,9 +132,8 @@ def _adam_param_groups(params: List[Tuple[torch.Tensor, bool]], conf_lr: float) 
 @dataclass
 class _StepBody:
     """One Adam step's device work, run eagerly or captured as G_step: the forward, the per-step scalars
-    stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost when
-    ``with_soft``), and the backward with the grad masks. Returns ``(packed, vis)``; ``vis`` is ``None``
-    unless ``keep_vis``."""
+    stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost), and the
+    backward with the grad masks. Returns ``(packed, vis)``; ``vis`` is ``None`` unless ``keep_vis``."""
     particles: dict
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
@@ -143,7 +142,6 @@ class _StepBody:
     consider_types: set
     params: List[torch.Tensor]
     grad_masks: Dict[int, torch.Tensor]
-    with_soft: bool
     keep_vis: bool
 
     def __call__(self) -> Tuple[torch.Tensor, Optional[tuple]]:
@@ -155,9 +153,8 @@ class _StepBody:
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
         scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-        if self.with_soft:
-            soft_costs = self.cost_reducer.soft_costs(cost_dict)
-            scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
+        soft_costs = self.cost_reducer.soft_costs(cost_dict)
+        scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
         packed = torch.stack(scalars).detach()
         # The backward runs before the loop's bookkeeping, so elapsed[s] and the first-solution times include
         # it. It writes only .grad, which the bookkeeping doesn't read.
@@ -776,8 +773,7 @@ class ParticleOptimizer:
         # Setup some more metrics
         opt_metrics["num_satisfying"] = []
         opt_metrics["loss"] = []
-        if self.config.soft_cost is not None:
-            opt_metrics["best_soft_costs"] = []
+        opt_metrics["best_soft_costs"] = []
         opt_metrics["elapsed"] = []
 
         vis_every = self.config.opt_viz_interval
@@ -830,7 +826,6 @@ class ParticleOptimizer:
         body = _StepBody(
             particles, rollout_fn, cost_fn, self.cost_reducer, self.get_satisfying_mask, consider_types,
             params=[p for g in optimizer.param_groups for p in g["params"]], grad_masks=grad_masks,
-            with_soft=self.config.soft_cost is not None,
             # The no-op Visualizer skips the vis block, and with it the block's syncs.
             keep_vis=type(visualizer) is not Visualizer,
         )
@@ -855,7 +850,7 @@ class ParticleOptimizer:
                 else:
                     optimizer.zero_grad()
                     packed, vis = body()
-                num_satisfying, loss_val, min_cost, *best_soft = packed.tolist()
+                num_satisfying, loss_val, min_cost, best_soft = packed.tolist()
                 num_satisfying = int(num_satisfying)
                 opt_metrics["num_satisfying"].append(num_satisfying)
 
@@ -871,8 +866,7 @@ class ParticleOptimizer:
                 opt_metrics["loss"].append(loss_val)
 
                 # Soft costs are recorded even if we don't optimize them.
-                if self.config.soft_cost is not None:
-                    opt_metrics["best_soft_costs"].append(best_soft[0] if num_satisfying > 0 else None)
+                opt_metrics["best_soft_costs"].append(best_soft if num_satisfying > 0 else None)
 
                 torch.cuda.synchronize()
                 opt_metrics["elapsed"].append(time.perf_counter() - start_time)
