@@ -63,6 +63,17 @@ COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, mete
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
 COM_TOL = COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2  # on-boundary penalty, 4e-4 (known-bugs N5)
 LOAD_GUARD_A = 0.1                   # each foot carries at least this share of the weight (design call 5)
+# How far a planted sole may leave the stance (design 7.4, decision 5), the hand's IK tolerances: the kinematic
+# constraint holds every conf to them (scripts/utils.py), and the balance gate every trajectory frame.
+SOLE_POS_TOL = 0.005                 # meters
+SOLE_ROT_TOL = 0.05                  # radians
+
+
+def soles_planted(pos_err: torch.Tensor, rot_err: torch.Tensor, pos_tol: float = SOLE_POS_TOL,
+                  rot_tol: float = SOLE_ROT_TOL) -> torch.Tensor:
+    """Elementwise: a sole's pose error against the stance within ``pos_tol`` and ``rot_tol``. At the tolerance
+    passes, as the constraint checker accepts a value at its tolerance; a NaN error fails."""
+    return (pos_err <= pos_tol) & (rot_err <= rot_tol)
 
 
 def support_rectangles(

@@ -18,7 +18,7 @@ from cutamp.task_planning.constraints import (
     Motion,
 )
 from cutamp.task_planning.costs import TrajectoryLength
-from cutamp.com_polygon_cost import COM_TOL
+from cutamp.com_polygon_cost import COM_TOL, SOLE_POS_TOL, SOLE_ROT_TOL
 
 
 default_constraint_to_mult = {
@@ -54,8 +54,11 @@ default_constraint_to_tol = {
     Collision.type: {"default": 1e-3},
     # Based on cuRobo thresholds: https://github.com/NVlabs/curobo/blob/2fbffc35225398cf9d5f382804faa9de2608753b/src/curobo/wrap/reacher/ik_solver.py#L127-L128
     # Can lower position for high precision, but should be fine for now.
-    # sole_*: the real legs' soles against the stance (design 7.4), on the hand's tolerances.
-    KinematicConstraint.type: {"pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": 0.005, "sole_rot_err": 0.05},
+    # sole_*: the real legs' soles against the stance (design 7.4), on the hand's tolerances; the balance gate holds
+    # every trajectory frame to the same two.
+    KinematicConstraint.type: {
+        "pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": SOLE_POS_TOL, "sole_rot_err": SOLE_ROT_TOL,
+    },
     # retract_*: the real legs' retract confs, which join the motion constraints (design 7.3).
     # trunk_tilt: the Trunk tilt past the envelope's maximum, at every conf, where the envelope sets one (call 22;
     # route A's sets none), in cosine: 1e-6 is 1.2e-6 rad of tilt at a 1.0 rad bound and 17 float32 ulps of its

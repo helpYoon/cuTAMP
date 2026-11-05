@@ -670,7 +670,7 @@ def gn_gate(
     Returns ``(pose_ok [N], com_ok [N])``: ``_achieved_pose_errors`` (the
     checker's metric, on each row's own arm) strictly under ``pos_tol`` and
     ``rot_tol``, on the real legs both soles' errors against the stance too
-    (:func:`soles_on_stance`, on the same tolerances), and
+    (:func:`soles_on_stance`, at most the same tolerances), and
     ``compute_com_polygon_mask``. ``q_full`` must be contiguous float32 on
     the kinematics device, as cuRobo's FK requires.
     """
@@ -703,12 +703,13 @@ def tilt_within_bound(world, q: torch.Tensor, tol: float) -> torch.Tensor:
 
 def soles_on_stance(world, state, pos_tol: float, rot_tol: float) -> torch.Tensor:
     """``[N]`` bool: both soles' pose errors against the stance (``world.stance_soles``, the checker's metric)
-    strictly under ``pos_tol`` and ``rot_tol``, on an FK ``state`` of ``world.kinematics`` or one of its sites.
-    For a model with soles: a conf whose soles left the stance passes a CoM check on a support polygon it no
-    longer stands on (design 7.4)."""
+    within ``pos_tol`` and ``rot_tol`` as the checker accepts them (:func:`~cutamp.com_polygon_cost.soles_planted`),
+    on an FK ``state`` of ``world.kinematics`` or one of its sites. For a model with soles: a conf whose soles left
+    the stance passes a CoM check on a support polygon it no longer stands on (design 7.4)."""
+    from cutamp.com_polygon_cost import soles_planted
     from cutamp.costs import curobo_pose_error
 
     soles = torch.stack([state.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix()
                          for frame in world.model.sole_frames], dim=1)  # [N, 2, 4, 4]
     sole_pos, sole_rot = curobo_pose_error(soles, world.stance_soles)
-    return ((sole_pos < pos_tol) & (sole_rot < rot_tol)).all(-1)
+    return soles_planted(sole_pos, sole_rot, pos_tol, rot_tol).all(-1)

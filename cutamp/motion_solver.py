@@ -33,6 +33,7 @@ from cutamp._curobo_internals import (
     cspace_plan_succeeded as _cspace_plan_succeeded,
     get_attachment_manager as _get_attachment_manager,
 )
+from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM
@@ -96,14 +97,17 @@ def _plan_arm_to_conf(
 
 
 def _failure_reason(world: TAMPWorld, result) -> str:
-    """Why a real-leg trajopt failed (design 7.4a): ``"torque"`` when ``result`` carries a trajectory (its
-    ``js_solution``) on which cuRobo's two RNEA passes with the floor's push (``world.segment_torques``) pass a joint's
-    effort, else ``"other"``. IK and Adam never see torque, so a conf can need more than a motor gives."""
-    js = getattr(result, "js_solution", None)
-    if js is None:
-        return "other"
+    """Why a real-leg trajopt failed (design 7.4a): ``"torque"`` when either trajectory ``result`` carries passes a
+    joint's effort by cuRobo's two RNEA passes with the floor's push (``world.segment_torques``), else ``"other"``.
+    The two are the trajopt horizon (``js_solution``) and the interpolated trajectory between its frames, which
+    trajopt's success test re-checks (``get_interpolated_plan``). IK and Adam never see torque, so a conf can need
+    more than a motor gives."""
     torques = world.segment_torques
-    return "torque" if bool((torques(js).abs() > torques.effort).any()) else "other"
+
+    def over(js) -> bool:
+        return js is not None and bool((torques(js).abs() > torques.effort).any())
+
+    return "torque" if over(getattr(result, "js_solution", None)) or over(_interp_plan(result)) else "other"
 
 
 def _plan_failed(world: Optional[TAMPWorld], result, message: str) -> RuntimeError:
@@ -625,8 +629,6 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
 RETIME_MAX = 4.0
 # The balance gate's central-difference step along each frame's motion, s.
 ZMP_STEP = 0.01
-# How far a frame's soles may leave the stance (decision 5): the kinematic constraint's sole tolerances, m and rad.
-SOLE_POS_TOL, SOLE_ROT_TOL = 0.005, 0.05
 
 
 def _taylor_positions(world: TAMPWorld, planner, plan_js, h: float = ZMP_STEP) -> torch.Tensor:
@@ -672,9 +674,10 @@ def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
 
 
 def _check_planted(world: TAMPWorld, q: torch.Tensor) -> None:
-    """Raise a RuntimeError, naming its check, unless every frame ``q`` ``[T, dof]`` keeps both soles within
-    ``SOLE_POS_TOL`` and ``SOLE_ROT_TOL`` of the stance (``world.stance_soles``) and, where the envelope sets a
-    maximum, the Trunk's tilt within it. The tilt is the angle between the Trunk's z axis, by FK, and the vertical."""
+    """Raise a RuntimeError, naming its check, unless every frame ``q`` ``[T, dof]`` keeps both soles on the stance
+    (``world.stance_soles``) within the kinematic constraint's sole tolerances (``soles_planted``) and, where the
+    envelope sets a maximum, the Trunk's tilt within it. The tilt is the angle between the Trunk's z axis, by FK, and
+    the vertical. A NaN fails either check."""
     from cutamp.com_polygon_cost import _fk_state
     from cutamp.costs import curobo_pose_error
 
@@ -682,28 +685,31 @@ def _check_planted(world: TAMPWorld, q: torch.Tensor) -> None:
     soles = torch.stack([ks.tool_poses.get_link_pose(f, make_contiguous=True).get_matrix()
                          for f in world.model.sole_frames], dim=1)  # [T, 2, 4, 4]
     pos, rot = curobo_pose_error(soles, world.stance_soles.expand_as(soles))
-    pos_max, rot_max = pos.max().item(), rot.max().item()
-    if not (pos_max < SOLE_POS_TOL and rot_max < SOLE_ROT_TOL):
+    if not bool(soles_planted(pos, rot).all()):
+        pos_max, rot_max = pos.max().item(), rot.max().item()
         raise RuntimeError(f"trajectory soles leave the stance by up to {1000 * pos_max:.1f} mm and {rot_max:.3f} rad")
     envelope = world.model.envelope
     if envelope is None or envelope.trunk_tilt_max is None:
         return
     trunk = _fk_state(world, q, world.bodies.kinematics).tool_poses.get_link_pose("Trunk", make_contiguous=True)
     tilt = torch.acos(trunk.get_matrix()[..., 2, 2].clamp(-1.0, 1.0)).max().item()
-    if tilt > envelope.trunk_tilt_max:
+    if not tilt <= envelope.trunk_tilt_max:
         raise RuntimeError(f"trajectory Trunk tilt reaches {tilt:.3f} rad, past the envelope's "
                            f"{envelope.trunk_tilt_max:.3f} rad")
 
 
 def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
     """Raise a RuntimeError naming the torque unless every frame of ``plan_js`` keeps every joint's |torque|, by
-    cuRobo's two RNEA passes with the floor's push (``world.segment_torques``), within its effort."""
+    cuRobo's two RNEA passes with the floor's push (``world.segment_torques``), within its effort. A NaN torque
+    fails."""
     torques = world.segment_torques
-    excess = (torques(plan_js).abs() - torques.effort).amax(0)  # [dof]
+    tau = torques(plan_js).abs()
+    if bool((tau <= torques.effort).all()):
+        return
+    excess = (tau - torques.effort).nan_to_num(nan=math.inf).amax(0)  # [dof]
     j = int(excess.argmax())
-    if excess[j] > 0:
-        raise RuntimeError(f"retimed trajectory torque passes {world.model.joint_names[j]}'s "
-                           f"{torques.effort[j].item():.1f} N m effort by {excess[j].item():.2f} N m")
+    raise RuntimeError(f"retimed trajectory torque passes {world.model.joint_names[j]}'s "
+                       f"{torques.effort[j].item():.1f} N m effort by {excess[j].item():.2f} N m")
 
 
 def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
@@ -720,9 +726,10 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
 
     On a model standing on soles (the real legs) the gate first checks that every frame keeps both soles on the
     stance and, where the envelope sets a maximum, the Trunk's tilt within it (``_check_planted``). A segment it
-    slows must also keep every joint's torque within its effort (``_check_torques``): trajopt bounded the torques
-    only at the planner's own timing, and the slowed spline's derivatives differ (design 7.4a). Each check raises
-    a RuntimeError that names it."""
+    slows is checked again on the frames it returns, which are what is saved and executed: the spline's resamples
+    fall between the planned frames, so their soles and tilt are checked too, and every joint's torque must stay
+    within its effort (``_check_torques``), since trajopt bounded the torques only at the planner's own timing and
+    the slowed spline's derivatives differ (design 7.4a). Each check raises a RuntimeError that names it."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, retime_factor
 
     half = world.model.support.gate_half
@@ -749,6 +756,7 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
                 raise RuntimeError(f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
             s = 1.25 * tried
         if out is not plan_js and world.model.sole_frames:
+            _check_planted(world, _full_positions(world, planner, out))
             _check_torques(world, out)
     n, n_out = plan_js.position.shape[-2], out.position.shape[-2]
     stats = {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0, "com_min_margin": com_m, "zmp_min_margin": zmp_m}

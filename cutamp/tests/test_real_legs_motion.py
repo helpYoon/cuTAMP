@@ -23,7 +23,6 @@ needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="sl
 
 DT = 0.025  # the hand-built segments' frame spacing, s
 SHOULDERS = ("Left_Shoulder_Pitch", "Right_Shoulder_Pitch")
-SOLE_POS_TOL, SOLE_ROT_TOL = 0.005, 0.05  # the balance gate's sole drift (decision 5)
 
 
 def _ramp(world, moves, T):
@@ -41,6 +40,20 @@ def _ramp(world, moves, T):
         pos[:, j] += delta * p
         vel[:, j], acc[:, j] = delta * v, delta * a
     return JointState(position=pos, velocity=vel, acceleration=acc, joint_names=names)
+
+
+def _still(world, q: torch.Tensor, T: float):
+    """The conf ``q`` held at rest for T s, every DT s: a JointState in ``world.model.joint_names`` order."""
+    from curobo.types import JointState
+    pos = q.to(world.device, torch.float32).repeat(int(round(T / DT)) + 1, 1)
+    return JointState(position=pos, velocity=torch.zeros_like(pos), acceleration=torch.zeros_like(pos),
+                      joint_names=list(world.model.joint_names))
+
+
+def _shoulder_peak(world, js) -> float:
+    """The larger shoulder pitch's peak |torque| over ``js``'s frames, by ``world.segment_torques``."""
+    columns = [world.model.joint_names.index(j) for j in SHOULDERS]
+    return float(world.segment_torques(js).abs()[:, columns].max())
 
 
 def _swing(world):
@@ -96,6 +109,7 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
     # get_model, load_t1_container and q_init = REAL_LEGS.home. The spies only record.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
+    from cutamp.com_polygon_cost import soles_planted
     from cutamp.config import TAMPConfiguration
     from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
     from cutamp.motion_solver import _full_positions
@@ -140,7 +154,7 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
     torques = world.segment_torques
     for k, entry in enumerate(curobo_plan):
         pos, rot = _sole_errors(world, _full_positions(world, None, entry["plan"]))
-        assert float(pos.max()) < SOLE_POS_TOL and float(rot.max()) < SOLE_ROT_TOL, (k, float(pos.max()))
+        assert bool(soles_planted(pos, rot).all()), (k, float(pos.max()), float(rot.max()))
         excess = (torques(entry["plan"]).abs() - torques.effort).amax(0)
         assert float(excess.max()) <= 0.0, (k, world.model.joint_names[int(excess.argmax())], float(excess.max()))
 
@@ -246,26 +260,30 @@ def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner)
             assert c.config.cos_max == math.cos(1.0) and float(c._weight.max()) == 1e5
 
 
+def _plan_reach(world, real_plan, planner):
+    """A planned home -> reach segment: plan_cspace's result for the first pick conf of ``real_plan`` that plans."""
+    from cutamp.motion_solver import _plan_arm_to_conf, _planner_js_from_full
+    skeleton, particles = real_plan
+    op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
+    obj, conf = op.values[0], op.values[-1]
+    names = list(world.model.joint_names)
+    home = torch.tensor(world.model.home, device=world.device)
+    start = _planner_js_from_full(planner, home, names)
+    for q in particles[conf][(particles[conf] != home).any(-1)][:8]:  # IK-solved reaches; a few may not plan
+        try:
+            return _plan_arm_to_conf(planner, q, start, names, disable_obstacle=obj, ground_op=op)
+        except RuntimeError:
+            continue
+    raise AssertionError("no reach planned from home")
+
+
 @needs_cuda
 def test_segment_torques_equal_trajopt_s(real_world, real_plan, planner):
     # The gate re-runs cuRobo's own two passes: on a planned home -> reach segment, SegmentTorques equals the torque
     # every trajopt transition computes, the cost's and the success test's.
-    from cutamp.motion_solver import _interp_plan, _plan_arm_to_conf, _planner_js_from_full
-    skeleton, particles = real_plan
-    op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
-    obj, conf = op.values[0], op.values[-1]
+    from cutamp.motion_solver import _interp_plan
     names = list(real_world.model.joint_names)
-    home = torch.tensor(real_world.model.home, device=real_world.device)
-    start = _planner_js_from_full(planner, home, names)
-    result = None
-    for q in particles[conf][(particles[conf] != home).any(-1)][:8]:  # IK-solved reaches; a few may not plan
-        try:
-            result = _plan_arm_to_conf(planner, q, start, names, disable_obstacle=obj, ground_op=op)
-            break
-        except RuntimeError:
-            continue
-    assert result is not None, "no reach planned from home"
-    plan = planner.kinematics.get_active_js(_interp_plan(result))
+    plan = planner.kinematics.get_active_js(_interp_plan(_plan_reach(real_world, real_plan, planner)))
     tau = real_world.segment_torques(plan)
     assert tau.shape == (plan.position.shape[-2], len(names))
     assert float(tau[:, real_world.model.body].abs().max()) > 1.0  # the legs carry the robot: not a vacuous match
@@ -274,23 +292,76 @@ def test_segment_torques_equal_trajopt_s(real_world, real_plan, planner):
 
 
 @needs_cuda
-def test_gate_fails_a_slowed_segment_past_a_torque_limit(real_world, planner, monkeypatch):
-    # Trajopt bounds the torque at the planner's timing only; the gate's slowed, resampled segment runs the two
-    # passes again (design 7.4a), and fails past an effort.
-    from cutamp.motion_solver import _balance_gate
-    swing = _swing(real_world)
-    _, stats, fast = _balance_gate(real_world, planner, swing, DT)
-    assert stats["retime"] > 1.0 and fast is not None  # slowed, and passes at the real efforts
-    torques = real_world.segment_torques
-    effort = torques.effort.clone()
-    effort[[real_world.model.joint_names.index(j) for j in SHOULDERS]] = 0.1
-    monkeypatch.setattr(torques, "effort", effort)
-    with pytest.raises(RuntimeError, match="torque"):
-        _balance_gate(real_world, planner, swing, DT)
+def test_planned_torques_equal_segment_torques(real_world, real_plan, planner):
+    # The torques trajopt computed while it planned, read where the plan left them, equal SegmentTorques on the same
+    # frames: the metrics rollout's (the trajopt horizon, computed inside its replayed CUDA graph) and the
+    # interpolated rollout's last ones (its success test). A graph captured before the floor's push was hooked would
+    # replay without the push, while the eager calls above would still see it.
+    from curobo.types import JointState
+    _plan_reach(real_world, real_plan, planner)
+    ts = planner.trajopt_solver
+    names = list(real_world.model.joint_names)
+    interpolated = ts.additional_metrics_rollouts["interpolated_rollout"]
+    executors = {"metrics": ts.metrics_rollout._compute_metrics_from_action_executor,
+                 "interpolated": interpolated._compute_metrics_from_state_executor}
+    for label, executor in executors.items():
+        assert executor._graph is not None, label  # captured, so the plan's last call replayed it
+        state = executor._graph_output[0].state
+        js, columns = state.joint_state, list(state.joint_state.joint_names)
+        n = len(columns)
+        frames = JointState(position=js.position.reshape(-1, n), velocity=js.velocity.reshape(-1, n),
+                            acceleration=js.acceleration.reshape(-1, n), joint_names=columns)
+        tau = real_world.segment_torques(frames)
+        planned = state.joint_torque.reshape(-1, n)[:, [columns.index(j) for j in names]]
+        assert float(tau[:, real_world.model.body].abs().max()) > 1.0, label  # the legs carry the robot
+        torch.testing.assert_close(planned, tau, atol=1e-3, rtol=0, msg=lambda m: f"{label}: {m}")
 
 
 @needs_cuda
-def test_gate_rejects_sole_drift_and_tilt(real_world, planner, monkeypatch):
+def test_gate_fails_a_slowed_segment_past_a_torque_limit(real_world, planner, monkeypatch):
+    # Trajopt bounds the torque at the planner's timing only; the gate's slowed, resampled segment runs the two
+    # passes again (design 7.4a), and fails past an effort. The slowed swing's shoulders carry less than the planned
+    # one's, so an effort between the two peaks passes only if the gate checks the frames it returns.
+    from cutamp.motion_solver import _balance_gate
+    swing = _swing(real_world)
+    out, stats, fast = _balance_gate(real_world, planner, swing, DT)
+    assert stats["retime"] > 1.0 and fast is not None  # slowed, and passes at the real efforts
+    planned_peak, slowed_peak = _shoulder_peak(real_world, swing), _shoulder_peak(real_world, out)
+    assert planned_peak > slowed_peak
+    torques = real_world.segment_torques
+    columns = [real_world.model.joint_names.index(j) for j in SHOULDERS]
+    for shoulder_effort, passes in ((0.5 * (planned_peak + slowed_peak), True), (0.1, False)):
+        effort = torques.effort.clone()
+        effort[columns] = shoulder_effort
+        monkeypatch.setattr(torques, "effort", effort)
+        if passes:
+            _balance_gate(real_world, planner, swing, DT)
+        else:
+            with pytest.raises(RuntimeError, match="torque"):
+                _balance_gate(real_world, planner, swing, DT)
+
+
+@needs_cuda
+def test_gate_checks_the_soles_and_tilt_of_the_frames_it_returns(real_world, planner, monkeypatch):
+    # A slowed segment's frames are spline resamples between the planned ones, and they are what is saved and
+    # executed: the gate checks their soles and tilt as well as the planned frames'.
+    import cutamp.motion_solver as ms
+    checked, check = [], ms._check_planted
+
+    def spy(world, q):
+        checked.append(q.clone())
+        return check(world, q)
+
+    monkeypatch.setattr(ms, "_check_planted", spy)
+    swing = _swing(real_world)
+    out, stats, _ = ms._balance_gate(real_world, planner, swing, DT)
+    assert stats["retime"] > 1.0
+    assert [q.shape[0] for q in checked] == [swing.position.shape[-2], out.position.shape[-2]]
+    torch.testing.assert_close(checked[1], ms._full_positions(real_world, planner, out), rtol=0, atol=0)
+
+
+@needs_cuda
+def test_gate_rejects_sole_drift(real_world, planner, monkeypatch):
     import cutamp.com_polygon_cost as cpc
     from cutamp.motion_solver import _audit_traj_com, _balance_gate
     # Every CoM and ZMP margin the real-leg gate and audit take is against the gate's rectangle about the stance
@@ -311,22 +382,116 @@ def test_gate_rejects_sole_drift_and_tilt(real_world, planner, monkeypatch):
     # The whole robot slides 1 cm with the legs fixed: the soles leave the stance.
     with pytest.raises(RuntimeError, match="sole"):
         _balance_gate(real_world, planner, _ramp(real_world, {"base_j_x": 0.01}, 1.0), DT)
-    # Under an envelope with a tilt bound the gate checks every frame's tilt: home's 0 rad is past -1e-3 rad.
-    tilted = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=-1e-3))
-    monkeypatch.setattr(real_world, "robot_container", dataclasses.replace(real_world.robot_container, model=tilted))
+
+
+def _bowed(world, real_plan, planner):
+    """A still segment at a bowed conf the gate passes under route A's envelope, and the conf's tilt, acos(cos p cos
+    r) of the base's pitch p and roll r (YXZ): an IK-solved pick conf whose base both pitches and rolls."""
+    from cutamp.motion_solver import _balance_gate
+    skeleton, particles = real_plan
+    names = list(world.model.joint_names)
+    pitch, roll = names.index("base_j_pitch"), names.index("base_j_roll")
+    for op in skeleton:
+        if op.operator.metadata.action_type != "pick":
+            continue
+        q = particles[op.values[-1]].double()
+        tilt = torch.acos(torch.cos(q[:, pitch]) * torch.cos(q[:, roll]))
+        for k in torch.nonzero((tilt > 0.2) & (q[:, roll].abs() > 0.05)).flatten().tolist():
+            still = _still(world, q[k], 0.5)
+            try:
+                _balance_gate(world, planner, still, DT)
+            except RuntimeError:  # its soles or CoM fail on their own
+                continue
+            return still, float(tilt[k])
+    raise AssertionError("no bowed pick conf passes the gate")
+
+
+@needs_cuda
+def test_gate_bounds_a_bowed_confs_tilt(real_world, real_plan, planner, monkeypatch):
+    # Under an envelope with a tilt bound the gate checks every frame's Trunk tilt: a bound 1e-3 rad under a bowed
+    # conf's acos(cos p cos r) fails it, and one 1e-3 rad over passes it.
+    from cutamp.motion_solver import _balance_gate
+    still, tilt = _bowed(real_world, real_plan, planner)
+    for bound, passes in ((tilt + 1e-3, True), (tilt - 1e-3, False)):
+        model = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=bound))
+        monkeypatch.setattr(real_world, "robot_container", dataclasses.replace(real_world.robot_container, model=model))
+        if passes:
+            _balance_gate(real_world, planner, still, DT)
+        else:
+            with pytest.raises(RuntimeError, match="tilt"):
+                _balance_gate(real_world, planner, still, DT)
+
+
+@needs_cuda
+def test_gate_tilt_check_fails_a_nan_tilt(real_world, monkeypatch):
+    # A NaN Trunk pose fails the tilt check (the soles stay finite here, so the tilt check is the one that runs).
+    import cutamp.com_polygon_cost as cpc
+    from cutamp.motion_solver import _check_planted
+    fk = cpc._fk_state
+    monkeypatch.setattr(cpc, "_fk_state", lambda world, q, kin=None: fk(world, q if kin is None else q * math.nan, kin))
+    bounded = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
+    monkeypatch.setattr(real_world, "robot_container", dataclasses.replace(real_world.robot_container, model=bounded))
     with pytest.raises(RuntimeError, match="tilt"):
-        _balance_gate(real_world, planner, still, DT)
+        _check_planted(real_world, _ramp(real_world, {}, 2 * DT).position)
+
+
+def _result(js_solution, interpolated=None):
+    """A trajopt result's two trajectories: the horizon's (``js_solution``) and the interpolated one."""
+    return SimpleNamespace(js_solution=js_solution, get_interpolated_plan=lambda: interpolated)
 
 
 @needs_cuda
 def test_failure_reason_names_torque(real_world, monkeypatch):
+    # "torque" when either trajectory of a failed trajopt passes an effort: the horizon's, or the interpolated one
+    # between its frames that trajopt's success test re-checks.
     from cutamp.motion_solver import _failure_reason
-    swing = _swing(real_world)
-    assert _failure_reason(real_world, SimpleNamespace(js_solution=None)) == "other"
-    assert _failure_reason(real_world, SimpleNamespace(js_solution=_ramp(real_world, {}, 2 * DT))) == "other"
-    assert _failure_reason(real_world, SimpleNamespace(js_solution=swing)) == "other"  # within the real efforts
+    swing, still = _swing(real_world), _ramp(real_world, {}, 2 * DT)
+    assert _failure_reason(real_world, None) == "other"
+    assert _failure_reason(real_world, _result(None)) == "other"
+    assert _failure_reason(real_world, _result(still, still)) == "other"
+    assert _failure_reason(real_world, _result(swing, swing)) == "other"  # within the real efforts
     torques = real_world.segment_torques
+    columns = [real_world.model.joint_names.index(j) for j in SHOULDERS]
+    still_peak, swing_peak = _shoulder_peak(real_world, still), _shoulder_peak(real_world, swing)
+    assert still_peak < swing_peak
     effort = torques.effort.clone()
-    effort[[real_world.model.joint_names.index(j) for j in SHOULDERS]] = 0.1
+    effort[columns] = 0.5 * (still_peak + swing_peak)
     monkeypatch.setattr(torques, "effort", effort)
-    assert _failure_reason(real_world, SimpleNamespace(js_solution=swing)) == "torque"
+    assert _failure_reason(real_world, _result(swing, still)) == "torque"
+    assert _failure_reason(real_world, _result(still, swing)) == "torque"
+    assert _failure_reason(real_world, _result(None, swing)) == "torque"
+    assert _failure_reason(real_world, _result(still, still)) == "other"
+
+
+def test_torque_check_fails_a_nan_torque():
+    # A NaN torque fails the gate's torque check, and names its joint; torques within every effort pass.
+    from cutamp.motion_solver import _check_torques
+    n = len(REAL_LEGS.joint_names)
+
+    class Torques:  # world.segment_torques's interface: [T, dof] torques and an effort per joint
+        effort = torch.ones(n)
+
+        def __init__(self, tau):
+            self.tau = tau
+
+        def __call__(self, js):
+            return self.tau
+
+    tau = torch.zeros(3, n)
+    _check_torques(SimpleNamespace(model=REAL_LEGS, segment_torques=Torques(tau)), None)
+    tau[1, 7] = math.nan
+    with pytest.raises(RuntimeError, match=f"torque passes {REAL_LEGS.joint_names[7]}'s"):
+        _check_torques(SimpleNamespace(model=REAL_LEGS, segment_torques=Torques(tau)), None)
+
+
+def test_soles_planted_at_the_checker_tolerances():
+    # One rule for a planted sole, the constraint checker's: an error at the tolerance passes, past it or NaN fails.
+    # The kinematic constraint and the balance gate share the tolerances.
+    from cutamp.com_polygon_cost import SOLE_POS_TOL, SOLE_ROT_TOL, soles_planted
+    from cutamp.scripts.utils import default_constraint_to_tol
+    from cutamp.task_planning.constraints import KinematicConstraint
+    tol = default_constraint_to_tol[KinematicConstraint.type]
+    assert (tol["sole_pos_err"], tol["sole_rot_err"]) == (SOLE_POS_TOL, SOLE_ROT_TOL) == (0.005, 0.05)
+    pos = torch.tensor([SOLE_POS_TOL, 0.0, 1.01 * SOLE_POS_TOL, 0.0, math.nan, 0.0])
+    rot = torch.tensor([SOLE_ROT_TOL, SOLE_ROT_TOL, 0.0, 1.01 * SOLE_ROT_TOL, 0.0, math.nan])
+    assert soles_planted(pos, rot).tolist() == [True, True, False, False, False, False]

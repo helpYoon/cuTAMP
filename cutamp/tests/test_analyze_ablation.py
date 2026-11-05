@@ -347,7 +347,7 @@ def test_torque_failures_count_both_forms(tmp_path):
     def world(tau):
         return SimpleNamespace(model=REAL_LEGS, segment_torques=Torques(tau))
 
-    result = SimpleNamespace(js_solution=object())
+    result = SimpleNamespace(js_solution=object(), get_interpolated_plan=lambda: None)  # a trajopt result
     with pytest.raises(RuntimeError) as gate:
         _check_torques(world(2.0), None)
     messages = [str(_plan_failed(world(2.0), result, "Retract plan failed for op")), str(gate.value),
