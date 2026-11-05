@@ -615,6 +615,79 @@ def test_gate_slows_a_resampled_segment_that_fails_its_recheck(real_world, plann
     assert calls == [17]
 
 
+def _squat(world, theta=0.4, T=0.5, eps=0.01):
+    """Both legs bending alike from home, min-jerk over T s every DT s (each hip and ankle pitch by -theta, each knee
+    by 2 theta), the base re-solved at every frame so that both soles stay on the stance
+    (particle_initialization._stand_on_the_stance), its velocity and acceleration by central differences over eps s:
+    the Trunk drops 7.5 cm."""
+    from curobo.types import JointState
+    from cutamp.particle_initialization import _stand_on_the_stance
+    names = list(world.model.joint_names)
+    home = torch.tensor(world.model.home, device=world.device, dtype=torch.float64)
+    lower, upper = world.kinematics.get_joint_limits().position
+
+    def legs(t):
+        u = (t / T).clamp(0.0, 1.0)
+        p, v, a = (10 * u**3 - 15 * u**4 + 6 * u**5, (30 * u**2 - 60 * u**3 + 30 * u**4) / T,
+                   (60 * u - 180 * u**2 + 120 * u**3) / T**2)
+        q = home.repeat(len(t), 1)
+        vel, acc = torch.zeros_like(q), torch.zeros_like(q)
+        for side in ("Left", "Right"):
+            for joint, delta in (("Hip_Pitch", -theta), ("Knee_Pitch", 2 * theta), ("Ankle_Pitch", -theta)):
+                j = names.index(f"{side}_{joint}")
+                q[:, j] += delta * p
+                vel[:, j], acc[:, j] = delta * v, delta * a
+        return q, vel, acc
+
+    n = int(round(T / DT)) + 1
+    t = torch.linspace(0.0, T, n, dtype=torch.float64, device=world.device)
+    q, v, a = legs(t)
+    stood = _stand_on_the_stance(world, torch.cat([legs(t - eps)[0], q, legs(t + eps)[0]]).float(), lower, upper)
+    before, q, after = stood.double().split(n)
+    b = world.model.base
+    v[:, b], a[:, b] = (after - before)[:, b] / (2 * eps), (after - 2 * q + before)[:, b] / eps**2
+    return JointState(position=q.float(), velocity=v.float(), acceleration=a.float(), joint_names=names)
+
+
+@needs_cuda
+def test_gate_finds_no_zmp_where_the_floor_would_have_to_pull(real_world, planner):
+    # The floor can only push. Sped up past about 0.38x, the squat's CoM starts falling faster than g: there
+    # sum m (g + z'') is negative, the soles would leave the floor, and there is no ZMP. com_zmp_in_support gives
+    # those frames +inf, so the search's margins are -inf at those scales. The torque bound (0.28x) lies below that
+    # crossing, and the gate still times the squat above it, where the ZMP binds (0.65x). Frames resampled at 0.3x
+    # fail their re-check on "zmp", which says why.
+    from cutamp.com_polygon_cost import _fk_com_and_base, com_zmp_in_support
+    from cutamp.motion_solver import (RETIME_MAX, ZMP_STEP, _at_scales, _balance_gate, _check_planted, _check_velocity,
+                                      _recheck, _retime, _taylor_positions, _torque_scale, _zmp_margins)
+    world, squat = real_world, _squat(real_world)
+    _check_planted(world, squat.position)
+
+    def loads(js, scales):
+        """``[K, T]``: each frame's sum m (g + z'') over M g under each scale, from the CoM's height (cuRobo's CoM)
+        at the Taylor positions com_zmp_in_support takes."""
+        q3 = _taylor_positions(world, planner, _at_scales(js, scales))
+        z = torch.stack([_fk_com_and_base(world, q)[0][:, 2].clone() for q in q3])  # cuRobo reuses its FK buffers
+        return (1 + (z[2] - 2 * z[1] + z[0]) / ZMP_STEP**2 / 9.81).reshape(len(scales), -1)
+
+    fast = torch.tensor([0.1, 0.2, 0.3])
+    load = loads(squat, fast)
+    assert float(load.amin(-1).max()) < -0.5  # at each of these scales some frame would need the floor to pull
+    _, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, _at_scales(squat, fast)), ZMP_STEP)
+    zmp = zmp.reshape(len(fast), -1, 2)
+    assert bool(torch.isposinf(zmp[load < -0.05]).all()) and bool(torch.isfinite(zmp[load > 0.05]).all())
+    assert bool((_zmp_margins(world, planner, squat, fast) == -math.inf).all())
+    grid = torch.linspace(0.3, 0.5, 201)
+    crossing = float(grid[(loads(squat, grid).amin(-1) > 0).cpu()][0])  # the fastest at which the floor always pushes
+    s_t, joint = _torque_scale(world, squat, _check_velocity(world, squat, RETIME_MAX)[0], RETIME_MAX)
+    assert joint is not None and s_t < crossing  # where the ZMP's search starts
+    out, stats, _ = _balance_gate(world, planner, squat, DT)
+    assert stats["binding"] == "zmp" and stats["retime"] > crossing and stats["zmp_min_margin"] >= 0
+    assert float(loads(squat, torch.tensor([stats["retime"]])).min()) > 0 and float(loads(out, torch.ones(1)).min()) > 0
+    with pytest.raises(RuntimeError, match="floor would have to pull on the retimed trajectory's soles") as e:
+        _recheck(world, planner, _retime(squat, 0.3, DT))
+    assert e.value.check == "zmp"
+
+
 def _result(js_solution, interpolated=None):
     """A trajopt result's two trajectories: the horizon's (``js_solution``) and the interpolated one."""
     return SimpleNamespace(js_solution=js_solution, get_interpolated_plan=lambda: interpolated)

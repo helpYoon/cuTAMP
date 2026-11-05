@@ -341,7 +341,10 @@ def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
     spin about its own CoM (y: plus), over ``sum m (g + z'')``. A trunk swinging above the hips moves it
     centimetres past the CoM alone's cart-table ZMP. z is the height above the support frame's origin, the sole
     plane (test_robot_com.py, test_real_legs_support.py). The support frame stays put during a segment (the
-    simplified model's base is pinned, the real legs' stance hangs off the world), so it is inertial."""
+    simplified model's base is pinned, the real legs' stance hangs off the world), so it is inertial.
+
+    The floor can only push. A frame whose ``sum m (g + z'')`` is not positive would need it to pull: the soles would
+    leave the floor and there is no ZMP, so that frame's is +inf, outside every support region."""
     from curobo.types import Pose
     kin, m, c, inertia = world.bodies
     T = q3.shape[1]
@@ -364,7 +367,8 @@ def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
                        (f * x[..., 1] - m * x[..., 2] * a[..., 1]).sum(-1) + spin[:, 0]], dim=-1)
     centre = _center(world.model.support.center, x.device, x.dtype)
     com = (m.unsqueeze(-1) * x[..., :2]).sum(-2) / m.sum()
-    return com - centre, zmp / f.sum(-1, keepdim=True) - centre
+    load = f.sum(-1, keepdim=True)  # [T, 1]: the floor's vertical push
+    return com - centre, torch.where(load > 0, zmp / load - centre, math.inf)
 
 
 def compute_com_polygon_penalties(

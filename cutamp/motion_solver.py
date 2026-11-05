@@ -817,7 +817,8 @@ def _torque_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tup
 
 def _zmp_margins(world: TAMPWorld, planner, js: JointState, scales: torch.Tensor) -> torch.Tensor:
     """``[K]``: the multibody ZMP's smallest margin to the gate's support rectangle over the frames of ``js`` under each
-    uniform time scale in ``scales`` (negative outside; a NaN fails), from the scaled frames' Taylor positions."""
+    uniform time scale in ``scales`` (negative outside, -inf where a frame would need the floor to pull; a NaN fails),
+    from the scaled frames' Taylor positions."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     _, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, _at_scales(js, scales)), ZMP_STEP)
@@ -850,9 +851,10 @@ def _zmp_scale(world: TAMPWorld, planner, js: JointState, lo: float, hi: float) 
 def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) -> Tuple[float, float]:
     """The gate's checks on the frames it returns, from their own velocities and accelerations: both soles on the
     stance and the Trunk's tilt (``_check_planted``; ``planted`` False skips it on the planner's own frames, which
-    passed it already), the CoM and the multibody ZMP inside the gate's support rectangle, every joint's torque within
-    its effort and every actuated joint's speed within its limit. Returns the CoM's and the ZMP's smallest margins; a
-    failed check raises a RuntimeError whose ``check`` names it."""
+    passed it already), the CoM and the multibody ZMP inside the gate's support rectangle (a frame that would need the
+    floor to pull has no ZMP and fails it), every joint's torque within its effort and every actuated joint's speed
+    within its limit. Returns the CoM's and the ZMP's smallest margins; a failed check raises a RuntimeError whose
+    ``check`` names it."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     half = world.model.support.gate_half
@@ -862,6 +864,10 @@ def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) ->
     com_m, zmp_m = com_margin_from_base(com, half).min().item(), com_margin_from_base(zmp, half).min().item()
     if not com_m >= 0:
         raise _gate_error("com", f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
+    lifted = int(torch.isposinf(zmp).any(-1).sum())  # com_zmp_in_support: no ZMP where the floor would have to pull
+    if lifted:
+        raise _gate_error("zmp", f"the floor would have to pull on the retimed trajectory's soles at {lifted} "
+                                 f"frames: there is no ZMP")
     if not zmp_m >= 0:
         raise _gate_error("zmp", f"retimed trajectory ZMP leaves the support region by {-100 * zmp_m:.1f} cm")
     _check_torques(world, js)
