@@ -10,32 +10,38 @@
 """Particle initialization under cuRobo v0.8 single-MotionPlanner architecture.
 
 Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single vector in
-the model's full cspace order (its 33 joints).
+the model's full cspace order (its 33 joints). A pick's and a place's conf come from :func:`gn_ik`, the
+planner's only IK: balance first, clear of collision.
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import NamedTuple, Optional, Sequence, Union
 
 import roma
 import torch
 
 from curobo.scene import Cuboid
-from curobo.types import GoalToolPose, JointState, Pose
+from curobo.types import JointState, Pose
 
-from cutamp._curobo_internals import (
-    build_pin_weights,
-    restore_cspace_target_dof_weight,
-    snapshot_cspace_target_dof_weight,
-    write_cspace_target_dof_weight,
-)
 from cutamp.config import TAMPConfiguration
+from cutamp.constraint_checker import ConstraintChecker
 from cutamp.costs import sphere_to_sphere_overlap
+from cutamp.gn_refresh import (
+    _row_layout,
+    _row_tool_pose,
+    collision_penetration,
+    gn_project_balanced,
+    soles_on_stance,
+    tilt_within_bound,
+)
+from cutamp.rollout import movable_spheres_fn
 from cutamp.samplers import (
     grasp_4dof_sampler,
     place_4dof_sampler,
 )
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
+from cutamp.task_planning.constraints import KinematicConstraint, Motion
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
@@ -46,106 +52,7 @@ from cutamp.utils.common import (
 _log = logging.getLogger(__name__)
 
 
-def _build_multi_frame_goal(
-    host,
-    active_tool_frame: str,
-    target_pose: Pose,
-    current_state: JointState,
-    fixed: Optional[Dict[str, Pose]] = None,
-) -> GoalToolPose:
-    """Build a GoalToolPose covering all of ``host.kinematics.tool_frames``.
-
-    ``host`` may be a ``MotionPlanner`` or an ``IKSolver`` — both expose
-    ``kinematics.tool_frames`` and ``compute_kinematics(state)``.
-
-    The active frame gets ``target_pose``, and each frame in ``fixed`` its
-    pose there (the planted soles' stance, ``TAMPWorld.sole_goals``); every
-    other inactive frame gets its current FK pose at ``current_state``. This
-    satisfies cuRobo IK's ``reorder_links`` requirement that the goal cover
-    every kinematics tool frame, and holds each inactive hand where it is in
-    the world.
-    """
-    all_frames: List[str] = list(host.kinematics.tool_frames)
-    poses: Dict[str, Pose] = {**(fixed or {}), active_tool_frame: target_pose}
-    inactive = [f for f in all_frames if f not in poses]
-    if inactive:
-        kin_state = host.compute_kinematics(current_state)
-        for f in inactive:
-            poses[f] = kin_state.tool_poses.get_link_pose(f)
-    return GoalToolPose.from_poses(poses, ordered_tool_frames=all_frames)
-
-
-def _ik_for_pose(
-    world: TAMPWorld,
-    world_from_ee: torch.Tensor,
-    arm: Optional[str],
-    *,
-    current_state_q: Optional[torch.Tensor] = None,
-):
-    """Solve IK for a batch of EE poses, targeting the active arm's tool frame.
-
-    The soles' goals are their stance poses (``world.sole_goals``), never
-    their FK at the IK's start conf
-    (design 7.3), so a retry's noisy seed cannot move them.
-
-    The multi-frame goal targets the inactive frame at its current FK pose,
-    so the inactive hand stays put in the world while its arm's joints
-    counter-rotate as the body bends (about 1 rad per approach in blocks_t1).
-    Without it, IK leaves the inactive arm unconstrained and it drifts to
-    arbitrary joint values, polluting downstream particle optimization. This
-    goal is the only hold on the inactive hand (known-bugs B15): the cspace
-    pin below is a no-op (``T1State.pin_for_arm_action``), the GN refreshes
-    keep the inactive arm's joints fixed while they move the body, and the
-    motion planner holds nothing between confs.
-
-    ``current_state_q`` (full-cspace ``[B, len(world.kinematics.joint_names)]``)
-    anchors the inactive-frame goal at a non-home pose. cuRobo's
-    ``solve_pose`` also makes it the first optimization seed when no
-    ``seed_config`` is given (fork solver_ik.py:735-736; the remaining seeds
-    are random).
-    """
-    ik = world.ik_solver
-    active_frame = world.tool_frame_for_arm(arm)
-    if active_frame not in ik.kinematics.tool_frames:
-        raise RuntimeError(
-            f"IK solver does not expose tool frame {active_frame!r}; "
-            f"available: {ik.kinematics.tool_frames}"
-        )
-    target_pose = Pose.from_matrix(world_from_ee)
-    batch_size = world_from_ee.shape[0]
-    full_names = list(world.kinematics.joint_names)
-    if current_state_q is None:
-        seed_full = world.q_init.unsqueeze(0).expand(batch_size, -1)
-    else:
-        # Caller passes full-cspace q; trust their batch shape.
-        seed_full = current_state_q
-    full_js = JointState.from_position(seed_full, joint_names=full_names)
-    current_state = ik.kinematics.get_active_js(full_js)
-    goal = _build_multi_frame_goal(
-        ik, active_frame, target_pose, current_state, fixed=world.sole_goals(batch_size),
-    )
-
-    snapshot = snapshot_cspace_target_dof_weight([ik])
-    try:
-        if arm is not None:
-            # Weight the inactive arm's DOFs in cuRobo's cspace target term: a
-            # no-op (``cspace_target_weight`` is 0, and that term's target is a
-            # zero joint vector, not these joints' current values). The inactive
-            # frame's target in ``goal`` is what holds that hand in the world.
-            model = world.model
-            write_cspace_target_dof_weight(
-                [ik], build_pin_weights(
-                    ik, model.joint_names[model.right_arm if arm == "left" else model.left_arm],
-                ),
-            )
-        return ik.solve_pose(
-            goal_tool_poses=goal, current_state=current_state, seed_config=None,
-        )
-    finally:
-        restore_cspace_target_dof_weight([ik], snapshot)
-
-
-#: A retry's leg noise: each pitch joint draws once per pair, left onto right,
+#: A noisy start's leg noise: each pitch joint draws once per pair, left onto right,
 #: and roll and yaw hold q_init's, so the legs stay mirrored.
 _MIRRORED_LEG_JOINTS = ("Hip_Pitch", "Knee_Pitch", "Ankle_Pitch")
 _HELD_LEG_JOINTS = ("Hip_Roll", "Hip_Yaw", "Ankle_Roll")
@@ -153,8 +60,8 @@ _HELD_LEG_JOINTS = ("Hip_Roll", "Hip_Yaw", "Ankle_Roll")
 _BASE_JOINTS = ("base_j_x", "base_j_y", "base_j_z", "base_j_pitch", "base_j_roll", "base_j_yaw")
 
 
-def _retry_seed(world: TAMPWorld, batch_size: int, arm: Optional[str], noise_std: float) -> torch.Tensor:
-    """``[batch_size, dof]``: a CoM-gate retry's start conf, ``world.q_init``
+def _noisy_start(world: TAMPWorld, batch_size: int, arm: Optional[str], noise_std: float) -> torch.Tensor:
+    """``[batch_size, dof]``: one of :func:`gn_ik`'s noisy start confs, ``world.q_init``
     plus Gaussian noise of std ``noise_std`` rad on the body and the active
     arm, clamped to the joint limits. The inactive arm keeps ``q_init``.
 
@@ -182,8 +89,7 @@ def _retry_seed(world: TAMPWorld, batch_size: int, arm: Optional[str], noise_std
         for side in ("Left", "Right"):
             noise[:, col(f"{side}_{joint}")] = 0.0
     seed = seed + noise
-    # Clamp the perturbed seed to joint limits so large-sigma retries don't
-    # hand cuRobo an out-of-limits current_state. Limits come from the same
+    # Clamp the perturbed seed to joint limits, which GN keeps every iterate inside. Limits come from the same
     # full-cspace kinematics that defines world.q_init's joint order
     # (JointLimits.joint_names == kinematics.joint_names, verified [2, full_dof]).
     # The left and right pitch limits are equal, so the clamp keeps the legs mirrored.
@@ -200,7 +106,7 @@ def _stand_on_the_stance(
     """``seed`` with each row's base re-solved so that the first of
     ``model.sole_frames`` sits on its stance pose: ``B' = S @ inv(W) @ B``,
     with ``S`` the stance pose, ``W`` the sole's FK pose and ``B`` the base
-    pose. With mirrored legs (``_retry_seed``) the other sole's pose relative
+    pose. With mirrored legs (``_noisy_start``) the other sole's pose relative
     to the first is unchanged, so it lands on its stance pose too. A row whose
     ``B'`` leaves the base joints' limits takes home's base and body, keeping
     only its arm's noise.
@@ -227,63 +133,85 @@ def _stand_on_the_stance(
     return out
 
 
-def _ik_for_pose_com_safe(
-    world: TAMPWorld,
-    world_from_ee: torch.Tensor,
-    arm: Optional[str],
-    *,
-    max_retries: int = 3,
-    context: str = "",
-):
-    """Call ``_ik_for_pose``; verify COM-in-polygon; retry failed particles.
+#: The GN IK (:func:`gn_ik`): GN_IK_ITERS iterations that reach balance first, then GN_IK_CLEAR_ITERS with the
+#: collision row, and the noise std (rad) of the stance-rooted starts that run beside the first (home, or the
+#: stored conf), one start per value. The iterates are not motions, so only the conf they end at must be clear;
+#: with the row on from the start, an arm that met the body on its way pressed against it, and the picks of
+#: blocks_t1's first plan fell from 64 to 49 of 64 targets (20 + 10 iterations: 52; 25 + 5 and 30 + 10: 64).
+#: Places reached 42 of 64 on two plans at every split; their misses are out of balanced reach (still about 6 cm
+#: off at 120 iterations), and the clear iterations take the rest out of contact. Before the collision row, 16
+#: starts gained 0-3 targets over one, and four rows per target cost about what one does (a call: 0.2 s at 64
+#: targets, 256 rows, and at 256).
+GN_IK_ITERS = 30
+GN_IK_CLEAR_ITERS = 10
+GN_IK_START_SIGMAS = (0.1, 0.2, 0.3)
 
-    A best-effort backstop behind the CoM-aware seed-IK residual (cuRobo
-    fork). Each of up to ``max_retries`` rounds re-solves the batch
-    from a noisier start conf (``_retry_seed``) and copies the new results,
-    success flags included, into the rows still outside, whether or not
-    they land inside. Rows that fail every retry are kept: the caller's
-    ``_store_ik_q`` resets only IK failures, to home (``world.q_init``). On
-    blocks_t1 about half the IK-solved place rows stay outside after 3
-    retries. The CoM is enforced downstream,
-    by GN's balance-first projection (``gn_refresh.gn_project_balanced``)
-    and by the balance gate on every trajectory frame
-    (``motion_solver._balance_gate``).
 
-    Returns the last batch result. Logs the final count of rows outside at
-    WARNING level so persistent failures are visible.
-    """
-    from cutamp.com_polygon_cost import compute_com_polygon_mask
-    result = _ik_for_pose(world, world_from_ee, arm)
-    batch_size = world_from_ee.shape[0]
-    for _attempt in range(max_retries):
-        q_batch = _ik_solution_to_full_q(result, world)
-        in_polygon = compute_com_polygon_mask(world, q_batch)
-        if bool(in_polygon.all()):
-            return result
-        # Retry from a noisier start conf each round: noise of 0.1, 0.2, 0.3,
-        # ... rad on the body and the active arm (_retry_seed). It reaches the
-        # IK two ways. solve_pose makes current_state the first of the LM seed
-        # IK's starts (fork solver_ik.py:735-736, seed_ik_solver.py:511-517;
-        # only the seed manager's own current_state argument is ignored,
-        # manager_seed.py:98-100), the rest being random. And it moves the
-        # goals that _build_multi_frame_goal builds from current_state: the
-        # idle hand's target moves with the trunk. Both can send
-        # the solver to other basins than the COM-infeasible "lean forward +
-        # tip" one.
-        seed = _retry_seed(world, batch_size, arm, 0.1 * (_attempt + 1))
-        retry_result = _ik_for_pose(world, world_from_ee, arm, current_state_q=seed)
-        result.copy_at_batch_indices(retry_result, ~in_polygon)
-    # Final check for logging.
-    q_batch_final = _ik_solution_to_full_q(result, world)
-    in_polygon_final = compute_com_polygon_mask(world, q_batch_final)
-    n_fail = int((~in_polygon_final).sum().item())
-    if n_fail > 0:
-        prefix = f"[{context}] " if context else ""
-        _log.warning(
-            f"{prefix}_ik_for_pose_com_safe: {n_fail}/{len(q_batch_final)} particles "
-            f"still out of COM polygon after {max_retries} retries"
-        )
-    return result
+class IKTol(NamedTuple):
+    """The constraint checker's tolerances an IK conf must meet: the hand's and the soles' pose errors
+    (KinematicConstraint) and the Trunk tilt past the envelope's bound (Motion)."""
+    pos: float
+    rot: float
+    sole_pos: float
+    sole_rot: float
+    tilt: float
+
+    @classmethod
+    def from_checker(cls, checker: ConstraintChecker) -> "IKTol":
+        kc = KinematicConstraint.type
+        return cls(*(checker._get_tol(kc, n) for n in ("pos_err", "rot_err", "sole_pos_err", "sole_rot_err")),
+                   checker._get_tol(Motion.type, "trunk_tilt"))
+
+
+def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arms: Union[str, Sequence[str]],
+             movables: torch.Tensor, tol: IKTol):
+    """``(ok, safe, hand_err)``, each ``[N]``, from one FK of ``q`` ``[N, dof]`` on ``world.kinematics``, with rows
+    in ``arms``' dep-major blocks (:func:`~cutamp.gn_refresh.gn_project_balanced`'s layout). ``safe``: the conf
+    stands balanced (the CoM inside the support rectangle, both soles on the stance within ``tol``), clear of the
+    scene, of ``movables`` ``[N, M, 4]`` and of itself (:func:`~cutamp.gn_refresh.collision_penetration` is 0)
+    and inside the envelope's tilt bound. ``ok``: safe, with the hand on ``world_from_ee`` within ``tol``, all at
+    the checker's ``<=``. ``hand_err``: the hand's position plus rotation error, cuRobo IK's ranking."""
+    from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
+    from cutamp.costs import curobo_pose_error
+
+    arms = (arms,) if isinstance(arms, str) else tuple(arms)
+    _, is_left = _row_layout(world.model, arms, q.shape[0], q.shape[1], q.device, q.dtype)
+    state = _fk_state(world, q)
+    pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
+    pos_err, rot_err = curobo_pose_error(
+        Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix(), world_from_ee,
+    )
+    safe = (com_polygon_mask_from_state(state, world.model.support)
+            & soles_on_stance(world, state, tol.sole_pos, tol.sole_rot)
+            & (collision_penetration(world, state.robot_spheres, movables) <= 0)
+            & tilt_within_bound(world, q, tol.tilt))
+    return safe & (pos_err <= tol.pos) & (rot_err <= tol.rot), safe, pos_err + rot_err
+
+
+def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequence[str]], movables: torch.Tensor,
+          tol: IKTol, q_start: Optional[torch.Tensor] = None):
+    """The planner's IK: :func:`~cutamp.gn_refresh.gn_project_balanced` of ``world_from_ee`` ``[N, 4, 4]``, rows
+    in ``arms``' dep-major blocks (a bare ``str`` is one dep), from ``1 + len(GN_IK_START_SIGMAS)`` starts per row
+    in one batched call, ``q_start`` (default ``world.q_init``) and :func:`_noisy_start`'s stance-rooted noise:
+    ``GN_IK_ITERS`` iterations balance first, then ``GN_IK_CLEAR_ITERS`` that also clear the scene, ``movables``
+    ``[N, M, 4]`` and the robot itself, and pull the CoM toward the keyframe rectangle's centre (GN's level 3).
+
+    Returns ``(q [N, dof], ok [N])``: per row, the accepted start (:func:`ik_check`) closest to the target; where
+    none is, the closest safe one, else the closest, a balanced-first iterate that the periodic refresh keeps
+    projecting and whose pose error the kinematic cost hands to the placement. ``ok`` marks the accepted rows."""
+    arms = (arms,) if isinstance(arms, str) else tuple(arms)
+    n = world_from_ee.shape[0]
+    batch = n // len(arms)
+    first = world.q_init.expand(n, -1) if q_start is None else q_start
+    starts = [first] + [torch.cat([_noisy_start(world, batch, arm, s) for arm in arms]) for s in GN_IK_START_SIGMAS]
+    k = len(starts)
+    targets, mov, rows_arms = world_from_ee.repeat(k, 1, 1), movables.repeat(k, 1, 1), arms * k
+    q = gn_project_balanced(world, torch.cat(starts), targets, rows_arms, iters=GN_IK_ITERS, collision=False)
+    q = gn_project_balanced(world, q, targets, rows_arms, iters=GN_IK_CLEAR_ITERS, movables=mov)
+    ok, safe, err = ik_check(world, q, targets, rows_arms, mov, tol)
+    # Tiers: accepted, then safe, then the rest, each by hand error (under 10: metres plus radians).
+    best = (err + 100.0 * ~ok + 1e4 * ~safe).view(k, n).argmin(0) * n + torch.arange(n, device=q.device)
+    return q[best], ok[best]
 
 
 def _achieved_pose_errors(
@@ -292,13 +220,6 @@ def _achieved_pose_errors(
     """``([B] pos_err, [B] rot_err)`` of ``q_full`` against ``world_from_ee``
     on ``arm``'s tool frame, in the constraint checker's own metric
     (``curobo_pose_error``).
-
-    Exists because cuRobo v0.8's ``IKSolverResult.position_error`` /
-    ``rotation_error`` are unusable on multi-tool-frame robots: ``_get_result``
-    concatenates the per-frame convergence metrics blockwise
-    ``[P0..PL-1, R0..RL-1]`` but then views them as interleaved
-    ``(num_links, 2)`` pairs, cross-pairing metres with radians (the success
-    flag uses the un-mixed values and is unaffected).
     """
     from cutamp.costs import curobo_pose_error
     js = JointState.from_position(
@@ -314,47 +235,13 @@ def _achieved_pose_errors(
     return curobo_pose_error(ee, world_from_ee)
 
 
-def _ik_solution_to_full_q(ik_result, world: TAMPWorld) -> torch.Tensor:
-    """Build a full-cspace ``[B, len(world.kinematics.joint_names)]`` tensor
-    from an IK result. Joints the IK kinematics locks (only the head and
-    fingers, none of the model's, so the reorder drops them) come from its
-    own ``lock_jointstate``, the source the planner uses.
-    """
-    ik = world.ik_solver
-    sol_js = JointState.from_position(
-        ik_result.solution[:, 0], joint_names=list(ik.kinematics.joint_names),
-    )
-    return ik.kinematics.get_full_js(sol_js).reorder(list(world.kinematics.joint_names)).position
-
-
-def _ik_success_mask(ik_result) -> torch.Tensor:
-    """``[B]`` bool success mask for the stored (seed-0) solution.
-
-    cuRobo result fields are ``[B]`` or ``[B, return_seeds]``; the seed-0
-    column pairs with ``_ik_solution_to_full_q``'s ``solution[:, 0]``.
-    """
-    s = ik_result.success
-    return (s.reshape(s.shape[0], -1)[:, 0] if s.ndim > 1 else s).bool().reshape(-1)
-
-
-def _store_ik_q(particles: dict, q_name: str, ik_result, world: TAMPWorld, arm: Optional[str]) -> None:
-    """Store the IK result's q under ``q_name``, reordered to the full kin's joint order.
-
-    Rows whose IK reported failure fall back to ``world.q_init``: cuRobo's joint
-    limits are a soft residual + success filter (nothing clamps), so an
-    unsuccessful solution may be out-of-limit and must not enter particles.
-    """
-    q_full = _ik_solution_to_full_q(ik_result, world)
-    success = _ik_success_mask(ik_result).to(q_full.device)
-    home = world.q_init.to(q_full.device).unsqueeze(0).expand_as(q_full)
-    particles[q_name] = torch.where(success.unsqueeze(-1), q_full, home)
-
-
 class ParticleInitializer:
-    def __init__(self, world: TAMPWorld, config: TAMPConfiguration):
+    def __init__(self, world: TAMPWorld, config: TAMPConfiguration, constraint_checker: ConstraintChecker):
         self.world = world
         self.config = config
         self.q_init = world.q_init.repeat(config.num_particles, 1)
+        # A conf's IK is accepted on the tolerances the run's checker enforces.
+        self.ik_tol = IKTol.from_checker(constraint_checker)
 
     def _initial_particles(self) -> Particles:
         return {
@@ -426,14 +313,9 @@ class ParticleInitializer:
                 obj_from_grasp = obj_from_grasp[good_idxs]
                 world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(
-                    world, world_from_ee, arm,
-                    context=f"pick({arm})",
-                )
-                log_debug(
-                    f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
-                )
-                _store_ik_q(particles, q, ik_result, world, arm)
+                movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)
+                particles[q], ok = gn_ik(world, world_from_ee, arm, movables, self.ik_tol)
+                log_debug(f"{header}. IK accepted: {int(ok.sum())}/{num_particles}")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
@@ -471,14 +353,10 @@ class ParticleInitializer:
                 particles[placement] = sampled_placements
                 obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                ik_result = _ik_for_pose_com_safe(
-                    world, world_from_ee, arm,
-                    context=f"place({arm})",
-                )
-                log_debug(
-                    f"{header}. IK success: {ik_result.success.sum()}/{num_particles}"
-                )
-                _store_ik_q(particles, q, ik_result, world, arm)
+                # The placed object at its new placement (particles[placement], set above), as the rollout has it.
+                movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)
+                particles[q], ok = gn_ik(world, world_from_ee, arm, movables, self.ik_tol)
+                log_debug(f"{header}. IK accepted: {int(ok.sum())}/{num_particles}")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 

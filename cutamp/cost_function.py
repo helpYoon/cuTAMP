@@ -504,8 +504,8 @@ class CostFunction:
             return torch.zeros(num_particles, device=device)
 
         # Joint limits — a hinge² penalty on endpoint configurations past the
-        # position limits, which are already the policy's soft limits (no
-        # margin band, call 17). q0s are excluded inside the helper: the
+        # position limits, which are already the policy's soft limits, cut by
+        # the envelope (no margin band, call 17). q0s are excluded inside the helper: the
         # initial robot state must never acquire limit gradients (Phase-2
         # LBFGS re-leafs every cloned particle).
         elif cost_name == "joint_limit_margin":

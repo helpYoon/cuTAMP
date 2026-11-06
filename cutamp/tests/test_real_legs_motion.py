@@ -270,13 +270,14 @@ def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner)
 def _plan_reach(world, real_plan, planner):
     """A planned home -> reach segment: plan_cspace's result for the first pick conf of ``real_plan`` that plans."""
     from cutamp.motion_solver import _plan_arm_to_conf, _planner_js_from_full
+    from cutamp.tests.test_real_legs_gn import _accepted
     skeleton, particles = real_plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     obj, conf = op.values[0], op.values[-1]
     names = list(world.model.joint_names)
     home = torch.tensor(world.model.home, device=world.device)
     start = _planner_js_from_full(planner, home, names)
-    for q in particles[conf][(particles[conf] != home).any(-1)][:8]:  # IK-solved reaches; a few may not plan
+    for q in particles[conf][_accepted(world, real_plan, conf)][:8]:  # GN IK's accepted reaches; a few may not plan
         try:
             return _plan_arm_to_conf(planner, q, start, names, disable_obstacle=obj, ground_op=op)
         except RuntimeError:

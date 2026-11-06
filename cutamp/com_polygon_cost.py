@@ -244,7 +244,7 @@ def com_polygon_mask_from_state(ks, support) -> torch.Tensor:
     :class:`~cutamp.robots.t1.Support`) on a state a CoM-enabled FK already computed."""
     com, base_T = _com_and_base_from_state(ks, support.link)
     # Gate through the SAME penalty the hard ComPolygon constraint uses, so the
-    # post-IK COM-safe check and ConstraintChecker can never diverge. With the
+    # GN IK acceptance check and ConstraintChecker can never diverge. With the
     # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
     half = _half_extents(support.keyframe_half, com.device, com.dtype)
     pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, support.center)

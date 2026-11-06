@@ -1,6 +1,6 @@
 """Particle init on the stance (design 7.3). On the real legs:
-- the IK's sole goals are the stance's, never FK at the IK seed;
-- a CoM-gate retry's noisy seed stands on the stance, its base re-solved there (the stance is the noise's root);
+- every pick and place conf (GN IK, ``gn_ik``) stands on the stance with its CoM in the keyframe rectangle;
+- a noisy start of GN IK stands on the stance, its base re-solved there (the stance is the noise's root);
 - retract confs stand at home, their base and body locked out of Adam, and join the joint-limit and self-collision
   constraints.
 The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module."""
@@ -46,78 +46,16 @@ def _span(*slices) -> set:
 
 
 @needs_cuda
-def test_goal_soles_come_from_the_stance(real_world):
-    # The goal's soles are the stance's, bit for bit, whatever the seed; the idle hand keeps its FK
-    # pose at the seed, as today.
-    from curobo.types import JointState, Pose
-    from cutamp.particle_initialization import _build_multi_frame_goal, _retry_seed
-    world, ik, n = real_world, real_world.ik_solver, 8
-    torch.manual_seed(0)
-    seeds = _retry_seed(world, n, "left", 0.3)
-    current = ik.kinematics.get_active_js(
-        JointState.from_position(seeds, joint_names=list(world.kinematics.joint_names)))
-    active, idle = world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right")
-    target = Pose.from_matrix(_poses(world, _home(world).expand(n, -1), active))
-    goal = _build_multi_frame_goal(ik, active, target, current, fixed=world.sole_goals(n))
-    for i, sole in enumerate(world.model.sole_frames):
-        got = goal.get_link_pose(sole, make_contiguous=True).get_matrix().reshape(n, 4, 4)
-        assert torch.equal(got, world.stance_soles[i].expand(n, 4, 4)), sole
-    idle_goal = goal.get_link_pose(idle, make_contiguous=True).get_matrix().reshape(n, 4, 4)
-    torch.testing.assert_close(idle_goal, _poses(world, seeds, idle), rtol=0.0, atol=1e-6)
-
-
-@needs_cuda
-def test_retry_keeps_sole_goals_on_the_stance(real_world):
-    # Reachable targets, solved from retry seeds and from seeds off the stance: every solved conf stands on the stance.
-    from cutamp.particle_initialization import _ik_for_pose, _ik_solution_to_full_q, _ik_success_mask, _retry_seed
-    world, n = real_world, 16
-    names = list(world.model.joint_names)
-    reach = _home(world).repeat(n, 1)
-    reach[:, names.index("Left_Shoulder_Pitch")] += torch.linspace(-0.1, -0.4, n, device=world.device)
-    targets = _poses(world, reach, world.tool_frame_for_arm("left"))
-
-    def solve(ee, seeds):
-        """``(ok [k], q [k, dof])`` of ``_ik_for_pose`` on ``k`` rows. The fork pads a short batch up to the solver's
-        max_batch_size, but not its current state's jerk (solver_ik.py:62-74), so once a solver has solved one batch
-        size, another raises in its goal buffer's copy_. Every solve in this module is therefore full size: pad here
-        as the fork does, with copies of row 0."""
-        k = len(seeds)
-        pad = world.ik_solver.config.max_batch_size - k
-        result = _ik_for_pose(world, torch.cat([ee, ee[:1].expand(pad, -1, -1)]), "left",
-                              current_state_q=torch.cat([seeds, seeds[:1].expand(pad, -1)]))
-        return _ik_success_mask(result)[:k], _ik_solution_to_full_q(result, world)[:k]
-
-    torch.manual_seed(0)
-    ok, q = solve(targets, _retry_seed(world, n, "left", 0.3))
-    assert int(ok.sum()) >= 12, ok
-    pos, rot = _sole_errors(world, q[ok])
-    assert float(pos.max()) <= POS_TOL and float(rot.max()) <= ROT_TOL, (pos, rot)
-
-    # Off the stance: the old inline retry seed (_inline_seed) holds the base and noises the legs, so its soles
-    # swing off the stance. Only _ik_for_pose's stance goals (fixed=world.sole_goals(...)) bring them back: goals
-    # from FK at the seed would hold them there. The final repair (optimize_plan.py) relies on this, since it starts
-    # from particles Adam has moved.
-    torch.manual_seed(0)
-    off = _inline_seed(world, 4, "left", 0.3)
-    pos, _ = _sole_errors(world, off)
-    assert float(pos.min()) > 2 * POS_TOL, pos
-    ok, q = solve(targets[::4], off)
-    assert int(ok.sum()) >= 2, ok
-    pos, rot = _sole_errors(world, q[ok])
-    assert float(pos.max()) <= POS_TOL and float(rot.max()) <= ROT_TOL, (pos, rot)
-
-
-@needs_cuda
-def test_retry_seeds_stand_on_the_stance(real_world):
+def test_noisy_starts_stand_on_the_stance(real_world):
     # The legs draw their pitch once per pair and hold their roll and yaw, and the base puts the left sole
     # on the stance; the right sole follows. Standing on the stance, a seed's Trunk is in the legs' reach, so its base
     # could leave the box only by leaning within 0.1 rad of its side (the roll cap), which legs bent alike in pitch
     # never do. Under a box cut lower, a row whose base would leave it keeps home's base and body.
-    from cutamp.particle_initialization import _retry_seed, _stand_on_the_stance
+    from cutamp.particle_initialization import _noisy_start, _stand_on_the_stance
     world, m, n = real_world, real_world.model, 256
     names, home = list(m.joint_names), _home(real_world)
     torch.manual_seed(0)
-    q = _retry_seed(world, n, "left", 0.3)
+    q = _noisy_start(world, n, "left", 0.3)
     pos, rot = _sole_errors(world, q)
     assert float(pos.max()) <= 1e-5 and float(rot.max()) <= 1e-4, (float(pos.max()), float(rot.max()))
     lo, hi = world.joint_limits
@@ -140,38 +78,20 @@ def test_retry_seeds_stand_on_the_stance(real_world):
     assert torch.equal(out[fell_back][:, m.body], home[m.body].expand(int(fell_back.sum()), -1))
 
 
-def _inline_seed(world, batch_size, arm, noise_std):
-    """The CoM-gate retry's seed as ``_ik_for_pose_com_safe`` built it inline up to 18bc4a6."""
-    full_dof = world.q_init.shape[-1]
-    device = world.q_init.device
-    seed = world.q_init.unsqueeze(0).expand(batch_size, -1).clone()
-    noise = torch.randn(batch_size, full_dof, device=device) * noise_std
-    model = world.model
-    noise[:, model.base] = 0.0
-    if arm == "left":
-        noise[:, model.right_arm] = 0.0
-    elif arm == "right":
-        noise[:, model.left_arm] = 0.0
-    seed = seed + noise
-    limits = world.kinematics.get_joint_limits().position
-    return torch.clamp(seed, min=limits[0].to(seed.device, seed.dtype), max=limits[1].to(seed.device, seed.dtype))
-
-
 @needs_cuda
 def test_init_confs_stand_on_the_stance(real_world, real_plan):
-    # Rows whose IK failed hold home (_store_ik_q), which stands on the stance too; the IK-solved rows are the rest.
-    # Not checked: their CoM. The init's CoM gate is best effort: it keeps an IK-solved row that fails every retry,
-    # as about half the IK-solved place rows on blocks_t1 do. GN's balance-first projection and the balance gate
-    # enforce the CoM downstream.
+    # GN IK holds the soles and the CoM first (level 1), so every row of every pick and place conf stands on the
+    # stance with its CoM inside, the rows it accepted and the rest, which keep its closest balanced iterate.
+    from cutamp.com_polygon_cost import compute_com_polygon_mask
     skeleton, particles = real_plan
     home = _home(real_world)
     reaches, retracts = _ops(skeleton, "pick", "place"), _ops(skeleton, "retract")
     assert reaches and len(retracts) == len(reaches), skeleton
     for _, conf in reaches:
-        solved = particles[conf][(particles[conf] != home).any(-1)]
-        assert len(solved) >= 16, (conf, len(solved))
-        pos, rot = _sole_errors(real_world, solved)
+        q = particles[conf]
+        pos, rot = _sole_errors(real_world, q)
         assert float(pos.max()) <= POS_TOL and float(rot.max()) <= ROT_TOL, (conf, float(pos.max()), float(rot.max()))
+        assert bool(compute_com_polygon_mask(real_world, q).all()), conf
     for _, conf in retracts:
         assert torch.equal(particles[conf], home.expand_as(particles[conf])), conf
 

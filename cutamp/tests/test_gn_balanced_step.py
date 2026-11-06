@@ -9,9 +9,10 @@ from cutamp.gn_refresh import _balanced_step, _rotmat_to_rotvec, _row_layout
 from cutamp.robots.t1 import REAL_LEGS
 
 
-def _synthetic(seed, B=64):
+def _synthetic(seed, B=64, coll=False):
     """``(stack, blocks)``: one ``_balanced_step`` argument tuple on four dep-major ``B``-row
-    blocks of the real legs' cspace and its four per-block slices, with 12 synthetic sole rows. Some
+    blocks of the real legs' cspace and its four per-block slices, with 12 synthetic sole rows and, with
+    ``coll``, a synthetic collision row, in contact on about half the rows, and level 3 on. Some
     joints sit on a limit and some CoM rows are outside, so every active set fires."""
     g = torch.Generator().manual_seed(seed)
     dof = len(REAL_LEGS.joint_names)
@@ -32,11 +33,14 @@ def _synthetic(seed, B=64):
         r = 0.01 * torch.randn(B, 6, generator=g)
         jac_sole = 0.3 * torch.randn(B, 12, dof, generator=g) * c.unsqueeze(1)
         r_sole = 1e-3 * torch.randn(B, 12, generator=g)
-        deps.append((q, r, jac, jac_com, com, jac_sole, r_sole))
+        pen = torch.relu(0.01 * torch.randn(B, 1, generator=g))
+        jac_pen = 0.1 * torch.randn(B, 1, dof, generator=g) * c.unsqueeze(1)
+        deps.append((q, r, jac, jac_com, com, jac_sole, r_sole, pen, jac_pen))
 
     def args(dep, c):
-        q, r, jac, jac_com, com, jac_sole, r_sole = dep
-        return (q, r, jac, jac_com, com, lower, upper, c, half, jac_sole, r_sole)
+        q, r, jac, jac_com, com, jac_sole, r_sole, pen, jac_pen = dep
+        return (q, r, jac, jac_com, com, lower, upper, c, half, jac_sole, r_sole, None,
+                (pen, jac_pen) if coll else None, coll)
 
     stack = args([torch.cat(x) for x in zip(*deps)], col_mask)
     blocks = [args(d, c) for d, c in zip(deps, col_mask.split(B))]
@@ -55,19 +59,58 @@ def test_rotmat_to_rotvec_matches_roma_bitwise():
             assert torch.equal(_rotmat_to_rotvec(R), roma.rotmat_to_rotvec(R))
 
 
-def test_balanced_step_stack_matches_per_dep():
+@pytest.mark.parametrize("coll", [False, True])
+def test_balanced_step_stack_matches_per_dep(coll):
     # Every op is row-wise and the active-set rounds always run in full, so
-    # no row's step depends on which other deps share its call.
+    # no row's step (levels 1-2's, or with the collision row levels 1-3's) depends on which other deps share
+    # its call.
     for seed in range(10):
-        stack, blocks = _synthetic(seed)                 # one [4B] stack + its 4 [B] blocks
-        assert torch.equal(_balanced_step(*stack), torch.cat([_balanced_step(*b) for b in blocks]))
+        stack, blocks = _synthetic(seed, coll=coll)      # one [4B] stack + its 4 [B] blocks
+        steps, per_dep = _balanced_step(*stack), [_balanced_step(*b) for b in blocks]
+        for k in range(2):
+            assert torch.equal(steps[k], torch.cat([s[k] for s in per_dep]))
 
 
-def test_balanced_step_moves_no_pinned_column():
-    stack, _ = _synthetic(0)
-    step, col_mask = _balanced_step(*stack), stack[7]
+@pytest.mark.parametrize("coll", [False, True])
+def test_balanced_step_moves_no_pinned_column(coll):
+    stack, _ = _synthetic(0, coll=coll)
+    (step, step12), col_mask = _balanced_step(*stack), stack[7]
     assert torch.all(step[col_mask == 0] == 0)
     assert torch.any(step[col_mask == 1] != 0)  # not vacuous: the free columns move
+    # Level 3 runs beside the collision row only, and changes none of levels 1-2's active sets: their step is
+    # bitwise the one they take without it, and a row in contact takes it alone.
+    assert torch.equal(step, step12) != coll
+    if coll:
+        assert torch.equal(step12, _balanced_step(*stack[:-1], False)[0])
+        in_contact = stack[12][0][:, 0] > 0
+        assert bool(in_contact.any()) and torch.equal(step[in_contact], step12[in_contact])
+        # Under a tilt bound too, where a row whose full step ends past the bound takes levels 1-2's step.
+        from cutamp.joint_limit_cost import trunk_tilt_cosine
+        names = list(REAL_LEGS.joint_names)
+        tilt = (names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(1.0), math.cos(0.99))
+        tilted = stack[:11] + (tilt,) + stack[12:]
+        step, step12 = _balanced_step(*tilted)
+        assert torch.equal(step12, _balanced_step(*tilted[:-1], False)[0])
+        past = trunk_tilt_cosine(stack[0] + step, *tilt[:2]) < tilt[2]
+        assert bool(past.any()) and torch.equal(step[past], step12[past])
+
+
+def test_level3_never_carries_a_free_com_axis_out(monkeypatch):
+    # A row takes levels 1-2's step where level 3's would carry a CoM axis that step leaves inside the rectangle
+    # past its edge (linear, as levels 1-2's pushes are tested). Level 3 never pulls that far on these rows, so here
+    # it pushes outward: without the veto, 65 of the 256 rows end outside.
+    import cutamp.gn_refresh as gn
+    real = gn._centring_step
+    monkeypatch.setattr(gn, "_centring_step", lambda *a: -real(*a))
+    stack, _ = _synthetic(0, coll=True)
+    step, step12 = _balanced_step(*stack)
+    jac_com, com, half = stack[3], stack[4], torch.tensor(stack[8])
+
+    def lin(s):
+        return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
+
+    assert bool((step != step12).any())  # not vacuous: level 3 still moves rows it keeps inside
+    assert not bool(((lin(step).abs() > half) & (lin(step12).abs() <= half)).any())
 
     # The pins on an interleaved arm order, against a layout built block by block.
     # The base columns are free: the sole rows hold the stance.

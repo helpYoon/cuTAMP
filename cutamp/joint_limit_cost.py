@@ -2,8 +2,8 @@
 
 :func:`joint_limit_margin_soft_cost` is cuTAMP's particle-side soft cost over
 segment-endpoint configurations: a hinge² penalty for leaving the joint
-limits, which are bfm_wm's soft limits (robots/t1.py), so it has no margin
-band. Empirical analysis of saved plans showed 100% of near-limit danger
+limits, which are bfm_wm's soft limits cut by the envelope (robots/t1.py), so
+it has no margin band. Empirical analysis of saved plans showed 100% of near-limit danger
 comes from endpoint configs (IK/particle output), never from trajopt
 excursions.
 
