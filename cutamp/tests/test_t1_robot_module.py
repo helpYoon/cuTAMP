@@ -99,26 +99,6 @@ def test_raw_motion_plan_in_model_order():
                 np.testing.assert_array_equal(out[key], getattr(js, key)[0][:, cols].numpy())
 
 
-def test_mpc_example_refuses_a_raw_plan_until_the_export(tmp_path):
-    # The MPC example reads schema 3, the simplified model's. Regenerating a raw real-leg plan saves the same schema,
-    # so for one the example says real-leg plans await stage 6's export, not "regenerate".
-    import importlib.util
-    import pickle
-    from pathlib import Path
-
-    from cutamp.robots.t1 import REAL_LEGS
-    from cutamp.utils.plan_processor import raw_motion_plan
-    path = Path(__file__).resolve().parents[2] / "examples" / "load_motion_plan_for_mpc.py"
-    spec = importlib.util.spec_from_file_location("load_motion_plan_for_mpc", path)
-    example = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(example)
-    with open(tmp_path / "motion_plan.pkl", "wb") as f:
-        pickle.dump(raw_motion_plan(_raw_plan_input(), REAL_LEGS), f)
-    with pytest.raises(RuntimeError, match="real-leg plans await stage 6's export") as refused:
-        example.load_for_mpc(tmp_path / "motion_plan.pkl")
-    assert "egenerate" not in str(refused.value)
-
-
 def _poses(translation, mat3x3) -> np.ndarray:
     """``[n, 4, 4]`` from Rerun's Transform3D translations and 3x3 matrices, which Rerun stores column-major."""
     pose = np.tile(np.eye(4), (len(translation), 1, 1))

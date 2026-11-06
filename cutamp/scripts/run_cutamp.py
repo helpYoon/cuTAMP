@@ -45,8 +45,7 @@ def cutamp_demo(
         ``None`` — don't save the motion plan (default).
         ``"auto"`` — save to ``<experiment_root>/<experiment_id>/motion_plan.pkl``.
         Any other string — save to that path (parent directory auto-created).
-    The simplified model's plan is saved in schema 3, a real-leg plan raw
-    (``"stage3-raw"``); see cutamp/utils/plan_processor.py for both.
+    The plan is saved raw (``"stage3-raw"``); see cutamp/utils/plan_processor.py.
     """
     setup_logging()
 
@@ -70,13 +69,11 @@ def cutamp_demo(
         else:
             out_path = Path(save_plan)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # The simplified model's plan is processed into the structured [trunk, arms, hands] schema 3; a real-leg
-        # plan is saved raw, in its model's joint order, until stage 6's schema 4 (decision 9). See
-        # cutamp/utils/plan_processor.py for both.
-        from cutamp.robots.t1 import SIMPLIFIED, get_model
-        from cutamp.utils.plan_processor import process_motion_plan, raw_motion_plan
-        model = get_model(config.robot)
-        processed = process_motion_plan(curobo_plan) if model is SIMPLIFIED else raw_motion_plan(curobo_plan, model)
+        # The plan is saved raw, in its model's joint order, until stage 6's schema 4 (decision 9). See
+        # cutamp/utils/plan_processor.py.
+        from cutamp.robots.t1 import get_model
+        from cutamp.utils.plan_processor import raw_motion_plan
+        processed = raw_motion_plan(curobo_plan, get_model(config.robot))
         with open(out_path, "wb") as f:
             pickle.dump(processed, f)
         n_traj = len(curobo_plan)
@@ -257,9 +254,8 @@ def entrypoint():
         default=None,
         help=(
             "Save the motion plan as a pickle (no arg: "
-            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): schema 3 "
-            "on the simplified model, the raw 'stage3-raw' plan on the real legs. "
-            "See cutamp/utils/plan_processor.py for both."
+            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): the raw "
+            "'stage3-raw' plan. See cutamp/utils/plan_processor.py."
         ),
     )
 
