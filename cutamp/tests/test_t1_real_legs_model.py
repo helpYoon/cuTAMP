@@ -1,9 +1,7 @@
-"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): ``T1Model``'s two instances, the ``--robot``
-switch and its refusals, the support rectangles, and the blocks_t1 world on the real legs, standing on the home
-stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
+"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the soft-cost default and
+the removed options (the ablation's and ``--robot``), the support rectangles, and the blocks_t1 world on the real legs,
+standing on the home stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
 
-import dataclasses
-import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -12,32 +10,13 @@ import pytest
 import torch
 import yaml
 
-from cutamp.com_polygon_cost import (
-    COM_CENTER,
-    COM_HALF_EXTENTS,
-    LOAD_GUARD_A,
-    SUPPORT_HALF_EXTENTS,
-    support_rectangles,
-)
+from cutamp.com_polygon_cost import LOAD_GUARD_A, support_rectangles
 from cutamp.config import TAMPConfiguration, validate_tamp_config
-from cutamp.robots.t1 import BASE_INDICES, JOINT_NAMES_FULL, REAL_LEGS, SIMPLIFIED, get_model, t1_home
+from cutamp.robots.t1 import REAL_LEGS
 from cutamp.tests.conftest import needs_cuda
 
 CUTAMP = Path(__file__).resolve().parents[1]
 T1_29DOF = CUTAMP / "robots" / "assets" / "t1_29dof"
-SIMPLIFIED_NAMES = ("CUROBO_DOF", "URDF_DOF", "BASE_DOF", "BASE_INDICES", "BODY_INDICES", "LEFT_ARM_INDICES",
-                    "RIGHT_ARM_INDICES", "JOINT_NAMES_FULL", "t1_home", "T1_LIMIT_MARGIN_LOWER",
-                    "T1_LIMIT_MARGIN_UPPER")
-SIMPLIFIED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES)})\b")
-#: The definitions, their re-exports, and a script that checks simplified plans only.
-MAY_READ_SIMPLIFIED_CONSTANTS = {"robots/t1.py", "robots/__init__.py", "scripts/check_plan_margins.py"}
-#: The extended list adds the simplified support region and its frame, which ``world.model.support`` replaces.
-SUPPORT_NAMES = ("COM_HALF_EXTENTS", "SUPPORT_HALF_EXTENTS", "COM_CENTER", "mobile_base_link")
-EXTENDED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES + SUPPORT_NAMES)})\b")
-#: Their definitions, the sphere editor, which edits the simplified model only, and the real legs' build script,
-#: which names the simplified legs it replaces.
-MAY_READ_EXTENDED_CONSTANTS = MAY_READ_SIMPLIFIED_CONSTANTS | {
-    "com_polygon_cost.py", "scripts/robot_sphere_editor.py", "robots/assets/t1_29dof/build_planner_model.py"}
 LEGS = {
     side: {f"{link}_{side.title()}" for link in ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Shank", "Ankle_Cross")}
     | {f"{side}_foot_link", f"{side}_sole_link"}
@@ -116,89 +95,167 @@ def _yaml_soft_limits() -> dict:
 
 def test_real_legs_layout():
     m = REAL_LEGS
-    assert len(m.joint_names) == 33 and not m.lock_base
+    assert len(m.joint_names) == 33
     assert m.joint_names[m.base] == tuple(f"base_j_{n}" for n in ("x", "y", "z", "pitch", "roll", "yaw"))
     assert m.joint_names[m.left_arm][0] == "Left_Shoulder_Pitch" and m.joint_names[m.right_arm][-1] == "Right_Hand_Roll"
     assert set(m.joint_names[m.body]) == {"Waist"} | {f"{s}_{j}" for s in ("Left", "Right") for j in
         ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll")}
     assert (m.base, m.left_arm, m.right_arm, m.body) == (slice(0, 6), slice(6, 13), slice(13, 20), slice(20, 33))
-    assert not any(m.margin_lower + m.margin_upper) and len(m.margin_lower) == len(m.margin_upper) == 33
     assert len(m.home) == 33 and m.sole_frames == ("left_sole_link", "right_sole_link")
-    assert m.envelope.name == "route_a_start" and SIMPLIFIED.envelope is None
-    assert SIMPLIFIED.home == t1_home and SIMPLIFIED.base == BASE_INDICES and SIMPLIFIED.joint_names == JOINT_NAMES_FULL
-    assert SIMPLIFIED.lock_base and SIMPLIFIED.sole_frames == ()
+    assert m.envelope.name == "route_a_start"
 
 
-def test_unknown_robot():
-    assert get_model("simplified") is SIMPLIFIED and get_model("real_legs") is REAL_LEGS
-    with pytest.raises(ValueError, match="t2"):
-        get_model("t2")
-    with pytest.raises(ValueError, match="t2"):
-        validate_tamp_config(TAMPConfiguration(robot="t2"))
-
-
-def test_real_legs_are_the_default(monkeypatch):
-    # The user, 2026-11-05, once the speed gate passed at n 64: the config, run_cutamp's CLI and conftest's worlds
-    # plan on the real legs unless told otherwise.
+def _cli_config(monkeypatch, *argv) -> TAMPConfiguration:
+    """The TAMPConfiguration run_cutamp's CLI builds from ``argv``, with the run itself stubbed out."""
     import sys
 
     import cutamp.scripts.run_cutamp as rc
-    from cutamp.tests.conftest import DEFAULT_MODEL
     seen = []
     monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
-    monkeypatch.setattr(sys, "argv", ["run_cutamp"])
+    monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
     rc.entrypoint()
-    assert TAMPConfiguration().robot == seen[0].robot == "real_legs" and DEFAULT_MODEL is REAL_LEGS
+    return seen[-1]
 
 
-def test_soft_cost_default_by_robot():
-    real_default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
-    assert TAMPConfiguration().soft_cost == TAMPConfiguration(robot="real_legs").soft_cost == real_default
-    assert TAMPConfiguration(robot="simplified").soft_cost == ["place_close_to_base", "joint_limit_margin"]
-    assert TAMPConfiguration(robot="real_legs", soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
+def test_soft_cost_default_and_choice(monkeypatch):
+    # CostReducer sums the soft costs in this order, so the order is part of a same-seed run's result.
+    default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
+    assert TAMPConfiguration().soft_cost == default and _cli_config(monkeypatch).soft_cost == default
+    assert TAMPConfiguration(soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
+    assert _cli_config(monkeypatch, "--soft_cost", "joint_limit_margin").soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
-    # As config.py's soft_cost comment says: replace() keeps the resolved list unless soft_cost=None is passed.
-    simplified = TAMPConfiguration(robot="simplified")
-    assert dataclasses.replace(simplified, robot="real_legs").soft_cost == simplified.soft_cost
-    assert dataclasses.replace(simplified, robot="real_legs", soft_cost=None).soft_cost == real_default
 
 
-@pytest.mark.parametrize("kw", [dict(enable_com_polygon=False), dict(enable_com_aware_ik=False),
-    dict(enable_com_init_gate=False), dict(enable_com_hard_constraint=False), dict(coupled_reik=False),
-    dict(force_adam=True), dict(reik_balance_first=False)])
-def test_real_legs_refuses_ablation_paths(kw):
-    validate_tamp_config(TAMPConfiguration(robot="real_legs"))
-    validate_tamp_config(TAMPConfiguration(robot="simplified", **kw))
-    with pytest.raises(ValueError, match="real_legs"):
-        validate_tamp_config(TAMPConfiguration(robot="real_legs", **kw))
+#: The paper's ablation options, which main fixes at the full system (they live on branch ablation-baseline): each
+#: CLI spelling, with the argument it took, and each config field at its old default.
+REMOVED_CLI_OPTIONS = (["--no_coupled_reik"], ["--reik_balance_first"], ["--no_reik_balance_first"],
+                       ["--no_enable_com_polygon"], ["--no_enable_com_aware_ik"], ["--no_com_all"], ["--force_adam"],
+                       ["--soft_in_adam", "always"], ["--robot", "real_legs"])
+REMOVED_FIELDS = {"enable_com_polygon": True, "enable_com_aware_ik": True, "enable_com_init_gate": True,
+                  "enable_com_hard_constraint": True, "coupled_reik": True, "force_adam": False,
+                  "reik_balance_first": True, "soft_in_adam": "auto", "reik_num_seeds": 4, "reik_lbfgs_iters": 40,
+                  "robot": "real_legs"}
 
 
-def simplified_reads(pattern: re.Pattern, allowed: set) -> list:
-    """``path:line: text`` of every line of cutamp's modules, comments included, that ``pattern`` matches: tests and
-    the ``allowed`` files (paths relative to cutamp/) aside."""
-    hits = []
-    for path in sorted(CUTAMP.rglob("*.py")):
-        rel = path.relative_to(CUTAMP).as_posix()
-        if rel.startswith("tests/") or rel in allowed:
-            continue
-        hits += [f"{rel}:{k}: {line.strip()}" for k, line in enumerate(path.read_text().splitlines(), 1)
-                 if pattern.search(line)]
-    return hits
+@pytest.mark.parametrize("argv", REMOVED_CLI_OPTIONS, ids=lambda argv: argv[0])
+def test_removed_options_are_rejected(monkeypatch, capsys, argv):
+    # An old command line fails loudly, even one that only restated a default.
+    with pytest.raises(SystemExit) as exit_info:
+        _cli_config(monkeypatch, *argv)
+    assert exit_info.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
 
 
-def test_no_module_reads_simplified_constants():
-    # A simplified slice, home or margin read where world.model should be gives plausible, wrong numbers on the
-    # real legs. Comments count too. The extended list, with its wider allow-list, is
-    # test_real_legs_support.test_extended_grep's.
-    hits = simplified_reads(SIMPLIFIED_CONSTANTS, MAY_READ_SIMPLIFIED_CONSTANTS)
-    assert not hits, "\n".join(hits)
+@pytest.mark.parametrize("name", REMOVED_FIELDS)
+def test_removed_fields_are_rejected(name):
+    with pytest.raises(TypeError, match=name):
+        TAMPConfiguration(**{name: REMOVED_FIELDS[name]})
+
+
+def test_joint_limit_margin_is_registered_and_weighted():
+    # Unregistered names pass through UNWEIGHTED in CostReducer, so the weight entry is mandatory.
+    from cutamp.config import SUPPORTED_SOFT_COSTS
+    from cutamp.scripts.utils import default_constraint_to_mult
+    assert "joint_limit_margin" in SUPPORTED_SOFT_COSTS
+    validate_tamp_config(TAMPConfiguration(soft_cost=["joint_limit_margin"]))
+    assert default_constraint_to_mult["soft"]["joint_limit_margin"] == 1e3
+
+
+def test_shrunken_bounds_penalty_is_zero_strictly_inside():
+    from cutamp.joint_limit_cost import shrunken_bounds_penalty
+    lo, hi = torch.tensor([-1.0, 0.0]), torch.tensor([1.0, 2.0])
+    q = torch.tensor([[0.0, 1.0], [-0.99, 1.99]])
+    assert shrunken_bounds_penalty(q, lo, hi).sum() == 0.0
+
+
+def test_shrunken_bounds_penalty_is_quadratic_in_penetration():
+    # 0.2 below the lower bound -> 0.04; doubling the depth quadruples it.
+    from cutamp.joint_limit_cost import shrunken_bounds_penalty
+    lo, hi = torch.tensor([0.0]), torch.tensor([1.0])
+    p1 = shrunken_bounds_penalty(torch.tensor([[-0.2]]), lo, hi)
+    p2 = shrunken_bounds_penalty(torch.tensor([[-0.4]]), lo, hi)
+    assert torch.allclose(p1, torch.tensor([[0.04]]))
+    assert torch.allclose(p2, 4.0 * p1)
+
+
+def test_shrunken_bounds_penalty_penalizes_both_sides():
+    from cutamp.joint_limit_cost import shrunken_bounds_penalty
+    lo, hi = torch.tensor([0.0]), torch.tensor([1.0])
+    below = shrunken_bounds_penalty(torch.tensor([[-0.1]]), lo, hi)
+    above = shrunken_bounds_penalty(torch.tensor([[1.1]]), lo, hi)
+    assert below.item() > 0.0 and above.item() > 0.0
+    assert torch.allclose(below, above)
+
+
+WAIST = REAL_LEGS.joint_names.index("Waist")
+
+
+def _real_limits() -> torch.Tensor:
+    """The real legs' ``[2, 33]`` limits in the model's joint order, row 0 lower: t1_29dof.yml's, which every factory's
+    kinematics reports (test_factories_keep_the_soft_limits_on_their_joints), so the soft cost's
+    ``world.joint_limits``."""
+    soft = _yaml_soft_limits()
+    return torch.tensor([soft[n] for n in REAL_LEGS.joint_names], dtype=torch.float32).T.contiguous()
+
+
+def _joint_limit_margin(particles: dict, n: int) -> torch.Tensor:
+    """The joint_limit_margin soft cost as cost_function.py computes it: on the real legs' limits."""
+    from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
+    return joint_limit_margin_soft_cost(particles, _real_limits(), num_particles=n, device=torch.device("cpu"))
+
+
+def _real_home(n: int) -> torch.Tensor:
+    return torch.tensor(REAL_LEGS.home, dtype=torch.float32).expand(n, -1).clone()
+
+
+def test_joint_limit_margin_is_zero_inside_the_limits():
+    # No margin band: home, and a conf 1 mrad inside the Waist's upper limit, cost exactly nothing.
+    near = _real_home(4)
+    near[:, WAIST] = _real_limits()[1, WAIST] - 0.001
+    cost = _joint_limit_margin({"q_retract": _real_home(4), "left_q1": near}, 4)
+    assert cost.shape == (4,)
+    assert torch.all(cost == 0.0)
+
+
+def test_joint_limit_margin_penalizes_a_conf_past_its_limit():
+    # The Waist 0.08 rad past its upper limit: penalty 0.08^2 = 6.4e-3.
+    q = _real_home(2)
+    q[:, WAIST] = _real_limits()[1, WAIST] + 0.08
+    assert torch.allclose(_joint_limit_margin({"q_pick": q}, 2), torch.full((2,), 0.08 ** 2), atol=1e-6)
+
+
+def test_joint_limit_margin_excludes_the_initial_confs():
+    # A violating conf under every initial-state name and a clean home under q_pick: the total is exactly 0 (the
+    # exclusion works inside the stacked path, not just via the empty-dict fallback). Initial states must never
+    # acquire limit gradients through the Adam soft loss.
+    bad = _real_home(2)
+    bad[:, WAIST] = _real_limits()[1, WAIST] + 0.08
+    cost = _joint_limit_margin({"q0": bad, "left_q0": bad.clone(), "right_q0": bad.clone(), "q_pick": _real_home(2)}, 2)
+    assert torch.all(cost == 0.0)
+
+
+def test_joint_limit_margin_without_confs_is_zero():
+    cost = _joint_limit_margin({"pose1": torch.zeros(3, 4)}, 3)
+    assert cost.shape == (3,) and torch.all(cost == 0.0)
+
+
+def test_joint_limit_margin_gradient_restores_and_skips_the_initial_confs():
+    # (a) The gradient through the hinge^2 points back toward the interior; (b) an excluded initial-state conf gets
+    # no gradient even when it is in the dict, the safety property the exclusion exists for.
+    bad = _real_home(2)
+    bad[:, WAIST] = _real_limits()[0, WAIST] - 0.08  # 0.08 below the lower limit
+    q_pick, left_q0 = bad.clone().requires_grad_(True), bad.clone().requires_grad_(True)
+    _joint_limit_margin({"q_pick": q_pick, "left_q0": left_q0}, 2).sum().backward()
+    assert left_q0.grad is None or torch.all(left_q0.grad == 0.0)
+    # d/dq of relu(lower - q)^2 is -2 relu(lower - q): pushing q up, toward the interior, lowers the cost.
+    assert q_pick.grad is not None and bool((q_pick.grad[:, WAIST] < 0.0).all())
+    others = [k for k in range(len(REAL_LEGS.joint_names)) if k != WAIST]
+    assert torch.all(q_pick.grad[:, others] == 0.0)  # the untouched joints get no gradient
 
 
 def test_support_rectangles():
     gate, key = support_rectangles((0.2249, 0.100), 0.10625, 0.1)
     assert gate == pytest.approx((0.09245, 0.135)) and key == pytest.approx((0.08745, 0.130))
     assert REAL_LEGS.support == ("stance", (0.0, 0.0), gate, key)
-    assert SIMPLIFIED.support == ("mobile_base_link", COM_CENTER, SUPPORT_HALF_EXTENTS, COM_HALF_EXTENTS)
 
 
 def test_load_guard_is_the_hull_of_its_32_sums():

@@ -1,6 +1,6 @@
 """GN and the gates on the real legs (design 7.4). On the real legs:
 - 12 sole rows in GN's level 1 hold both soles on the stance, beside the active CoM rows, and the base columns are
-  free (``_row_layout`` freezes them only where ``model.lock_base``);
+  free;
 - level 1 holds the CoM in the real legs' keyframe rectangle;
 - level 1 holds the Trunk tilt within an envelope's maximum: one row, active where the tilt is past the bound or a
   step would push it past, as a CoM axis is. Route A's envelope sets no tilt bound, so the tilt tests plan on the
@@ -233,8 +233,7 @@ def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, monkeypatch, til
 
 @needs_cuda
 def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monkeypatch):
-    # _balanced_step's half=None default is the simplified rectangle, so every real-leg call passes the
-    # real legs' own, with the sole rows.
+    # Every iteration passes _balanced_step the support's keyframe rectangle and the sole rows, by name.
     import cutamp.gn_refresh as gn_refresh
     arm, _, q0 = _first_pick(real_world, real_plan)
     targets, _ = _moved_targets(real_world, q0, arm)
@@ -297,17 +296,15 @@ def test_soles_on_stance_at_the_checker_tolerances(real_world):
 
 def test_tilt_within_bound_on_the_motion_values_metric():
     # The final repair's tilt test, on the Motion value's metric and tolerance: under a 1.0 rad bound, upright and on
-    # the bound (roll 1.0 rad) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, and a model
-    # without an envelope pass every conf.
+    # the bound (roll 1.0 rad) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, passes every
+    # conf.
     from types import SimpleNamespace
     from cutamp.gn_refresh import tilt_within_bound
-    from cutamp.robots.t1 import SIMPLIFIED
     names = list(REAL_LEGS.joint_names)
     q = torch.tensor(REAL_LEGS.home).repeat(3, 1)
     q[1:, names.index("base_j_roll")] = torch.tensor([1.0, 1.01])
     assert tilt_within_bound(SimpleNamespace(model=TILTED), q, 1e-6).tolist() == [True, True, False]
     assert tilt_within_bound(SimpleNamespace(model=REAL_LEGS), q, 1e-6).all()
-    assert tilt_within_bound(SimpleNamespace(model=SIMPLIFIED), q[:, :len(SIMPLIFIED.joint_names)], 1e-6).all()
 
 
 @needs_cuda
@@ -341,7 +338,7 @@ def test_final_repair_takes_no_conf_past_the_tilt_bound(real_world, real_plan, m
     monkeypatch.setattr(op, "_ik_success_mask", lambda result: torch.ones(len(repaired), dtype=torch.bool,
                                                                             device=repaired.device))
     deps = [dep for dep in op._build_ik_deps(skeleton, real_world) if dep.q_name == conf]
-    make_optimizer(TAMPConfiguration(robot="real_legs", num_particles=64))._refresh_ik_deps(particles, deps, real_world)
+    make_optimizer(TAMPConfiguration(num_particles=64))._refresh_ik_deps(particles, deps, real_world)
     assert torch.equal(particles[conf][a], moved[a] if tilt_max is not None else repaired[a])
     assert torch.equal(particles[conf][b], repaired[b])
 
@@ -365,7 +362,7 @@ def test_kinematic_constraint_checks_the_soles(real_world, real_plan):
     assert [reducer._get_multiplier(kc, n) for n in ("sole_pos_err", "sole_rot_err")] == [1.0, 5.0]
 
     skeleton, particles = real_plan
-    config = TAMPConfiguration(robot="real_legs", num_particles=64)
+    config = TAMPConfiguration(num_particles=64)
     rollout_fn, cost_fn = RolloutFunction(skeleton, real_world, config), CostFunction(skeleton, real_world, config)
     checker = ConstraintChecker(default_constraint_to_tol.copy())
     _, conf, _ = _first_pick(real_world, real_plan)

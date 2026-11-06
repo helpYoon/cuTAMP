@@ -1,12 +1,14 @@
-"""Tests for COM-anchored pick/place terminals (plan_cspace to the conf)."""
+"""COM-anchored pick/place terminals (plan_cspace to the conf), the trajectory audit, and one real-legs blocks_t1
+plan's balance metrics against its exported frames."""
 import os
+import pickle
 
+import numpy as np
 import pytest
 import torch
 
 import cutamp.motion_solver as ms
-from cutamp.robots.t1 import SIMPLIFIED
-from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
+from cutamp.tests.conftest import needs_cuda
 
 
 def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
@@ -25,7 +27,7 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
             return "FAKE_RESULT"
 
     res = ms._plan_arm_to_conf(
-        FakePlanner(), torch.zeros(21), last_js="LAST", full_joint_names=["a"],
+        FakePlanner(), torch.zeros(33), last_js="LAST", full_joint_names=["a"],
         disable_obstacle=None, ground_op="OP",
     )
     assert res == "FAKE_RESULT"
@@ -46,7 +48,7 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
 
     fp = FakePlanner()
     with pytest.raises(RuntimeError, match="cspace-anchored"):
-        ms._plan_arm_to_conf(fp, torch.zeros(21), "LAST", ["a"],
+        ms._plan_arm_to_conf(fp, torch.zeros(33), "LAST", ["a"],
                              disable_obstacle=None, ground_op="OP")
     assert fp.n == 1  # no repeat: the same start and goal plan the same way
 
@@ -69,158 +71,64 @@ def test_audit_counts_each_junction_frame_once(monkeypatch):
     assert ms._audit_traj_com(world, None, plans) == {"traj_com_violation_frac": 1 / 7, "traj_com_frames": 7}
 
 
-def _generate_plan_segments(seed: int, enable_com_polygon: bool = True):
-    """Run the full cuTAMP pipeline once for blocks_t1 and return
-    ``(world, segments, overall_metrics)``: a TAMPWorld for COM checks, the
-    processed motion-plan segments (schema v3), and the ``overall_metrics``
-    dict (includes the measure-only trajectory CoM audit).
-
-    ``run_cutamp(env, config, cost_reducer, constraint_checker, q_init=None,
-    experiment_id=None)`` takes an env (not a prebuilt world), builds the
-    world itself via ``setup_cutamp``, and returns a
-    ``(curobo_plan, num_satisfying, overall_metrics)`` tuple; the raw plan is
-    then processed to schema v3 with ``process_motion_plan``. The TAMPWorld
-    used for the COM checks is built separately from the same env — its
-    kinematics depend only on the robot/env, so it matches the planner's.
-
-    On the simplified model: schema v3, its support rectangle, ``coupled_reik=False`` and the no-CoM arm are that
-    model's (design call 15). The real legs' plans have their own tests (test_real_legs_motion.py).
-    """
-    from cutamp.envs.utils import get_env_dir, load_env
+@needs_cuda
+def test_real_legs_plan_audit(tmp_path, monkeypatch):
+    # One real-legs plan as the slow end-to-end test runs it (blocks_t1, seed 0, 64 particles, the surface at 0.5 m,
+    # the motion plan saved raw): the metrics the gate records hold for the exported segments, and the CoM and the
+    # multibody ZMP re-measured on those frames stay inside the gate's rectangle (compute_support_mask's). On the real
+    # legs the gate sets each segment's pace, faster or slower than the planner's (measured 2026-11-05: 0.28x to
+    # 2.47x over 8 segments), so retime_max may be under 1.
+    import cutamp.algorithm as alg
+    import cutamp.scripts.run_cutamp as rc
+    from curobo.types import JointState
+    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, compute_support_mask
     from cutamp.config import TAMPConfiguration
-    from cutamp.algorithm import run_cutamp
-    from cutamp.constraint_checker import ConstraintChecker
-    from cutamp.cost_reduction import CostReducer
-    from cutamp.scripts.utils import (
-        default_constraint_to_mult,
-        default_constraint_to_tol,
-    )
-    from cutamp.utils.plan_processor import process_motion_plan
+    from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
 
-    torch.manual_seed(seed)
+    seen = {}
+    run, solve = rc.run_cutamp, alg.solve_curobo
+
+    def run_spy(*args, **kwargs):
+        seen["run"] = run(*args, **kwargs)
+        return seen["run"]
+
+    def solve_spy(plan_info, particle, world, *args, **kwargs):
+        seen["world"] = world
+        return solve(plan_info, particle, world, *args, **kwargs)
+
+    monkeypatch.setattr(rc, "run_cutamp", run_spy)
+    monkeypatch.setattr(alg, "solve_curobo", solve_spy)
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    config = TAMPConfiguration(
-        robot="simplified",
-        num_particles=64,
-        num_opt_steps=50,
-        curobo_plan=True,
-        enable_com_polygon=enable_com_polygon,
-        # Pin coupled re-IK OFF, which keeps the soft costs out of Adam: these
-        # tests assert segment schema + arrival COM-in-hull, which the CoM-aware
-        # IK + hard gate guarantee regardless; running the default coupled-reik
-        # optimization here only doubles runtime (coverage of that lives in
-        # test_coupled_reik_smoke).
-        coupled_reik=False,
-        enable_visualizer=False,
-        enable_experiment_logging=False,
-    )
-    cost_reducer = CostReducer(default_constraint_to_mult.copy())
-    constraint_checker = ConstraintChecker(default_constraint_to_tol.copy())
+    raise_surface_height(env, 0.5)
+    torch.manual_seed(0)  # run_cutamp's --seed 0
+    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
+                               experiment_root=str(tmp_path))
+    rc.cutamp_demo(env, config, experiment_id="audit", save_plan="auto")
 
-    curobo_plan, _num_satisfying, overall_metrics = run_cutamp(
-        env, config, cost_reducer, constraint_checker,
-        experiment_id="test_place_arrival",
-    )
-    if curobo_plan is None:
-        raise RuntimeError(
-            "run_cutamp produced no motion plan (curobo_plan is None) for "
-            f"seed={seed}; cannot check place arrival COM."
-        )
-    processed = process_motion_plan(curobo_plan)
-
-    # Separate TAMPWorld for COM checks (kinematics depend only on env/robot).
-    world = make_blocks_t1_world(model=SIMPLIFIED)
-    return world, processed["segments"], overall_metrics
-
-
-def _frame_q(q_home, idx, P, t):
-    """Full-dof configuration for frame ``t`` of a segment's position dict."""
-    from cutamp.robots.t1 import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
-
-    q = q_home.clone()
-    q[idx["Torso_Pitch"]] = float(P["trunk_pitch"][t])
-    q[idx["Waist_Yaw"]] = float(P["trunk_yaw"][t])
-    q[idx["ankle_pitch"]] = float(P["ankle_pitch"][t])
-    q[idx["knee_pitch"]] = float(P["knee_pitch"][t])
-    for j, n in enumerate(LEFT_ARM_JOINT_NAMES):
-        q[idx[n]] = float(P["left_arm"][t][j])
-    for j, n in enumerate(RIGHT_ARM_JOINT_NAMES):
-        q[idx[n]] = float(P["right_arm"][t][j])
-    return q
-
-
-@needs_cuda
-@pytest.mark.parametrize("seed", [0, 1])
-def test_all_segment_arrivals_com_in_hull(seed):
-    # A full plan generates (no RuntimeError from solve_curobo), produces
-    # segments, and EVERY segment's ARRIVAL (last frame) — pick, place,
-    # retract — is COM-in-hull, since each is a cspace-anchored conf or
-    # retract-home. (Pre-fix, place arrivals leaked out.) Both seeds exercise
-    # the pick and the place anchoring: each plan calls _plan_arm_to_conf once
-    # per LeftPick, RightPick, LeftPlace and RightPlace (measured 2026-11-01).
-    from cutamp.robots.t1 import t1_home
-    from cutamp.com_polygon_cost import compute_com_polygon_penalties, COM_TOL
-
-    world, segments, overall = _generate_plan_segments(seed=seed)
-    assert len(segments) > 0, "plan produced no segments"
-    names = list(world.kinematics.joint_names)
-    idx = {n: i for i, n in enumerate(names)}
-    q_home = torch.as_tensor(t1_home, dtype=torch.float32,
-                             device=world.kinematics.device_cfg.device)
-    worst = 0.0
-    for si, seg in enumerate(segments):
-        P = seg["position"]; T = seg["T"]
-        q = _frame_q(q_home, idx, P, T - 1).unsqueeze(0)
-        pen = float(compute_com_polygon_penalties(world, {"q": q})["q"][0])
-        worst = max(worst, pen)
-        assert pen <= COM_TOL, (
-            f"segment {si} arrival COM penalty {pen:.6f} > tol {COM_TOL}"
-        )
-    print(f"all {len(segments)} arrivals in hull; worst penalty {worst:.6f} <= {COM_TOL}")
-
-    # Trajectory audit is recorded (measure-only) whenever a plan is produced.
-    assert overall["motion_plan_success"] is True
-    assert 0.0 <= overall["traj_com_violation_frac"] <= 1.0
-    assert overall["traj_com_frames"] > 0
-    # The balance gate: no frame's CoM or ZMP leaves the support rectangle.
-    assert overall["traj_com_violation_frac"] == 0.0
-    assert overall["traj_com_min_margin"] >= 0.0 and overall["traj_zmp_min_margin"] >= 0.0
-    assert overall["retime_max"] >= 1.0 and overall["plan_duration_s"] > 0.0
-    # A segment the gate slowed keeps its motion planner's timing: fewer frames along the same path, from the
-    # same start to the same arrival; no other segment has one.
-    slowed = [seg for seg in segments if seg["planner_timing"] is not None]
-    assert bool(slowed) == (overall["retime_max"] > 1.0)
-    for seg in slowed:
-        pt = seg["planner_timing"]
-        assert pt["T"] < seg["T"] and pt["dt"] == seg["dt"]
-        assert 1.0 < (seg["T"] - 1) / (pt["T"] - 1) <= overall["retime_max"] + 1e-9
-        assert pt["held_objs"].keys() == seg["held_objs"].keys()
-        assert all(poses.shape[-3] == pt["T"] for _, poses in pt["held_objs"].values())
-        for k in ("trunk_pitch", "knee_pitch", "left_arm", "right_arm"):
-            for t in (0, -1):
-                assert abs(pt["position"][k][t] - seg["position"][k][t]).max() < 1e-5
-    # ... measured again on the frames actually exported, so a gated segment that never reaches the export
-    # fails here.
-    from cutamp.com_polygon_cost import SUPPORT_HALF_EXTENTS, com_margin_from_base, com_zmp_in_support
-    from cutamp.motion_solver import ZMP_STEP
-    zero, h = torch.zeros_like(q_home), ZMP_STEP
-    for si, seg in enumerate(segments):
-        Q, V, A = (torch.stack([_frame_q(base, idx, seg[f], t) for t in range(seg["T"])])
-                   for base, f in ((q_home, "position"), (zero, "velocity"), (zero, "acceleration")))
-        com, zmp = com_zmp_in_support(world, torch.stack([Q - h * V + h * h / 2 * A, Q, Q + h * V + h * h / 2 * A]), h)
-        for name, xy in (("CoM", com), ("ZMP", zmp)):
-            m = com_margin_from_base(xy, SUPPORT_HALF_EXTENTS).min().item()
-            assert m >= -1e-5, f"segment {si}: exported {name} {-100 * m:.2f} cm outside the support rectangle"
-
-
-@needs_cuda
-def test_no_balance_arm_is_not_gated(monkeypatch):
-    # The no-CoM ablation arms keep their plans as planned: the gate never runs, and no gate metric is recorded.
-    import cutamp.motion_solver as ms
-
-    def boom(*a, **k):
-        raise AssertionError("balance gate ran with enable_com_polygon=False")
-
-    monkeypatch.setattr(ms, "_balance_gate", boom)
-    _, segments, overall = _generate_plan_segments(seed=0, enable_com_polygon=False)
-    assert len(segments) > 0 and "retime_max" not in overall and overall["plan_duration_s"] > 0.0
+    _, _, metrics = seen["run"]
+    assert metrics["found_solution"] and metrics["motion_plan_success"], metrics.get("motion_plan_failures")
+    assert metrics["traj_com_min_margin"] >= 0 and metrics["traj_zmp_min_margin"] >= 0
+    with open(tmp_path / "audit" / "motion_plan.pkl", "rb") as f:
+        segments = pickle.load(f)["segments"]
+    assert metrics["plan_duration_s"] == pytest.approx(sum((len(s["position"]) - 1) * s["dt"] for s in segments))
+    scales = []
+    for k, seg in enumerate(segments):
+        timing = seg["planner_timing"]
+        n = len(seg["position"])
+        scales.append((n - 1) / ((n if timing is None else len(timing["position"])) - 1))
+        if timing is not None:  # the same path at the planner's timing: from the same start to the same arrival
+            # The planner-timing spline misses a joint that moves to 0 by a rounding error (measured 3e-27).
+            np.testing.assert_allclose(timing["position"][[0, -1]], seg["position"][[0, -1]], rtol=0, atol=1e-6,
+                                       err_msg=f"segment {k}")
+    assert metrics["retime_max"] == pytest.approx(max(scales))
+    # Measured again on the frames actually exported, so a gated segment that never reaches the export fails here.
+    world = seen["world"]
+    for k, seg in enumerate(segments):
+        js = JointState(position=torch.as_tensor(seg["position"], device=world.device),
+                        velocity=torch.as_tensor(seg["velocity"], device=world.device),
+                        acceleration=torch.as_tensor(seg["acceleration"], device=world.device),
+                        joint_names=list(world.model.joint_names))
+        assert bool(compute_support_mask(world, js.position).all()), f"segment {k}: an exported CoM is outside"
+        _, zmp = com_zmp_in_support(world, ms._taylor_positions(world, None, js), ms.ZMP_STEP)
+        margin = com_margin_from_base(zmp, world.model.support.gate_half).min().item()
+        assert margin >= 0, f"segment {k}: an exported ZMP is {-100 * margin:.2f} cm outside the gate's rectangle"

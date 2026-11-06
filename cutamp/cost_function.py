@@ -115,15 +115,13 @@ class CostFunction:
             self_collision_kin_config=self.world.kinematics.get_self_collision_config(),
         )
         self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
-        # On the real legs the retract confs join the joint-limit and self-collision constraints (design 7.3), on a
-        # cost of their own: an instance rewrites its output and gradient buffers on every call of one shape.
-        self.retract_self_collision_cost_fn = (
-            SelfCollisionCost(self_collision_config) if world.model.sole_frames and self.retract_info else None
-        )
+        # The retract confs join the joint-limit and self-collision constraints (design 7.3), on a cost of their
+        # own: an instance rewrites its output and gradient buffers on every call of one shape.
+        self.retract_self_collision_cost_fn = SelfCollisionCost(self_collision_config) if self.retract_info else None
         # The envelope's Trunk tilt bound (call 22), as trunk_tilt_excess's arguments after the confs: the base's pitch
-        # and roll columns, and the cosine of the maximum tilt. None without an envelope or when it sets no bound.
+        # and roll columns, and the cosine of the maximum tilt. None when the envelope sets no bound.
         envelope, names = world.model.envelope, world.model.joint_names
-        self.trunk_tilt_args = None if envelope is None or envelope.trunk_tilt_max is None else (
+        self.trunk_tilt_args = None if envelope.trunk_tilt_max is None else (
             names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(envelope.trunk_tilt_max)
         )
 
@@ -205,15 +203,13 @@ class CostFunction:
         self._rollout_validated = True
 
     def kinematic_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Kinematic constraints - i.e., pose error between actual and desired end-effector poses. On the real
-        legs also both soles' error against the stance at every conf, ``sole_pos_err`` and ``sole_rot_err``
-        ``[N, 2H]``: a conf whose feet drifted would pass the CoM gate on a support polygon it no longer stands
-        on (design 7.4)."""
+        """Kinematic constraints - i.e., pose error between actual and desired end-effector poses, and both
+        soles' error against the stance at every conf, ``sole_pos_err`` and ``sole_rot_err`` ``[N, 2H]``: a conf
+        whose feet drifted would pass the CoM gate on a support polygon it no longer stands on (design 7.4)."""
         pos_errs, rot_errs = curobo_pose_error(rollout["world_from_ee"], rollout["world_from_ee_desired"])
         values = {"pos_err": pos_errs, "rot_err": rot_errs}
-        if rollout["world_from_soles"] is not None:
-            sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.stance_soles)  # [N, H, 2]
-            values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
+        sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.stance_soles)  # [N, H, 2]
+        values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
         kinematic_cost = {
             "type": "constraint",
             "constraints": self.kinematic_constraints,
@@ -222,9 +218,9 @@ class CostFunction:
         return kinematic_cost
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and, on the
-        real legs, of the retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope
-        that bounds the tilt, also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
+        """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and of the
+        retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope that bounds the
+        tilt, also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 
@@ -415,7 +411,7 @@ class CostFunction:
         gradient toward COM-feasibility instead of a dead-weight 0/1
         Boolean.
         """
-        if not self.config.enable_com_polygon or self._particles is None:
+        if self._particles is None:
             return None
 
         pens = self._com_polygon_penalties()
@@ -507,30 +503,19 @@ class CostFunction:
                 return (all_configs[:, :, body] - home_body).pow(2).sum(dim=(1, 2))
             return torch.zeros(num_particles, device=device)
 
-        # Joint-limit margin — keep endpoint configurations a soft band away
-        # from position limits. Per-joint/per-side margins from the model
-        # (zero on the home-side bounds the standing posture sits ON, so home
-        # costs exactly 0; zero everywhere on the real legs, whose limits are
-        # already the policy's soft limits, so the cost is 0 there). q0s are
-        # excluded inside the helper: the initial robot state must never
-        # acquire margin gradients (Phase-2 LBFGS re-leafs every cloned
-        # particle).
+        # Joint limits — a hinge² penalty on endpoint configurations past the
+        # position limits, which are already the policy's soft limits (no
+        # margin band, call 17). q0s are excluded inside the helper: the
+        # initial robot state must never acquire limit gradients (Phase-2
+        # LBFGS re-leafs every cloned particle).
         elif cost_name == "joint_limit_margin":
             if self._particles is None:
                 raise RuntimeError("Particles must be provided for joint_limit_margin soft cost")
 
             from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
 
-            model = self.world.model
             limits = self.world.joint_limits  # [2, dof], row 0 = lower
-            return joint_limit_margin_soft_cost(
-                self._particles,
-                limits,
-                _device_const(model.margin_lower, device, limits.dtype),
-                _device_const(model.margin_upper, device, limits.dtype),
-                num_particles,
-                device,
-            )
+            return joint_limit_margin_soft_cost(self._particles, limits, num_particles, device)
 
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
@@ -577,8 +562,7 @@ class CostFunction:
 
         # COM-over-base-polygon hard filter (mirrors Collision)
         com_polygon_cost = self.com_polygon_constraint()
-        if self.config.enable_com_hard_constraint:
-            add_cost(ComPolygon.type, com_polygon_cost)
+        add_cost(ComPolygon.type, com_polygon_cost)
 
         # Soft costs
         if self.config.soft_cost:

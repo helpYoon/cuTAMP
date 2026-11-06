@@ -39,26 +39,15 @@ from curobo._src.cost.cost_base import BaseCost
 from curobo._src.cost.cost_base_cfg import BaseCostCfg
 
 
-# --- The simplified model's support region (robots/t1.py SIMPLIFIED.support) ---
-# The real T1's two-foot support region (t1.urdf foot boxes, legs together): the
-# soles span x [-0.1015, +0.1215] about the ankle axis (mobile_base_link) and
-# y +-0.15625, so the rectangles are centred 1 cm ahead of the base origin.
-# SUPPORT_HALF_EXTENTS shrinks the soles by COM_SAFETY_MARGIN on every side for
-# the model and tracking errors a real robot adds: every trajectory frame's CoM
-# and ZMP stay inside it (motion_solver._balance_gate). COM_HALF_EXTENTS, the
-# keyframes' rectangle, sits COM_DYNAMIC_RESERVE further in, so a segment can
-# decelerate into its end conf without the ZMP leaving (a conf on the support
-# edge needed 4-7x slowdowns; with 1 cm the optimizer found no satisfying conf
-# on 2 of 4 blocks_t1 seeds). t1_simplified carries the real T1's masses, so
-# this model's CoM is the robot's (test_robot_com.py). The real legs' region
-# comes from support_rectangles, with the same margins. Consumers read the
-# region from the model's Support, never from these names.
-SOLE_HALF_EXTENTS = (0.1115, 0.15625)  # (X, Y) half-extents of the soles' footprint, meters
-COM_CENTER = (0.01, 0.0)               # the footprint's centre in mobile_base_link frame, meters
+# --- The support region's margins, the CoM penalty's barrier and the balance tolerances ---
+# The trajectory gate's rectangle (support.gate_half) shrinks the soles by COM_SAFETY_MARGIN for the model and
+# tracking errors a real robot adds: every trajectory frame's CoM and ZMP stay inside it (motion_solver._balance_gate).
+# The keyframes' rectangle (support.keyframe_half) sits COM_DYNAMIC_RESERVE further in, so a segment can decelerate
+# into its end conf without the ZMP leaving. The reserve was set on the simplified model (branch ablation-baseline):
+# a conf on the support edge needed 4-7x slowdowns, and a 1 cm reserve left the optimizer no satisfying conf on 2 of
+# 4 blocks_t1 seeds. support_rectangles builds the region from them; consumers read it from the model's Support.
 COM_SAFETY_MARGIN = 0.02               # model, tracking and sole-edge error budget, meters
-SUPPORT_HALF_EXTENTS = tuple(h - COM_SAFETY_MARGIN for h in SOLE_HALF_EXTENTS)  # (0.0915, 0.13625)
 COM_DYNAMIC_RESERVE = 0.005            # keyframe CoM room for an arrival's deceleration, meters
-COM_HALF_EXTENTS = tuple(h - COM_DYNAMIC_RESERVE for h in SUPPORT_HALF_EXTENTS)  # (0.0865, 0.13125)
 COM_INSIDE_MARGIN = 0.02             # inside-edge soft-barrier band width, meters
 COM_INSIDE_WEIGHT = 1.0              # inside-barrier scale vs the outside quadratic
 COM_TOL = COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN**2  # on-boundary penalty, 4e-4 (known-bugs N5)
@@ -85,7 +74,7 @@ def support_rectangles(
     The soles' hull is ``|x| <= sole_box[0] / 2``, ``|y| <= sole_y + sole_box[1] / 2``. The load guard's region
     S_a, where some load split gives each foot at least ``a`` of the weight, keeps x and narrows y by
     ``2 sole_y a``. The gate is S_a inside the hull shrunk by ``COM_SAFETY_MARGIN`` (at a = 0.1 the margin binds
-    only in x), and the keyframes' rectangle sits ``COM_DYNAMIC_RESERVE`` further in, as on the simplified model.
+    only in x), and the keyframes' rectangle sits ``COM_DYNAMIC_RESERVE`` further in.
     Both soles stand on one stance, so the region is this rectangle in the stance frame."""
     hull = (sole_box[0] / 2, sole_y + sole_box[1] / 2)
     s_a_y = hull[1] - 2 * sole_y * a
@@ -202,7 +191,7 @@ class ComOverBasePolygonCost(BaseCost):
         b, h = state.joint_state.position.shape[:2]
         n = b * h
         com_world = state.cuda_robot_model_state.robot_com[..., :3].reshape(n, 3)
-        # Not through _link_matrix: the support frame is constant in q (stance) or a pure yaw, where FK's grad is exact.
+        # Not through _link_matrix: the support frame (the stance) is constant in q, where FK's grad is exact.
         base_T = (
             state.tool_poses.get_link_pose(cfg.base_link_name, make_contiguous=True)
             .get_matrix()
@@ -235,7 +224,7 @@ def _com_and_base_from_state(ks, link: str):
     state, ``base_T`` the world pose of the support frame ``link``: the inputs
     every COM-polygon helper needs."""
     com_world = ks.robot_com[..., :3].reshape(-1, 3)
-    # Not through _link_matrix: the support frame is constant in q (stance) or a pure yaw, where FK's grad is exact.
+    # Not through _link_matrix: the support frame (the stance) is constant in q, where FK's grad is exact.
     base_T = (
         ks.tool_poses.get_link_pose(link, make_contiguous=True)
         .get_matrix()
@@ -306,8 +295,8 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     """``[B]`` stability margins for full-cspace configs via FK, against the keyframes' rectangle
     (``world.model.support.keyframe_half``).
 
-    Measure-only companion to :func:`compute_com_polygon_mask`; used by the
-    ablation study's shared yardstick (recorded in every arm)."""
+    Measure-only companion to :func:`compute_com_polygon_mask`: the best
+    particle's ``best_com_margin`` (optimize_plan.py) and the planned one's (algorithm.py)."""
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q_batch)
     return com_margin_from_base(_project_com_to_base(com, base_T, support.center), support.keyframe_half)
@@ -317,17 +306,6 @@ def _vee(m: torch.Tensor) -> torch.Tensor:
     """The vector of a ``[..., 3, 3]`` matrix's skew-symmetric part."""
     return 0.5 * torch.stack([m[..., 2, 1] - m[..., 1, 2], m[..., 0, 2] - m[..., 2, 0],
                               m[..., 1, 0] - m[..., 0, 1]], dim=-1)
-
-
-def retime_factor(com_xy: torch.Tensor, zmp_xy: torch.Tensor, half: Tuple[float, float]) -> float:
-    """The uniform slowdown ``s >= 1`` that brings every frame's ZMP inside the support rectangle ``half`` (the
-    gate's, ``support.gate_half``), given its CoM is: slowing by ``s`` divides the ZMP's offset from the CoM by
-    ``s**2``, and an offset no larger than the CoM's room to the edge keeps the ZMP inside. ``inf`` if an offset
-    frame has no room."""
-    room = (com_xy.new_tensor(half) - com_xy.abs()).clamp_min(0.0)
-    off = (zmp_xy - com_xy).abs()
-    ratio = torch.where(off > 0, off / room, torch.zeros_like(off)).max().item()
-    return max(1.0, math.sqrt(ratio))
 
 
 def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
@@ -340,8 +318,8 @@ def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
     The ZMP is the multibody one: over the links, ``sum m (g + z'') x - m z x''`` less the rate of each link's
     spin about its own CoM (y: plus), over ``sum m (g + z'')``. A trunk swinging above the hips moves it
     centimetres past the CoM alone's cart-table ZMP. z is the height above the support frame's origin, the sole
-    plane (test_robot_com.py, test_real_legs_support.py). The support frame stays put during a segment (the
-    simplified model's base is pinned, the real legs' stance hangs off the world), so it is inertial.
+    plane (test_real_legs_support.py). The support frame stays put during a segment (the stance hangs off the
+    world), so it is inertial.
 
     The floor can only push. A frame whose ``sum m (g + z'')`` is not positive would need it to pull: the soles would
     leave the floor and there is no ZMP, so that frame's is +inf, outside every support region."""

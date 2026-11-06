@@ -9,7 +9,7 @@
 
 """Particle-rollout under cuRobo v0.8 single-MotionPlanner architecture.
 
-Configurations are single vectors in the model's cspace (21 or 33 joints). One FK
+Configurations are single vectors in the model's cspace (its 33 joints). One FK
 call covers the whole chain; for multi-tool robots we extract per-timestep
 ee/tool poses by looking up which arm each timestep's conf belongs to.
 """
@@ -37,8 +37,8 @@ class _FKQuatGrad(torch.autograd.Function):
     in quaternion_util.cuh) but dots the result with world-frame joint axes, which need
     Omega = 0.5 (-g_w v + w g_v + v x g_v). Passing g' = 2 q (x) (0, Omega) makes its decode return Omega exactly
     (for unit q, at any angle). cuRobo's own pose costs already encode this way; only PyTorch autograd needs it.
-    If the fork's decode is ever changed to the world-frame formula, drop this: test_fk_orientation_grad.py would
-    then fail on the double correction.
+    If the fork's decode is ever changed to the world-frame formula, drop this:
+    cutamp/tests/test_real_legs_fk_orientation_grad.py would then fail on the double correction.
     """
 
     @staticmethod
@@ -111,7 +111,7 @@ class Rollout(TypedDict):
     conf_params: List[str]
     robot_spheres: torch.Tensor  # [num_particles, *h, n, 4]
     world_from_ee: torch.Tensor  # [num_particles, *h, 4, 4]
-    world_from_soles: Optional[torch.Tensor]  # [num_particles, *h, 2, 4, 4] on the real legs; None without soles
+    world_from_soles: torch.Tensor  # [num_particles, *h, 2, 4, 4]
     world_from_tool_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     world_from_ee_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     gripper_close: List[bool]
@@ -179,15 +179,13 @@ class RolloutFunction:
             world_from_soles = torch.stack([
                 _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True)).view(*confs.shape[:2], 4, 4)
                 for frame in sole_frames
-            ], dim=2) if sole_frames else None
+            ], dim=2)
 
             # Robot spheres: shared across tool frames; reshape directly.
             robot_spheres = kin_state.robot_spheres.view(num_particles, confs.shape[1], -1, 4)
         else:
             world_from_ee = torch.empty(num_particles, 0, 4, 4, device=self.world.device)
-            world_from_soles = (
-                torch.empty(num_particles, 0, len(sole_frames), 4, 4, device=self.world.device) if sole_frames else None
-            )
+            world_from_soles = torch.empty(num_particles, 0, len(sole_frames), 4, 4, device=self.world.device)
             robot_spheres = torch.empty(num_particles, 0, 0, 4, device=self.world.device)
 
         # Walk operators to produce action targets.

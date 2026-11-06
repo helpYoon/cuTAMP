@@ -18,13 +18,12 @@ upgrade audit catches them):
 
 * CUDA graphs can't be re-captured ("CUDA graph reset is not available."), so
   a solver whose call structure changes after its first solve must run
-  without them. The main IK solver in ``cutamp.robots.t1`` does (particle init
-  mixes calls with and without ``current_state``); the coupled-reIK refresh
-  solver and the motion planner each see one fixed call shape and use them.
-  cuRobo captures in CUDA's global mode, where another thread's allocations
-  and syncs fail mid-capture, so captures run only on the main thread while
-  the planner-build thread is not running (``TAMPWorld.warmup_ik_solver``,
-  ``motion_solver.build_motion_planner``).
+  without them. The IK solver in ``cutamp.robots.t1`` does (particle init
+  mixes calls with and without ``current_state``); the motion planner sees
+  one fixed call shape and uses them. cuRobo captures in CUDA's global mode,
+  where another thread's allocations and syncs fail mid-capture, so captures
+  run only on the main thread while the planner-build thread is not running
+  (``motion_solver.build_motion_planner``).
 """
 
 from typing import Dict, Iterable, List
@@ -54,7 +53,7 @@ def get_attachment_manager(planner):
 # Don't second-guess it: ``result.cspace_error`` is declared but never set
 # (always None), and a trajectory ending on the goal proves nothing because
 # cuRobo pins the last waypoint to it. A rejected T1 plan is a real violation
-# (e.g. ankle_pitch past its 0 rad upper limit mid-path); fix the planner.
+# (e.g. Left_Ankle_Pitch past a joint limit mid-path); fix the planner.
 def cspace_plan_succeeded(result) -> bool:
     """True iff cuRobo reports a successful (converged and feasible) plan."""
     return result is not None and bool(result.success.any())

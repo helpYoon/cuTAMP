@@ -28,7 +28,7 @@ from cutamp.experiment_logger import ExperimentLogger
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
-from cutamp.robots import get_model, load_t1_container
+from cutamp.robots import REAL_LEGS, load_t1_container
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
@@ -222,9 +222,9 @@ def _motion_plan_with_retries(
       - ``attempts``: number of candidates actually planned (skips excluded).
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
-      - ``failures``: each planned candidate's failure message, in order. On
-        the real legs a failed trajopt's message names its reason, so a report
-        can count the candidates lost to torque (design 7.4a).
+      - ``failures``: each planned candidate's failure message, in order. A
+        failed trajopt's message names its reason (design 7.4a). The caller
+        records them in ``overall_metrics["motion_plan_failures"]``.
     """
     skeleton = plan_info["plan_skeleton"]
     last_err, tried, failed, failures = None, 0, [], []
@@ -300,7 +300,7 @@ def setup_cutamp(
 
     # Loading robot can be done offline, so doesn't count towards timing
     tensor_args = TensorDeviceType()
-    model = get_model(config.robot)
+    model = REAL_LEGS
     robot_container = load_t1_container(model, device_cfg=tensor_args)
 
     # v0.8 single-MotionPlanner: q_init is a single full-DOF vector of the model's cspace.
@@ -319,16 +319,12 @@ def setup_cutamp(
             collision_activation_distance=0.0,
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
-            enable_com_aware_ik=config.enable_com_aware_ik,
             ik_max_batch_size=config.num_particles,
-            # Balance-first runs no cuRobo during Adam, so it needs no refresh solver.
-            reik_num_seeds=0 if config.reik_balance_first else config.reik_num_seeds,
-            reik_lbfgs_iters=config.reik_lbfgs_iters,
         )
         check_tamp_world_not_in_collision(world)
 
     with timer.time("warmup_ik_solver", log_callback=_log.info):
-        world.warmup_ik_solver(config.num_particles, warm_refresh=config.coupled_reik)
+        world.warmup_ik_solver(config.num_particles)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -440,11 +436,9 @@ def run_cutamp(
     if config.curobo_plan:
         # Default to False so a run that never reaches motion planning
         # (e.g. no satisfying particles found for any skeleton) still
-        # reports motion_plan_success=False instead of an absent key —
-        # an absent key drops the run from the analyzer's mean entirely,
-        # biasing the per-cell denominator toward runs that got far
-        # enough to attempt planning. Runs without curobo_plan never had
-        # a chance to plan, so the key stays absent for them.
+        # reports motion_plan_success=False instead of an absent key, so
+        # every curobo_plan run reports it. Runs without curobo_plan never
+        # had a chance to plan, so the key stays absent for them.
         overall_metrics["motion_plan_success"] = False
         overall_metrics["motion_plan_failures"] = []  # every failed candidate's message, over the skeletons planned
     curobo_plan = None

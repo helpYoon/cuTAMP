@@ -1,12 +1,14 @@
 """Motion planning on the real legs with planted feet and cuRobo's torque check (design 7.4a, 7.5): the floor's push on
-every trajopt transition, SegmentTorques against trajopt's own torques, the balance gate's sole, tilt and torque checks,
-the failed-trajopt reason, and blocks_t1 end to end through cutamp_demo, with its saved raw plan.
+every trajopt transition, SegmentTorques against trajopt's own torques, the balance gate's multibody ZMP against a
+float64 reference, its sole, tilt, CoM and torque checks, the failed-trajopt reason, and blocks_t1 end to end through
+cutamp_demo, with its saved raw plan.
 
 The slow end-to-end test comes first: cutamp_demo builds its own world, and the module's ``real_world`` and ``planner``
 must not exist beside it (two worlds OOM a 24 GiB card). Module fixtures are built at their first use, so pytest's
 file order keeps them apart."""
 
 import dataclasses
+import functools
 import math
 import os
 import pickle
@@ -108,8 +110,8 @@ def _transition_torques(tm, js) -> torch.Tensor:
 @needs_cuda
 @needs_slow
 def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
-    # The only test of the --robot real_legs path: cutamp_demo -> setup_cutamp builds the world from
-    # get_model, load_t1_container and q_init = REAL_LEGS.home. The spies only record.
+    # cutamp_demo end to end: setup_cutamp builds the world from REAL_LEGS, load_t1_container and
+    # q_init = REAL_LEGS.home. The spies only record.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
     from cutamp.com_polygon_cost import soles_planted
@@ -145,7 +147,7 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, 0.5)
     torch.manual_seed(0)  # run_cutamp's --seed 0
-    config = TAMPConfiguration(robot="real_legs", num_particles=64, curobo_plan=True, enable_visualizer=False,
+    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
                                experiment_root=str(tmp_path))
     rc.cutamp_demo(env, config, experiment_id="e2e", save_plan="auto")
 
@@ -190,7 +192,7 @@ def planner(real_world):
     """``real_world``'s motion planner as solve_curobo builds it, built once."""
     from cutamp.config import TAMPConfiguration
     from cutamp.motion_solver import build_motion_planner
-    with build_motion_planner(real_world, TAMPConfiguration(robot="real_legs")) as mp:
+    with build_motion_planner(real_world, TAMPConfiguration()) as mp:
         yield mp
 
 
@@ -243,7 +245,7 @@ def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner)
     # Route A's envelope sets no tilt bound, so its planner has no TrunkTiltCost; under an envelope with
     # one, trajopt bounds the tilt (weight 1e5, the bound's cosine, on the base's pitch and roll columns).
     from cutamp._curobo_internals import iter_rollouts
-    from cutamp.joint_limit_cost import JointLimitMarginCost, TrunkTiltCost
+    from cutamp.joint_limit_cost import TrunkTiltCost
     from cutamp.robots.t1 import get_t1_motion_planner
     from cutamp.utils.common import get_world_cfg
 
@@ -252,13 +254,13 @@ def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner)
                 for c in getattr(mgr, "_extra_costs", {}).values() if isinstance(c, kind)]
 
     assert REAL_LEGS.envelope.trunk_tilt_max is None
-    assert not extra_costs(planner, TrunkTiltCost) and not extra_costs(planner, JointLimitMarginCost)
+    assert not extra_costs(planner, TrunkTiltCost)
     bounded = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
     with get_t1_motion_planner(bounded, get_world_cfg(real_world.env, include_movables=True),
                                use_cuda_graph=False, device_cfg=real_world.device_cfg) as mp:
         costs = extra_costs(mp, TrunkTiltCost)
         names = list(mp.kinematics.joint_names)
-        assert costs and not extra_costs(mp, JointLimitMarginCost)
+        assert costs
         columns = (names.index("base_j_pitch"), names.index("base_j_roll"))
         for c in costs:
             assert (c.config.pitch_index, c.config.roll_index) == columns
@@ -615,38 +617,52 @@ def test_gate_slows_a_resampled_segment_that_fails_its_recheck(real_world, plann
     assert calls == [17]
 
 
-def _squat(world, theta=0.4, T=0.5, eps=0.01):
-    """Both legs bending alike from home, min-jerk over T s every DT s (each hip and ankle pitch by -theta, each knee
-    by 2 theta), the base re-solved at every frame so that both soles stay on the stance
-    (particle_initialization._stand_on_the_stance), its velocity and acceleration by central differences over eps s:
-    the Trunk drops 7.5 cm."""
+def _on_the_stance(world, moves, T, eps=0.01):
+    """The rest-to-rest min-jerk move ``moves`` ({joint: delta} from home) over T s every DT s, the base re-solved at
+    every frame so that both soles stay on the stance (particle_initialization._stand_on_the_stance, which puts the
+    left sole there: the legs must move alike for the right one to follow), its velocity and acceleration by central
+    differences over eps s."""
     from curobo.types import JointState
     from cutamp.particle_initialization import _stand_on_the_stance
     names = list(world.model.joint_names)
     home = torch.tensor(world.model.home, device=world.device, dtype=torch.float64)
     lower, upper = world.kinematics.get_joint_limits().position
 
-    def legs(t):
+    def ramp(t):
         u = (t / T).clamp(0.0, 1.0)
         p, v, a = (10 * u**3 - 15 * u**4 + 6 * u**5, (30 * u**2 - 60 * u**3 + 30 * u**4) / T,
                    (60 * u - 180 * u**2 + 120 * u**3) / T**2)
         q = home.repeat(len(t), 1)
         vel, acc = torch.zeros_like(q), torch.zeros_like(q)
-        for side in ("Left", "Right"):
-            for joint, delta in (("Hip_Pitch", -theta), ("Knee_Pitch", 2 * theta), ("Ankle_Pitch", -theta)):
-                j = names.index(f"{side}_{joint}")
-                q[:, j] += delta * p
-                vel[:, j], acc[:, j] = delta * v, delta * a
+        for name, delta in moves.items():
+            j = names.index(name)
+            q[:, j] += delta * p
+            vel[:, j], acc[:, j] = delta * v, delta * a
         return q, vel, acc
 
     n = int(round(T / DT)) + 1
     t = torch.linspace(0.0, T, n, dtype=torch.float64, device=world.device)
-    q, v, a = legs(t)
-    stood = _stand_on_the_stance(world, torch.cat([legs(t - eps)[0], q, legs(t + eps)[0]]).float(), lower, upper)
+    q, v, a = ramp(t)
+    stood = _stand_on_the_stance(world, torch.cat([ramp(t - eps)[0], q, ramp(t + eps)[0]]).float(), lower, upper)
     before, q, after = stood.double().split(n)
     b = world.model.base
     v[:, b], a[:, b] = (after - before)[:, b] / (2 * eps), (after - 2 * q + before)[:, b] / eps**2
     return JointState(position=q.float(), velocity=v.float(), acceleration=a.float(), joint_names=names)
+
+
+def _squat(world, theta=0.4, T=0.5, eps=0.01):
+    """Both legs bending alike from home, min-jerk over T s every DT s (each hip and ankle pitch by -theta, each knee
+    by 2 theta), on the stance (``_on_the_stance``): the Trunk drops 7.5 cm."""
+    bends = (("Hip_Pitch", -theta), ("Knee_Pitch", 2 * theta), ("Ankle_Pitch", -theta))
+    return _on_the_stance(world, {f"{side}_{joint}": delta for side in ("Left", "Right") for joint, delta in bends},
+                          T, eps)
+
+
+def _lean(world, pitch, T=2.0):
+    """Both ankle pitches tipping the robot forward by ``pitch`` rad from home, min-jerk over T s, on the stance
+    (``_on_the_stance``): the whole robot leans about its ankles, the CoM moving forward about 0.53 m per rad from
+    home's 1.2 cm ahead of the mid-sole."""
+    return _on_the_stance(world, {f"{side}_Ankle_Pitch": -pitch for side in ("Left", "Right")}, T)
 
 
 @needs_cuda
@@ -712,6 +728,138 @@ def test_gate_reports_the_smaller_margin_of_its_frames_and_the_planners(real_wor
     assert stats["com_min_margin"] == min(com_out, com_planner)
 
 
+@functools.lru_cache(maxsize=1)
+def _planner_urdf():
+    """t1_planner.urdf as yourdfpy parses it, float64: the Trunk at its root, each link's inertial and each joint as the
+    URDF defines them. No scene graph: yourdfpy 0.0.58 builds it through a NumPy conversion deprecated since 1.25 (one
+    DeprecationWarning per revolute joint, an error in a later NumPy), so _reference_zmp chains the joints itself."""
+    import yourdfpy
+    from cutamp.robots.t1 import T1_29DOF_DIR
+    return yourdfpy.URDF.load(str(T1_29DOF_DIR / "t1_planner.urdf"), load_meshes=False, build_scene_graph=False,
+                              build_collision_scene_graph=False, load_collision_meshes=False)
+
+
+def _reference_zmp(q_of_t, t, h=1e-4, g=9.81):
+    """``(zmp_xy, com_xy)`` at time ``t`` of the trajectory ``q_of_t`` (float64 confs in ``REAL_LEGS.joint_names``
+    order), about the home mid-sole on flat ground, from first principles: float64 FK on t1_planner.urdf's joints as
+    yourdfpy parses them (each child at its parent times the joint's origin and its rotation about its axis, yourdfpy's
+    own product), the Trunk placed by trunk_pose_from_q and the joints the planner locks (head, fingers) at 0; every
+    link's CoM acceleration by central differences of the true trajectory, its spin L = R I R^T w (w from R' R^T)
+    differentiated the same way; sum m (g + z'') x - m z x'' - L'_y over the links (y: + L'_x), over sum m (g + z''),
+    with z the height above the soles' plane (world z = 0). The mid-sole is the soles' midpoint at home: each foot
+    link's pose times t1_29dof.yml's fixed sole offset."""
+    import yaml
+    from trimesh.transformations import rotation_matrix
+
+    from cutamp.robots.t1 import T1_29DOF_DIR, trunk_pose_from_q
+    u = _planner_urdf()
+    joint_to = {j.child: j for j in u.robot.joints}
+    assert {j.type for j in u.robot.joints} == {"fixed", "revolute"} and not any(j.mimic for j in u.robot.joints)
+    (root,) = {link.name for link in u.robot.links} - set(joint_to)  # "world", whose fixed joint carries the Trunk
+    links = [(n, link.inertial) for n, link in u.link_map.items() if link.inertial is not None and link.inertial.mass]
+    m = np.array([i.mass for _, i in links])
+    com = np.stack([i.origin[:3, 3] for _, i in links])                                     # in the link frame
+    inertia = np.stack([i.origin[:3, :3] @ i.inertia @ i.origin[:3, :3].T for _, i in links])  # about it, too
+
+    def poses(q, frames):
+        value = dict(zip(REAL_LEGS.joint_names, q.tolist()))
+        X = {root: trunk_pose_from_q(REAL_LEGS, q).numpy()}  # the root-Trunk joint is the identity
+
+        def pose(link):
+            if link not in X:
+                j = joint_to[link]
+                motion = rotation_matrix(value.get(j.name, 0.0), j.axis) if j.type == "revolute" else np.eye(4)
+                X[link] = pose(j.parent) @ (np.eye(4) if j.origin is None else j.origin) @ motion
+            return X[link]
+
+        return np.stack([pose(f) for f in frames])
+
+    extra = yaml.safe_load((T1_29DOF_DIR / "t1_29dof.yml").read_text())["robot_cfg"]["kinematics"]["extra_links"]
+    feet = poses(np.array(REAL_LEGS.home), ("left_foot_link", "right_foot_link"))
+    soles = [F[:3, :3] @ extra[f"{side}_sole_link"]["fixed_transform"][:3] + F[:3, 3]
+             for F, side in zip(feet, ("left", "right"))]
+    mid_sole = np.mean(soles, 0)[:2]
+
+    def state(tau):
+        X = poses(q_of_t(t + tau), [n for n, _ in links])
+        return np.einsum("lij,lj->li", X[:, :3, :3], com) + X[:, :3, 3], X[:, :3, :3]
+
+    st = {k: state(k * h) for k in (-2, -1, 0, 1, 2)}
+    x = st[0][0]
+    a = (st[1][0] - 2 * x + st[-1][0]) / h**2
+
+    def spin(k):
+        W = (st[k + 1][1] - st[k - 1][1]) / (2 * h) @ st[k][1].transpose(0, 2, 1)
+        w = 0.5 * np.stack([W[:, 2, 1] - W[:, 1, 2], W[:, 0, 2] - W[:, 2, 0], W[:, 1, 0] - W[:, 0, 1]], -1)
+        return np.einsum("lij,ljk,lmk,lm->li", st[k][1], inertia, st[k][1], w).sum(0)
+
+    dL = (spin(1) - spin(-1)) / (2 * h)
+    f = m * (g + a[:, 2])
+    zmp = np.array([(f * x[:, 0] - m * x[:, 2] * a[:, 0]).sum() - dL[1],
+                    (f * x[:, 1] - m * x[:, 2] * a[:, 1]).sum() + dL[0]]) / f.sum()
+    return zmp - mid_sole, (m[:, None] * x).sum(0)[:2] / m.sum() - mid_sole
+
+
+@needs_cuda
+def test_real_legs_zmp_matches_multibody_reference(real_world, planner):
+    # Home to a leaning conf in 0.6 s, min-jerk in every joint, the base's six with them: the hips bow 0.5 rad, the
+    # knees bend 0.3 and the ankles 0.15, the Waist turns 0.4, the left shoulder swings 1 rad forward and the right
+    # elbow bends 0.8, the base re-solved so that the end conf stands on the stance (its Trunk pitched 0.35 rad and
+    # yawed -0.4). Every link moves and spins. The gate's CoM and multibody ZMP, from the plan's own velocities and
+    # accelerations as the gate takes them, match the float64 first-principles ones at every frame, at rest and at the
+    # acceleration peaks, where the ZMP runs 9 cm from the CoM. Measured 2026-11-05: the CoM within 1.3e-8 m and the
+    # ZMP within 2.7e-5 m of the reference, against tolerances of 2e-4 and 3e-4 m.
+    from cutamp.com_polygon_cost import com_zmp_in_support
+    from cutamp.motion_solver import ZMP_STEP, _model_frames, _taylor_positions
+    from cutamp.particle_initialization import _stand_on_the_stance
+    world, names, T = real_world, list(real_world.model.joint_names), 0.6
+    home = torch.tensor(world.model.home, dtype=torch.float64)
+    bent = home.clone()
+    for joint, delta in (("Left_Hip_Pitch", -0.5), ("Right_Hip_Pitch", -0.5), ("Left_Knee_Pitch", 0.3),
+                         ("Right_Knee_Pitch", 0.3), ("Left_Ankle_Pitch", -0.15), ("Right_Ankle_Pitch", -0.15),
+                         ("Waist", 0.4), ("Left_Shoulder_Pitch", -1.0), ("Right_Elbow_Pitch", -0.8)):
+        bent[names.index(joint)] += delta
+    lo, hi = world.kinematics.get_joint_limits().position
+    end = _stand_on_the_stance(world, bent.view(1, -1).to(world.device, torch.float32), lo, hi)[0].double().cpu()
+    assert float(end[names.index("base_j_pitch")]) == pytest.approx(0.35, abs=1e-4)  # it stands: no fallback to home
+    delta = end - home
+    plan = _ramp(world, {j: float(d) for j, d in zip(names, delta) if d != 0}, T)
+    com, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, _model_frames(world, planner, plan)),
+                                  ZMP_STEP)
+    assert float((zmp - com).abs().max()) > 0.05  # the motion moves the ZMP: not a static match
+
+    def q_of_t(t):
+        u = min(max(t / T, 0.0), 1.0)
+        return (home + (10 * u**3 - 15 * u**4 + 6 * u**5) * delta).numpy()
+
+    for k in range(plan.position.shape[0]):
+        ref_zmp, ref_com = _reference_zmp(q_of_t, k * DT)
+        np.testing.assert_allclose(com[k].cpu().numpy(), ref_com, atol=2e-4, err_msg=f"frame {k}")
+        np.testing.assert_allclose(zmp[k].cpu().numpy(), ref_zmp, atol=3e-4, err_msg=f"frame {k}")
+
+
+@needs_cuda
+@pytest.mark.parametrize("site", ["recheck", "planner"])
+def test_real_legs_gate_rejects_com_outside_support(real_world, planner, site):
+    # The CoM follows the path, which no time scale changes: the gate fails a segment whose CoM leaves its rectangle,
+    # with check "com", on the planner's own frames and on the frames it returns (_recheck). Leaning 0.25 rad
+    # over 2 s, the CoM ends 14.4 cm ahead of the mid-sole, 3.2 cm past the toes (the soles' front edge is at
+    # 11.245 cm, the gate's at 9.245); leaning 0.12 rad it ends at 7.6 cm, 1.6 cm inside the gate's edge, and passes.
+    import cutamp.motion_solver as ms
+    from cutamp.com_polygon_cost import COM_SAFETY_MARGIN, com_zmp_in_support
+    world = real_world
+    gate = {"recheck": lambda js: ms._recheck(world, planner, js)[0],
+            "planner": lambda js: ms._balance_gate(world, planner, js, DT)[1]["com_min_margin"]}[site]
+    raised = {"recheck": "^retimed trajectory CoM leaves", "planner": "^trajectory CoM leaves"}[site]
+    out = _lean(world, 0.25)
+    com, _ = com_zmp_in_support(world, ms._taylor_positions(world, planner, out), ms.ZMP_STEP)
+    assert float(com[-1, 0]) > world.model.support.gate_half[0] + COM_SAFETY_MARGIN  # past the soles' front edge
+    with pytest.raises(RuntimeError, match=raised) as e:
+        gate(out)
+    assert e.value.check == "com"
+    assert gate(_lean(world, 0.12)) >= 0.0
+
+
 def _result(js_solution, interpolated=None):
     """A trajopt result's two trajectories: the horizon's (``js_solution``) and the interpolated one."""
     return SimpleNamespace(js_solution=js_solution, get_interpolated_plan=lambda: interpolated)
@@ -738,6 +886,43 @@ def test_failure_reason_names_torque(real_world, monkeypatch):
     assert _failure_reason(real_world, _result(still, swing)) == "torque"
     assert _failure_reason(real_world, _result(None, swing)) == "torque"
     assert _failure_reason(real_world, _result(still, still)) == "other"
+
+
+def test_plan_failed_names_torque_in_every_torque_form():
+    # A failed candidate's message names torque in trajopt's reason (": torque") and in each of the balance gate's
+    # torque raises: no time scale up to the cap keeps every effort (_torque_scale), or the frames it returns pass one
+    # (_check_torques). Trajopt's ": other" and the gate's velocity and ZMP raises don't. The last assert pins which of
+    # the six messages name torque.
+    from cutamp.motion_solver import RETIME_MAX, _check_torques, _check_velocity, _plan_failed, _torque_scale
+
+    n = len(REAL_LEGS.joint_names)
+
+    class Torques:  # world.segment_torques's interface: [T, dof] torques, and an effort and a speed limit per joint
+        def __init__(self, tau):
+            self.tau, self.effort, self.velocity = tau, torch.ones(n), torch.ones(n)
+
+        def __call__(self, js):
+            return torch.full((getattr(js, "position", torch.zeros(3, n)).shape[0], n), self.tau)
+
+    def world(tau):
+        return SimpleNamespace(model=REAL_LEGS, segment_torques=Torques(tau))
+
+    rest = torch.zeros(3, n)
+    js = SimpleNamespace(position=rest, velocity=rest + 2 * RETIME_MAX, acceleration=rest,
+                         joint_names=list(REAL_LEGS.joint_names))  # twice the speed limit at the slowdown cap
+    raised = []
+    for check, args in ((_check_torques, (world(2.0), None)), (_torque_scale, (world(2.0), js, 0.5, RETIME_MAX)),
+                        (_check_velocity, (world(0.5), js, RETIME_MAX))):
+        with pytest.raises(RuntimeError) as e:
+            check(*args)
+        raised.append(str(e.value))
+    result = SimpleNamespace(js_solution=object(), get_interpolated_plan=lambda: None)  # a trajopt result
+    messages = [str(_plan_failed(world(2.0), result, "Retract plan failed for op")), *raised,
+                str(_plan_failed(world(0.5), result, "Retract plan failed for op")),
+                f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
+    assert messages[0].endswith(": torque") and messages[4].endswith(": other")
+    assert f"at the {RETIME_MAX}x slowdown cap" in messages[2] and "velocity passes" in messages[3]
+    assert [("torque" in m) for m in messages] == [True, True, True, False, False, False]
 
 
 def test_torque_check_fails_a_nan_torque():

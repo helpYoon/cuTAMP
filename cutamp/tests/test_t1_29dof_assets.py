@@ -7,6 +7,7 @@ The model is built here straight from ``t1_29dof.yml``."""
 
 import hashlib
 import importlib.util
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -118,6 +119,34 @@ def test_planner_model_regenerates_byte_identical(tmp_path):
         data = (tmp_path / name).read_bytes()
         assert data == (T1_29DOF / name).read_bytes(), name
         assert str(tmp_path).encode() not in data and str(REPO).encode() not in data, name  # no absolute path
+
+
+def test_builder_needs_no_simplified_file(tmp_path):
+    # The real legs' sources are their own: a copy of the assets without the simplified model's files builds the same
+    # three outputs.
+    assets = tmp_path / "assets"
+    shutil.copytree(T1_29DOF.parent, assets, ignore=shutil.ignore_patterns(
+        "t1_simplified.urdf", "t1_spheres.yml", "t1_planar_base.yml", "t1.urdf"))
+    out = tmp_path / "out"
+    run = subprocess.run([sys.executable, str(assets / "t1_29dof" / "build_planner_model.py"), "--out", str(out)],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    for name in OUTPUTS:
+        assert (out / name).read_bytes() == (T1_29DOF / name).read_bytes(), name
+
+
+def test_sphere_editor_defaults_exist():
+    # Both editors' default paths exist and none names a simplified file.
+    scripts = REPO / "cutamp" / "scripts"
+    for name in ("robot_sphere_editor", "gripper_sphere_editor"):
+        spec = importlib.util.spec_from_file_location(name, scripts / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        defaults = module.default_paths()
+        assert defaults, name
+        for path in defaults:
+            assert Path(path).exists(), (name, path)
+            assert not any(old in str(path) for old in ("t1_simplified", "t1_spheres", "t1_planar_base")), (name, path)
 
 
 def test_base_limits_are_the_legs_reach():

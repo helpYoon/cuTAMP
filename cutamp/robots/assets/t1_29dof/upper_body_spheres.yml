@@ -1,11 +1,10 @@
-##
-## Collision spheres configuration
-##
+# Upper-body collision spheres (vendor frame), hand-kept and edited by robot_sphere_editor.py and
+# gripper_sphere_editor.py. build_planner_model.py adds the legs' spheres and writes t1_29dof_spheres.yml.
 collision_spheres:
   Trunk:
-  - center: [-0.00476351473480463, -3.020884469151497e-05, 0.14906761050224304]
+  - center: [0.05773648526519537, -3.020884469151497e-05, 0.14906761050224304]
     radius: 0.14321203529834747
-  - center: [-0.009999999776482582, 0.0, 0.02499999850988388]
+  - center: [0.05250000022351742, 0.0, 0.02499999850988388]
     radius: 0.11500002443790436
   H1: []
   H2:
@@ -67,9 +66,6 @@ collision_spheres:
     radius: 0.009999997914
   - center: [0.09603382647, 0.04269996658, -0.008999999613]
     radius: 0.009999997914
-  # Finger spheres are consolidated into left_base_link's frame above (the
-  # finger joints are locked open in t1_planar_base.yml's lock_joints, so the
-  # finger geometry is rigidly attached to base_link at fixed positions).
   left_Link1: []
   left_Link11: []
   left_Link2: []
@@ -128,59 +124,10 @@ collision_spheres:
     radius: 0.009999997914
   - center: [0.09603382647, 0.04269996658, -0.008999999613]
     radius: 0.009999997914
-  # Same as the left side — finger spheres consolidated into right_base_link.
   right_Link1: []
   right_Link11: []
   right_Link2: []
   right_Link22: []
-  mobile_base_link:
-  - center: [0.0, 0.0, 0.021]
-    radius: 0.16
-  - center: [0.095, 0.095, 0.021]
-    radius: 0.055
-  - center: [-0.095, 0.095, 0.021]
-    radius: 0.055
-  - center: [0.095, -0.095, 0.021]
-    radius: 0.055
-  - center: [-0.095, -0.095, 0.021]
-    radius: 0.055
-  # One column per real leg, at t1.urdf's hip pitch y = +-0.106; the midline
-  # leg links stand in for both. The thigh columns lean to the hip, which sits
-  # 0.014 ahead of the knee (Torso_Pitch origin).
-  shank_link:
-  - center: [0.0, 0.106, 0.04]
-    radius: 0.065
-  - center: [0.0, 0.106, 0.12]
-    radius: 0.065
-  - center: [0.0, 0.106, 0.20]
-    radius: 0.065
-  - center: [0.0, 0.106, 0.27]
-    radius: 0.065
-  - center: [0.0, -0.106, 0.04]
-    radius: 0.065
-  - center: [0.0, -0.106, 0.12]
-    radius: 0.065
-  - center: [0.0, -0.106, 0.20]
-    radius: 0.065
-  - center: [0.0, -0.106, 0.27]
-    radius: 0.065
-  thigh_link:
-  - center: [0.0018, 0.106, 0.03]
-    radius: 0.065
-  - center: [0.0053, 0.106, 0.09]
-    radius: 0.065
-  - center: [0.0089, 0.106, 0.15]
-    radius: 0.065
-  - center: [0.0125, 0.106, 0.21]
-    radius: 0.065
-  - center: [0.0018, -0.106, 0.03]
-    radius: 0.065
-  - center: [0.0053, -0.106, 0.09]
-    radius: 0.065
-  - center: [0.0089, -0.106, 0.15]
-    radius: 0.065
-  - center: [0.0125, -0.106, 0.21]
-    radius: 0.065
   Waist:
   - center: [0.0, 0.0, 0.0]
     radius: 0.0933

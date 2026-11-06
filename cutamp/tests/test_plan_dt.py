@@ -1,4 +1,4 @@
-"""The schema-v3 ``dt`` label (``motion_solver._plan_dt``): it must be the spacing of the positions
+"""The stage3-raw plan's ``dt`` label (``motion_solver._plan_dt``): it must be the spacing of the positions
 ``get_interpolated_plan()`` returns, cuRobo's ``interpolation_dt``. The optimizer's
 ``js_solution.dt`` (0.0145-0.0246 s) played plans 1.02-1.54x too fast."""
 
@@ -18,7 +18,7 @@ def test_plan_dt_labels_interpolated_spacing():
     names = list(world.kinematics.joint_names)
     start = world.q_init.view(1, -1).clone()
     goal = start.clone()
-    # Arm joints only: both models have them, and they leave the real legs' soles where they stand.
+    # Arm joints only: every model has them, and they leave the real legs' soles where they stand.
     for joint, delta in (("Right_Shoulder_Pitch", -1.2), ("Left_Shoulder_Pitch", -0.6),
                          ("Left_Elbow_Yaw", 0.4), ("Right_Elbow_Yaw", -0.3)):
         goal[0, names.index(joint)] += delta

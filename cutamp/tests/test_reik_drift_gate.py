@@ -53,21 +53,10 @@ def test_tiny_rotation_drift_resolves_in_float32():
     assert rot_drift.max().item() > 1e-4
 
 
-def test_log_stat_records_drift_histogram():
-    gate = _ReikDriftGate(1, pos_tol=0.005, rot_tol=0.05)
-    pos_drift = torch.tensor([0.0004, 0.0015, 0.003, 0.02])
-    rot_drift = torch.zeros(4)
-    gate.log_stat(5, "left_q3", 4, 1, 0.1, pos_drift, rot_drift, gn_fail=2,
-                  gn_fail_pose=1, gn_fail_com=1)
-    rec = gate.stats[-1]
-    assert rec["conf"] == "left_q3" and rec["gn_fail"] == 2
-    assert rec["frac_drift_below"]["2mm"] == 0.5
-
-
 @needs_cuda
-def test_log_batch_flush_matches_log_stat():
-    # Balance-first stats stay on the device until flush(), which turns them
-    # into the records log_stat writes: same keys, types and drift stats.
+def test_log_batch_flush_records():
+    # Refresh stats stay on the device until flush(), which turns them into
+    # one record per dep: its miss counts, event time and drift stats.
     D, B = 2, 4
     names = ["left_q1", "right_q2"]
     pose_ok = torch.tensor([1, 1, 0, 1, 0, 0, 1, 1], device="cuda").bool()
@@ -92,17 +81,15 @@ def test_log_batch_flush_matches_log_stat():
     assert [(r["step"], r["conf"], r["batch"]) for r in gate.stats] == [(s, n, B) for s in (7, 12) for n in names]
     for rec, counts, (start, end) in zip(gate.stats, [(2, 1, 1), (2, 2, 1)] * 2, events):
         assert (rec["gn_fail"], rec["gn_fail_pose"], rec["gn_fail_com"]) == counts
-        assert rec["n_ik_fail"] == rec["gn_fail"] and rec["fallback"] is False
+        assert rec["n_ik_fail"] == rec["gn_fail"]
         # The refresh's event time, split evenly over its deps.
         assert rec["solve_s"] == round(start.elapsed_time(end) / 1e3 / D, 4)
     assert 0 < gate.stats[0]["solve_s"] < gate.stats[2]["solve_s"]
 
-    ref_gate = _ReikDriftGate(1, pos_tol=0.005, rot_tol=0.05)
-    ref_gate.log_stat(7, names[0], B, 2, 0.0, pos_drift[:B], rot_drift[:B],
-                      gn_fail=2, gn_fail_pose=1, gn_fail_com=1, fallback=False)
-    ref, rec = ref_gate.stats[0], gate.stats[0]
-    assert rec.keys() == ref.keys()
-    assert all(type(rec[k]) is type(ref[k]) for k in ref), {k: (type(rec[k]), type(ref[k])) for k in ref}
+    types = {"step": int, "conf": str, "batch": int, "n_ik_fail": int, "solve_s": float, "gn_fail": int,
+             "gn_fail_pose": int, "gn_fail_com": int, "pos_drift_mean": float, "pos_drift_max": float,
+             "rot_drift_max": float, "frac_drift_below": dict}
+    assert {k: type(v) for k, v in gate.stats[0].items()} == types
     gate.flush()  # the queue is empty now: nothing is appended twice
     assert len(gate.stats) == 4
 

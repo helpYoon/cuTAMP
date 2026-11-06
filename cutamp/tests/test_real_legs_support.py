@@ -1,12 +1,10 @@
-"""Every balance check on the model's support (design 7.4, call 5): on the real legs the masks, margins, penalties
-and the multibody ZMP measure the CoM in the stance frame, against S_a inside the soles' hull shrunk by 2 cm, not
-against the simplified rectangle about ``mobile_base_link``. The GPU tests share conftest's module-scoped
-``real_world``: one world per module."""
+"""Every balance check on the model's support (design 7.4, call 5): the masks, margins, penalties and the multibody
+ZMP measure the CoM in the stance frame, against S_a inside the soles' hull shrunk by 2 cm. The GPU tests share
+conftest's module-scoped ``real_world``: one world per module."""
 
 import torch
 
 from cutamp.tests.conftest import needs_cuda
-from cutamp.tests.test_t1_real_legs_model import EXTENDED_CONSTANTS, MAY_READ_EXTENDED_CONSTANTS, simplified_reads
 
 
 def _home(world) -> torch.Tensor:
@@ -16,13 +14,6 @@ def _home(world) -> torch.Tensor:
 def _mid_sole_xy(world) -> torch.Tensor:
     """The home mid-sole, world xy: the midpoint of the two planted soles."""
     return world.stance_soles[:, :2, 3].mean(0)
-
-
-def test_extended_grep():
-    # test_t1_real_legs_model's list plus the simplified support region and its frame: a 1 cm centre or a
-    # mobile_base_link read where world.model.support should be gives plausible, wrong numbers on the real legs.
-    hits = simplified_reads(EXTENDED_CONSTANTS, MAY_READ_EXTENDED_CONSTANTS)
-    assert not hits, "\n".join(hits)
 
 
 @needs_cuda

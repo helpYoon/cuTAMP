@@ -22,7 +22,7 @@ from cutamp.com_polygon_cost import COM_TOL, SOLE_POS_TOL, SOLE_ROT_TOL
 
 
 default_constraint_to_mult = {
-    # sole_*: the real legs' soles against the stance at every conf (design 7.4), weighted as the hand is.
+    # sole_*: the soles against the stance at every conf (design 7.4), weighted as the hand is.
     KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0},
     StablePlacement.type: {"goal_support": 2.0},
     TrajectoryLength.type: {"traj_length": 1e-3},
@@ -40,11 +40,11 @@ default_constraint_to_mult = {
         "align_yaw": 5e-2,
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
-        # Hinge² band penalties are O(1e-3) rad² (0.05 rad intrusion into the
-        # 0.1 band ≈ 2.5e-3). Tuned in the Task-6 verification battery
-        # (2026-06-11): 1e2 left endpoint offenders; 1e3 cleared every
-        # non-trunk endpoint; 1e4 bought nothing more; 1e5 distorted particle
-        # selection (minted a new elbow offender). Keep 1e3.
+        # Tuned on the simplified model's 0.1 rad margin band (branch
+        # ablation-baseline; Task-6 verification battery, 2026-06-11: 1e2 left
+        # endpoint offenders, 1e3 cleared every non-trunk endpoint, 1e4 bought
+        # nothing more, 1e5 distorted particle selection). The band is now
+        # zero, so it weights limit violations only; kept at 1e3.
         "joint_limit_margin": 1e3,
     },
 }
@@ -54,12 +54,12 @@ default_constraint_to_tol = {
     Collision.type: {"default": 1e-3},
     # Based on cuRobo thresholds: https://github.com/NVlabs/curobo/blob/2fbffc35225398cf9d5f382804faa9de2608753b/src/curobo/wrap/reacher/ik_solver.py#L127-L128
     # Can lower position for high precision, but should be fine for now.
-    # sole_*: the real legs' soles against the stance (design 7.4), on the hand's tolerances; the balance gate holds
+    # sole_*: the soles against the stance (design 7.4), on the hand's tolerances; the balance gate holds
     # every trajectory frame to the same two.
     KinematicConstraint.type: {
         "pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": SOLE_POS_TOL, "sole_rot_err": SOLE_ROT_TOL,
     },
-    # retract_*: the real legs' retract confs, which join the motion constraints (design 7.3).
+    # retract_*: the retract confs, which join the motion constraints (design 7.3).
     # trunk_tilt: the Trunk tilt past the envelope's maximum, at every conf, where the envelope sets one (call 22;
     # route A's sets none), in cosine: 1e-6 is 1.2e-6 rad of tilt at a 1.0 rad bound and 17 float32 ulps of its
     # cosine, so the rounding of cos(1.0) does not reject a conf on the bound.

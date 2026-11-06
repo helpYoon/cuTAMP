@@ -130,8 +130,6 @@ class SegmentTorques:
 
         from cutamp.robots.t1 import get_t1_kinematics
 
-        if not model.sole_frames:
-            raise ValueError(f"SegmentTorques needs a model standing on soles; the {model.name} model has none")
         self.joint_names = list(model.joint_names)
         # The robot config's load_dynamics only makes RobotCfg build a DynamicsCfg like this one from the same
         # kinematics (types/robot.py); KinematicsCfg reads the URDF's inertias either way.

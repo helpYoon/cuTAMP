@@ -11,8 +11,9 @@
 
 Per plan-skeleton operator (T1):
   - Arm ops (Pick/Place/Move/Retract): ``pin_for_arm_action(arm)`` pins the
-    inactive arm's cspace weights, a no-op. The base is locked at
-    construction; nothing holds the inactive hand between confs.
+    inactive arm's cspace weights, a no-op. Every joint is free, the base
+    included, and trajopt holds the soles on the stance
+    (``get_t1_motion_planner``); nothing holds the inactive hand between confs.
   - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
     we plan to the gate-approved particle conf with the grasp-object /
     placement-surface obstacle temporarily disabled.
@@ -53,12 +54,9 @@ _log = logging.getLogger(__name__)
 def _planner_js_from_full(planner, full_pos, full_joint_names):
     """Build a planner-native JointState from a full-cspace position vector.
 
-    On a model with ``lock_base`` the planner config locks the mobile base
-    (``get_t1_motion_planner`` extends ``lock_joints`` with ``base_j_x/y/yaw``),
-    so the planner's cspace drops those joints while particles and
-    ``world.kinematics`` keep the model's full cspace (21 or 33 joints). cuRobo's
-    ``get_active_js`` reorders + drops locked joints based on ``joint_names``,
-    which is why we must set ``joint_names`` on the full-cspace JointState.
+    cuRobo's ``get_active_js`` reorders + drops locked joints based on
+    ``joint_names``, which is why we must set ``joint_names`` on the
+    full-cspace JointState (the model's 33 joints).
     """
     if full_pos.dim() == 1:
         full_pos = full_pos[None]
@@ -82,8 +80,8 @@ def _plan_arm_to_conf(
     redundancy solution. Mirrors the retract branch. ``disable_obstacle`` (if
     given) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
-    cuRobo result; raises ``RuntimeError`` if it fails (``_plan_failed``: on
-    ``world``'s real legs it names the reason).
+    cuRobo result; raises ``RuntimeError`` if it fails (``_plan_failed``: given
+    ``world`` it names the reason).
 
     One call: plan_cspace already makes 5 attempts (4 graph-seeded), and
     calling it again with the same start and goal returns the same trajectory
@@ -99,7 +97,7 @@ def _plan_arm_to_conf(
 
 
 def _failure_reason(world: TAMPWorld, result) -> str:
-    """Why a real-leg trajopt failed (design 7.4a): ``"torque"`` when either trajectory ``result`` carries passes a
+    """Why a trajopt failed (design 7.4a): ``"torque"`` when either trajectory ``result`` carries passes a
     joint's effort by cuRobo's two RNEA passes with the floor's push (``world.segment_torques``), else ``"other"``.
     The two are the trajopt horizon (``js_solution``) and the interpolated trajectory between its frames, which
     trajopt's success test re-checks (``get_interpolated_plan``). IK and Adam never see torque, so a conf can need
@@ -113,9 +111,9 @@ def _failure_reason(world: TAMPWorld, result) -> str:
 
 
 def _plan_failed(world: Optional[TAMPWorld], result, message: str) -> RuntimeError:
-    """The RuntimeError for a failed trajopt; on a model standing on soles its message ends with the reason
+    """The RuntimeError for a failed trajopt; given ``world`` its message ends with the reason
     (``_failure_reason``), which ``_motion_plan_with_retries`` keeps per candidate."""
-    if world is not None and world.model.sole_frames:
+    if world is not None:
         message = f"{message}: {_failure_reason(world, result)}"
     return RuntimeError(message)
 
@@ -150,7 +148,7 @@ def _interp_plan(result):
     return None if result is None else result.get_interpolated_plan()
 
 
-# attached_object_{left,right} extra_link names from t1_planar_base.yml.
+# attached_object_{left,right} extra_link names from t1_29dof.yml.
 # Each has 50 reserved sphere slots; we use only ~6 via VOXEL fit.
 _ATTACH_LINK_FOR_ARM = {
     "left": "attached_object_left",
@@ -199,7 +197,7 @@ def _attach_object(
     """Attach a scene obstacle to ``arm``'s attach link via cuRobo's v0.8 attach.
 
     ``attach_from_scene`` fits spheres for the obstacle, mounts them on the
-    attach link (which has reserved sphere slots in t1_planar_base.yml), and
+    attach link (which has reserved sphere slots in t1_29dof.yml), and
     auto-disables the obstacle in the world collision checker so it isn't
     double-counted; ``_detach_object`` undoes both. The held block then
     travels with the robot in subsequent plans and keeps collision against the
@@ -230,7 +228,7 @@ def _attach_object(
             sphere_fit_type=SphereFitType.VOXEL,
         )
         # The attach link is a FIXED identity child of the arm's tool frame
-        # (t1_planar_base.yml), so the tool-frame pose is the link pose.
+        # (t1_29dof.yml), so the tool-frame pose is the link pose.
         world_from_link = planner.kinematics.compute_kinematics(last_js).tool_poses.get_link_pose(
             TOOL_FRAME_FOR_ARM[arm]
         )
@@ -319,7 +317,7 @@ def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
     thread, and cuRobo captures in CUDA's global mode, where the main thread's
     allocations and syncs fail mid-capture. The first ``plan_cspace`` captures
     instead (~1 s), on the main thread after the join; every later segment has
-    the same shape and replays.
+    the same shape and replays. ``config`` reads nothing today; the callers pass the run's.
     """
     return world.get_motion_planner(
         # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (the
@@ -328,7 +326,6 @@ def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
         # (metrics_base.yml). At 0 the optimum hugs obstacles, and retracts after
         # a place grazed the block just released by up to 0.2 mm.
         collision_activation_distance=0.0025,
-        enable_com_polygon=config.enable_com_polygon,
     )
 
 
@@ -361,8 +358,8 @@ def solve_curobo(
     # retry attempt.
     _reset_attachment_state(planner, world)
 
-    # Build initial state. Planner is in active-cspace (mobile base locked);
-    # particles are in full-cspace — convert at every boundary.
+    # Build initial state. Planner is in active-cspace (head and grippers
+    # locked); particles are in full-cspace — convert at every boundary.
     full_joint_names = world.kinematics.joint_names
     last_js = _planner_js_from_full(
         planner, best_particle["left_q0"].clone(), full_joint_names,
@@ -377,16 +374,14 @@ def solve_curobo(
     gate_stats: List[dict] = []
 
     def add_segment(plan, dt, arm):
-        # The real robot's balance check (balance arms only): every frame's CoM and ZMP inside the support
-        # rectangle, slowing the segment down if its ZMP needs it, and on the real legs the segment's pace from its
-        # speeds, torques and ZMP; a RuntimeError fails the candidate. A retimed segment also keeps its motion
-        # planner's timing, with the held objects along it.
+        # The real robot's balance check: every frame's CoM and ZMP inside the support rectangle, and the
+        # segment's pace from its speeds, torques and ZMP; a RuntimeError fails the candidate. A retimed segment
+        # also keeps its motion planner's timing, with the held objects along it.
         entry = {"dt": dt, "arm": arm}
-        if config.enable_com_polygon:
-            plan, stats, fast = _balance_gate(world, planner, plan, dt)
-            gate_stats.append(stats)
-            if fast is not None:
-                entry["planner_timing"] = {"plan": fast, "held_objs": state.compute_all_held_obj_poses(fast)}
+        plan, stats, fast = _balance_gate(world, planner, plan, dt)
+        gate_stats.append(stats)
+        if fast is not None:
+            entry["planner_timing"] = {"plan": fast, "held_objs": state.compute_all_held_obj_poses(fast)}
         entry.update(plan=plan, held_objs=state.compute_all_held_obj_poses(plan))
         accum_plans.append(entry)
         return plan
@@ -403,8 +398,7 @@ def solve_curobo(
         metadata = ground_op.operator.metadata
         arm = metadata.arm
 
-        # Pin protocol: arm ops pin the inactive arm's cspace weights (the base
-        # is locked at construction). The pin is a no-op and plan_cspace holds
+        # Pin protocol: arm ops pin the inactive arm's cspace weights. The pin is a no-op and plan_cspace holds
         # nothing between endpoint confs, so the inactive hand is not held
         # along the segment (T1State.pin_for_arm_action). Both arms stay in the
         # collision checks, except against the obstacle a pick or place
@@ -533,11 +527,10 @@ def solve_curobo(
         pos = plan.position
         while pos.dim() > 2:
             pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
-        # Reproject to the model's full cspace (21 or 33 joints), the form
+        # Reproject to the model's full cspace (its 33 joints), the form
         # T1RerunRobot takes. Planner trajectories arrive in either the active
-        # cspace (without the simplified model's locked base) or the fully
-        # articulated form (with the head and grippers) depending on which
-        # planner method produced them.
+        # cspace or the fully articulated form (with the head and grippers)
+        # depending on which planner method produced them.
         full_dof = len(full_joint_names)
         if pos.shape[-1] != full_dof:
             src_names = getattr(plan, "joint_names", None)
@@ -548,8 +541,6 @@ def solve_curobo(
                     else list(planner.kinematics.all_articulated_joint_names)
                 )
             traj_js = JointState.from_position(pos, joint_names=src_names)
-            if pos.shape[-1] < full_dof:
-                traj_js = planner.kinematics.get_full_js(traj_js)
             pos = traj_js.reorder(list(full_joint_names)).position
 
         if traj_arm in ("left", "right"):
@@ -571,18 +562,16 @@ def solve_curobo(
     metrics["plan_duration_s"] = sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)
     if gate_stats:
         metrics["retime_max"] = max(g["retime"] for g in gate_stats)
-        metrics["retime_min"] = min(g["retime"] for g in gate_stats)  # below 1 where the real legs' gate sped one up
-        bindings = [g["binding"] for g in gate_stats if "binding" in g]  # the real legs' gate names each segment's
-        if bindings:
-            metrics["retime_binding"] = dict(collections.Counter(bindings))
+        metrics["retime_min"] = min(g["retime"] for g in gate_stats)  # below 1 where the gate sped one up
+        metrics["retime_binding"] = dict(collections.Counter(g["binding"] for g in gate_stats))
         metrics["traj_com_min_margin"] = min(g["com_min_margin"] for g in gate_stats)
         metrics["traj_zmp_min_margin"] = min(g["zmp_min_margin"] for g in gate_stats)
     return accum_plans, metrics
 
 
 def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
-    """Measure-only trajectory CoM audit (recorded in every ablation arm): the plan's frame count,
-    ``traj_com_frames``, and the fraction of them whose CoM leaves the support rectangle the gate enforces
+    """Measure-only trajectory CoM audit: the plan's frame count, ``traj_com_frames``, and the fraction of them
+    whose CoM leaves the support rectangle the gate enforces
     (``world.model.support.gate_half``, through ``compute_support_mask``), ``traj_com_violation_frac``."""
     # The whole block is exception-isolated: this audit is MEASURE-ONLY
     # and must never change which plans are produced or accepted. Any
@@ -614,11 +603,9 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
     """``[T, full_dof]`` positions of a planner trajectory in ``world.kinematics.joint_names`` order.
 
     accum_plans entries carry trajectories in different DOF forms depending on which planner method
-    produced them: the planner's active cspace (on the simplified model, without the locked base joints) or
-    the fully articulated form (a superset of world.kinematics's 21 or 33 joints). Only the first is
-    augmented with get_full_js (on the second it raises ``lock_joints is also listed``); a plain
-    reorder handles both. ``plan.joint_names`` may be None, then the planner's names are picked by
-    shape, as in ``_last_timestep_js``."""
+    produced them: the planner's active cspace or the fully articulated form (a superset of
+    world.kinematics's 33 joints); a plain reorder handles both. ``plan.joint_names`` may be None, then the
+    planner's names are picked by shape, as in ``_last_timestep_js``."""
     pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
     src_names = getattr(plan_js, "joint_names", None)
     if src_names is None:
@@ -628,8 +615,6 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
             else list(planner.kinematics.all_articulated_joint_names)
         )
     js = JointState.from_position(pos, joint_names=list(src_names))
-    if pos.shape[-1] < len(world.kinematics.joint_names):
-        js = planner.kinematics.get_full_js(js)
     return js.reorder(list(world.kinematics.joint_names)).position
 
 
@@ -637,8 +622,8 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
 RETIME_MAX = 4.0
 # The balance gate's central-difference step along each frame's motion, s.
 ZMP_STEP = 0.01
-# On a model standing on soles the gate times each segment at the smallest uniform time scale its checks pass, found
-# to within this fraction above it: a search setting, not a limit (_pace) ...
+# The gate times each segment at the smallest uniform time scale its checks pass, found to within this fraction
+# above it: a search setting, not a limit (_balance_gate) ...
 RETIME_TOL = 0.02
 # ... testing this many time scales per batched round of the ZMP's search ...
 RETIME_SEARCH_POINTS = 16
@@ -713,7 +698,7 @@ def _check_planted(world: TAMPWorld, q: torch.Tensor) -> None:
         raise _gate_error("soles", f"trajectory soles leave the stance by up to {1000 * pos_max:.1f} mm and "
                                    f"{rot_max:.3f} rad")
     envelope = world.model.envelope
-    if envelope is None or envelope.trunk_tilt_max is None:
+    if envelope.trunk_tilt_max is None:
         return
     trunk = _fk_state(world, q, world.bodies.kinematics).tool_poses.get_link_pose("Trunk", make_contiguous=True)
     tilt = torch.acos(trunk.get_matrix()[..., 2, 2].clamp(-1.0, 1.0)).max().item()
@@ -739,7 +724,7 @@ def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
 
 def _model_frames(world: TAMPWorld, planner, plan_js: JointState) -> JointState:
     """``plan_js``'s frames: ``[T, n]`` positions, velocities and accelerations in ``world.model.joint_names`` order. A
-    real-leg plan may also carry the joints the planner locks (the head, the fingers); a plan without joint names takes
+    plan may also carry the joints the planner locks (the head, the fingers); a plan without joint names takes
     the planner's, picked by shape as in ``_full_positions``."""
     names = list(world.model.joint_names)
     dof = plan_js.position.shape[-1]
@@ -875,8 +860,12 @@ def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) ->
     return com_m, zmp_m
 
 
-def _pace(world: TAMPWorld, planner, plan_js: JointState, dt: float):
-    """``_balance_gate`` on a model standing on soles: the segment at the pace the robot allows.
+def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
+    """The real robot's balance check on every interpolated frame of a segment, and the segment at the pace the
+    robot allows. Returns ``(plan_js, stats, planner_timing)``: the plan at that pace; its stats; and, for a retimed
+    segment, the same spline sampled at the motion planner's own timing: its positions exactly, with the spline's
+    velocities and accelerations (the timing test runs both), else None. Each check raises a RuntimeError that names
+    it, so the planner moves to its next candidate or skeleton.
 
     Every frame must keep both soles on the stance and the Trunk's tilt within the envelope's bound
     (``_check_planted``), and its CoM inside the gate's support rectangle; no time scale changes either. The gate then
@@ -930,54 +919,4 @@ def _pace(world: TAMPWorld, planner, plan_js: JointState, dt: float):
         zmp_planner = float(_zmp_margins(world, planner, js, torch.tensor([s_eff]))[0])
     stats = {"retime": s_eff, "binding": binding, "com_min_margin": min(com_m, com_planner),
              "zmp_min_margin": min(zmp_m, zmp_planner)}
-    return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)
-
-
-def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
-    """The real robot's balance check on every interpolated frame of a segment; on a model standing on soles it also
-    sets the segment's pace.
-
-    The CoM must stay inside the gate's support rectangle (``world.model.support.gate_half``); a segment whose CoM
-    leaves it raises RuntimeError, so the planner moves to its next candidate or skeleton. The multibody ZMP, from the
-    plan's own velocities and accelerations, must stay inside too. Returns ``(plan_js, stats, planner_timing)``: the
-    plan, retimed if needed; ``{"retime", "com_min_margin", "zmp_min_margin"}``, the uniform time scale it ran at and
-    the two smallest margins (metres); and, for a retimed segment, the same spline sampled at the motion planner's own
-    timing: its positions exactly, with the spline's velocities and accelerations (the timing test runs both), else
-    None.
-
-    On the simplified model a segment whose ZMP leaves the rectangle is slowed down uniformly until it fits, up to
-    ``RETIME_MAX``, past which it raises; any other keeps the planner's timing.
-
-    On a model standing on soles (the real legs) robot facts alone set the pace (``_pace``): each segment runs at the
-    smallest uniform time scale at which every actuated joint's speed stays within cuRobo's limit, every joint's
-    torque (cuRobo's RNEA with the floor's push on the soles, design 7.4a) within its effort and the ZMP inside, faster
-    or slower than the planner's; both soles stay on the stance and the Trunk's tilt within the envelope's bound. Its
-    stats add ``"binding"``, the check that sets the scale. Each check raises a RuntimeError that names it."""
-    if world.model.sole_frames:
-        return _pace(world, planner, plan_js, dt)
-    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, retime_factor
-
-    half = world.model.support.gate_half
-
-    def margins(js):
-        com, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
-        return (com, zmp, com_margin_from_base(com, half).min().item(),
-                com_margin_from_base(zmp, half).min().item())
-
-    with torch.no_grad():
-        com, zmp, com_m, zmp_m = margins(plan_js)
-        if com_m < 0:
-            raise RuntimeError(f"trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
-        out, s, tried = plan_js, 1.05 * retime_factor(com, zmp, half), 1.0
-        while zmp_m < 0:
-            if tried >= RETIME_MAX:
-                raise RuntimeError(f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap")
-            tried = min(s, RETIME_MAX)
-            out = _retime(plan_js, tried, dt)
-            _, _, com_m, zmp_m = margins(out)
-            if com_m < 0:
-                raise RuntimeError(f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
-            s = 1.25 * tried
-    n, n_out = plan_js.position.shape[-2], out.position.shape[-2]
-    stats = {"retime": (n_out - 1) / (n - 1) if n_out != n else 1.0, "com_min_margin": com_m, "zmp_min_margin": zmp_m}
     return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)

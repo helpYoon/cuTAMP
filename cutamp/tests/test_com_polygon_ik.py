@@ -1,20 +1,19 @@
 """Tests for the COM polygon penalty math, hard gate, and post-IK mask."""
 import pytest
 
-from cutamp.robots.t1 import SIMPLIFIED, get_model
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
-#: A lean from home that carries the CoM far past the support's front edge, per planning model ({joint: delta}): the
-#: simplified model bows at its Torso_Pitch, ankle and knee (the teetering pose seen before the CoM fix); the real legs'
-#: floating base carries the whole body 30 cm ahead of the stance its support region stays on.
-EXTREME_LEAN = {"simplified": {"Torso_Pitch": -1.7, "ankle_pitch": -0.5, "knee_pitch": 0.8},
-                "real_legs": {"base_j_x": 0.3}}
+#: A lean from home that carries the CoM far past the support's front edge ({joint: delta}): the floating base carries
+#: the whole body 30 cm ahead of the stance its support region stays on.
+EXTREME_LEAN = {"base_j_x": 0.3}
 
-#: The spread test_mask_matches_penalty_gate adds to home, per planning model ({joint: sigma}, rad or m), so that its
-#: rows straddle the keyframe rectangle's edge: the simplified model's CoM moves with its legs and trunk; the real
-#: legs' trunk rides the floating base, whose x and y carry the CoM across the stance's edges.
-EDGE_SPREAD = {"simplified": dict.fromkeys(SIMPLIFIED.joint_names[SIMPLIFIED.body], 0.3),
-               "real_legs": {"base_j_x": 0.1, "base_j_y": 0.1}}
+#: The spread test_mask_matches_penalty_gate adds to home ({joint: sigma}, m), so that its rows straddle the keyframe
+#: rectangle's edge: the trunk rides the floating base, whose x and y carry the CoM across the stance's edges.
+EDGE_SPREAD = {"base_j_x": 0.1, "base_j_y": 0.1}
+
+#: A support centre for the penalty tests, in the base frame: the real legs' is (0, 0), and a nonzero one keeps the
+#: penalty's subtraction of it tested.
+CENTER = (0.01, 0.0)
 
 
 def _moved(world, moves: dict):
@@ -30,12 +29,12 @@ def _moved(world, moves: dict):
 def test_compute_com_polygon_mask_excludes_extreme_lean():
     """Batched COM-in-polygon check returns the expected shape, classifies
     home poses as inside (the CoM over the support's centre) and the
-    model's EXTREME_LEAN as OUTSIDE the polygon."""
+    EXTREME_LEAN as OUTSIDE the polygon."""
     import torch
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     world = make_blocks_t1_world()
     home = world.q_init.detach().clone()
-    bent = _moved(world, EXTREME_LEAN[world.model.name])
+    bent = _moved(world, EXTREME_LEAN)
     q_batch = torch.stack([home, home, home, bent], dim=0)  # [4, full_dof]
     mask = compute_com_polygon_mask(world, q_batch)
     assert mask.shape == (4,), f"expected shape (4,), got {mask.shape}"
@@ -121,7 +120,7 @@ def test_curobo_batched_com_kernel_returns_per_batch_distinct():
     # Build four distinct configurations spanning the COM excursion range: home, the lean, every leg and trunk
     # joint bent, and a left-arm reach.
     home = world.q_init.detach().clone()
-    bent_forward = _moved(world, EXTREME_LEAN[world.model.name])
+    bent_forward = _moved(world, EXTREME_LEAN)
     bent_body = home.clone()
     bent_body[world.model.body] += 0.3
     reach = _moved(world, {world.model.joint_names[world.model.left_arm][0]: -1.2})
@@ -167,7 +166,7 @@ def test_compute_com_polygon_penalties_is_differentiable():
 
     # Use a configuration with the COM outside the support polygon so the
     # penalty is non-zero and the gradient is non-trivially non-zero.
-    leaning = _moved(world, EXTREME_LEAN[world.model.name])
+    leaning = _moved(world, EXTREME_LEAN)
 
     B = 4
     q = leaning.unsqueeze(0).expand(B, -1).contiguous().clone().requires_grad_(True)
@@ -178,7 +177,8 @@ def test_compute_com_polygon_penalties_is_differentiable():
     p = pens["left_q1"]
     assert p.shape == (B,), f"Expected shape ({B},), got {p.shape}"
     assert p.requires_grad, "Penalty tensor must carry an autograd connection."
-    assert float(p[0]) > COM_TOL, f"premise: the lean must put the COM outside; penalty {float(p[0]):.6f}"
+    p0 = float(p[0].detach())
+    assert p0 > COM_TOL, f"premise: the lean must put the COM outside; penalty {p0:.6f}"
 
     # Backward through the sum; q.grad must be populated and non-trivial.
     p.sum().backward()
@@ -266,12 +266,11 @@ def test_retract_collision_grads_match_per_conf():
 
 
 def _support_centre_at_origin():
-    """A base pose that puts the support rectangle's centre (COM_CENTER) at the world origin, so the
+    """A base pose that puts the support rectangle's centre (CENTER) at the world origin, so the
     points below are offsets from it."""
     import torch
-    from cutamp.com_polygon_cost import COM_CENTER
     base_T = torch.eye(4).unsqueeze(0)
-    base_T[0, :2, 3] = -torch.tensor(COM_CENTER)
+    base_T[0, :2, 3] = -torch.tensor(CENTER)
     return base_T
 
 
@@ -281,13 +280,13 @@ def test_com_polygon_penalty_corner_equals_single_edge():
     # scores ~7.2e-4 (> tol 4e-4) and gets wrongly rejected; with the correct
     # max-over-axes barrier it scores ~3.6e-4 (< tol).
     import torch
-    from cutamp.com_polygon_cost import COM_CENTER, com_polygon_penalty
+    from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
     base_T = _support_centre_at_origin()
     e = 0.001  # 1mm inside each edge
     com_world = torch.tensor([[0.10 - e, 0.15 - e, 0.0]])
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, COM_CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
     # nearest-edge barrier: weight * (margin - e)**2 = 1 * 0.019**2 = 3.61e-4
     assert pen.item() == pytest.approx((margin - e) ** 2, rel=1e-3)
     assert pen.item() < 4e-4  # passes the COM tol; the summed bug gave 7.22e-4
@@ -296,12 +295,12 @@ def test_com_polygon_penalty_corner_equals_single_edge():
 def test_com_polygon_penalty_corner_on_boundary_equals_tol():
     # COM exactly on the corner -> penalty == weight*margin**2 == COM tol 4e-4.
     import torch
-    from cutamp.com_polygon_cost import COM_CENTER, com_polygon_penalty
+    from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
     base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.10, 0.15, 0.0]])
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, COM_CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
@@ -310,12 +309,12 @@ def test_com_polygon_penalty_single_edge_equals_tol():
     # This is the calibration case the tol was derived from; max-over-axes must
     # leave it unchanged from the old summed behavior (only the X axis is active).
     import torch
-    from cutamp.com_polygon_cost import COM_CENTER, com_polygon_penalty
+    from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
     base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.10, 0.0, 0.0]])  # on X edge, centered in Y
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, COM_CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
@@ -330,23 +329,23 @@ def test_com_polygon_penalty_deep_inside_is_zero():
     # Barrier-only: deep-inside COM scores exactly 0 (the hard-gate path
     # relies on this).
     import torch
-    from cutamp.com_polygon_cost import COM_CENTER, com_polygon_penalty
+    from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.03, 0.04, 0.0]])  # well inside inset rect
-    pen = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0, COM_CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0, CENTER)
     assert pen.item() == 0.0
 
 
 def test_com_polygon_penalty_just_outside_exceeds_tol():
     # COM 1mm past one edge -> penalty > tol (outside quadratic + saturated barrier).
     import torch
-    from cutamp.com_polygon_cost import COM_CENTER, com_polygon_penalty
+    from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
     base_T = _support_centre_at_origin()
     com_world = torch.tensor([[0.101, 0.0, 0.0]])  # 1mm past X edge
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, COM_CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
     # outside=0.001 -> 0.001**2; inside barrier saturates at (0.001+0.02)**2.
     # Sum: 1e-6 + 4.41e-4 ≈ 4.42e-4 > tol 4e-4.
     assert pen.item() > 4e-4
@@ -354,8 +353,7 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
 
 
 @needs_cuda
-@pytest.mark.parametrize("robot", ["simplified", "real_legs"])
-def test_mask_matches_penalty_gate(robot):
+def test_mask_matches_penalty_gate():
     # The post-IK mask must equal (penalty <= COM_TOL) elementwise, so the IK
     # COM-safe retry loop and the ConstraintChecker can never disagree.
     # COM_TOL is inside_weight * inside_margin^2 = 4e-4, calibrating the hard
@@ -364,15 +362,15 @@ def test_mask_matches_penalty_gate(robot):
     from cutamp.com_polygon_cost import (
         COM_TOL, compute_com_margin, compute_com_polygon_mask, compute_com_polygon_penalties,
     )
-    world = make_blocks_t1_world(get_model(robot))
+    world = make_blocks_t1_world()
     home = world.q_init.detach().clone()
-    bent = _moved(world, EXTREME_LEAN[world.model.name])  # genuinely out-of-hull
-    # Spread a batch of configs around home by the model's EDGE_SPREAD, so its
+    bent = _moved(world, EXTREME_LEAN)  # genuinely out-of-hull
+    # Spread a batch of configs around home by EDGE_SPREAD, so its
     # rows straddle the polygon edge, then append the deterministic [home, bent]
     # pair so both classifications are guaranteed present in the batch.
     torch.manual_seed(0)
     names = list(world.kinematics.joint_names)
-    spread = EDGE_SPREAD[world.model.name]
+    spread = EDGE_SPREAD
     q = home.unsqueeze(0).repeat(32, 1).clone()
     sigma = torch.tensor(list(spread.values()), device=q.device)
     q[:, [names.index(n) for n in spread]] += sigma * torch.randn(32, len(spread), device=q.device)

@@ -45,8 +45,7 @@ def cutamp_demo(
         ``None`` — don't save the motion plan (default).
         ``"auto"`` — save to ``<experiment_root>/<experiment_id>/motion_plan.pkl``.
         Any other string — save to that path (parent directory auto-created).
-    The simplified model's plan is saved in schema 3, a real-leg plan raw
-    (``"stage3-raw"``); see cutamp/utils/plan_processor.py for both.
+    The plan is saved raw (``"stage3-raw"``); see cutamp/utils/plan_processor.py.
     """
     setup_logging()
 
@@ -70,13 +69,11 @@ def cutamp_demo(
         else:
             out_path = Path(save_plan)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # The simplified model's plan is processed into the structured [trunk, arms, hands] schema 3; a real-leg
-        # plan is saved raw, in its model's joint order, until stage 6's schema 4 (decision 9). See
-        # cutamp/utils/plan_processor.py for both.
-        from cutamp.robots.t1 import SIMPLIFIED, get_model
-        from cutamp.utils.plan_processor import process_motion_plan, raw_motion_plan
-        model = get_model(config.robot)
-        processed = process_motion_plan(curobo_plan) if model is SIMPLIFIED else raw_motion_plan(curobo_plan, model)
+        # The plan is saved raw, in its model's joint order, until stage 6's schema 4 (decision 9). See
+        # cutamp/utils/plan_processor.py.
+        from cutamp.robots import REAL_LEGS
+        from cutamp.utils.plan_processor import raw_motion_plan
+        processed = raw_motion_plan(curobo_plan, REAL_LEGS)
         with open(out_path, "wb") as f:
             pickle.dump(processed, f)
         n_traj = len(curobo_plan)
@@ -91,7 +88,7 @@ def cutamp_demo(
 def entrypoint():
     import argparse
 
-    from cutamp.config import SUPPORTED_ROBOTS, SUPPORTED_SOFT_COSTS
+    from cutamp.config import SUPPORTED_SOFT_COSTS
     _defaults = TAMPConfiguration()
 
     parser = argparse.ArgumentParser(
@@ -100,48 +97,23 @@ def entrypoint():
     )
 
     parser.add_argument(
-        "--robot", choices=SUPPORTED_ROBOTS, default=_defaults.robot,
-        help="Planning model: real_legs (the default), bfm_wm's 33-DOF T1 standing on its home stance, which runs "
-             "only the full system (no ablation flags), or simplified, the 21-DOF T1 the paper's ablation arms run on.",
-    )
-    parser.add_argument(
         "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
     )
     parser.add_argument(
         "--surface_height", type=float, default=0.0,
         help="Elevate the manipulation surface (boxes + goal pad) by this many METRES. "
              "0.0 = ground variant (default). cuTAMP is kinematic, so objects sit at the "
-             "new z with no support geometry added. Used for the height sweep.",
+             "new z with no support geometry added.",
     )
 
     # Soft costs
     parser.add_argument(
-        "--no_coupled_reik", dest="coupled_reik", action="store_false",
-        help="Disable re-IK-coupled Adam (default: on). Coupled mode is required for "
-             "pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
-    )
-    parser.set_defaults(coupled_reik=_defaults.coupled_reik)
-    parser.add_argument(
         "--reik_interval", type=int, default=_defaults.reik_interval,
-        help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
+        help="Periodic IK projection cadence K. Smaller K bounds KinematicConstraint drift but does more IK calls.",
     )
-    # --reik_balance_first and --cuda_graphs only restate the defaults; the
-    # paper's reproduction commands pass them.
-    parser.add_argument(
-        "--reik_balance_first", dest="reik_balance_first", action="store_true",
-        help="Balance-first GN refresh (CoM in polygon, then pose, then joint-limit margins), "
-             "persistent iterates, no cuRobo during Adam. On by default.",
-    )
-    parser.add_argument(
-        "--no_reik_balance_first", dest="reik_balance_first", action="store_false",
-        help="Use the pose-only GN refresh with cuRobo fallbacks instead; joint-limit margins "
-             "are then not enforced on covered Confs.",
-    )
-    parser.set_defaults(reik_balance_first=_defaults.reik_balance_first)
     parser.add_argument(
         "--cuda_graphs", dest="cuda_graphs", action="store_true",
-        help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs. On by default; "
-             "runs without coupled re-IK or balance-first, or with align_yaw, stay eager.",
+        help="Replay the Adam step and re-IK refresh as CUDA graphs. On by default; align_yaw runs stay eager.",
     )
     parser.add_argument(
         "--no_cuda_graphs", dest="cuda_graphs", action="store_false",
@@ -153,8 +125,8 @@ def entrypoint():
         nargs="*",
         default=None,
         choices=list(SUPPORTED_SOFT_COSTS),
-        help="Soft cost(s) to optimize (default: TAMPConfiguration's for --robot: place_close_to_base and "
-             "joint_limit_margin, plus minimize_body_movement on real_legs; a bare --soft_cost runs none). "
+        help="Soft cost(s) to optimize (default: place_close_to_base, joint_limit_margin and "
+             "minimize_body_movement; a bare --soft_cost runs none). "
              "Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
     )
 
@@ -170,7 +142,7 @@ def entrypoint():
     )
     parser.add_argument(
         "--conf_lr", type=float, default=_defaults.conf_lr,
-        help="Adam LR for Conf particle params (robot q). Lowering this reduces Adam first-step destruction on T1's 21-DOF cspace.",
+        help="Adam LR for Conf particle params (robot q).",
     )
     parser.add_argument(
         "--max_duration",
@@ -187,43 +159,8 @@ def entrypoint():
         help="Whether to plan for full motions after using cuTAMP.",
     )
     parser.add_argument(
-        "--no_enable_com_polygon",
-        dest="enable_com_polygon",
-        action="store_false",
-        help="Disable the COM-over-base-polygon soft cost on the motion planner. "
-             "By default the cost is enabled (5e5 weight) and keeps the planner's "
-             "configurations from tipping over the wheelbase.",
-    )
-    parser.set_defaults(enable_com_polygon=_defaults.enable_com_polygon)
-    parser.add_argument(
-        "--no_enable_com_aware_ik",
-        dest="enable_com_aware_ik",
-        action="store_false",
-        help="Disable the CoM-aware seed-IK residual (cuRobo fork). By default "
-             "IK trades hand-pose vs COM and recruits the legs to center the "
-             "COM (validated 2026-06-09; see config.enable_com_aware_ik).",
-    )
-    parser.set_defaults(enable_com_aware_ik=_defaults.enable_com_aware_ik)
-    parser.add_argument(
-        "--no_com_all", action="store_true",
-        help="Ablation umbrella: disable ALL CoM machinery — seed-IK residual "
-             "(L1), init gate+retries (L2), ComPolygon hard constraint (L3), "
-             "trajopt cost (L5). Equivalent to the four individual flags.",
-    )
-    parser.add_argument(
-        "--force_adam", action="store_true",
-        help="Run Phase 1 even when init already satisfies with coupled_reik "
-             "off (fairness fix for the ablation baseline).",
-    )
-    parser.add_argument(
-        "--soft_in_adam", choices=["auto", "always"], default=None,
-        help="'always' puts soft costs in the Adam loss even without "
-             "coupled_reik (upstream-faithful attempt for -reIK arms).",
-    )
-    parser.add_argument(
         "--seed", type=int, default=None,
-        help="torch.manual_seed for reproducible sampling (ablation study "
-             "uses seeds 0..4).",
+        help="torch.manual_seed for reproducible sampling.",
     )
 
     # Visualization and logging
@@ -257,9 +194,8 @@ def entrypoint():
         default=None,
         help=(
             "Save the motion plan as a pickle (no arg: "
-            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): schema 3 "
-            "on the simplified model, the raw 'stage3-raw' plan on the real legs. "
-            "See cutamp/utils/plan_processor.py for both."
+            "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): the raw "
+            "'stage3-raw' plan. See cutamp/utils/plan_processor.py."
         ),
     )
 
@@ -269,26 +205,17 @@ def entrypoint():
         import torch
         torch.manual_seed(args.seed)
     config = TAMPConfiguration(
-        robot=args.robot,
         num_particles=args.num_particles,
         num_opt_steps=args.num_opt_steps,
         early_stop_patience=args.early_stop_patience,
         lr=args.lr,
         conf_lr=args.conf_lr,
         max_loop_dur=args.max_duration,
-        coupled_reik=args.coupled_reik,
         reik_interval=args.reik_interval,
-        reik_balance_first=args.reik_balance_first,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
         curobo_plan=args.motion_plan,
-        enable_com_polygon=args.enable_com_polygon and not args.no_com_all,
-        enable_com_aware_ik=args.enable_com_aware_ik and not args.no_com_all,
-        enable_com_init_gate=not args.no_com_all,
-        enable_com_hard_constraint=not args.no_com_all,
-        force_adam=args.force_adam,
-        soft_in_adam=args.soft_in_adam or TAMPConfiguration.soft_in_adam,
         enable_visualizer=not args.disable_visualizer,
         opt_viz_interval=args.viz_interval,
         viz_robot_mesh=not args.disable_robot_mesh,

@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- cuTAMP gripper: the links and joints the builder appends to the vendor URDF (weightless, meshes relative to the planner URDF's folder). -->
+<robot name="gripper">
+  <link name="left_base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_Link1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_Link11">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link11.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link11.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_Link2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_Link22">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link22.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/left_Link22.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Link1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Link11">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link11.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link11.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Link2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Link22">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link22.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.894117647058823 0.913725490196078 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../t1_description/meshes/right_Link22.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_base_link" type="fixed">
+    <origin xyz="0 0.084 0" rpy="0 0 1.5708" />
+    <parent link="left_hand_link" />
+    <child link="left_base_link" />
+  </joint>
+  <joint name="left_Link1" type="revolute">
+    <origin xyz="0.036 -0.04 -0.019" rpy="0 0 -0.30719" />
+    <parent link="left_base_link" />
+    <child link="left_Link1" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="1" effort="1" velocity="1" />
+  </joint>
+  <joint name="left_Link11" type="revolute">
+    <origin xyz="0.042 0 0.003" rpy="0 0 0.30719" />
+    <parent link="left_Link1" />
+    <child link="left_Link11" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1" upper="0" effort="1" velocity="1" />
+  </joint>
+  <joint name="left_Link2" type="revolute">
+    <origin xyz="0.036 0.04 -0.019" rpy="0 0 0.30719" />
+    <parent link="left_base_link" />
+    <child link="left_Link2" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1" upper="0" effort="1" velocity="1" />
+  </joint>
+  <joint name="left_Link22" type="revolute">
+    <origin xyz="0.042 0 0.015" rpy="0 0 2.8344" />
+    <parent link="left_Link2" />
+    <child link="left_Link22" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="1" effort="1" velocity="1" />
+  </joint>
+  <joint name="right_base_link" type="fixed">
+    <origin xyz="0 -0.084 0" rpy="0 0 -1.5708" />
+    <parent link="right_hand_link" />
+    <child link="right_base_link" />
+  </joint>
+  <joint name="right_Link1" type="revolute">
+    <origin xyz="0.036 -0.04 -0.019" rpy="0 0 -0.30719" />
+    <parent link="right_base_link" />
+    <child link="right_Link1" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="1" effort="1" velocity="1" />
+  </joint>
+  <joint name="right_Link11" type="revolute">
+    <origin xyz="0.042 0 0.003" rpy="0 0 0.30719" />
+    <parent link="right_Link1" />
+    <child link="right_Link11" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1" upper="0" effort="1" velocity="1" />
+  </joint>
+  <joint name="right_Link2" type="revolute">
+    <origin xyz="0.036 0.04 -0.019" rpy="0 0 0.30719" />
+    <parent link="right_base_link" />
+    <child link="right_Link2" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1" upper="0" effort="1" velocity="1" />
+  </joint>
+  <joint name="right_Link22" type="revolute">
+    <origin xyz="0.042 0 0.015" rpy="0 0 2.8344" />
+    <parent link="right_Link2" />
+    <child link="right_Link22" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="1" effort="1" velocity="1" />
+  </joint>
+</robot>
