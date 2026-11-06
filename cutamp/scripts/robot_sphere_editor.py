@@ -7,11 +7,11 @@ This tool allows you to:
 3. Optionally auto-fit spheres from link collision geometry (F key)
 4. Export back to YAML for cuRobo motion planning
 
-Usage:
-    python -m cutamp.scripts.robot_sphere_editor \
-        --urdf path/to/robot.urdf \
-        --yaml path/to/robot.yml \
-        --links mobile_base_link shank_link thigh_link
+Usage (the defaults edit the real legs' upper-body spheres against t1_planner.urdf):
+    python -m cutamp.scripts.robot_sphere_editor --links Trunk AL3
+
+Rerun cutamp/robots/assets/t1_29dof/build_planner_model.py after saving: it writes t1_29dof_spheres.yml from the
+edited upper_body_spheres.yml.
 
 Key Controls:
     L           - Cycle through links
@@ -154,19 +154,28 @@ class YamlSphereEditor(SphereEditor):
 # Main
 # =============================================================================
 
+T1_29DOF = Path(__file__).resolve().parents[1] / "robots" / "assets" / "t1_29dof"
+DEFAULT_URDF = T1_29DOF / "t1_planner.urdf"
+DEFAULT_YAML = T1_29DOF / "upper_body_spheres.yml"
+
+
+def default_paths() -> list:
+    """The files the defaults read and write."""
+    return [DEFAULT_URDF, DEFAULT_YAML]
+
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive YAML Collision Sphere Editor")
     parser.add_argument(
         "--urdf",
         type=str,
-        default="cutamp/robots/assets/t1_description/t1_simplified.urdf",
+        default=str(DEFAULT_URDF),
         help="Path to URDF file",
     )
     parser.add_argument(
         "--yaml",
         type=str,
-        default="cutamp/robots/assets/t1_description/t1_spheres.yml",
+        default=str(DEFAULT_YAML),
         help="Path to YAML configuration file with collision_spheres",
     )
     parser.add_argument(
@@ -180,7 +189,7 @@ def main():
         "--add-links",
         type=str,
         nargs="+",
-        default=["mobile_base_link", "shank_link", "thigh_link"],
+        default=[],
         help="Additional links to add for editing (even if empty in YAML)",
     )
 
@@ -220,7 +229,7 @@ def main():
         # Default: all links that have spheres in YAML + additional links
         target_link_names = list(yaml_spheres.keys())
 
-        # Add extra links (like lifting column) even if they're not in YAML yet
+        # Add extra links even if they're not in YAML yet
         if args.add_links:
             for link_name in args.add_links:
                 if link_name not in target_link_names:

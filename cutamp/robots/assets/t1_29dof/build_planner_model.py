@@ -1,13 +1,13 @@
 """Derive cuTAMP's real-leg planner model from the pinned copy of bfm_wm's T1 (design 7.2, call 18).
 
-Writes three files into ``--out`` (default: this folder). They depend only on the pinned copy and on the simplified
-model's gripper, spheres and robot config in ``../t1_description``, and are written byte for byte the same each run:
+Writes three files into ``--out`` (default: this folder). They depend only on the pinned copy, cuTAMP's gripper
+(``../t1_description/gripper.urdf``) and the upper-body collision model (``upper_body_spheres.yml`` and the collision
+lists below), and are written byte for byte the same each run:
 
 - ``t1_planner.urdf``: ``urdf/T1_29dof.urdf`` with bfm_wm's CamelCase names, a ``world`` link fixed to Trunk and the
-  simplified model's gripper, weightless, at today's mount (call 8). Every vendor element is unchanged, joint limits
+  cuTAMP's gripper, weightless, at its mount on each hand (call 8). Every vendor element is unchanged, joint limits
   included.
-- ``t1_29dof_spheres.yml``: the simplified model's spheres without its legs, Trunk's moved into the vendor frame, plus
-  4 per thigh and 4 per shank.
+- ``t1_29dof_spheres.yml``: the upper-body spheres, plus 4 per thigh and 4 per shank.
 - ``t1_29dof.yml``: the cuRobo robot config, with paths relative to its folder, its six base joints' limits the legs'
   reach (``_base_limits``), and a ``cutamp:`` block (joint order, home, sole box, sole y, home mid-sole) that cuRobo
   never reads.
@@ -31,7 +31,7 @@ T1_DESC = HERE.parent / "t1_description"
 VENDOR_URDF = HERE / "urdf" / "T1_29dof.urdf"
 ACTUATORS = HERE / "t1_actuators.npz"
 PLANNER_URDF, ROBOT_YML, SPHERES_YML = "t1_planner.urdf", "t1_29dof.yml", "t1_29dof_spheres.yml"
-GRIPPER_MESH_DIR = "../t1_description"  # the gripper's meshes, seen from this folder
+UPPER_BODY_SPHERES = HERE / "upper_body_spheres.yml"
 
 # bfm_wm utils/build_t1_mjcf.py:25-38, copied: vendor names to bfm_wm's, which equal t1.xml's and T1_JOINT_NAMES.
 _ARM = {"shoulder_pitch": "Shoulder_Pitch", "shoulder_roll": "Shoulder_Roll", "elbow_pitch": "Elbow_Pitch",
@@ -91,7 +91,7 @@ ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's
 # that timing, so they shape each path and its time profile. The balance gate keeps that profile and sets only each
 # segment's uniform time scale, from the robot's speed limits, efforts and the ZMP (motion_solver._pace), so their
 # shape reaches every exported motion. They are not robot facts: the acceleration and jerk caps are
-# the simplified model's (t1_planar_base.yml), and the base's velocity limit is cuRobo's default for extra links
+# trajopt's pace limits for the real legs, and the base's velocity limit is cuRobo's default for extra links
 # (link_params.py:32), written out. With non-binding caps in their place (1e4, 1e6, 1e3) both seed-0 runs of P2's
 # check set failed every candidate's first trajopt on its torque check, so trajopt keeps these.
 TRAJOPT_MAX_ACCELERATION = 15.0  # rad/s^2 (m/s^2 on the base's x, y, z)
@@ -105,8 +105,59 @@ SOLE_BOX = (0.2249, 0.100)
 SOLE_FRAMES = tuple(f"{s}_sole_link" for s, _ in SIDES)
 TOOL_FRAMES = ["left_base_link", "right_base_link", *SOLE_FRAMES, "stance"]
 
-OLD_LEG_LINKS = ("mobile_base_link", "shank_link", "thigh_link")  # the simplified model's legs
-TRUNK_SPHERE_SHIFT_X = 0.0625  # t1.urdf's Trunk frame to the vendor's (design 7.2)
+# The upper body's collision model, copied from the generated t1_29dof.yml: the links cuRobo checks, the links whose
+# contact counts as the grasp's, the attached-object sphere budgets and the self-collision pairs to skip. The legs'
+# links, the base chain and the hips' entries are added below.
+GRASP_CONTACT_LINK_NAMES = ["left_hand_link", "left_base_link", "left_Link1", "left_Link11", "left_Link2",
+    "left_Link22", "right_hand_link", "right_base_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22",
+    "attached_object_left", "attached_object_right"]
+COLLISION_LINK_NAMES = ["Waist", "Trunk", "H1", "H2", "AL1", "AL2", "AL3", "AL4", "AL5", "AL6", "left_hand_link",
+    "left_base_link", "left_Link1", "left_Link11", "left_Link2", "left_Link22", "AR1", "AR2", "AR3", "AR4", "AR5",
+    "AR6", "right_hand_link", "right_base_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22",
+    "attached_object_left", "attached_object_right"]
+EXTRA_COLLISION_SPHERES = {"attached_object_left": 50, "attached_object_right": 50}
+SELF_COLLISION_IGNORE = {
+    "Waist": ["Trunk", "H1", "H2", "AL1", "AL2", "AL3", "AR1", "AR2", "AR3"],
+    "Trunk": ["Waist", "H1", "H2", "AL1", "AL2", "AL3", "AL4", "AR1", "AR2", "AR3", "AR4"],
+    "H1": ["H2", "Trunk", "Waist", "AL1", "AL2", "AL3", "AR1", "AR2", "AR3"],
+    "H2": ["H1", "Trunk", "Waist", "AL1", "AL2", "AL3", "AL4", "AR1", "AR2", "AR3", "AR4"],
+    "AL1": ["AL2", "AL3", "AL4", "Trunk", "Waist", "H1", "H2", "AR1"],
+    "AL2": ["AL1", "AL3", "AL4", "AL5", "Trunk", "Waist", "H1", "H2", "AR1", "AR2"],
+    "AL3": ["AL1", "AL2", "AL4", "AL5", "AL6", "Trunk", "Waist", "H2"],
+    "AL4": ["AL2", "AL3", "AL5", "AL6", "left_hand_link", "Trunk", "H2"],
+    "AL5": ["AL3", "AL4", "AL6", "left_hand_link", "left_base_link"],
+    "AL6": ["AL4", "AL5", "left_hand_link", "left_base_link", "left_Link1", "left_Link11"],
+    "left_hand_link": ["AL5", "AL6", "left_base_link", "left_Link1", "left_Link11", "left_Link2", "left_Link22",
+        "attached_object_left"],
+    "left_base_link": ["AL6", "left_hand_link", "left_Link1", "left_Link11", "left_Link2", "left_Link22",
+        "attached_object_left"],
+    "left_Link1": ["left_Link11", "left_Link2", "left_Link22", "left_base_link", "left_hand_link",
+        "attached_object_left"],
+    "left_Link11": ["left_Link1", "left_Link2", "left_Link22", "left_base_link", "left_hand_link",
+        "attached_object_left"],
+    "left_Link2": ["left_Link1", "left_Link11", "left_Link22", "left_base_link", "left_hand_link",
+        "attached_object_left"],
+    "left_Link22": ["left_Link1", "left_Link11", "left_Link2", "left_base_link", "left_hand_link",
+        "attached_object_left"],
+    "AR1": ["AR2", "AR3", "AR4", "Trunk", "Waist", "H1", "H2", "AL1"],
+    "AR2": ["AR1", "AR3", "AR4", "AR5", "Trunk", "Waist", "H1", "H2", "AL1", "AL2"],
+    "AR3": ["AR1", "AR2", "AR4", "AR5", "AR6", "Trunk", "Waist", "H2"],
+    "AR4": ["AR2", "AR3", "AR5", "AR6", "right_hand_link", "Trunk", "H2"],
+    "AR5": ["AR3", "AR4", "AR6", "right_hand_link", "right_base_link"],
+    "AR6": ["AR4", "AR5", "right_hand_link", "right_base_link", "right_Link1", "right_Link11"],
+    "right_hand_link": ["AR5", "AR6", "right_base_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22",
+        "attached_object_right"],
+    "right_base_link": ["AR6", "right_hand_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22",
+        "attached_object_right"],
+    "right_Link1": ["right_Link11", "right_Link2", "right_Link22", "right_base_link", "right_hand_link",
+        "attached_object_right"],
+    "right_Link11": ["right_Link1", "right_Link2", "right_Link22", "right_base_link", "right_hand_link",
+        "attached_object_right"],
+    "right_Link2": ["right_Link1", "right_Link11", "right_Link22", "right_base_link", "right_hand_link",
+        "attached_object_right"],
+    "right_Link22": ["right_Link1", "right_Link11", "right_Link2", "right_base_link", "right_hand_link",
+        "attached_object_right"],
+}
 LEG_SPHERE_RADIUS = {"Hip_Yaw": 0.055, "Shank": 0.045}  # stage 2 (REPORT.md section 5)
 
 HEADER = "# Generated by build_planner_model.py from the pinned copy of bfm_wm's T1 (PROVENANCE.yml). Do not edit.\n"
@@ -151,17 +202,9 @@ def _build_urdf() -> tuple[ET.Element, dict]:
     ET.SubElement(world_joint, "child", link="Trunk")
     root.insert(0, ET.Element("link", name="world"))
     root.insert(1, world_joint)
-    simplified = ET.parse(T1_DESC / "t1_simplified.urdf").getroot()
-    for link in simplified.findall("link"):
-        if link.get("name") in GRIPPER_LINKS:
-            for inertial in link.findall("inertial"):
-                link.remove(inertial)
-            for mesh in link.iter("mesh"):
-                mesh.set("filename", f"{GRIPPER_MESH_DIR}/{mesh.get('filename')}")
-            root.append(link)
-    for joint in simplified.findall("joint"):
-        if joint.find("child").get("link") in GRIPPER_LINKS:
-            root.append(joint)
+    gripper = ET.parse(T1_DESC / "gripper.urdf").getroot()  # its links, then its joints, in the order appended
+    root.extend(gripper.findall("link"))
+    root.extend(gripper.findall("joint"))
     return root, joints
 
 
@@ -178,13 +221,9 @@ def _check_soles(root: ET.Element) -> None:
 
 
 def _build_spheres(joints: dict) -> dict:
-    """The simplified model's spheres without its legs, Trunk's moved into the vendor frame, plus 4 on each Hip_Yaw
+    """The upper-body spheres, plus 4 on each Hip_Yaw
     link (the hip-pitch centre to the knee) and 4 on each Shank (the knee to the ankle)."""
-    spheres = yaml.safe_load((T1_DESC / "t1_spheres.yml").read_text())["collision_spheres"]
-    for key in OLD_LEG_LINKS:
-        spheres.pop(key)
-    for sphere in spheres["Trunk"]:
-        sphere["center"][0] += TRUNK_SPHERE_SHIFT_X
+    spheres = yaml.safe_load(UPPER_BODY_SPHERES.read_text())["collision_spheres"]
     origin = {name: np.array(_floats(joint.find("origin").get("xyz"))) for name, joint in joints.items()}
     for _, side in SIDES:
         hip = -(origin[f"{side}_Hip_Roll"] + origin[f"{side}_Hip_Yaw"])  # the hip-pitch centre in Hip_Yaw, roll 0
@@ -329,13 +368,12 @@ def _extra_links(mid_sole: list, base_limits: dict) -> dict:
     return extra
 
 
-def _self_collision_ignore(today: dict) -> dict:
-    """The base chain; the simplified model's pairs without its legs; each leg chain, and Trunk and Waist against the
+def _self_collision_ignore() -> dict:
+    """The base chain; the upper body's pairs; each leg chain, and Trunk and Waist against the
     hips and thighs. Left leg against right leg, and legs against arms, stay checked (design 7.2)."""
     chain = [f"base_link_{n}" for n, _ in BASE] + ["Trunk"]
     ignore = {link: chain[max(i - 1, 0):i] + chain[i + 1:i + 2] for i, link in enumerate(chain[:-1])}
-    ignore.update({k: [x for x in v if x not in OLD_LEG_LINKS]
-                   for k, v in today["self_collision_ignore"].items() if k not in OLD_LEG_LINKS})
+    ignore.update({k: list(v) for k, v in SELF_COLLISION_IGNORE.items()})
     for side, Side in SIDES:
         hips = [f"Hip_Pitch_{Side}", f"Hip_Roll_{Side}", f"Hip_Yaw_{Side}"]
         for body in ("Waist", "Trunk"):
@@ -347,7 +385,6 @@ def _self_collision_ignore(today: dict) -> dict:
 
 def _kinematics(mid_sole: list, base_limits: dict) -> dict:
     """The robot config's kinematics, except its cspace."""
-    today = yaml.safe_load((T1_DESC / "t1_planar_base.yml").read_text())["robot_cfg"]["kinematics"]
     legs = [f"{key}_{Side}" for _, Side in SIDES for key in LEG_SPHERE_RADIUS]
     return {
         "format_version": 2.0,
@@ -355,17 +392,17 @@ def _kinematics(mid_sole: list, base_limits: dict) -> dict:
         "urdf_path": PLANNER_URDF,
         "base_link": "world",
         "tool_frames": list(TOOL_FRAMES),
-        "grasp_contact_link_names": today["grasp_contact_link_names"],
-        "collision_link_names": [k for k in today["collision_link_names"] if k not in OLD_LEG_LINKS] + legs,
+        "grasp_contact_link_names": list(GRASP_CONTACT_LINK_NAMES),
+        "collision_link_names": [*COLLISION_LINK_NAMES, *legs],
         "collision_spheres": SPHERES_YML,
         "collision_sphere_buffer": {},
-        "extra_collision_spheres": today["extra_collision_spheres"],
+        "extra_collision_spheres": dict(EXTRA_COLLISION_SPHERES),
         "extra_links": _extra_links(mid_sole, base_limits),
         "lock_joints": {j: 0.0 for j in (*HEAD, *FINGERS)},
         "use_global_cumul": True,
         "mesh_link_names": None,
         "self_collision_buffer": {},
-        "self_collision_ignore": _self_collision_ignore(today),
+        "self_collision_ignore": _self_collision_ignore(),
     }
 
 

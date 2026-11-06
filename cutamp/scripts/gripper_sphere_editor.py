@@ -6,8 +6,12 @@ This tool allows you to:
 2. Interactively adjust sphere positions and radii
 3. Export to .pt tensor for gripper spheres (used by particle initialization)
 
-Usage:
-    python -m cutamp.scripts.gripper_sphere_editor --urdf path/to/robot.urdf
+Usage (the default URDF is t1_description/gripper.urdf):
+    python -m cutamp.scripts.gripper_sphere_editor
+
+The gripper spheres live twice: in the .pt files in t1_description (particle initialization) and, through
+build_planner_model.py, in t1_29dof_spheres.yml (cuRobo). Saving writes the .pt files and the gripper links in
+t1_29dof/upper_body_spheres.yml; rerun build_planner_model.py afterwards to regenerate t1_29dof_spheres.yml.
 
 Key Controls:
     L           - Cycle through links
@@ -34,6 +38,7 @@ import torch
 import yaml
 from yourdfpy import URDF
 
+from cutamp.robots.t1 import T1_ASSETS_DIR
 from cutamp.scripts._sphere_editor_common import (
     SphereEditor,
     fit_spheres_to_link,
@@ -478,13 +483,22 @@ T1_GRIPPERS = {
 }
 
 
+DEFAULT_URDF = T1_ASSETS_DIR / "gripper.urdf"
+DEFAULT_YAML = Path(__file__).resolve().parents[1] / "robots" / "assets" / "t1_29dof" / "upper_body_spheres.yml"
+
+
+def default_paths() -> list:
+    """The files the defaults read and write."""
+    return [DEFAULT_URDF, DEFAULT_YAML, *(T1_ASSETS_DIR / cfg["output_suffix"] for cfg in T1_GRIPPERS.values())]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive Gripper Sphere Editor")
     parser.add_argument(
         "--urdf",
         type=str,
-        default="cutamp/robots/assets/t1_description/t1_simplified.urdf",
-        help="Path to URDF file",
+        default=str(DEFAULT_URDF),
+        help="Path to URDF file (the gripper's links and joints)",
     )
     parser.add_argument(
         "--gripper",
@@ -538,7 +552,7 @@ def main():
     for gripper_name in grippers_to_process:
         cfg = T1_GRIPPERS[gripper_name]
         all_gripper_links.extend(cfg["links"])
-        output_path = urdf_dir / cfg["output_suffix"]
+        output_path = T1_ASSETS_DIR / cfg["output_suffix"]
         gripper_configs.append({
             "name": gripper_name,
             "ee_link": cfg["ee_link"],
@@ -551,7 +565,7 @@ def main():
     urdf = URDF.load(str(urdf_path))
 
     # Set up YAML path for spheres
-    spheres_yaml_path = urdf_dir / "t1_spheres.yml"
+    spheres_yaml_path = DEFAULT_YAML
 
     # Try loading existing spheres
     link_spheres = {}
