@@ -20,14 +20,14 @@ operator. This is a *physical* lock, not a soft penalty: even with Adam's
 per-parameter normalization, a zero gradient produces a zero step.
 
 Per-operator locking policy for T1, on the planning model's slices
-(``world.model``):
+(``world.model``), set by the first operator that names the conf:
 
-* Arm action / arm motion (Pick, Place, MoveFree, MoveHolding,
-  Retract): lock the inactive arm (the 7 DOFs of the non-active arm).
-  Active arm, base and legs/Waist remain free.
-* Retract: a retract conf stands where its reach stood (design 7.3), so its
-  base and body are locked too, at home, where particle init puts them. Only
-  its active arm moves.
+* Arm action / arm motion (Pick, Place, MoveFree, MoveHolding): lock the
+  inactive arm (the 7 DOFs of the non-active arm). Active arm, base and
+  legs/Waist remain free.
+* Retract (RetractHolding, RetractFree): a retract conf stands where its reach
+  stood (design 7.3), so its base and body are locked too, at home, where
+  particle init puts them, beside the inactive arm. Only its active arm moves.
 """
 
 from __future__ import annotations

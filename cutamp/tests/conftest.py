@@ -22,16 +22,16 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-def make_blocks_t1_world(model=REAL_LEGS, **tamp_world_kwargs):
-    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``model``, starting at its home."""
+def make_blocks_t1_world(**tamp_world_kwargs):
+    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home."""
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.robots import load_t1_container
     from cutamp.tamp_world import TAMPWorld
     dc = DeviceCfg()
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    robot = load_t1_container(model, dc)
-    q_init = torch.as_tensor(model.home, dtype=torch.float32, device=dc.device)
+    robot = load_t1_container(REAL_LEGS, dc)
+    q_init = torch.as_tensor(REAL_LEGS.home, dtype=torch.float32, device=dc.device)
     return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, **tamp_world_kwargs)
 
 
@@ -66,7 +66,7 @@ def blocks_t1_plan(real_world, real_plan):
 def _real_world_slot():
     """Holds ``real_world``'s world, so teardown can free it: ``real_world`` is torn down first, and with it pytest's
     own reference to the world."""
-    slot = [make_blocks_t1_world(model=REAL_LEGS, collision_activation_distance=0.0, ik_max_batch_size=64)]
+    slot = [make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)]
     yield slot
     slot.clear()
     sys.last_type = sys.last_value = sys.last_traceback = None  # a failed test's traceback holds its locals

@@ -53,7 +53,7 @@ def get_attachment_manager(planner):
 # Don't second-guess it: ``result.cspace_error`` is declared but never set
 # (always None), and a trajectory ending on the goal proves nothing because
 # cuRobo pins the last waypoint to it. A rejected T1 plan is a real violation
-# (e.g. ankle_pitch past its 0 rad upper limit mid-path); fix the planner.
+# (e.g. Left_Ankle_Pitch past a joint limit mid-path); fix the planner.
 def cspace_plan_succeeded(result) -> bool:
     """True iff cuRobo reports a successful (converged and feasible) plan."""
     return result is not None and bool(result.success.any())

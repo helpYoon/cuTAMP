@@ -22,9 +22,7 @@
 - [Installation](#installation)
 - [Getting Started](#getting-started)
 - [Examples](#examples)
-    - [Tetris Packing](#tetris-packing)
     - [Optimizing Soft Costs](#optimizing-soft-costs)
-    - [Searching over Plan Skeletons](#searching-over-plan-skeletons)
 - [Troubleshooting](#troubleshooting)
 - [Acknowledgements](#acknowledgements)
 - [Citation](#citation)
@@ -86,8 +84,7 @@ pip install -e .
 > [helpYoon/curobo](https://github.com/helpYoon/curobo), not `NVlabs/curobo`.
 > The fork adds the `compute_com` plumbing and the CoM-aware seed-IK residual
 > the T1 humanoid depends on — a plain NVlabs checkout will **not** run cuTAMP.
-> All additions default off, so the fork stays byte-identical to upstream when
-> unused; see the fork's README for details.
+> [README.md](README.md)'s fork note lists every edit.
 
 Before cloning cuRobo, make sure `git-lfs` is installed (used for pulling large assets).
 
@@ -124,7 +121,7 @@ cutamp-demo
 ```
 
 This runs the [cutamp/scripts/run_cutamp.py](cutamp/scripts/run_cutamp.py) script with the default parameters on the
-Tetris environment with 3 blocks. We use [Rerun](https://rerun.io/) to visualize the optimization and plan.
+`blocks_t1` environment (two blocks and a goal pad on the ground). We use [Rerun](https://rerun.io/) to visualize the optimization and plan.
 
 - If you're on a machine with a display, you're now good to go!
 - If you're on a **remote or headless machine** (i.e., no display), see the instructions below on how to run with or
@@ -182,11 +179,11 @@ cutamp-demo -h
 
 ```bash
 # Minimize the distance between the objects for 10 seconds
-# (soft costs are always optimized under coupled re-IK, the default)
-cutamp-demo --env blocks_t1 --soft_cost min_obj_dist --max_duration 10
+# (soft costs are always optimized under coupled re-IK)
+cutamp-demo --soft_cost min_obj_dist --max_duration 10
 
 # Maximize the distance between the objects for 10 seconds
-cutamp-demo --env blocks_t1 --soft_cost max_obj_dist --max_duration 10
+cutamp-demo --soft_cost max_obj_dist --max_duration 10
 ```
 
 ### Helpful Flags
@@ -208,10 +205,10 @@ Make sure to describe your setup and detail the problem you're facing.
 torch.OutOfMemoryError: CUDA out of memory...
 ```
 
-Try reducing the number of particles (the default is 1024):
+Try reducing the number of particles (the default is 256):
 
 ```bash
-cutamp-demo --num_particles 256
+cutamp-demo --num_particles 64
 ```
 
 ### Rerun installation fails
@@ -247,7 +244,7 @@ conda install -c conda-forge libstdcxx-ng -y
 ### cuTAMP can't find any satisfying particles for my new domain
 
 If you've created a new placement surface, make sure you set the tolerance appropriately here for the surface name: 
-[cutamp/scripts/utils.py](cutamp/scripts/utils.py#L19).
+`default_constraint_to_tol` in [cutamp/scripts/utils.py](cutamp/scripts/utils.py).
 
 Additionally, check the logs and analyze which constraints have been violated. Try loosening the threshold for those
 constraints to debug.
