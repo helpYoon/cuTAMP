@@ -9,9 +9,9 @@
 
 """TAMPWorld for cuTAMP (cuRobo v0.8 single-MotionPlanner architecture).
 
-The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics, a
-single multi-tool-frame InverseKinematics solver, and a MotionPlanner
-factory, all on the planning model ``world.model``. T1 exposes two tool
+The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics and a MotionPlanner
+factory, all on the planning model ``world.model``. The IK is GN's (``particle_initialization.gn_ik``), on
+these kinematics. T1 exposes two tool
 frames in ``robot_container.tool_frames``.
 """
 
@@ -20,11 +20,10 @@ from typing import Dict, List, Union
 
 import torch
 
-from curobo.inverse_kinematics import InverseKinematics
 from curobo.kinematics import Kinematics
 from curobo.motion_planner import MotionPlanner
 from curobo.scene import Obstacle, Scene
-from curobo.types import DeviceCfg, GoalToolPose, JointState, Pose
+from curobo.types import DeviceCfg, JointState, Pose
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.floor_wrench import SegmentTorques
@@ -33,7 +32,6 @@ from cutamp.robots.t1 import (
     TOOL_FRAME_FOR_ARM,
     T1Model,
     get_t1_bodies,
-    get_t1_ik_solver,
     get_t1_kinematics,
     get_t1_motion_planner,
 )
@@ -44,7 +42,6 @@ from cutamp.utils.common import (
     approximate_goal_aabb,
     get_world_cfg,
     pose_list_to_mat4x4,
-    sample_between_bounds,
     transform_spheres,
 )
 from cutamp.utils.shapes import sample_greedy_surface_spheres
@@ -73,7 +70,6 @@ class TAMPWorld:
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
-        ik_max_batch_size: int = 512,  # Must be >= config.num_particles (particle init solves full-batch).
     ):
         self.env = env
         self.device_cfg = device_cfg
@@ -92,18 +88,6 @@ class TAMPWorld:
         self.robot_container = robot
         self._q_init = q_init
 
-        # Single multi-frame IK solver. Both tool frames are configured
-        # (matches the planner). Particle init holds the inactive hand where
-        # the IK's start conf puts it (home, or a CoM-gate retry's perturbed
-        # seed), so that arm's joints counter-rotate as the body bends (the
-        # per-DOF cspace pin is a no-op), and both soles on the stance
-        # (sole_goals). A conf whose IK fails starts at home
-        # instead (_store_ik_q). The GN refresh then moves the body
-        # with the inactive arm's joints fixed, so that hand rides with the
-        # trunk, most at those home confs (known-bugs B15).
-        self.ik_solver: InverseKinematics = get_t1_ik_solver(
-            self.model, self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
-        )
         self._kinematics_jac = None
         self._bodies = None
         self._segment_torques = None
@@ -138,19 +122,18 @@ class TAMPWorld:
             ).position.flatten().detach().cpu(),
         }
 
-        # The planted soles' world poses at the model's home: every action stands on this one stance. The FK poses
-        # stay too, as the soles' IK goals (sole_goals), so those goals are the stance bit for bit.
-        self._stance_sole_poses: Dict[str, Pose] = {}
+        # The planted soles' world poses at the model's home: every action stands on this one stance.
+        stance_sole_poses: Dict[str, Pose] = {}
         stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
         stance_ks = self.kinematics.compute_kinematics(stance_js)
         for frame in self.model.sole_frames:
             pose = stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True)
             # Copies: a single conf's pose is a view of cuRobo's FK buffers, which the next FK call rewrites.
-            self._stance_sole_poses[frame] = Pose(
+            stance_sole_poses[frame] = Pose(
                 position=pose.position.detach().clone(), quaternion=pose.quaternion.detach().clone(),
             )
         self._stance_soles: torch.Tensor = torch.stack([
-            pose.get_matrix().reshape(4, 4) for pose in self._stance_sole_poses.values()
+            pose.get_matrix().reshape(4, 4) for pose in stance_sole_poses.values()
         ])
 
     # ---- Container delegates ------------------------------------------------
@@ -203,14 +186,6 @@ class TAMPWorld:
     def stance_soles(self) -> torch.Tensor:
         """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction)."""
         return self._stance_soles
-
-    def sole_goals(self, n: int) -> Dict[str, Pose]:
-        """Each of ``model.sole_frames``' stance pose, repeated ``n`` times: the planted soles' IK goals
-        (design 7.3: from the stance, never from FK at the IK seed)."""
-        return {
-            frame: Pose(position=pose.position.repeat(n, 1), quaternion=pose.quaternion.repeat(n, 1))
-            for frame, pose in self._stance_sole_poses.items()
-        }
 
     # ---- Movables and indexing ---------------------------------------------
 
@@ -311,19 +286,6 @@ class TAMPWorld:
         if name not in self._site_kinematics:
             self._site_kinematics[name] = Kinematics(self.kinematics.config, compute_com=True)
         return self._site_kinematics[name]
-
-    def warmup_ik_solver(self, num_particles: int):
-        """Warmup the multi-frame IK solver with a multi-frame FK goal."""
-        ik = self.ik_solver
-        max_bs = getattr(ik.config, "max_batch_size", num_particles)
-        n = min(num_particles, max_bs)
-        q = sample_between_bounds(n, bounds=self.joint_limits)
-        js = JointState.from_position(q)
-        kin_state = self.kinematics.compute_kinematics(js)
-        all_frames = list(ik.kinematics.tool_frames)
-        poses = {f: kin_state.tool_poses.get_link_pose(f) for f in all_frames}
-        goal = GoalToolPose.from_poses(poses, ordered_tool_frames=all_frames)
-        _ = ik.solve_pose(goal_tool_poses=goal)
 
     def get_motion_planner(
         self,

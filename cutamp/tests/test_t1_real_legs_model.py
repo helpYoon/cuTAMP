@@ -337,13 +337,14 @@ def test_world_on_real_legs(real_world):
 def test_factories_keep_the_soft_limits_on_their_joints(real_world):
     # cuRobo never reorders position_limit_clip with the cspace, so a build whose joint order differs from
     # the YAML's puts the soft limits on the wrong joints, silently. Each factory asserts the order; this checks it
-    # and every factory's limits, by name.
+    # and every factory's limits, by name: the soft limits, each envelope range cut into its joint's.
     from cutamp.robots.t1 import get_t1_motion_planner
     soft = _yaml_soft_limits()
+    for joint, (lo, hi) in REAL_LEGS.envelope.joint_ranges.items():
+        soft[joint] = (max(soft[joint][0], lo), min(soft[joint][1], hi))
     planner = get_t1_motion_planner(REAL_LEGS, real_world.world_cfg, use_cuda_graph=False)
     builds = {"kinematics": real_world.kinematics, "kinematics_jac": real_world.kinematics_jac,
-              "bodies": real_world.bodies.kinematics, "ik": real_world.ik_solver.kinematics,
-              "planner": planner.kinematics}
+              "bodies": real_world.bodies.kinematics, "planner": planner.kinematics}
     for what, kin in builds.items():
         names = list(kin.joint_names)
         assert names == list(REAL_LEGS.joint_names), what
@@ -351,46 +352,11 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
         want_lo, want_hi = np.array([soft[n] for n in names]).T
         assert np.abs(lo - want_lo).max() < 1e-6 and np.abs(hi - want_hi).max() < 1e-6, what
     assert real_world.bodies.kinematics.tool_frames[0] == "stance" and float(real_world.bodies.mass[0]) == 0.0
+    # Trajopt bounds those limits at TRAJOPT_POSITION_BOUND_WEIGHT, on its live cost (cuRobo's would be 1e4).
+    from cutamp._curobo_internals import _cspace_costs_from_rollouts, iter_rollouts
+    from cutamp.robots.t1 import TRAJOPT_POSITION_BOUND_WEIGHT
+    costs = _cspace_costs_from_rollouts(iter_rollouts(planner))
+    assert costs and all(float(c._weight[0]) == TRAJOPT_POSITION_BOUND_WEIGHT == 1e6 for c in costs)
     # The planner keeps the YAML's tool frames in the YAML's order; the floor hook and the CoM cost find theirs.
     yml = yaml.safe_load((T1_29DOF / "t1_29dof.yml").read_text())["robot_cfg"]["kinematics"]["tool_frames"]
     assert list(planner.kinematics.tool_frames) == list(planner.trajopt_solver.tool_frames) == yml
-
-
-@needs_cuda
-def test_retry_rounds_seed_from_retry_seed(real_world, monkeypatch):
-    # Each CoM-gate retry round starts IK from _retry_seed's conf, at sigma 0.1,
-    # 0.2 and 0.3, which stands the real legs on the stance (test_real_legs_init.py checks its seeds). The noise moves
-    # the body and the active arm; the inactive arm holds q_init. IK and the CoM mask are stubbed: every row fails the
-    # gate, so all three retries run, and only their seeds count.
-    import cutamp.com_polygon_cost as com_polygon_cost
-    import cutamp.particle_initialization as particle_initialization
-
-    class _Result:
-        def copy_at_batch_indices(self, other, idx):
-            pass
-
-    n, m, q0, seeds, made = 8, real_world.model, real_world.q_init, [], []
-    retry_seed = particle_initialization._retry_seed
-
-    def _ik(world, world_from_ee, arm, *, current_state_q=None):
-        if current_state_q is not None:
-            seeds.append(current_state_q)
-        return _Result()
-
-    def _seed(world, batch_size, arm, noise_std):
-        made.append(((batch_size, arm, noise_std), retry_seed(world, batch_size, arm, noise_std)))
-        return made[-1][1]
-
-    monkeypatch.setattr(particle_initialization, "_ik_for_pose", _ik)
-    monkeypatch.setattr(particle_initialization, "_retry_seed", _seed)
-    monkeypatch.setattr(particle_initialization, "_ik_solution_to_full_q", lambda result, world: q0.expand(n, -1))
-    monkeypatch.setattr(com_polygon_cost, "compute_com_polygon_mask",
-                        lambda world, q: torch.zeros(len(q), dtype=torch.bool, device=q.device))
-    torch.manual_seed(0)
-    particle_initialization._ik_for_pose_com_safe(real_world, torch.eye(4, device=q0.device).expand(n, 4, 4), "left")
-    assert [args for args, _ in made] == [(n, "left", pytest.approx(sigma)) for sigma in (0.1, 0.2, 0.3)]
-    assert len(seeds) == 3 and all(seed is q for seed, (_, q) in zip(seeds, made))
-    for seed in seeds:
-        assert torch.equal(seed[:, m.right_arm], q0[m.right_arm].expand(n, -1))
-        for noisy in (m.body, m.left_arm):
-            assert not torch.equal(seed[:, noisy], q0[noisy].expand(n, -1))

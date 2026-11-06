@@ -11,7 +11,8 @@ The simplified 21-DOF model and the paper's ablation reproduce from branch `abla
 > **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
 > `curobo/` tree (the `compute_com` plumbing; the CoM-aware seed-IK
 > residual, whose solution is kept for each problem the seed IK solved, so
-> the CoM-blind optimizer replaces only the failed ones; the URDF parser's
+> the CoM-blind optimizer replaces only the failed ones, unused since the
+> planner's IK became GN's; the URDF parser's
 > link-CoM and link-mass fixes; a thread-safety fix for warp stream
 > wrappers; and a seed-IK LM fix — 10 Python source files, no kernel
 > changes; the earlier batched-COM kernel fix was dropped
@@ -59,11 +60,17 @@ graph LR
    the closer arm for each object first (`make_arm_affinity_priority_fn`).
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
-   / configs (`samplers.py`) and runs cuRobo IK — with CoM-aware seed-IK, and
-   both soles' goals on the home stance (`sole_goals`) — for each pick / place
-   conf, re-solving particles whose CoM leaves the model's keyframe rectangle
-   (`world.model.support.keyframe_half`). Retract confs start at the model's
-   home (`REAL_LEGS.home`).
+   / configs (`samplers.py`) and solves each pick / place conf with GN IK
+   (`gn_ik`): balance-first Gauss-Newton from home and from three noisy starts
+   on the stance in one batch, first reaching and then clearing any collision
+   with the scene, the robot itself and the movable objects, the clearing
+   iterations also pulling the CoM toward the keyframe rectangle's centre so
+   a conf doesn't park on its edge. Each target keeps
+   its best start, and a conf is accepted only inside the checker's
+   tolerances (`ik_check`): the hand, both soles on the stance, the CoM in the
+   model's keyframe rectangle (`world.model.support.keyframe_half`), no
+   collision and the tilt bound. Retract confs start at the model's home
+   (`REAL_LEGS.home`).
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic — the hand's pose and both soles on the stance — motion,
@@ -74,11 +81,12 @@ graph LR
    `support_rectangles`) plus soft costs. Adam is always **re-IK-coupled** —
    outer Adam moves poses while the confs an IK target covers are re-projected
    every `reik_interval` steps by balance-first Gauss-Newton (`gn_refresh.py`:
-   the CoM in the support rectangle and both soles on the stance first, then
-   the pose, every step kept inside the joint limits), with no cuRobo during
-   Adam and the Adam step and refresh replayed as CUDA graphs
-   (`cuda_graphs.py`); the final pre-check refresh repairs rows that miss
-   tolerance or leave the CoM polygon with the full cuRobo IK.
+   the CoM in the support rectangle, both soles on the stance and no
+   collision first, then the pose, every step kept inside the joint limits),
+   with no cuRobo during Adam and the Adam step and refresh replayed as CUDA
+   graphs (`cuda_graphs.py`); the final pre-check refresh repairs the rows GN
+   IK's own check (`ik_check`, collision at zero penetration, stricter than the
+   checker's) rejects with GN IK (`gn_ik`) from the stored confs.
    Adam stops after `early_stop_patience` steps without progress and keeps the
    best-seen particles. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
@@ -132,17 +140,15 @@ Its cspace, in cuRobo's order (`t1_29dof.yml`'s `joint_order`), is:
 The head and gripper joints are locked (`lock_joints`). The floating base is a
 virtual chain of massless `extra_links`
 (`world → base_link_x → … → base_link_yaw → Trunk`) whose limits are the
-legs' reach, and nothing locks it: IK, GN and the planner move it with the
-legs. Both soles stand on the home stance: the IK's sole goals, GN's sole
+legs' reach, and nothing locks it: GN (the IK and the refresh) and the
+planner move it with the legs. Both soles stand on the home stance: GN's sole
 rows, the kinematic constraint and trajopt's sole tracking hold them there.
 The kinematics exposes five tool frames: the hands (`left_base_link`,
 `right_base_link`), the soles (`left_sole_link`, `right_sole_link`) and
 `stance`, a world-fixed frame at the home mid-sole on the floor that is the
-support region's frame. Per-arm IK builds one `GoalToolPose` over every tool
-frame (`_build_multi_frame_goal`): the active hand gets the target, the soles
-their stance poses, and the others stay at their FK pose at the IK's start
-conf, which is what holds the idle hand. The planner's dynamics include the
-floor's push on the soles.
+support region's frame. GN moves the base, the body and the active arm; the
+idle arm keeps its start joints, so that hand rides with the trunk. The
+planner's dynamics include the floor's push on the soles.
 
 ```mermaid
 graph TD
@@ -200,8 +206,9 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   that no URDF or code references.
 - **[`assets/envelopes/`](cutamp/robots/assets/envelopes/)** —
   `route_a_start.yml`, route A's envelope: the joint ranges the planner
-  enforces (the Waist's) and a Trunk floor and tilt bound, both unset; the
-  rest is stored for later stages.
+  enforces (the Waist's, and the ankle pitches' up to home, so no plan pitches
+  a shin back past the home stance) and a Trunk floor and tilt bound, both
+  unset; the rest is stored for later stages.
 - [`assets/README.md`](cutamp/robots/assets/README.md) — short index of the
   asset files.
 
@@ -218,16 +225,15 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
     the cspace and its joint groups (`base`, `body`, `left_arm`,
     `right_arm`), home, support region (`Support`: its frame, centre,
     `gate_half` and `keyframe_half`), sole frames and envelope, to which
-    `t1_curobo_cfg` cuts the model's limits.
+    `t1_curobo_cfg` cuts the model's limits (each end on its own, in a copy
+    of the planner URDF, since cuRobo reads a URDF joint's limits only from
+    the URDF).
   - cuRobo loaders: `get_t1_kinematics` (always `compute_com=True`;
-    `compute_jacobian=True` for the GN refresh), `get_t1_ik_solver` (a single
-    multi-tool-frame IK over both arms, every joint free; its seed-IK LM stage
-    carries a CoM residual — a cuRobo fork edit — over the largest
-    frame-centred box inside the model's keyframe rectangle, which on the
-    stance is the rectangle itself, weighted by `T1_COM_IK_WEIGHT` and the
-    pull-to-center `T1_COM_IK_CENTER_WEIGHT`), `get_t1_motion_planner` (the
+    `compute_jacobian=True` for GN), `get_t1_motion_planner` (the
     single planner: cuRobo's RNEA in trajopt with the floor's push on the
-    planted soles and each joint's torque bounded at its effort, the soles held
+    planted soles and each joint's torque bounded at its effort, the joint
+    limits bounded at `TRAJOPT_POSITION_BOUND_WEIGHT` (1e6, cuRobo's 1e4
+    times 100, so paths that end on the ankle cap stay inside it), the soles held
     on the stance at every waypoint, the COM-over-polygon rollout soft cost,
     and the Trunk-tilt cost where the envelope sets a bound), and
     `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
@@ -245,10 +251,10 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
 
 - [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a
   TAMPEnvironment with the collision Scene, the single `Kinematics` (built
-  with `compute_com=True`), a single multi-tool-frame `InverseKinematics`
-  solver, and a `MotionPlanner` factory. `q_init` is the model's home. It
-  also holds the stance (`stance_soles`, `sole_goals`). Built lazily:
-  `kinematics_jac` (the Jacobian twin for the GN refresh), `bodies`
+  with `compute_com=True`) and a `MotionPlanner` factory; it builds no IK
+  solver (the IK is GN's, `gn_ik`). `q_init` is the model's home. It also
+  holds the stance (`stance_soles`). Built lazily:
+  `kinematics_jac` (the Jacobian twin for GN), `bodies`
   (`get_t1_bodies`: a second `Kinematics` whose tool frames are every massive
   link, for the balance gate's multibody ZMP), `segment_torques` (the gate's
   torque and speed checks), and one `site_kinematics(name)` per Adam-loop FK
@@ -287,8 +293,8 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   consumers: `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
   `ComOverBasePolygonCost` (the planner rollout cost),
   `compute_com_polygon_penalties` (the hard `ComPolygon` constraint),
-  `compute_com_polygon_mask` (the post-IK COM-safe retry and the final
-  refresh's repair check), `compute_com_margin` (the planned particle's static
+  `com_polygon_mask_from_state` (GN IK's acceptance), `compute_com_polygon_mask`
+  (the per-conf CoM report after optimizing), `compute_com_margin` (the planned particle's static
   margin in the run metrics), and for the trajectory gate
   `com_zmp_in_support` (each frame's CoM and multibody ZMP) and
   `compute_support_mask` (the audit's mask on
@@ -297,7 +303,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) —
   `joint_limit_margin_soft_cost` (the `joint_limit_margin` soft cost: a
   hinge² penalty on segment-endpoint confs past the joint limits, which are
-  bfm_wm's soft limits, so there is no band), and the Trunk tilt bound an
+  bfm_wm's soft limits cut by the envelope, so there is no band), and the Trunk tilt bound an
   envelope may set: `trunk_tilt_excess` (the Motion value `trunk_tilt`),
   `TrunkTiltCost` on the planner, and GN's tilt row.
 
@@ -329,15 +335,15 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   `traj_com_frames` against the gate's rectangle.
 
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
-  particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc.
-  `_ik_for_pose_com_safe` re-solves particles whose COM leaves the polygon
-  from noisier seeds that stand on the stance (`_retry_seed`).
-  `_build_multi_frame_goal` builds the
-  `GoalToolPose` covering every tool frame for single-arm actions: the
-  active frame gets the target pose, the soles their stance poses, while each
-  inactive hand keeps its ENABLED pose criteria, targeting its FK pose at the
-  IK's start conf: home in particle init, a perturbed home seed in the
-  CoM-safe retries, or the current particle in the final refresh's repair.
+  particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. `gn_ik` is
+  the planner's only IK: multi-start balance-first GN (home or the stored
+  confs, plus noisy starts that stand on the stance, `_noisy_start`), 30
+  reaching iterations without the collision row and 10 with it (the iterates
+  are not motions, so only the result must be collision-free), then
+  `ik_check` on the checker's tolerances; each target keeps its accepted
+  start with the smallest hand error. The movable objects' spheres at each
+  conf come from `rollout.movable_spheres_fn`, placed as the rollout places
+  them.
 
 - [`samplers.py`](cutamp/samplers.py) — grasp / placement / yaw samplers
   (`grasp_4dof_sampler`, `place_4dof_sampler`,
@@ -372,7 +378,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
   particles; respects `left_q0` / `right_q0` as fixed initial-state. Holds the
   re-IK dependencies (`IKDep`), the balance-first refresh
-  (`_refresh_balanced`) and the final pre-check refresh's cuRobo repair, the
+  (`_refresh_balanced`) and the final pre-check refresh's GN IK repair, the
   best-seen snapshot and early stop (`_BestSnapshot`), per-refresh stats
   (`_ReikDriftGate`), and the CUDA step and refresh graphs
   (`G_step`, `G_refresh`; `--no_cuda_graphs` runs them eagerly).
@@ -380,11 +386,17 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`gn_refresh.py`](cutamp/gn_refresh.py) — batched damped Gauss-Newton
   projection of the warm conf onto a moved pose target, balance first:
   `gn_project_balanced`, whose level 1 keeps the CoM in the keyframe
-  rectangle and both soles on the stance (and the Trunk's tilt within an
-  envelope's bound), and whose level 2 is the pose, least squares inside it,
-  every step scaled inside the joint limits, with no cuRobo during Adam.
-  `gn_gate` checks the result against the checker's tolerances for the refresh
-  stats.
+  rectangle, both soles on the stance, the robot out of collision with the
+  scene, itself and the movable objects (one row on the summed penetration,
+  `collision_penetration`, aimed 5 mm past contact, a solver margin) and the
+  Trunk's tilt within an envelope's bound, whose level 2 is the pose, least
+  squares inside it, and whose level 3, beside the collision row, pulls the
+  CoM toward the rectangle's centre in the freedom left (`_centring_step`; on
+  every iteration but the last, and a row in contact, or whose step would end
+  in contact, past the tilt bound or with a CoM axis past the rectangle,
+  takes levels 1-2's step), every step
+  scaled inside the joint limits, with no cuRobo during Adam. `gn_gate` checks the result against the checker's
+  tolerances for the refresh stats; it checks no collision.
 
 - [`cuda_graphs.py`](cutamp/cuda_graphs.py) — `CapturedGraph` capture and
   replay of those graphs, refusing a replay once a device address it
@@ -457,13 +469,8 @@ comparator `assert_bitwise`). Highlights:
   rectangles, the world on the home stance), the pinned assets and their
   byte-identical rebuild, and route A's envelope.
 - [`test_com_polygon_ik.py`](cutamp/tests/test_com_polygon_ik.py) — COM
-  penalty math, mask/gate parity, the post-IK COM-safe retry, gradient
-  checks, and a guard on cuRobo's batched-COM kernel (fixed upstream in PR
+  penalty math, mask/gate parity, gradient checks, and a guard on cuRobo's batched-COM kernel (fixed upstream in PR
   #678).
-- [`test_com_aware_seed_ik.py`](cutamp/tests/test_com_aware_seed_ik.py) —
-  CoM-aware seed-IK: the solver's CoM parameters, fork/cuTAMP penalty parity,
-  gradients FD-checked on every joint, centering A/B with joint-limit and
-  pose-accuracy guards, and an unsolved problem keeping the others centred.
 - [`test_motion_anchor.py`](cutamp/tests/test_motion_anchor.py) —
   cspace-anchored pick/place terminals, the trajectory audit, and one
   blocks_t1 plan's balance metrics against its exported frames.
@@ -538,7 +545,7 @@ end-to-end run in
 By default a run plans on bfm_wm's T1 on its home stance with 256 particles
 and the soft costs `place_close_to_base`, `joint_limit_margin` and
 `minimize_body_movement`, optimized under re-IK-coupled Adam with the
-balance-first GN refresh replayed as CUDA graphs, and CoM-aware IK, so
+balance-first GN refresh replayed as CUDA graphs, and balance-first GN IK, so
 placements stay near the base, the body stays near its home, and every
 arrival lands with its CoM inside the keyframe rectangle
 (`joint_limit_margin` has no band: the limits are already bfm_wm's soft
@@ -577,11 +584,10 @@ python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/re
 
 **Available soft costs** (see `SUPPORTED_SOFT_COSTS`):
 - `place_close_to_base` *(default)* — pull placed objects toward the base;
-  keeps placements inside the reach range where the CoM-aware IK can center
-  the COM.
+  keeps placements inside the range the balanced IK reaches.
 - `joint_limit_margin` *(default)* — a hinge² penalty on segment-endpoint
-  confs past the joint limits; the limits are already bfm_wm's soft limits,
-  so there is no band and the cost is zero inside them. It acts on the confs
+  confs past the joint limits; the limits are already bfm_wm's soft limits
+  (cut by the envelope), so there is no band and the cost is zero inside them. It acts on the confs
   Adam optimizes: the confs an IK target covers (pick, place) are outside
   Adam, and the GN refresh keeps its steps inside the joint limits.
 - `retract_close_to_home` — penalize retract configs far from the model's
@@ -593,9 +599,9 @@ python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/re
 
 Pose-class soft costs (e.g. `place_close_to_base`) are optimized through the
 re-IK coupling: outer Adam moves pose/grasp particles while their dependent
-confs are re-projected every `reik_interval` steps (balance-first
-Gauss-Newton, no cuRobo during Adam; the final pre-check refresh still
-repairs with cuRobo IK).
+confs are re-projected every `reik_interval` steps (balance-first,
+collision-aware Gauss-Newton, no cuRobo during Adam; the final pre-check
+refresh repairs with GN IK).
 
 ## Key Design Decisions
 
@@ -607,25 +613,22 @@ repairs with cuRobo IK).
 
 2. **Floating base via `extra_links`** — `world → base_link_x → … →
    base_link_yaw → Trunk` adds six massless virtual joints (x, y, z, pitch,
-   roll, yaw), free in IK, GN and the planner and limited to the legs' reach.
-   The soles stay on the stance instead: IK's sole goals, GN's sole rows, the
+   roll, yaw), free in GN and the planner and limited to the legs' reach.
+   The soles stay on the stance instead: GN's sole rows, the
    kinematic constraint and trajopt's sole tracking hold them there.
 
 3. **Inactive-arm handling** — `pin_for_arm_action` writes the inactive
    arm's per-DOF `cspace_target_dof_weight` into the optimizer rollouts of
    the planner's trajopt solver and of its internal IK solver (restored by
-   `unpin()`), and particle-init and refresh IK write the same weights for
-   each call. The pin is a no-op: cuRobo scales those weights by
+   `unpin()`). The pin is a no-op: cuRobo scales those weights by
    `cspace_target_weight`, which is 0 in every IK and trajopt config used,
    and cuRobo zeroes it again when it builds the cost. The term's target is
-   also a zero joint vector, not the arm's current joints. What holds the
-   inactive hand is IK's multi-frame goal, which targets that frame where it
-   is, at the confs IK solves. The optimizer's gradient masks and the GN
-   refresh keep the inactive arm's joints fixed, so that hand rides with the
-   trunk when they move the body, and `plan_cspace` holds nothing between
-   confs. Both arms are in the optimizer's collision constraints and the
-   planner's collision checks, with three gaps: GN checks no collision (the
-   optimizer rescores every conf each step), a pick or place segment
+   also a zero joint vector, not the arm's current joints. Nothing holds the
+   inactive hand: GN IK, the GN refresh and the optimizer's gradient masks
+   keep the inactive arm's joints fixed, so that hand rides with the trunk
+   when they move the body, and `plan_cspace` holds nothing between confs.
+   Both arms are in GN's collision row, the optimizer's collision constraints
+   and the planner's collision checks, with two gaps: a pick or place segment
    disables its block or support surface for the whole robot, and a segment
    the balance gate retimes (slows down or speeds up) is resampled through
    the planner's frames (`_retime`) without new collision or joint-limit
@@ -663,16 +666,18 @@ repairs with cuRobo IK).
    `support_rectangles`' two rectangles, centred on the stance
    (`com_polygon_cost.py`). Independent layers each guard a different
    frontier:
-   - **CoM-aware seed-IK** (cuRobo fork residual): the IK itself trades hand
-     pose vs COM, recruiting the legs within joint limits, with a
-     pull-to-center term on a frame-centred box (`get_t1_ik_solver`) —
-     endpoint confs come out near the stance's centre, not edge-parked.
+   - **Balance-first GN IK** (`gn_ik`): the IK itself puts the CoM in the
+     keyframe rectangle, the soles on the stance and the robot out of
+     collision first, the hand pose second and the CoM toward the
+     rectangle's centre third, recruiting the legs within joint limits, and
+     accepts a conf only inside every tolerance.
    - **Hard `ComPolygon` gate**: every optimizer conf must have COM penalty
-     ≤ `COM_TOL`; a post-IK mask + retry backstops the IK.
+     ≤ `COM_TOL`.
    - **Balance-first re-IK refresh**: covered confs are outside Adam, so the
-     GN refresh puts the CoM and the soles first (the pose is least squares
-     inside them) and the final pre-check refresh repairs any row still
-     outside with the CoM-aware cuRobo IK.
+     GN refresh puts the CoM, the soles and collision first (the pose is
+     least squares inside them, the pull to the centre below the pose) and
+     the final pre-check refresh repairs any
+     row `ik_check` rejects with GN IK.
    - **COM-anchored terminals**: pick/place trajectories end exactly at the
      gate-approved conf (`plan_cspace`), so cuRobo can't re-resolve the
      redundancy at the endpoint.

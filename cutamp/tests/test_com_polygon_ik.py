@@ -1,7 +1,7 @@
-"""Tests for the COM polygon penalty math, hard gate, and post-IK mask."""
+"""Tests for the COM polygon penalty math, hard gate, and mask."""
 import pytest
 
-from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
+from cutamp.tests.conftest import default_checker, make_blocks_t1_world, needs_cuda
 
 #: A lean from home that carries the CoM far past the support's front edge ({joint: delta}): the floating base carries
 #: the whole body 30 cm ahead of the stance its support region stays on.
@@ -42,29 +42,6 @@ def test_compute_com_polygon_mask_excludes_extreme_lean():
         f"home poses should be inside polygon; mask={mask}"
     )
     assert not bool(mask[3]), f"deeply-bent pose should be OUTSIDE polygon; mask[3]={mask[3]}"
-
-
-@needs_cuda
-def test_ik_for_pose_com_safe_returns_valid_result():
-    """End-to-end smoke check: _ik_for_pose_com_safe returns an IK result
-    with the expected shape on a real grasp target. We don't assert
-    everything-in-polygon (Layer 1 should help, but hard targets may
-    still fail) — just that the wrapper runs without error and returns
-    a usable result."""
-    import torch
-    from cutamp.particle_initialization import _ik_for_pose_com_safe
-    world = make_blocks_t1_world()
-    # Build a [B=4, 4, 4] batch of reachable left-hand targets.
-    # Pose: hand at (0.4, +0.2, 0.5) world — well within left arm reach.
-    B = 4
-    target = torch.eye(4, device=world.kinematics.device_cfg.device).unsqueeze(0).expand(B, 4, 4).contiguous()
-    target[..., 0, 3] = 0.4
-    target[..., 1, 3] = 0.2
-    target[..., 2, 3] = 0.5
-    result = _ik_for_pose_com_safe(world, target, "left", max_retries=2)
-    # Result must have success + solution fields with batch dim B.
-    assert hasattr(result, "success") and result.success.shape[0] == B
-    assert hasattr(result, "solution") and result.solution.shape[0] == B
 
 
 def test_constraint_checker_filters_com_violators():
@@ -235,7 +212,7 @@ def test_retract_collision_grads_match_per_conf():
     world = make_blocks_t1_world()
     config = TAMPConfiguration(num_particles=8)
     skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
-    particles = ParticleInitializer(world, config)(skeleton)
+    particles = ParticleInitializer(world, config, default_checker())(skeleton)
     cost_fn = CostFunction(skeleton, world, config)
     retract_info = list(cost_fn.retract_info)
     assert len(retract_info) > 1
@@ -354,8 +331,8 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
 
 @needs_cuda
 def test_mask_matches_penalty_gate():
-    # The post-IK mask must equal (penalty <= COM_TOL) elementwise, so the IK
-    # COM-safe retry loop and the ConstraintChecker can never disagree.
+    # The mask must equal (penalty <= COM_TOL) elementwise, so ik_check (GN
+    # IK's acceptance) and the ConstraintChecker can never disagree.
     # COM_TOL is inside_weight * inside_margin^2 = 4e-4, calibrating the hard
     # constraint's tolerance against the mask's definition of 'inside'.
     import torch

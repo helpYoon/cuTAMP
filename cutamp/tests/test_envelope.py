@@ -1,5 +1,6 @@
 """Route A's envelope (design 7.10, call 22): the pinned file, the cut of the real legs' limits to it (a Trunk floor
-on ``base_j_z``, the joint ranges through ``position_limit_clip``, never widening one), and the Trunk tilt bound, as a
+on ``base_j_z``, each joint range at either end of its soft range on its own, never widening one; route A's caps
+both ankle pitches at home), and the Trunk tilt bound, as a
 Motion value over the confs and as a trajopt cost. Route A's envelope sets no Trunk floor or tilt bound, so the floor
 and tilt tests replace it with one that does. The GPU tests share conftest's module-scoped ``real_world``: one world
 per module."""
@@ -47,7 +48,7 @@ def test_route_a_start_values():
         sha1=hashlib.sha1(path.read_bytes()).hexdigest(),
         trunk_height_min=None,
         trunk_tilt_max=None,
-        joint_ranges={"Waist": (-0.911, 0.911)},
+        joint_ranges={"Waist": (-0.911, 0.911), "Left_Ankle_Pitch": (-0.809, -0.2), "Right_Ankle_Pitch": (-0.809, -0.2)},
         speed_caps=None,
         acceleration_caps=None,
         trunk_speed_caps=None,
@@ -56,6 +57,10 @@ def test_route_a_start_values():
         hold_s={"start_blend": 0.5, "grasp": 0.5, "end": 1.0},
     )
     assert REAL_LEGS.envelope == envelope and REAL_LEGS.envelope.name == "route_a_start"
+    # The ankle pitches' upper end is home (the user, 2026-11-05: no shin pitches back past the home stance).
+    for ankle in ("Left_Ankle_Pitch", "Right_Ankle_Pitch"):
+        assert envelope.joint_ranges[ankle][1] == pytest.approx(REAL_LEGS.home[REAL_LEGS.joint_names.index(ankle)],
+                                                                abs=1e-7)
 
 
 def test_load_envelope_refuses_a_misnamed_file_or_another_field(tmp_path, monkeypatch):
@@ -99,8 +104,13 @@ def test_envelope_cuts_never_widen():
         np.testing.assert_allclose(real[joint], limits, atol=1e-6, err_msg=joint)
     np.testing.assert_allclose(real["base_j_z"], BASE_Z, atol=1e-6)
     np.testing.assert_allclose(real["Waist"], (-0.9108, 0.9108), atol=1e-6)
+    # Both ankle pitches keep their soft lower limit and stop at home, where the robot stands: home is on the bound.
+    for ankle in ("Left_Ankle_Pitch", "Right_Ankle_Pitch"):
+        home = REAL_LEGS.home[REAL_LEGS.joint_names.index(ankle)]
+        np.testing.assert_allclose(real[ankle], (-0.809, -0.2), atol=1e-6, err_msg=ankle)
+        assert real[ankle][0] < home <= real[ankle][1]
     for waist, want in (((-0.5, 0.5), (-0.5, 0.5)), ((-2.0, 2.0), (-0.9108, 0.9108))):
-        got = _limits(_with_envelope(joint_ranges={"Waist": waist}))
+        got = _limits(_with_envelope(joint_ranges={**REAL_LEGS.envelope.joint_ranges, "Waist": waist}))
         np.testing.assert_allclose(got["Waist"], want, atol=1e-6, err_msg=str(waist))
         assert {n: v for n, v in got.items() if n != "Waist"} == {n: v for n, v in real.items() if n != "Waist"}
     # A floor above the base's lower limit raises it, alone; one below leaves it; one at or above its upper raises.
@@ -111,17 +121,17 @@ def test_envelope_cuts_never_widen():
     with pytest.raises(ValueError, match="base_j_z"):
         t1_curobo_cfg(_with_envelope(trunk_height_min=BASE_Z[1]))
     with pytest.raises(ValueError, match="Waist"):
-        t1_curobo_cfg(_with_envelope(joint_ranges={"Waist": (2.0, 3.0)}))
+        t1_curobo_cfg(_with_envelope(joint_ranges={**REAL_LEGS.envelope.joint_ranges, "Waist": (2.0, 3.0)}))
 
 
 @needs_cuda
 def test_envelope_cut_moves_only_its_joint():
-    # The cut writes position_limit_clip at the joint's index in cspace.joint_names, and cuRobo applies the clip
+    # The cut zeroes position_limit_clip at the joint's index in cspace.joint_names, and cuRobo applies the clip
     # without reindexing it. A knee, far from Waist in the cspace order and with the other knee's clip, cut 0.1 rad
     # inside its soft limit at both ends moves cuRobo's limits on that knee alone.
     real = _limits(REAL_LEGS)
     lo, hi = real["Left_Knee_Pitch"]
-    got = _limits(_with_envelope(joint_ranges={"Left_Knee_Pitch": (lo + 0.1, hi - 0.1)}))
+    got = _limits(_with_envelope(joint_ranges={**REAL_LEGS.envelope.joint_ranges, "Left_Knee_Pitch": (lo + 0.1, hi - 0.1)}))
     np.testing.assert_allclose(got["Left_Knee_Pitch"], (lo + 0.1, hi - 0.1), atol=1e-6)
     assert {n: v for n, v in got.items() if n != "Left_Knee_Pitch"} == {
         n: v for n, v in real.items() if n != "Left_Knee_Pitch"}
@@ -206,3 +216,22 @@ def test_motion_values_bound_the_tilt_on_the_real_legs(real_world, real_plan, mo
     assert float(tilt[1, 0]) <= 1e-6
     mask = ConstraintChecker(default_constraint_to_tol).get_full_mask(cost_dict)[Motion.type]["trunk_tilt"]
     assert not bool(mask[0, 0]) and bool(mask[1, 0])
+
+
+@needs_cuda
+def test_envelope_cut_is_one_sided_and_leaves_the_planner_urdf():
+    # Each end is cut on its own: an off-centre Waist range keeps both its ends, where a clip off both ends would
+    # plan in +-0.5. The cut goes into a copy of the URDF, which urdf_path then names; t1_planner.urdf is untouched,
+    # and an envelope that cuts nothing plans on it.
+    from cutamp.robots.t1 import T1_29DOF_DIR, t1_curobo_cfg
+    planner_urdf = T1_29DOF_DIR / "t1_planner.urdf"
+    before = hashlib.sha1(planner_urdf.read_bytes()).hexdigest()
+    real = _limits(REAL_LEGS)
+    got = _limits(_with_envelope(joint_ranges={**REAL_LEGS.envelope.joint_ranges, "Waist": (-0.5, 0.58)}))
+    np.testing.assert_allclose(got["Waist"], (-0.5, 0.58), atol=1e-6)
+    assert {n: v for n, v in got.items() if n != "Waist"} == {n: v for n, v in real.items() if n != "Waist"}
+    assert t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"]["urdf_path"] != str(planner_urdf)
+    uncut = _with_envelope(joint_ranges={"Waist": (-2.0, 2.0)})
+    assert t1_curobo_cfg(uncut)["robot_cfg"]["kinematics"]["urdf_path"] == str(planner_urdf)
+    np.testing.assert_allclose(_limits(uncut)["Left_Ankle_Pitch"], (-0.809, 0.289), atol=1e-6)
+    assert hashlib.sha1(planner_urdf.read_bytes()).hexdigest() == before

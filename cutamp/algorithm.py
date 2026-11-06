@@ -308,7 +308,7 @@ def setup_cutamp(
         q_init = model.home
     q_init = tensor_args.to_device(q_init)
 
-    # Load TAMP world and warmup IK solver
+    # Load TAMP world
     timer = TorchTimer()
     with timer.time("load_tamp_world", log_callback=_log.info):
         world = TAMPWorld(
@@ -319,12 +319,8 @@ def setup_cutamp(
             collision_activation_distance=0.0,
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
-            ik_max_batch_size=config.num_particles,
         )
         check_tamp_world_not_in_collision(world)
-
-    with timer.time("warmup_ik_solver", log_callback=_log.info):
-        world.warmup_ik_solver(config.num_particles)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -346,7 +342,7 @@ def run_cutamp(
 ):
     """Overall cuTAMP algorithm implementation."""
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id)
-    particle_initializer = ParticleInitializer(world, config)
+    particle_initializer = ParticleInitializer(world, config, constraint_checker)
 
     # Build the trajopt planner on a background thread, overlapped with
     # particle init and Phase 1. The build runs no solves, so no CUDA graph

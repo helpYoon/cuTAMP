@@ -20,11 +20,11 @@ _CAPTURE = ("capture_s", "capture_step", "refresh_capture_s", "refresh_capture_s
 def _install_recorder(monkeypatch) -> dict:
     """Record one optimize call into ``box["rec"]``, the same in both modes and with no eager body
     (a replay bypasses ``_StepBody.__call__``, so the per-step hook is ``_BestSnapshot.update``): each
-    step's packed scalars, particles and grads, the final refresh's particles, and its ``_ik_for_pose``
+    step's packed scalars, particles and grads, the final refresh's particles, and its ``gn_ik``
     results (the optimizer calls it only there)."""
     import cutamp.optimize_plan as op
     box = {"rec": None}
-    update, refresh, ik = op._BestSnapshot.update, op.ParticleOptimizer._refresh_ik_deps, op._ik_for_pose
+    update, refresh, ik = op._BestSnapshot.update, op.ParticleOptimizer._refresh_ik_deps, op.gn_ik
 
     def update_spy(self, step, num_satisfying, min_loss, particles):
         loop = sys._getframe(1).f_locals  # ParticleOptimizer.__call__'s frame
@@ -43,13 +43,13 @@ def _install_recorder(monkeypatch) -> dict:
             box["rec"]["post_final"] = clone_particles(particles)
 
     def ik_spy(*args, **kwargs):
-        res = ik(*args, **kwargs)
-        box["rec"]["ik"].append((res.solution.clone(), res.success.clone()))
-        return res
+        q, ok = ik(*args, **kwargs)
+        box["rec"]["ik"].append((q.clone(), ok.clone()))
+        return q, ok
 
     monkeypatch.setattr(op._BestSnapshot, "update", update_spy)
     monkeypatch.setattr(op.ParticleOptimizer, "_refresh_ik_deps", refresh_spy)
-    monkeypatch.setattr(op, "_ik_for_pose", ik_spy)
+    monkeypatch.setattr(op, "gn_ik", ik_spy)
     return box
 
 
@@ -67,7 +67,6 @@ def test_graph_calls_give_the_eager_result(blocks_t1_plan, monkeypatch):
         torch.cuda.set_rng_state_all(rng[1])
         np.random.set_state(rng[2])
         random.setstate(rng[3])
-        world.ik_solver.reset_seed()  # the IK seed sampler persists across solves
         config = _graph_config(num_opt_steps=100, cuda_graphs=cuda_graphs)
         box["rec"] = rec = {"steps": [], "pre_final": None, "post_final": None, "ik": []}
         info = make_plan_info(world, skeleton, clone_particles(base), config)

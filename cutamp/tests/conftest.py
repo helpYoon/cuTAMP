@@ -66,7 +66,7 @@ def blocks_t1_plan(real_world, real_plan):
 def _real_world_slot():
     """Holds ``real_world``'s world, so teardown can free it: ``real_world`` is torn down first, and with it pytest's
     own reference to the world."""
-    slot = [make_blocks_t1_world(collision_activation_distance=0.0, ik_max_batch_size=64)]
+    slot = [make_blocks_t1_world(collision_activation_distance=0.0)]
     yield slot
     slot.clear()
     sys.last_type = sys.last_value = sys.last_traceback = None  # a failed test's traceback holds its locals
@@ -76,8 +76,8 @@ def _real_world_slot():
 
 @pytest.fixture(scope="module")
 def real_world(_real_world_slot):
-    """The blocks_t1 world on the real-leg model, its IK sized for 64 particles. A module using it must not build a
-    second world (two OOM a 24 GiB card)."""
+    """The blocks_t1 world on the real-leg model. A module using it must not build a second world (two OOM a 24 GiB
+    card)."""
     return _real_world_slot[0]
 
 
@@ -92,7 +92,7 @@ def real_plan(real_world):
 
     skeleton = next(task_plan_generator(real_world.initial_state, real_world.goal_state, all_t1_operators))
     torch.manual_seed(0)
-    particles = ParticleInitializer(real_world, TAMPConfiguration(num_particles=64))(skeleton)
+    particles = ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())(skeleton)
     plan = [skeleton, particles]
     del skeleton, particles  # the list holds the only references
     yield plan
@@ -117,17 +117,20 @@ def make_plan_info(world, skeleton, particles: dict, config) -> dict:
     }
 
 
+def default_checker():
+    """The ``ConstraintChecker`` on the default tolerances, as ``run_cutamp.py`` builds it."""
+    from cutamp.constraint_checker import ConstraintChecker
+    from cutamp.scripts.utils import default_constraint_to_tol
+    return ConstraintChecker(default_constraint_to_tol.copy())
+
+
 def make_optimizer(config, **kw):
     """A ``ParticleOptimizer`` on the default multipliers and tolerances, as
     ``run_cutamp.py`` builds it."""
-    from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_reduction import CostReducer
     from cutamp.optimize_plan import ParticleOptimizer
-    from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-    return ParticleOptimizer(
-        config, CostReducer(default_constraint_to_mult.copy()), ConstraintChecker(default_constraint_to_tol.copy()),
-        **kw,
-    )
+    from cutamp.scripts.utils import default_constraint_to_mult
+    return ParticleOptimizer(config, CostReducer(default_constraint_to_mult.copy()), default_checker(), **kw)
 
 
 def run_optimizer(plan_info: dict, config, optimizer=None, visualizer=None, timer=None, **kw) -> tuple:

@@ -27,19 +27,14 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
-from cutamp.gn_refresh import gn_gate, gn_project_balanced, soles_on_stance, tilt_within_bound
-from cutamp.particle_initialization import (
-    _achieved_pose_errors,
-    _ik_for_pose,
-    _ik_solution_to_full_q,
-    _ik_success_mask,
-)
+from cutamp.gn_refresh import gn_gate, gn_project_balanced
+from cutamp.particle_initialization import IKTol, gn_ik, ik_check
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
-from cutamp.rollout import RolloutFunction
+from cutamp.rollout import RolloutFunction, movable_spheres_fn
 from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
-from cutamp.task_planning.constraints import KinematicConstraint, Motion
+from cutamp.task_planning.constraints import KinematicConstraint
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -53,11 +48,13 @@ class IKDep:
     ``target_fn(particles)`` rebuilds ``world_from_ee`` from the current
     particle state. ``q_name`` is the Conf to overwrite (in-place) with the
     IK solution. ``arm`` selects the active tool frame, and so which arm is
-    inactive (matching ``_ik_for_pose``'s contract).
+    inactive (GN freezes its columns). ``movables_fn(particles)`` gives the object spheres the conf must clear,
+    ``[B, M, 4]`` (:func:`~cutamp.rollout.movable_spheres_fn`).
     """
     q_name: str
     arm: Literal["left", "right"]
     target_fn: Callable[[dict], torch.Tensor]
+    movables_fn: Callable[[dict], torch.Tensor]
 
 
 def _build_ik_deps(
@@ -73,7 +70,7 @@ def _build_ik_deps(
     """
     deps: List[IKDep] = []
     grasp_to_mat = action_4dof_to_mat4x4
-    for ground_op in plan_skeleton:
+    for idx, ground_op in enumerate(plan_skeleton):
         meta = ground_op.operator.metadata
         if not getattr(meta, "is_actionable", False):
             continue
@@ -94,12 +91,12 @@ def _build_ik_deps(
             world_from_obj = world.get_object_pose(obj)
             def target_fn(p, _wo=world_from_obj, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
                 return _wo @ _gm(p[_g]) @ _t
-            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
+            deps.append(IKDep(q_name, arm, target_fn, movable_spheres_fn(world, plan_skeleton, idx)))
         elif action_type == "place":
             obj, grasp_name, placement, surface, q_name = params
             def target_fn(p, _pl=placement, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
                 return action_4dof_to_mat4x4(p[_pl]) @ _gm(p[_g]) @ _t
-            deps.append(IKDep(q_name=q_name, arm=arm, target_fn=target_fn))
+            deps.append(IKDep(q_name, arm, target_fn, movable_spheres_fn(world, plan_skeleton, idx)))
         # action_type in {"retract", None}: no IK target, skip.
     return deps
 
@@ -236,9 +233,7 @@ class _ReikDriftGate:
     tolerances the GN merge gate tests against.
 
     Records per dep-refresh: target drift since the previous refresh
-    (``curobo_pose_error`` — the checker's own metric; cuRobo's result
-    error fields cross-pair metres/radians on multi-tool-frame robots and
-    must not be used), solve time, failure counts, and the pose/CoM split
+    (``curobo_pose_error``, the checker's own metric), solve time, failure counts, and the pose/CoM split
     of merge-gate misses. Lands in ``opt_metrics["reik_refresh"]``.
     Refreshes keep their stats on the device until :meth:`flush`.
 
@@ -335,13 +330,15 @@ class _ReikDriftGate:
 def _project_and_write_back(
     particles: dict, ik_deps: List[IKDep], world: TAMPWorld, world_from_ee: torch.Tensor, gate: _ReikDriftGate,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GN-project the covered Confs' dep-major stack toward ``world_from_ee`` (``[D*B, 4, 4]``), gate the
-    result on the ``"gate"`` FK site, and write every row back in place. Returns ``(pose_ok, com_ok)``."""
+    """GN-project the covered Confs' dep-major stack toward ``world_from_ee`` (``[D*B, 4, 4]``), clear of each
+    conf's objects (``IKDep.movables_fn``), gate the result on the ``"gate"`` FK site, and write every row back in
+    place. Returns ``(pose_ok, com_ok)``: the gate checks no collision (the stats count pose and CoM misses)."""
     q_names = [dep.q_name for dep in ik_deps]
     batch = world_from_ee.shape[0] // len(ik_deps)
     arms = tuple(dep.arm for dep in ik_deps)
+    movables = torch.cat([dep.movables_fn(particles).detach() for dep in ik_deps])
     q = gn_project_balanced(
-        world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms,
+        world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms, movables=movables,
     )
     pose_ok, com_ok = gn_gate(
         world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol, kin=world.site_kinematics("gate"),
@@ -361,8 +358,8 @@ def _refresh_balanced(
 
     Every row's result is written back (a persistent lower-level iterate): an unconverged row resumes
     next refresh, and an unreachable one sits at its closest balanced pose, which the kinematic cost
-    pulls the placement toward. No cuRobo runs (see :class:`_ReikDriftGate`); the final pre-check
-    refresh is the only cuRobo repair, and the :func:`gn_gate` masks only feed the stats. No host syncs
+    pulls the placement toward. The final pre-check refresh repairs what is left
+    (:func:`~cutamp.particle_initialization.gn_ik`), and the :func:`gn_gate` masks only feed the stats. No host syncs
     once gn_refresh's constants are cached, since the loop is launch-bound: CUDA events time it, and
     the stats stay on the device until ``gate.flush()``.
     """
@@ -470,65 +467,33 @@ class ParticleOptimizer:
         corresponding Conf particle in-place.
 
         With a ``gate``, the refresh is :func:`_refresh_balanced`, which writes
-        every row back and records per-dep drift/timing stats. ``gate=None``
-        repairs the rows that miss checker tolerance or the CoM polygon on the
-        full-strength main solver, and the rest keep their q — used for the
-        final pre-check refresh.
-
-        cuRobo's IK uses autograd internally (LM Jacobian via ``cost.backward``)
-        so the IK call cannot run under ``torch.no_grad``; only the in-place
-        ``copy_`` is wrapped. Covered Confs are out of the optimizer, so
-        neither Adam nor ``apply_grad_masks`` touches them.
+        every row back and records per-dep drift/timing stats. ``gate=None`` is the final pre-check repair:
+        :func:`~cutamp.particle_initialization.gn_ik` over every dep in one call, from the stored confs (and its
+        noisy starts), and only the rows that GN IK's own check rejects now and accepts after take the result
+        (:func:`~cutamp.particle_initialization.ik_check`: the hand, the soles, the CoM and the tilt bound at the
+        checker's tolerances, collision at zero penetration, stricter than its). A blanket overwrite perturbs
+        already-good rows' soft costs (measured best_soft 18.6 -> 22.8 on one run). Covered Confs are out of the
+        optimizer, so neither Adam nor ``apply_grad_masks`` touches them.
         """
         if not ik_deps:
             return
         if gate is not None:
             return _refresh_balanced(particles, ik_deps, world, gate, step)
-        for dep in ik_deps:
-            # Detach the target so IK's backward doesn't try to flow into
-            # Pose / Grasp particles (which are leaves in our autograd graph).
-            world_from_ee = dep.target_fn(particles).detach()
-            # Final pre-check refresh: REPAIR-ONLY, on the full-strength
-            # main solver. Measure which rows actually fail the checker's
-            # kinematic tolerances (the hand's, and the soles' against the
-            # stance) or the CoM gate, and only
-            # overwrite those — a blanket success-masked overwrite perturbs
-            # already-good rows' soft costs (measured best_soft 18.6 -> 22.8
-            # on one run). Full batch always: cuRobo pads sub-capacity
-            # batches internally, so subsets save nothing.
-            from cutamp.com_polygon_cost import _fk_state, compute_com_polygon_mask
-            pos_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err")
-            rot_tol = self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err")
-            with torch.no_grad():
-                pos_err, rot_err = _achieved_pose_errors(
-                    world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
-                )
-                ok_now = (pos_err < pos_tol) & (rot_err < rot_tol)
-                ok_now &= soles_on_stance(
-                    world, _fk_state(world, particles[dep.q_name].detach()),
-                    self.constraint_checker._get_tol(KinematicConstraint.type, "sole_pos_err"),
-                    self.constraint_checker._get_tol(KinematicConstraint.type, "sole_rot_err"),
-                )
-                ok_now &= compute_com_polygon_mask(world, particles[dep.q_name])
-            if bool(ok_now.all()):
-                continue  # nothing to repair for this dep
-            ik_result = _ik_for_pose(
-                world, world_from_ee, dep.arm,
-                current_state_q=particles[dep.q_name].detach(),
-            )
-            new_q = _ik_solution_to_full_q(ik_result, world).detach()
-            success = _ik_success_mask(ik_result)
-            # Repair-only merge: already-good rows keep their q.
-            success = success & ~ok_now
-            if world.model.envelope.trunk_tilt_max is not None:
-                # cuRobo's IK does not see an envelope's tilt bound, which GN holds: on blocks_t1's floor scene,
-                # under a 1.0 rad bound, it bowed 9 of 11 repaired rows past it, each trading a hand, sole or CoM
-                # failure for a tilt one, so a repair past the bound is not taken.
-                success &= tilt_within_bound(world, new_q,
-                                             self.constraint_checker._get_tol(Motion.type, "trunk_tilt"))
-            with torch.no_grad():
-                merged = torch.where(success.view(-1, 1), new_q, particles[dep.q_name])
-                particles[dep.q_name].copy_(merged)
+        tol = IKTol.from_checker(self.constraint_checker)
+        arms = tuple(dep.arm for dep in ik_deps)
+        with torch.no_grad():
+            # Detached: nothing may flow into the Pose / Grasp leaves.
+            targets = torch.cat([dep.target_fn(particles) for dep in ik_deps])
+            movables = torch.cat([dep.movables_fn(particles) for dep in ik_deps])
+            q_now = torch.cat([particles[dep.q_name].detach() for dep in ik_deps])
+            ok_now = ik_check(world, q_now, targets, arms, movables, tol)[0]
+        if bool(ok_now.all()):
+            return  # nothing to repair
+        q_new, ok_new = gn_ik(world, targets, arms, movables, tol, q_start=q_now)
+        with torch.no_grad():
+            merged = torch.where((ok_new & ~ok_now).unsqueeze(-1), q_new, q_now)
+            for dep, q_dep in zip(ik_deps, merged.split(q_now.shape[0] // len(ik_deps))):
+                particles[dep.q_name].copy_(q_dep)
                 # Dropped from the optimizer, so .grad has no consumer.
                 particles[dep.q_name].grad = None
 

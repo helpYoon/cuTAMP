@@ -7,36 +7,26 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Batched Gauss-Newton projection for coupled-reIK refreshes.
+"""Batched Gauss-Newton IK, balance first: the planner's only IK.
 
-Between refreshes, each covered Conf already holds a near-answer for a pose
-target that Adam has moved by millimetres. Instead of re-running cuRobo's
-fixed-schedule IK pipeline (~170 ms per dep regardless of how converged the
-warm start is), project the stored q back onto the moved constraint manifold
-with damped Gauss-Newton; on the 6-DOF pose residual alone, its step is
+Each covered Conf (a pick's or a place's) is the IK of a pose target that Adam moves. Damped Gauss-Newton
+projects q onto that target's constraint manifold; on the 6-DOF pose residual alone, its step is
 
     dq = J^T (J J^T + lambda I)^-1 [t* - t(q); rotvec(R* R(q)^T)]
 
-That pose-only step cost ``GN_ITERS`` batched FK+Jacobian kernel calls plus a
-[B, 6, 6] solve, about 2-5 ms per dep at 512 particles; the balance-first
-levels add the CoM's autograd Jacobian (``gn_project_balanced``). It projects all
-of a refresh's deps in one call and makes no host syncs (the Adam loop is
-host-launch-bound), so its solves are the unchecked ``*_ex`` kernels.
+``gn_project_balanced`` puts that residual at level 2 of a three-level hierarchy whose level 1 holds the CoM in
+the support rectangle, both soles on the stance (12 rows, design 7.4: the base columns are free), the robot
+out of collision with the scene, the objects and itself (one row), and, on a model whose envelope bounds the
+Trunk tilt, the tilt inside that bound (one row, call 22); level 3, beside the collision row, pulls the CoM
+toward the rectangle's centre. ``gn_gate`` checks the soles too.
 
-What this deliberately does NOT do (the full cuRobo solver covers these at
-particle init and at the final pre-check refresh):
-
-- no self/world-collision vetting inside the update (the rollout's hard
-  constraints still score every conf every step, so violations surface in
-  the satisfying mask rather than silently passing),
-- no basin hopping (strictly local: a row that doesn't converge resumes at
-  the next refresh, and the final pre-check refresh repairs what is left).
-
-``gn_project_balanced`` is the balance-first refresh: level 1 holds the CoM
-in the support rectangle and both soles on the stance (12 rows, design 7.4:
-the base columns are free), and the pose is least squares inside it.
-``gn_gate`` checks the soles too. On a model whose envelope bounds the Trunk
-tilt, level 1 holds the tilt inside that bound too (one row, call 22).
+Three callers: the particle init (``particle_initialization.gn_ik``: from home and from noisy stance-rooted
+starts, iterations that reach balance first, then iterations with the collision row on, since only the conf
+the iterates end at must be clear), the periodic refresh inside the Adam loop (``GN_ITERS`` iterations from
+the stored q, the collision row on in every one, captured as G_refresh) and the final pre-check repair
+(``gn_ik`` again, from the stored q). A refresh projects
+all of its deps in one call and makes no host syncs (the Adam loop is host-launch-bound), so its solves are
+the unchecked ``*_ex`` kernels. Strictly local: a row that doesn't converge resumes at the next refresh.
 """
 
 import math
@@ -60,7 +50,7 @@ GN_DAMPING = 1e-4
 # (18 cm pose error), UNclamped steps overshoot to 45+ cm while clamped
 # descent converges linearly at ~0.7x error/iter. mm-scale refresh drift
 # never saturates it, so warm-start convergence stays effectively quadratic;
-# corrections big enough to ride the clamp belong to cuRobo or a later refresh.
+# corrections big enough to ride the clamp take more iterations (the init's 30) or a later refresh.
 GN_STEP_CLAMP = 0.15
 # A CoM axis outside the support rectangle (or that a step
 # would push out) is driven this far inside the edge, absorbing ~2-4 mm of
@@ -77,6 +67,44 @@ GN_COM_MARGIN = 0.005
 # take off instead (_balanced_step). 0.02 rad gave the same counts on
 # blocks_t1.
 GN_TILT_MARGIN = 0.01
+# A conf in collision (summed penetration c > 0, :func:`collision_penetration`) is driven this far past contact,
+# as the CoM is driven GN_COM_MARGIN inside its edge: a solver margin that absorbs the linearization error, not
+# a clearance a plan must keep. No band ahead of contact: a pick's palm sits 2-3 mm from its own block.
+GN_COLL_MARGIN = 0.005
+
+
+@lru_cache(maxsize=None)
+def _self_pairs(kin):
+    """``(i [P], j [P], pad [S])``: the sphere pairs cuRobo's self-collision kernel checks on ``kin`` (long
+    indices), kept where both spheres are real (the kernel skips a pair with a negative padded radius; a
+    disabled sphere's radius is -100), and the per-sphere padding the kernel adds to each radius. FK moves only
+    the centres, and objects attach to the motion planner's own kinematics, never to the world's, so the filter
+    holds. Cached, since building it reads the host; never evict it: a captured CUDA graph keeps reading it."""
+    cfg = kin.get_self_collision_config()
+    pad = cfg.sphere_padding
+    radius = kin.robot_spheres[:, 3].to(pad.device) + pad
+    pairs = cfg.collision_pairs.long()
+    pairs = pairs[(radius[pairs] >= 0).all(-1)]
+    return pairs[:, 0].contiguous(), pairs[:, 1].contiguous(), pad
+
+
+def collision_penetration(world, spheres: torch.Tensor, movables: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """``[N]``: the summed linear penetration depth (m) of the robot's ``spheres`` ``[N, S, 4]`` (an FK of
+    ``world.kinematics`` or one of its sites; differentiable) with the static scene (``world.collision_fn``),
+    with ``movables`` ``[N, M, 4]`` (world-frame object spheres, :func:`cutamp.rollout.movable_spheres_fn`)
+    and with itself. Zero exactly where the constraint checker's three terms are (``robot_to_world``,
+    ``robot_to_movables`` at the default activation 0 and ``self_collision``): the self term sums
+    ``relu(r_i + r_j - d)`` over the kernel's pairs, which is positive where the kernel's ``(r_i + r_j)^2 - d^2``
+    is, and has a gradient on every penetrating pair, not only the deepest."""
+    spheres = spheres.reshape(spheres.shape[0], -1, 4)
+    pen = world.collision_fn(spheres.unsqueeze(1).contiguous()).reshape(-1)
+    if movables is not None:
+        from cutamp.costs import sphere_to_sphere_overlap
+        pen = pen + sphere_to_sphere_overlap(spheres, movables, activation_distance=0.0)
+    i, j, pad = _self_pairs(world.kinematics)
+    c, r = spheres[..., :3], spheres[..., 3] + pad
+    d = (c[:, i] - c[:, j]).norm(dim=-1)
+    return pen + torch.relu(r[:, i] + r[:, j] - d).sum(-1)
 
 
 @lru_cache(maxsize=None)
@@ -227,12 +255,13 @@ def _tilt_after(q: torch.Tensor, dq: torch.Tensor, pitch: int, roll: int) -> tor
 
 
 def _prioritized_step(jac_com, com, active, com_target, jac, r, damping, jac_sole, r_sole, jac_tilt=None,
-                      r_tilt=None):
+                      r_tilt=None, jac_coll=None, r_coll=None):
     """One two-level step (Siciliano-Slotine form). Level 1 moves the active
     CoM axes to ``com_target`` with minimum norm, closes the soles' residual
     (``jac_sole`` ``[B, 12, dof]`` and ``r_sole`` ``[B, 12]``), whose rows are
     always active, and, given the tilt row ``jac_tilt`` ``[B, 1, dof]`` and
-    ``r_tilt`` ``[B, 1]`` (zeroed by the caller where inactive), moves the Trunk tilt's cosine by ``r_tilt``; level 2 is
+    ``r_tilt`` ``[B, 1]`` (zeroed by the caller where inactive), moves the Trunk tilt's cosine by ``r_tilt``, and
+    the collision row (``jac_coll``, ``r_coll``, the same shapes and zeroing) the penetration by ``r_coll``; level 2 is
     damped GN on the pose residual inside the null space of level 1. Inactive
     CoM rows are zeroed, so they drop out of both levels.
 
@@ -240,19 +269,22 @@ def _prioritized_step(jac_com, com, active, com_target, jac, r, damping, jac_sol
     Gram (condition number ~1e3) amplified their ~1e-3 relative error into
     level 2's null space. On 64 balanced blocks_t1 pick confs reaching 3 cm,
     float32 left 3 with a sole 1.5-12 mm off the stance after a call, float64
-    none over 0.35 mm."""
+    none over 0.35 mm.
+
+    Returns ``(dq1, dq2, ja)``: ``ja`` is level 1's rows ``[B, 14-16, dof]`` (float64), for
+    :func:`_centring_step`."""
     dtype = jac.dtype
     a = active.to(dtype)
     ja = jac_com * a.unsqueeze(-1)                                  # [B, 2, dof]
     t1 = (com_target - com) * a
-    extra = [(j, t) for j, t in ((jac_sole, r_sole), (jac_tilt, r_tilt)) if j is not None]
+    extra = [(j, t) for j, t in ((jac_sole, r_sole), (jac_tilt, r_tilt), (jac_coll, r_coll)) if j is not None]
     f64 = torch.float64
-    ja = torch.cat([ja, *(j for j, _ in extra)], dim=1).to(f64)      # [B, 14 | 15, dof]
+    ja = torch.cat([ja, *(j for j, _ in extra)], dim=1).to(f64)      # [B, 14-16, dof]
     t1 = torch.cat([t1, *(t for _, t in extra)], dim=1).to(f64)
     jac, r, damping = jac.to(f64), r.to(f64), damping.to(f64)
     # Batched LU stays in cuBLAS's sync-free kernels up to 16 x 16, so these inverses capture.
     gram = ja @ ja.transpose(-1, -2) + 1e-6 * torch.eye(ja.shape[1], device=jac.device, dtype=jac.dtype)
-    ja_pinv = ja.transpose(-1, -2) @ torch.linalg.inv_ex(gram)[0]   # [B, dof, 14 | 15]
+    ja_pinv = ja.transpose(-1, -2) @ torch.linalg.inv_ex(gram)[0]   # [B, dof, 14-16]
     dq1 = (ja_pinv @ t1.unsqueeze(-1)).squeeze(-1)
     eye_dof = torch.eye(jac.shape[-1], device=jac.device, dtype=jac.dtype)
     jn = jac @ (eye_dof - ja_pinv @ ja)                             # [B, 6, dof]
@@ -260,7 +292,46 @@ def _prioritized_step(jac_com, com, active, com_target, jac, r, damping, jac_sol
     rhs = r - (jac @ dq1.unsqueeze(-1)).squeeze(-1)
     y = torch.linalg.solve_ex(jn @ jn.transpose(-1, -2) + damping * eye6, rhs.unsqueeze(-1))[0]
     dq2 = (jn.transpose(-1, -2) @ y).squeeze(-1)
-    return dq1.to(dtype), dq2.to(dtype)
+    return dq1.to(dtype), dq2.to(dtype), ja
+
+
+def _centring_step(ja, jac, jac_com, com_lin, active, half):
+    """Level 3, below :func:`_prioritized_step`'s two: the CoM axes level 1 leaves free (``~active``) toward the
+    support's centre from ``com_lin``, the CoM (about the centre) after levels 1-2's step, linear on every
+    column, in the null space of level 1's rows ``ja`` ``[B, k, dof]`` and of the hand rows ``jac``
+    ``[B, 6, dof]``, every Jacobian on level 3's columns. Each axis is over ``half``, as in the old seed IK's
+    pull-to-center term ``sum((com / half)^2)``, and the damping grows with that residual, as level 2's does.
+
+    The null space is the stacked rows ``A = [ja; jac]``'s, ``I - A^T (A A^T + eps I)^-1 A``, by block
+    inversion: ``N1 = I - ja^+ ja`` and the Schur complement ``jac N1 jac^T + eps I``, so no inverse is over
+    16 x 16 and the call captures, and no ``[B, dof, dof]`` projector is formed. Taking level 2's ``jn jn^T``
+    (``jac N1^2 jac^T``) for that complement instead is right only where the regularized ``N1`` is idempotent: on
+    blocks_t1's floor picks, where level 1 is near-singular (a singular value ~2e-4) and level 3 has no exact
+    freedom left, that step moved the hand up to 0.4 m per step. Float64, as levels 1-2, with ``eps`` 1e-9:
+    the leak into any row of ``A`` is at most ``sqrt(eps) / 2`` per unit step; there it was under 1.5e-5 against
+    1.3e-3 at levels 1-2's 1e-6, and at 1e-12 the 16-row inverse lost 1.5e-2 to rounding (2026-11-06).
+
+    Without the level, GN's minimum-norm steps leave the CoM wherever level 1 stops it, at the rectangle's edge:
+    GN IK's blocks_t1 first picks sat at a median 0.95 (x) and 0.96 (|y|) of ``half``, with the base slid
+    0.12-0.18 m sideways onto one leg, and trajopt's move there from home needed 1.06-1.37 of the
+    Left_Ankle_Roll's effort (2026-11-06)."""
+    f64, eps = torch.float64, 1e-9
+
+    def eye(n):
+        return torch.eye(n, device=jac.device, dtype=f64)
+
+    ja, jac = ja.to(f64), jac.to(f64)
+    w = (~active).to(f64) / half.to(f64)                                             # [B, 2]
+    j3 = jac_com.to(f64) * w.unsqueeze(-1)                                           # [B, 2, dof]
+    t3 = -com_lin.to(f64) * w
+    ja_pinv = ja.mT @ torch.linalg.inv_ex(ja @ ja.mT + eps * eye(ja.shape[1]))[0]   # [B, dof, k]
+    jn = jac - (jac @ ja_pinv) @ ja                                                 # jac N1
+    j3 = j3 - (j3 @ ja_pinv) @ ja                                                   # j3 N1
+    s_inv = torch.linalg.inv_ex(jn @ jac.mT + eps * eye(6))[0]                      # (jac N1 jac^T + eps I)^-1
+    j3 = j3 - ((j3 @ jac.mT) @ s_inv) @ jn                                          # off levels 1 and 2
+    damping = (GN_DAMPING + (t3 * t3).sum(-1)).view(-1, 1, 1)
+    y = torch.linalg.solve_ex(j3 @ j3.mT + damping * eye(2), t3.unsqueeze(-1))[0]
+    return (j3.mT @ y).squeeze(-1).to(jac_com.dtype)
 
 
 def _fraction_that_fits(base, extra):
@@ -277,16 +348,20 @@ def _fraction_in_limits(pos, extra, lower, upper):
     return frac.amin(-1, keepdim=True).clamp(0.0, 1.0)
 
 
-def _scaled_step(q, dq1, dq2, lower, upper):
-    """Levels 1-2's step, trust region in priority order: ``dq1`` scaled into the ``GN_STEP_CLAMP`` box, plus the
-    largest fraction of ``dq2`` that still fits. Each fraction also keeps every joint inside [``lower``,
-    ``upper``]: the caller's final clamp would cut a crossing joint's motion, and that cut moves the soles by the
-    joint's column of the sole Jacobian. Scaling a level keeps it in level 1's null space; cutting one joint's
-    motion does not."""
+def _scaled_step(q, dq1, dq2, lower, upper, dq3=None):
+    """Levels 1-2's step (and level 3's ``dq3``, given), trust region in priority order: ``dq1`` scaled into the
+    ``GN_STEP_CLAMP`` box, plus the largest fraction of ``dq2`` that still fits, then of ``dq3``. Each fraction
+    also keeps every joint inside [``lower``, ``upper``]: the caller's final clamp would cut a crossing joint's
+    motion, and that cut moves the soles by the joint's column of the sole Jacobian. Scaling a level keeps it in
+    the null space of the levels above it; cutting one joint's motion does not."""
     f1 = torch.minimum(_fraction_that_fits(torch.zeros_like(dq1), dq1), _fraction_in_limits(q, dq1, lower, upper))
     step = f1 * dq1
     f2 = torch.minimum(_fraction_that_fits(step, dq2), _fraction_in_limits(q + step, dq2, lower, upper))
-    return step + f2 * dq2
+    step = step + f2 * dq2
+    if dq3 is None:
+        return step
+    f3 = torch.minimum(_fraction_that_fits(step, dq3), _fraction_in_limits(q + step, dq3, lower, upper))
+    return step + f3 * dq3
 
 
 def _crossing_joints(q, dq1, dq2, lower, upper):
@@ -296,6 +371,17 @@ def _crossing_joints(q, dq1, dq2, lower, upper):
     s2 = _fraction_that_fits(s1, dq2) * dq2
     p1, p2 = q + s1, q + s1 + s2
     return ((p1 > upper) & (s1 > 0)) | ((p1 < lower) & (s1 < 0)) | ((p2 > upper) & (s2 > 0)) | ((p2 < lower) & (s2 < 0))
+
+
+def _level3_blocked(q, dq1, dq2, dq3, lower, upper):
+    """``[B, dof]`` bool: the joints that level 3's step ``dq3`` pushes outward from where levels 1-2's
+    box-scaled step leaves them (as :func:`_crossing_joints` scales it): at a limit already, or carried past one."""
+    s1 = _fraction_that_fits(torch.zeros_like(dq1), dq1) * dq1
+    s12 = s1 + _fraction_that_fits(s1, dq2) * dq2
+    p12 = q + s12
+    p3 = p12 + _fraction_that_fits(s12, dq3) * dq3
+    up = ((p12 >= upper - 1e-5) | (p3 > upper)) & (dq3 > 0)
+    return up | (((p12 <= lower + 1e-5) | (p3 < lower)) & (dq3 < 0))
 
 
 def _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask, is_left):
@@ -329,10 +415,12 @@ def _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask
     return _scaled_step(q, dq1, dq2, lower, upper)
 
 
-def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_sole, r_sole, tilt=None):
-    """One balance-first step ``[N, dof]``, levels 1-2 of :func:`gn_project_balanced`,
-    on ``jac``, ``jac_com`` and ``jac_sole`` already masked by ``col_mask``. Every
-    op is row-wise, so a row's step doesn't depend on which deps share the call.
+def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_sole, r_sole, tilt=None, coll=None,
+                   centre=False):
+    """``(step, step12)``, each ``[N, dof]``: one balance-first step, levels 1-3 of :func:`gn_project_balanced`
+    (level 3 only with ``centre``, which needs ``coll``), and levels 1-2's alone, on ``jac``, ``jac_com``,
+    ``jac_sole`` and ``coll``'s Jacobian already masked by ``col_mask``. Every op is row-wise, so a row's step
+    doesn't depend on which deps share the call.
 
     ``com`` is the CoM about the support's centre, in its frame, and ``half``
     the rectangle level 1 holds it in, a support's ``keyframe_half``.
@@ -340,7 +428,10 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     (:func:`_sole_residual_and_jacobian`): level 1 closes them beside the
     active CoM axes, and level 2 moves in their null space. ``tilt`` is the
     tilt bound (:func:`_tilt_bound`): level 1 drives an active tilt row
-    (:func:`_tilt_row`) to ``cos_target``."""
+    (:func:`_tilt_row`) to ``cos_target``. ``coll`` is ``(c [N, 1], jac [N, 1, dof])``, the summed penetration
+    (:func:`collision_penetration`) and its Jacobian: level 1 drives a row in collision to ``-GN_COLL_MARGIN``.
+    A row out of collision has a zero gradient there, so its row stays off for the call's step: the next
+    iteration catches a step that ends in contact."""
     from cutamp.com_polygon_cost import _half_extents
 
     half = _half_extents(half, q.device, q.dtype)
@@ -372,16 +463,43 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
         c, jac_tilt = _tilt_row(q, pitch, roll, col_mask)
         tilt_active = c < cos_max
         bend = torch.zeros_like(c)
+    if coll is not None:
+        pen, jac_pen = coll
+        in_contact = pen > 0
+        coll_target = (-GN_COLL_MARGIN - pen) * in_contact
+        jac_pen = jac_pen * in_contact.unsqueeze(-1)
+    # Level 3 (:func:`_centring_step`, with ``centre``) changes none of levels 1-2's active sets, so ``step12``
+    # is bitwise the step levels 1-2 take without it: the CoM's and the tilt's pushes and the frozen joints are
+    # all tested on levels 1-2's step. Level 3's own step can still cross a bound: it moves one free CoM axis
+    # outward while it pulls the other in (a damped least-squares step on both: on blocks_t1's gn_ik, 81-101 of
+    # the 2400-3500 free axes it moved, by up to 1.2 cm, past the edge on at most 2 of 2304 rows), and it can tilt
+    # the Trunk out. Testing the tilt's push on level 3's step activated the tilt row on rows well inside the
+    # bound, which then drove them to it: on a first-pick row 0.06 rad inside, level 3's unscaled step was
+    # 0.48 rad, three times what the box let through (2026-11-06). So a row takes ``step12`` where level 3's step
+    # would carry a CoM axis that levels 1-2's leave inside past the rectangle (linear, as their pushes are
+    # tested) or the tilt past its bound (exact: the tilt reads two columns), as the caller's contact test does
+    # where the step would end in contact (:func:`gn_project_balanced`), and where the row is in contact: there
+    # the collision row pushes the hand off its target to clear it, and the pull builds on a posture the hand then
+    # has to leave. On a noisy self-contact conf the two alternated for a whole 10-iteration call, the clearing step
+    # 18-23 mm off the hand target and level 2's step back into the contact, ending 7.5 mm off, where without
+    # level 3 it converged (2026-11-06). Level 3's own frozen set (``free3``, inside ``free``) is the joints its
+    # step pushes past a limit; freezing them in ``free`` would let the lowest level take a joint from the top
+    # two.
     free = torch.ones_like(q)
+    free3 = free
     for _ in range(3):
         fc = free.unsqueeze(1)
         row = (None, None)
         if tilt is not None:
             row = (jac_tilt * fc * tilt_active.unsqueeze(-1), (cos_target - c - bend) * tilt_active)
-        dq1, dq2 = _prioritized_step(jac_com * fc, com, active, com_target, jac * fc, r, damping, jac_sole * fc,
-                                     r_sole, *row)
+        row_coll = (None, None) if coll is None else (jac_pen * fc, coll_target)
+        dq1, dq2, ja = _prioritized_step(jac_com * fc, com, active, com_target, jac * fc, r, damping,
+                                         jac_sole * fc, r_sole, *row, *row_coll)
         dq = dq1 + dq2
         com_lin = com + (jac_com @ dq.unsqueeze(-1)).squeeze(-1)
+        if centre:
+            f3c = free3.unsqueeze(1)
+            dq3 = _centring_step(ja * f3c, jac * f3c, jac_com * f3c, com_lin, active, half)
         pushed_out = ~active & (com_lin.abs() > half)
         blocked = ((q >= upper - 1e-5) & (dq > 0)) | ((q <= lower + 1e-5) & (dq < 0))
         blocked |= _crossing_joints(q, dq1, dq2, lower, upper)
@@ -389,13 +507,26 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
         com_target = torch.where(pushed_out, com_lin.sign() * inner, com_target)
         active = active | pushed_out
         free = free * ~blocked
+        if centre:
+            free3 = free3 * free * ~_level3_blocked(q, dq1, dq2, dq3, lower, upper)
         if tilt is not None:
             applied = _scaled_step(q, dq1, dq2, lower, upper)
             c_applied = _tilt_after(q, applied, pitch, roll)
             bend = c_applied - c - (jac_tilt @ applied.unsqueeze(-1)).squeeze(-1)
             tilt_active = tilt_active | (c_applied < cos_max) | (_tilt_after(q, dq, pitch, roll) < cos_max)
 
-    return _scaled_step(q, dq1, dq2, lower, upper)
+    step12 = _scaled_step(q, dq1, dq2, lower, upper)
+    if not centre:
+        return step12, step12
+    step = _scaled_step(q, dq1, dq2, lower, upper, dq3)
+
+    def com_after(s):
+        return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
+
+    skip = in_contact | ((com_after(step).abs() > half) & (com_after(step12).abs() <= half)).any(-1, keepdim=True)
+    if tilt is not None:
+        skip = skip | (_tilt_after(q, step, pitch, roll) < cos_max)
+    return torch.where(skip, step12, step), step12
 
 
 def gn_project_balanced(
@@ -404,32 +535,48 @@ def gn_project_balanced(
     world_from_ee: torch.Tensor,
     arms: str | Sequence[str],
     iters: int = GN_ITERS,
+    movables: Optional[torch.Tensor] = None,
+    collision: bool = True,
 ) -> torch.Tensor:
     """Project ``q_full`` (``[N, dof]`` full-cspace joint positions, not modified) toward
     ``FK(q) == world_from_ee`` (``[N, 4, 4]`` target tool poses), balance first, on ``world.kinematics_jac``.
 
-    Each step is a two-level hierarchy (Kanoun et al. T-RO 2011; Escande et
+    Each step is a three-level hierarchy (Kanoun et al. T-RO 2011; Escande et
     al. IJRR 2014): (1) keep the CoM, in the support frame of
     ``world.model.support``, inside its keyframe rectangle shrunk by
     ``GN_COM_MARGIN``, both soles on the stance (``world.stance_soles``),
-    since the free base and leg columns would otherwise slide them, and, on a
+    since the free base and leg columns would otherwise slide them, on a
     model whose envelope bounds the Trunk tilt, the tilt within that maximum
     (one row on the base's pitch and roll, active like a CoM axis and driven
     ``GN_TILT_MARGIN`` inside the bound), since the covered confs are outside
-    Adam, which alone sees the Motion value ``trunk_tilt``; (2) least squares
-    on the pose residual in whatever freedom level 1 leaves. An unreachable
+    Adam, which alone sees the Motion value ``trunk_tilt``, and the robot out of collision with the static scene,
+    with ``movables`` (``[N, M, 4]`` world-frame object spheres per row, the objects where the rollout puts
+    them at that conf; ``None``: none) and with itself (one row on :func:`collision_penetration`, active where
+    it is positive and driven ``GN_COLL_MARGIN`` past contact), since Adam's collision costs never move a
+    covered conf either (``collision=False`` drops the row, for :func:`~cutamp.particle_initialization.gn_ik`'s
+    reaching iterations); (2) least squares
+    on the pose residual in whatever freedom level 1 leaves; (3) with the collision row on, on every iteration
+    but the last, the CoM toward the rectangle's centre in whatever freedom levels 1-2 leave
+    (:func:`_centring_step`), so a conf doesn't stay edge-parked where level 1 stopped its CoM, except on a row
+    in contact, or whose step would end in contact, past the tilt bound or (linearly) with a CoM axis past the
+    rectangle that levels 1-2 left inside, which takes levels 1-2's step alone
+    (one more FK per iteration tests the step's end): the collision row is blind outside contact, so the pull
+    would take a conf back into a contact the row had just cleared. Level 3 changes none of levels 1-2's active
+    sets, and the last iteration's level 2 closes the hand's second-order drift from its last step. A conf whose
+    pull runs into a contact stays where it stopped, off-centre: on one init's blocks_t1 first pick the median row
+    stops 0.76 of the half-width out in y, where the pull would lower the Trunk onto the right Shank. An unreachable
     target therefore returns the closest balanced pose, not an unbalanced
     exact one, and its leftover pose error is what the kinematic cost hands
     to the placement.
 
     Beyond the hierarchy:
     - steps are scaled into the ``GN_STEP_CLAMP`` box (level 1 first, then
-      the largest fraction of level 2 that fits), not clipped per joint, so
+      the largest fraction of level 2 that fits, then of level 3), not clipped per joint, so
       they keep their direction;
     - damping grows with the squared residual (Levenberg-Marquardt), which
-      keeps steps sane where the two levels conflict;
-    - the CoM Jacobian comes from autograd through cuRobo's FK, so each
-      iteration costs about two iterations on the pose residual alone.
+      keeps steps sane where the levels conflict;
+    - the CoM's and the penetration's Jacobians come from autograd through cuRobo's FK, so each
+      iteration costs about three iterations on the pose residual alone.
 
     Every level's step also stays inside the joint
     limits (crossing joints frozen, then each level scaled), so the final
@@ -441,8 +588,7 @@ def gn_project_balanced(
 
     ``arms`` holds one arm per IK dep (a bare ``str`` is one): rows are
     ``len(arms)`` equal dep-major blocks, block ``i`` on ``arms[i]``'s tool
-    frame, with the other arm's columns frozen (cuRobo IK instead holds the
-    other hand in the world; known-bugs B15).
+    frame, with the other arm's columns frozen, so that hand rides with the trunk (known-bugs B15).
 
     Returns ``[N, dof]`` projected joint positions, clamped to the joint
     limits. Convergence is NOT guaranteed: :func:`gn_gate` measures it.
@@ -456,7 +602,7 @@ def gn_project_balanced(
     sole_idx = tuple(list(kin.tool_frames).index(frame) for frame in world.model.sole_frames)
     bound = _tilt_bound(world.model)  # None without a tilt bound
 
-    for _ in range(iters):
+    for it in range(iters):
         q_g = q.detach().requires_grad_(True)
         with torch.enable_grad():
             state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
@@ -469,16 +615,30 @@ def gn_project_balanced(
                 )
             com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T, support.center)
             # Clone: cuRobo's backward writes into a reused buffer, so without
-            # it the second grad call overwrites the x row with the y row.
+            # it the next grad call overwrites the x row with the y row.
             jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
-            jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g)[0]
+            jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g, retain_graph=collision)[0].clone()
+            if collision:
+                pen_g = collision_penetration(world, state.robot_spheres, movables)
+                jpen = torch.autograd.grad(pen_g.sum(), q_g)[0]
         with torch.no_grad():
             jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
             com = com_g.detach()
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
             r_sole, jac_sole = _sole_residual_and_jacobian(state, sole_idx, world.stance_soles, col_mask)
-            step = _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask,
-                                  half=support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole, tilt=bound)
+            coll = (pen_g.detach().unsqueeze(-1), (jpen * col_mask).unsqueeze(1)) if collision else None
+            # Level 3 runs beside the collision row, whose contact test below it needs, and not on the last
+            # iteration: its second-order drift moves the hand (about 3 mm per 0.3 rad step on noisy self-contact
+            # confs, 2026-11-06), which the next iteration's level 2 closes and the last would leave.
+            centre = collision and it < iters - 1
+            step, step12 = _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask,
+                                          half=support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole, tilt=bound,
+                                          coll=coll, centre=centre)
+            if centre:
+                # Level 3 never takes a row into contact: where the full step ends in contact, levels 1-2's alone.
+                q_end = (q + step).clamp(lower, upper)
+                spheres = kin.compute_kinematics(JointState.from_position(q_end, joint_names=joint_names)).robot_spheres
+                step = torch.where((collision_penetration(world, spheres, movables) > 0).unsqueeze(-1), step12, step)
             q = (q + step).clamp(lower, upper)
 
     with torch.no_grad():

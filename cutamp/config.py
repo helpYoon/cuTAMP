@@ -23,11 +23,9 @@ SUPPORTED_SOFT_COSTS = (
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
-    # Number of particles to initialize and optimize over. The IK solver's
-    # buffers are sized to this (ik_max_batch_size), so it bounds GPU memory:
-    # 1024 OOMs a 24 GB card at solver build, 512 peaks near ~17 GB, 256
-    # leaves room for two concurrent runs. Default lowered 1024 -> 256
-    # (2026-08-05); pass -n for larger sweeps.
+    # Number of particles to initialize and optimize over. Default lowered
+    # 1024 -> 256 (2026-08-05), when cuRobo's IK solver (since replaced by
+    # GN, gn_ik) bounded GPU memory; pass -n for larger sweeps.
     num_particles: int = 256
 
     # Optimization hyperparams
@@ -58,10 +56,10 @@ class TAMPConfiguration:
     # Grasps and free Confs, and the Confs an IK target covers (q_pick,
     # q_place, ...) leave the optimizer. Every reik_interval steps the
     # balance-first GN refresh (gn_project_balanced) projects them onto their
-    # moved targets: the CoM in the support rectangle and both soles on the
-    # stance first, the pose least squares inside it. Every row's
-    # iterate is written back, and no cuRobo runs during Adam; the final
-    # pre-check refresh repairs the rows that still miss.
+    # moved targets: the CoM in the support rectangle, both soles on the
+    # stance and the robot clear of collision first, the pose least squares
+    # inside it. Every row's iterate is written back; the final pre-check
+    # refresh (gn_ik, from the stored confs) repairs the rows that still miss.
     reik_interval: int = 5
     # Replay the Adam step and the re-IK refresh as CUDA graphs
     # (cutamp/cuda_graphs.py); align_yaw runs stay eager (see

@@ -27,6 +27,7 @@ from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
+    transform_spheres,
 )
 
 
@@ -103,6 +104,32 @@ def get_conf_to_arm(
                 conf_name = ground_op.values[idx]
                 conf_to_arm.setdefault(conf_name, arm)
     return conf_to_arm
+
+
+def movable_spheres_fn(world: TAMPWorld, plan_skeleton: PlanSkeleton, op_idx: int):
+    """``fn(particles) -> [B, M, 4]``: every movable's collision spheres where the rollout puts the objects at
+    the conf of ``plan_skeleton[op_idx]`` (a pick or a place), as ``robot_to_movables`` checks that conf: each
+    object at its initial pose until a place moves it, then at that place's placement, the conf's own place
+    included; objects in ``world.movables`` order. The initial poses are transformed here, so ``fn`` makes no
+    host copy and captures (G_refresh)."""
+    source = {obj.name: None for obj in world.movables}
+    for op in list(plan_skeleton)[: op_idx + 1]:
+        if op.operator.metadata.action_type == "place":
+            obj_name, _grasp, placement, _surface, _q = op.values
+            source[obj_name] = placement
+    fixed = {name: transform_spheres(world.get_collision_spheres(name), world.get_object_pose(name))
+             for name, placement in source.items() if placement is None}
+
+    def fn(particles: Particles) -> torch.Tensor:
+        batch = particles["left_q0"].shape[0]
+        parts = [
+            fixed[name].expand(batch, -1, -1) if placement is None
+            else transform_spheres(world.get_collision_spheres(name), action_4dof_to_mat4x4(particles[placement]))
+            for name, placement in source.items()
+        ]
+        return torch.cat(parts, dim=1) if parts else torch.empty(batch, 0, 4, device=world.device)
+
+    return fn
 
 
 class Rollout(TypedDict):

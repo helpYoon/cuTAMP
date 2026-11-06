@@ -19,7 +19,10 @@ handled at planning time in ``cutamp/t1_state.py``, and is a no-op (see
 """
 
 import copy
+import hashlib
 import math
+import os
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +37,6 @@ import trimesh
 from yourdfpy import URDF
 
 from curobo._src.util.config_io import load_yaml
-from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
 from curobo.kinematics import Kinematics, KinematicsCfg
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Scene
@@ -70,21 +72,6 @@ GRIPPER_JOINT_NAMES: Dict[str, Tuple[str, ...]] = {
     side: tuple(f"{side}_{link}" for link in ("Link1", "Link11", "Link2", "Link22")) for side in ("left", "right")
 }
 
-# Seed-IK CoM residual weights, tuned on the simplified model's 48-pose grid (branch ablation-baseline) and used
-# unchanged on the real legs. Constraints that bound them:
-# - Pose/joint-limit weights in the seed-IK solver are O(1); the planner's
-#   5e5 rollout weight is NOT transferable here.
-# - The fork re-solves the problems the seed LM fails with cuRobo's CoM-blind
-#   optimizer, so terms strong enough to hurt seed convergence lose centring
-#   on those problems (before known-bugs N7, one failure re-solved them all).
-# The sweeps on that grid: commits 473ec51 (support weight) and 5b9ae65 (center weight).
-T1_COM_IK_WEIGHT = 1.0
-
-# Pull-to-center term: cw * sum((com/half)^2), active everywhere (not just
-# the edge band).
-T1_COM_IK_CENTER_WEIGHT = 1e-3
-
-
 # =============================================================================
 # Planning models
 # =============================================================================
@@ -99,7 +86,7 @@ class Support(NamedTuple):
     link: str                            # the support frame, z = 0 on the sole plane
     center: Tuple[float, float]          # the region's centre in that frame
     gate_half: Tuple[float, float]       # per-frame trajectory gate
-    keyframe_half: Tuple[float, float]   # confs: masks, penalties, GN, seed IK, trajopt cost
+    keyframe_half: Tuple[float, float]   # confs: masks, penalties, GN, trajopt cost
 
 
 @dataclass(frozen=True, eq=False)        # identity hash: usable in lru_cache keys
@@ -188,9 +175,11 @@ def t1_curobo_cfg(model: T1Model) -> dict:
 
 def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
     """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: a Trunk
-    height floor, where the envelope sets one, raises ``base_j_z``'s lower limit, and each listed joint's range raises
-    its ``position_limit_clip``, which cuRobo takes off both ends of the URDF range (kinematics_loader.py:1119-1120).
-    Raises if a range leaves nothing of the soft range."""
+    height floor, where the envelope sets one, raises ``base_j_z``'s lower limit, and each listed joint's range cuts
+    its soft range (the URDF range less ``position_limit_clip`` at both ends, kinematics_loader.py:1119-1120) at
+    either end on its own. cuRobo reads a URDF joint's limits only from the URDF, so a cut joint's range is written into
+    a copy of it, clip 0, which ``urdf_path`` then names (meshes resolve against ``asset_root_path``). Raises if a range leaves
+    nothing of the soft range."""
     if envelope.trunk_height_min is not None:
         base_z = next((link for link in kinematics.get("extra_links", {}).values()
                        if link.get("joint_name") == "base_j_z"), None)
@@ -207,16 +196,31 @@ def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
     urdf_limits = {joint.get("name"): joint.find("limit") for joint in urdf.findall("joint")}
     cspace = kinematics["cspace"]
     clip = cspace["position_limit_clip"]
+    cut = False
     for joint, (lo, hi) in envelope.joint_ranges.items():
         i = cspace["joint_names"].index(joint)
-        hard_lo, hard_hi = (float(urdf_limits[joint].get(side)) for side in ("lower", "upper"))
-        # ponytail: the clip cuts both ends alike, so an off-centre range loses its wider side's excess (today's
-        # checkpoint's Waist, -0.50 to +0.58, would plan in +-0.50); route_a_start's Waist range is centred.
-        cut = max(clip[i], lo - hard_lo, hard_hi - hi)
-        if hard_lo + cut >= hard_hi - cut:
+        limit = urdf_limits[joint]
+        soft = (float(limit.get("lower")) + clip[i], float(limit.get("upper")) - clip[i])
+        new = (max(soft[0], lo), min(soft[1], hi))
+        if new[0] >= new[1]:
             raise ValueError(f"envelope {envelope.name!r}: {joint}'s range {(lo, hi)} leaves nothing of its soft range "
-                             f"{(hard_lo + clip[i], hard_hi - clip[i])}")
-        clip[i] = cut
+                             f"{soft}")
+        if new != soft:
+            limit.set("lower", repr(float(new[0])))
+            limit.set("upper", repr(float(new[1])))
+            clip[i] = 0.0
+            cut = True
+    if cut:  # per user and content, atomically: concurrent runs may write it at once; a file there not ours is replaced
+        data = ET.tostring(urdf)
+        path = Path(tempfile.gettempdir()) / f"cutamp-{os.getuid()}" / \
+            f"{Path(kinematics['urdf_path']).stem}-{envelope.name}-{hashlib.sha1(data).hexdigest()[:16]}.urdf"
+        if not path.exists() or path.read_bytes() != data:
+            path.parent.mkdir(mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        kinematics["urdf_path"] = str(path)
 
 
 def _check_joint_order(model: T1Model, joint_names) -> None:
@@ -307,6 +311,23 @@ def _trajopt_transition_dict_with_compute_com() -> dict:
     return d
 
 
+TRAJOPT_POSITION_BOUND_WEIGHT = 1e6
+"""Trajopt's joint-position bound cost weight, cuRobo's 1e4 times 100. The bound is a soft cost there (active within
+1% of a joint's range of it) and the success test a hard one; home's ankle pitch is the envelope's cap, so every
+return to home ends on it, and at 1e4 paths crossed it mid-motion (by up to 0.014 rad) and failed: 12 of 15 blocks_t1
+cases planned, 15 of 15 at 1e6 (2026-11-06)."""
+
+
+def _trajopt_optimizer_dict() -> dict:
+    """cuRobo's trajopt optimizer YAML with the position bound's weight at ``TRAJOPT_POSITION_BOUND_WEIGHT``."""
+    from curobo._src.util.config_io import resolve_config, join_path
+    from curobo.content import get_task_configs_path
+
+    d = resolve_config(join_path(get_task_configs_path(), "trajopt/lbfgs_bspline_trajopt.yml"))
+    d["rollout"]["cost_cfg"]["cspace_cfg"]["weight"][0] = TRAJOPT_POSITION_BOUND_WEIGHT  # position, vel, acc, jerk, tau
+    return d
+
+
 def get_t1_motion_planner(
     model: T1Model,
     scene: Scene,
@@ -332,7 +353,8 @@ def get_t1_motion_planner(
     COM projects outside the model's keyframe rectangle (``model.support``),
     on the kinematics kernel built with ``compute_com=True``.
 
-    The joint limits are bfm_wm's soft limits, with no further margin (call 17).
+    The joint limits are bfm_wm's soft limits cut by the envelope, with no further margin (call 17); trajopt bounds
+    them at ``TRAJOPT_POSITION_BOUND_WEIGHT``.
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
@@ -349,6 +371,7 @@ def get_t1_motion_planner(
         max_goalset=1,
         device_cfg=device_cfg,
         trajopt_transition_model=_trajopt_transition_dict_with_compute_com(),
+        trajopt_optimizer_configs=[_trajopt_optimizer_dict()],
     )
     planner = MotionPlanner(cfg)
     _check_joint_order(model, planner.kinematics.joint_names)
@@ -417,68 +440,6 @@ def get_t1_motion_planner(
         )
         add_extra_cost(planner, "trunk_tilt", TrunkTiltCost(tilt_cfg))
     return planner
-
-
-def get_t1_ik_solver(
-    model: T1Model,
-    scene: Scene,
-    *,
-    max_batch_size: int = 64,
-    device_cfg: DeviceCfg = None,
-) -> InverseKinematics:
-    """InverseKinematics solver for ``model``, every joint free, the base's six included.
-
-    Always built with every tool frame of the model's YAML (both hands, both
-    soles and the stance, ``t1_29dof.yml``). During particle-init IK calls
-    the multi-frame goal (``_build_multi_frame_goal``) holds the inactive
-    *hand* where the IK's start conf puts it (home, or a CoM-gate retry's
-    perturbed seed), so the inactive arm's joints
-    counter-rotate as the body bends (about 1 rad per approach in blocks_t1;
-    known-bugs B15). The cspace pin written beside it is a no-op
-    (``T1State.pin_for_arm_action``).
-
-    The seed-IK LM solver carries a CoM-over-support-rectangle residual
-    (cuRobo fork) that recruits the legs to keep the COM centered while
-    reaching. Its frame and box come from ``model.support``.
-    """
-    from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
-
-    if device_cfg is None:
-        device_cfg = DeviceCfg()
-    support = model.support
-    cfg_dict = copy.deepcopy(t1_curobo_cfg(model))
-    cfg = InverseKinematicsCfg.create(
-        robot=cfg_dict,
-        scene_model=scene,
-        num_seeds=32,
-        # The LBFGS polish stage keeps cuRobo's default schedule, 100
-        # iterations (lbfgs_ik.yml).
-        override_optimizer_num_iters={"particle": None, "lbfgs": None},
-        self_collision_check=True,
-        max_batch_size=max_batch_size,
-        device_cfg=device_cfg,
-        # CUDA graphs specialize for the call structure captured at first call
-        # and can't be re-captured ("CUDA graph reset is not available.").
-        # Particle init mixes calls with and without ``current_state``, so the
-        # solver runs without them.
-        use_cuda_graph=False,
-        # CoM-aware seed-IK residual (fork): pulls the CoM toward the support
-        # rectangle while the LM solver reaches the hand pose. The two weights
-        # turn it on (the fork derives compute_com from them).
-        seed_com_support_weight=T1_COM_IK_WEIGHT,
-        # ponytail: the fork's box has no centre, so it gets the largest frame-centred box inside
-        # the support rectangle. On the stance the rectangle is centred, so the box is the keyframe
-        # rectangle itself; give the fork a centre if an off-centre support needs that room. The
-        # real rectangle still gates every conf (com_polygon_cost).
-        seed_com_half_extents=[h - abs(c) for h, c in zip(support.keyframe_half, support.center)],
-        seed_com_inside_margin=COM_INSIDE_MARGIN,
-        seed_com_inside_weight=COM_INSIDE_WEIGHT,
-        seed_com_center_weight=T1_COM_IK_CENTER_WEIGHT,
-        seed_com_base_link_name=support.link,
-    )
-    ik_solver = InverseKinematics(cfg)
-    _check_joint_order(model, ik_solver.kinematics.joint_names)
-    return ik_solver
 
 
 # =============================================================================
