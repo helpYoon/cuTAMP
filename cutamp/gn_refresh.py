@@ -13,7 +13,7 @@ Between refreshes, each covered Conf already holds a near-answer for a pose
 target that Adam has moved by millimetres. Instead of re-running cuRobo's
 fixed-schedule IK pipeline (~170 ms per dep regardless of how converged the
 warm start is), project the stored q back onto the moved constraint manifold
-with damped Gauss-Newton on the 6-DOF pose residual:
+with damped Gauss-Newton; on the 6-DOF pose residual alone, its step is
 
     dq = J^T (J J^T + lambda I)^-1 [t* - t(q); rotvec(R* R(q)^T)]
 
@@ -23,28 +23,17 @@ of a refresh's deps in one call and makes no host syncs (the Adam loop is
 host-launch-bound), so its solves are the unchecked ``*_ex`` kernels.
 
 What this deliberately does NOT do (the full cuRobo solver covers these at
-particle init, at the final pre-check refresh, and in pose-only mode on the
-per-refresh fallback):
+particle init and at the final pre-check refresh):
 
 - no self/world-collision vetting inside the update (the rollout's hard
   constraints still score every conf every step, so violations surface in
   the satisfying mask rather than silently passing),
-- no CoM residual in ``gn_project`` — its pose-only-mode CALLER must AND
-  ``compute_com_polygon_mask`` into its merge gate so out-of-polygon rows
-  route to the CoM-aware cuRobo fallback (a pose-only gate demonstrably
-  locks in CoM decay: GN keeps pose converged while the conf drifts out of
-  the support polygon, and nothing else re-centers covered Confs during
-  Adam). An in-GN CoM residual row was A/B-rejected 2026-08-04 (null
-  runtime win, quality parity), but that version's CoM Jacobian had its x
-  row overwritten by the y row (see the clone in ``gn_project_balanced``),
-  so the rejection says nothing about a correct CoM row,
-- no basin hopping (strictly local; in pose-only mode, rows that don't
-  converge to checker tolerance are handed to the cuRobo fallback by the
-  caller).
+- no basin hopping (strictly local: a row that doesn't converge resumes at
+  the next refresh, and the final pre-check refresh repairs what is left).
 
-``gn_project_balanced`` is the balance-first variant behind
-``config.reik_balance_first``: CoM-in-polygon is a hard first level, the
-pose is least squares inside it, and joint-limit margins use what is left.
+``gn_project_balanced`` is the balance-first refresh: CoM-in-polygon is a
+hard first level, the pose is least squares inside it, and joint-limit
+margins use what is left.
 On the real legs, whose base columns are free, level 1 also holds both soles
 on the stance (12 rows, design 7.4), and ``gn_gate`` checks them; on a model
 whose envelope bounds the Trunk tilt it holds the tilt inside that bound too
@@ -61,7 +50,8 @@ import torch
 from curobo.types import JointState, Pose
 
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
-# fallback-rate or gn_fail instrumentation shows a fat non-converged band.
+# refresh records' gn_fail counts (opt_metrics["reik_refresh"]) show a fat
+# non-converged band.
 GN_ITERS = 3
 # Levenberg damping on JJ^T. Units mix metres/radians; at mm/mrad residuals
 # the conditioning effect dominates and the bias is negligible.
@@ -73,13 +63,13 @@ GN_DAMPING = 1e-4
 # never saturates it, so warm-start convergence stays effectively quadratic;
 # corrections big enough to ride the clamp belong to cuRobo or a later refresh.
 GN_STEP_CLAMP = 0.15
-# Balance-first only: a CoM axis outside the support rectangle (or that a step
+# A CoM axis outside the support rectangle (or that a step
 # would push out) is driven this far inside the edge, absorbing ~2-4 mm of
 # linearization error. Axes already inside are left alone: optimized confs
 # cluster within 1 cm of the edge, and a 1 cm activation band knocked 27/240
 # of them off their pose on the captured rows.
 GN_COM_MARGIN = 0.005
-# Balance-first only, level 3 (joint margins). Damping: a joint with little
+# Level 3 (joint margins). Damping: a joint with little
 # freedom left after balance and pose would otherwise demand a huge
 # compensating motion from the others; this caps it near 5x its own error.
 GN_MARGIN_DAMPING = 1e-2
@@ -249,44 +239,6 @@ def _tilt_after(q: torch.Tensor, dq: torch.Tensor, pitch: int, roll: int) -> tor
     """``[N, 1]``: the exact cosine of the Trunk tilt at ``q + dq``, which reads two columns."""
     from cutamp.joint_limit_cost import trunk_tilt_cosine
     return trunk_tilt_cosine(q + dq, pitch, roll).unsqueeze(-1)
-
-
-def gn_project(
-    world,
-    q_full: torch.Tensor,
-    world_from_ee: torch.Tensor,
-    arm: str,
-    iters: int = GN_ITERS,
-) -> torch.Tensor:
-    """Project ``q_full`` toward ``FK(q) == world_from_ee`` on ``arm``'s tool frame.
-
-    Args:
-        world: TAMPWorld (uses ``kinematics_jac``, the Jacobian-enabled FK).
-        q_full: ``[B, dof]`` full-cspace joint positions (not modified).
-        world_from_ee: ``[B, 4, 4]`` target tool poses.
-        arm: "left" / "right" — the OTHER arm and the virtual base are locked.
-            (cuRobo IK instead holds the other hand in the world; known-bugs B15.)
-
-    Returns:
-        ``[B, dof]`` projected joint positions, clamped to joint limits.
-        Convergence is NOT guaranteed — callers must measure the achieved
-        error (``_achieved_pose_errors``) and fall back for rows over
-        tolerance.
-    """
-    kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, (arm,))
-    eye6 = GN_DAMPING * torch.eye(6, device=q.device, dtype=q.dtype)
-
-    with torch.no_grad():
-        for _ in range(iters):
-            js = JointState.from_position(q, joint_names=joint_names)
-            state = kin.compute_kinematics(js)
-            r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
-            jjt = jac @ jac.transpose(-1, -2) + eye6                # [B, 6, 6]
-            y = torch.linalg.solve_ex(jjt, r.unsqueeze(-1))[0]
-            dq = (jac.transpose(-1, -2) @ y).squeeze(-1)            # [B, dof]
-            q = (q + dq.clamp(-GN_STEP_CLAMP, GN_STEP_CLAMP)).clamp(lower, upper)
-
-    return q
 
 
 def _prioritized_step(jac_com, com, active, com_target, jac, r, damping, jac_sole=None, r_sole=None,
@@ -552,9 +504,9 @@ def gn_project_balanced(
     world_from_ee: torch.Tensor,
     arms: str | Sequence[str],
     iters: int = GN_ITERS,
-    balance: bool = True,
 ) -> torch.Tensor:
-    """Balance-first variant of :func:`gn_project` (``config.reik_balance_first``).
+    """Project ``q_full`` (``[N, dof]`` full-cspace joint positions, not modified) toward
+    ``FK(q) == world_from_ee`` (``[N, 4, 4]`` target tool poses), balance first, on ``world.kinematics_jac``.
 
     Each step is a three-level hierarchy (Kanoun et al. T-RO 2011; Escande et
     al. IJRR 2014): (1) keep the CoM, in the support frame of
@@ -576,14 +528,14 @@ def gn_project_balanced(
     every particle's pick-conf Torso_Pitch ~3 mrad from its limit and kept a
     soft cost near 9.35 all run.
 
-    Differences from :func:`gn_project` beyond the hierarchy:
+    Beyond the hierarchy:
     - steps are scaled into the ``GN_STEP_CLAMP`` box (level 1 first, then
       the largest fractions of levels 2 and 3 that fit), not clipped per
       joint, so they keep their direction;
     - damping grows with the squared residual (Levenberg-Marquardt), which
       keeps steps sane where the two levels conflict;
     - the CoM Jacobian comes from autograd through cuRobo's FK, so each
-      iteration costs about two pose-only iterations.
+      iteration costs about two iterations on the pose residual alone.
 
     On a model with soles, every level's step also stays inside the joint
     limits (crossing joints frozen, then each level scaled), so the final
@@ -593,14 +545,13 @@ def gn_project_balanced(
     the hand. Together they hold the soles within 0.1 mm after each call on
     blocks_t1's pick confs, out-of-reach targets included.
 
-    Otherwise the contract is :func:`gn_project`'s, except that ``arms`` holds
-    one arm per IK dep (a bare ``str`` is one): rows are ``len(arms)`` equal
-    dep-major blocks, block ``i`` on ``arms[i]``'s tool frame and frozen columns.
+    ``arms`` holds one arm per IK dep (a bare ``str`` is one): rows are
+    ``len(arms)`` equal dep-major blocks, block ``i`` on ``arms[i]``'s tool
+    frame, with the other arm's columns frozen (cuRobo IK instead holds the
+    other hand in the world; known-bugs B15).
 
-    ``balance=False`` (the no-CoM ablation, ``config.enable_com_aware_ik``
-    off) drops level 1's CoM rows: a zero CoM and CoM Jacobian leave both CoM
-    active sets empty, so the step is levels 2-3 alone (beside the sole rows,
-    which a model with soles keeps), with no CoM autograd.
+    Returns ``[N, dof]`` projected joint positions, clamped to the joint
+    limits. Convergence is NOT guaranteed: :func:`gn_gate` measures it.
     """
     from cutamp.com_polygon_cost import _project_com_to_base
     from cutamp.cost_function import _device_const
@@ -615,30 +566,24 @@ def gn_project_balanced(
     bound = _tilt_bound(world.model)  # None when simplified, or without a tilt bound
 
     for _ in range(iters):
-        if balance:
-            q_g = q.detach().requires_grad_(True)
-            with torch.enable_grad():
-                state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
-                # The support frame is constant: the simplified base is pinned, and the real legs' stance hangs off
-                # the world, not off their free base. Held under no_grad, so CoM gradients never reach it (design 7.4).
-                with torch.no_grad():
-                    base_T = (
-                        state.tool_poses.get_link_pose(support.link, make_contiguous=True)
-                        .get_matrix().reshape(N, 4, 4)
-                    )
-                com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T, support.center)
-                # Clone: cuRobo's backward writes into a reused buffer, so without
-                # it the second grad call overwrites the x row with the y row.
-                jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
-                jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g)[0]
+        q_g = q.detach().requires_grad_(True)
+        with torch.enable_grad():
+            state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
+            # The support frame is constant: the simplified base is pinned, and the real legs' stance hangs off
+            # the world, not off their free base. Held under no_grad, so CoM gradients never reach it (design 7.4).
             with torch.no_grad():
-                jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
-                com = com_g.detach()
-        else:
-            with torch.no_grad():
-                state = kin.compute_kinematics(JointState.from_position(q, joint_names=joint_names))
-            com, jac_com = q.new_zeros(N, 2), q.new_zeros(N, 2, q.shape[-1])
+                base_T = (
+                    state.tool_poses.get_link_pose(support.link, make_contiguous=True)
+                    .get_matrix().reshape(N, 4, 4)
+                )
+            com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T, support.center)
+            # Clone: cuRobo's backward writes into a reused buffer, so without
+            # it the second grad call overwrites the x row with the y row.
+            jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
+            jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g)[0]
         with torch.no_grad():
+            jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
+            com = com_g.detach()
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
             r_sole, jac_sole = (
                 _sole_residual_and_jacobian(state, sole_idx, world.stance_soles, col_mask) if sole_idx else (None, None)

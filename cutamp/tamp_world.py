@@ -73,10 +73,7 @@ class TAMPWorld:
         collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
-        enable_com_aware_ik: bool = True,  # Matches config.enable_com_aware_ik's default (validated ON).
         ik_max_batch_size: int = 512,  # Must be >= config.num_particles (particle init solves full-batch).
-        reik_num_seeds: int = 0,  # >0: dedicated low-seed IK solver for coupled-reIK refreshes (see ik_refresh_solver).
-        reik_lbfgs_iters: int = 0,  # >0: LBFGS budget for the refresh solver (0 = cuRobo default 100).
     ):
         self.env = env
         self.device_cfg = device_cfg
@@ -101,18 +98,12 @@ class TAMPWorld:
         # seed), so that arm's joints counter-rotate as the body bends (the
         # per-DOF cspace pin is a no-op), and on the real legs both soles on
         # the stance (sole_goals). A conf whose IK fails starts at home
-        # instead (_store_ik_q). The balance-first refresh then moves the body
+        # instead (_store_ik_q). The GN refresh then moves the body
         # with the inactive arm's joints fixed, so that hand rides with the
         # trunk, most at those home confs (known-bugs B15).
         self.ik_solver: InverseKinematics = get_t1_ik_solver(
             self.model, self.world_cfg, device_cfg=device_cfg, max_batch_size=ik_max_batch_size,
-            enable_com_aware_ik=enable_com_aware_ik,
         )
-        self._reik_num_seeds = reik_num_seeds
-        self._reik_lbfgs_iters = reik_lbfgs_iters
-        self._ik_max_batch_size = ik_max_batch_size
-        self._enable_com_aware_ik = enable_com_aware_ik
-        self._ik_refresh_solver = None
         self._kinematics_jac = None
         self._bodies = None
         self._segment_torques = None
@@ -327,38 +318,8 @@ class TAMPWorld:
             self._site_kinematics[name] = Kinematics(self.kinematics.config, compute_com=True)
         return self._site_kinematics[name]
 
-    @property
-    def ik_refresh_solver(self) -> InverseKinematics:
-        """IK solver for coupled-reIK refreshes. With ``reik_num_seeds > 0``,
-        a dedicated low-seed solver (lazily built): refreshes are warm-started
-        from the current particle q, so they don't need the 32-seed global
-        search — cost scales ~linearly with seeds. Same capacity, collision
-        checking, and CoM-aware residual as the main solver, which stays in
-        use for particle init and the final pre-check refresh. Falls back to
-        the main solver when ``reik_num_seeds == 0``.
-        """
-        if self._reik_num_seeds <= 0:
-            return self.ik_solver
-        if self._ik_refresh_solver is None:
-            self._ik_refresh_solver = get_t1_ik_solver(
-                self.model, self.world_cfg, device_cfg=self.device_cfg,
-                max_batch_size=self._ik_max_batch_size,
-                enable_com_aware_ik=self._enable_com_aware_ik,
-                num_seeds=self._reik_num_seeds,
-                lbfgs_iters=self._reik_lbfgs_iters,
-                use_cuda_graph=True,  # captured by warmup_ik_solver(warm_refresh=True)
-            )
-        return self._ik_refresh_solver
-
-    def warmup_ik_solver(self, num_particles: int, warm_refresh: bool = False):
-        """Warmup the multi-frame IK solver with a multi-frame FK goal.
-
-        ``warm_refresh`` also captures the refresh solver's CUDA graphs with
-        the exact call the coupled-reIK fallback makes, when the world has one
-        (``reik_num_seeds > 0``; balance-first builds it with 0). It must run
-        before the planner thread starts: a capture concurrent with another
-        thread's CUDA calls fails.
-        """
+    def warmup_ik_solver(self, num_particles: int):
+        """Warmup the multi-frame IK solver with a multi-frame FK goal."""
         ik = self.ik_solver
         max_bs = getattr(ik.config, "max_batch_size", num_particles)
         n = min(num_particles, max_bs)
@@ -369,28 +330,11 @@ class TAMPWorld:
         poses = {f: kin_state.tool_poses.get_link_pose(f) for f in all_frames}
         goal = GoalToolPose.from_poses(poses, ordered_tool_frames=all_frames)
         _ = ik.solve_pose(goal_tool_poses=goal)
-        if warm_refresh and self._reik_num_seeds > 0:
-            from cutamp.particle_initialization import _ik_for_pose  # import cycle at module level
-
-            refresh = self.ik_refresh_solver
-            # On the simplified model the seed here is already the answer; on
-            # the real legs the soles' goals are the stance while q is a random
-            # conf. Either way the LBFGS stage must not exit early: it would stay
-            # uncaptured, and capture later, mid-optimization.
-            exit_early, refresh.config.exit_early = refresh.config.exit_early, False
-            try:
-                ee = kin_state.tool_poses.get_link_pose(
-                    self.tool_frame_for_arm("left"), make_contiguous=True,
-                ).get_matrix()
-                _ik_for_pose(self, ee, "left", current_state_q=q, ik=refresh, seed_from_current=True)
-            finally:
-                refresh.config.exit_early = exit_early
 
     def get_motion_planner(
         self,
         collision_activation_distance: float = 0.01,
         use_cuda_graph: bool = True,
-        enable_com_polygon: bool = True,
         enable_joint_limit_margin: bool = True,
     ) -> MotionPlanner:
         """Build a single MotionPlanner for the robot using the world's Scene
@@ -404,7 +348,6 @@ class TAMPWorld:
             use_cuda_graph=use_cuda_graph,
             collision_activation_distance=collision_activation_distance,
             device_cfg=self.device_cfg,
-            enable_com_polygon=enable_com_polygon,
             enable_joint_limit_margin=enable_joint_limit_margin,
         )
 

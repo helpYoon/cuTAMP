@@ -463,7 +463,6 @@ def get_t1_motion_planner(
     *,
     use_cuda_graph: bool = True,
     collision_activation_distance: float = 0.01,
-    enable_com_polygon: bool = True,
     enable_joint_limit_margin: bool = True,
     device_cfg: DeviceCfg = None,
 ) -> MotionPlanner:
@@ -481,12 +480,9 @@ def get_t1_motion_planner(
       and the CoM cost's support frame);
     - bounds the Trunk tilt (``TrunkTiltCost``, weight 1e5) when the envelope sets a maximum. Route A's sets none.
 
-    When ``enable_com_polygon`` is True (default), the planner gets a soft
-    cost penalizing trajectories whose mass-weighted COM projects outside the
-    model's keyframe rectangle (``model.support``). Note the kinematics
-    kernel always builds with ``compute_com=True`` (cheap, useful for any
-    future COM-based cost or diagnostic) — the flag only gates registration
-    of the cost itself.
+    The planner gets a soft cost penalizing trajectories whose mass-weighted
+    COM projects outside the model's keyframe rectangle (``model.support``),
+    on the kinematics kernel built with ``compute_com=True``.
 
     ``enable_joint_limit_margin`` (default True) additionally registers a
     hinge² cost that keeps the trajectory interior a soft 0.1 rad band away
@@ -531,44 +527,43 @@ def get_t1_motion_planner(
         })
         criteria[model.support.link] = ToolPoseCriteria.disabled()
         planner.update_tool_pose_criteria(criteria)
-    if enable_com_polygon:
-        from cutamp._curobo_internals import add_extra_cost
-        from cutamp.com_polygon_cost import (
-            ComOverBasePolygonCost,
-            ComOverBasePolygonCostCfg,
-            COM_INSIDE_MARGIN,
-            COM_INSIDE_WEIGHT,
-        )
-        # COM-polygon cost is a SAFETY BARRIER: zero cost anywhere inside
-        # the two-foot support rectangle, quadratic-in-distance penalty
-        # outside. ``body_home_posture`` is what keeps the body near upright
-        # at the joint level — having COM ALSO try to pull toward center
-        # produced fighting costs (COM "lean back to recenter" vs body "stay
-        # upright"), which manifested as the trunk pitching backward when
-        # arms reach forward. Boundary-only shape lets body_home_posture
-        # dictate posture; COM only intervenes if the body actually drifts
-        # to a tipping configuration. Bumped weight 1e5 → 5e5 to push back
-        # harder on excursions without re-introducing the inside barrier.
-        # Inside-barrier ON for the planner rollouts too: keyframe-only COM
-        # filter (Adam side) is satisfied, but the saved trajectory's mid-
-        # waypoint COM was excursing up to 5cm out of polygon (89% inside,
-        # ~58/528 frames out, peak penalty 2.4e-3 in place segments). Adding
-        # the inside-barrier here gives the trajopt LBFGS a gradient pull
-        # from inside the polygon edge band toward center, flattening the
-        # mid-trajectory bumps. The earlier concern (this fighting
-        # body_home_posture) is validated by retesting; if trunk pitches
-        # back too much we lower inside_weight from 1.0.
-        rollout_device_cfg = planner.trajopt_solver.optimizer_rollouts[0].device_cfg
-        cost_cfg = ComOverBasePolygonCostCfg(
-            weight=[5.0e5],
-            device_cfg=rollout_device_cfg,
-            half_extents=torch.tensor(model.support.keyframe_half),
-            inside_margin=COM_INSIDE_MARGIN,
-            inside_weight=COM_INSIDE_WEIGHT,
-            base_link_name=model.support.link,
-            center=model.support.center,
-        )
-        add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
+    from cutamp._curobo_internals import add_extra_cost
+    from cutamp.com_polygon_cost import (
+        ComOverBasePolygonCost,
+        ComOverBasePolygonCostCfg,
+        COM_INSIDE_MARGIN,
+        COM_INSIDE_WEIGHT,
+    )
+    # COM-polygon cost is a SAFETY BARRIER: zero cost anywhere inside
+    # the two-foot support rectangle, quadratic-in-distance penalty
+    # outside. ``body_home_posture`` is what keeps the body near upright
+    # at the joint level — having COM ALSO try to pull toward center
+    # produced fighting costs (COM "lean back to recenter" vs body "stay
+    # upright"), which manifested as the trunk pitching backward when
+    # arms reach forward. Boundary-only shape lets body_home_posture
+    # dictate posture; COM only intervenes if the body actually drifts
+    # to a tipping configuration. Bumped weight 1e5 → 5e5 to push back
+    # harder on excursions without re-introducing the inside barrier.
+    # Inside-barrier ON for the planner rollouts too: keyframe-only COM
+    # filter (Adam side) is satisfied, but the saved trajectory's mid-
+    # waypoint COM was excursing up to 5cm out of polygon (89% inside,
+    # ~58/528 frames out, peak penalty 2.4e-3 in place segments). Adding
+    # the inside-barrier here gives the trajopt LBFGS a gradient pull
+    # from inside the polygon edge band toward center, flattening the
+    # mid-trajectory bumps. The earlier concern (this fighting
+    # body_home_posture) is validated by retesting; if trunk pitches
+    # back too much we lower inside_weight from 1.0.
+    rollout_device_cfg = planner.trajopt_solver.optimizer_rollouts[0].device_cfg
+    cost_cfg = ComOverBasePolygonCostCfg(
+        weight=[5.0e5],
+        device_cfg=rollout_device_cfg,
+        half_extents=torch.tensor(model.support.keyframe_half),
+        inside_margin=COM_INSIDE_MARGIN,
+        inside_weight=COM_INSIDE_WEIGHT,
+        base_link_name=model.support.link,
+        center=model.support.center,
+    )
+    add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     if model.envelope is not None and model.envelope.trunk_tilt_max is not None:
         from cutamp._curobo_internals import add_extra_cost
         from cutamp.joint_limit_cost import TrunkTiltCost, TrunkTiltCostCfg
@@ -634,10 +629,6 @@ def get_t1_ik_solver(
     scene: Scene,
     *,
     max_batch_size: int = 64,
-    enable_com_aware_ik: bool = True,
-    num_seeds: int = 32,
-    lbfgs_iters: int = 0,
-    use_cuda_graph: bool = False,
     device_cfg: DeviceCfg = None,
 ) -> InverseKinematics:
     """InverseKinematics solver for ``model``, its base locked when ``model.lock_base``.
@@ -656,10 +647,9 @@ def get_t1_ik_solver(
     particle init. Legs / torso / waist / arms remain free. The real legs'
     six base joints stay free.
 
-    When ``enable_com_aware_ik`` is True (default), the seed-IK LM solver
-    carries a CoM-over-support-rectangle residual (cuRobo fork) that
-    recruits the legs to keep the COM centered while reaching. Its frame and
-    box come from ``model.support``.
+    The seed-IK LM solver carries a CoM-over-support-rectangle residual
+    (cuRobo fork) that recruits the legs to keep the COM centered while
+    reaching. Its frame and box come from ``model.support``.
     """
     from cutamp.com_polygon_cost import COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT
 
@@ -672,28 +662,22 @@ def get_t1_ik_solver(
     cfg = InverseKinematicsCfg.create(
         robot=cfg_dict,
         scene_model=scene,
-        num_seeds=num_seeds,
-        # The LBFGS polish stage defaults to 100 iterations (lbfgs_ik.yml) —
-        # sized for cold global solves. Warm-started refresh solvers pass a
-        # smaller count; 0 keeps the cuRobo default schedule.
-        override_optimizer_num_iters=(
-            {"particle": None, "lbfgs": lbfgs_iters} if lbfgs_iters > 0
-            else {"particle": None, "lbfgs": None}
-        ),
+        num_seeds=32,
+        # The LBFGS polish stage keeps cuRobo's default schedule, 100
+        # iterations (lbfgs_ik.yml).
+        override_optimizer_num_iters={"particle": None, "lbfgs": None},
         self_collision_check=True,
         max_batch_size=max_batch_size,
         device_cfg=device_cfg,
         # CUDA graphs specialize for the call structure captured at first call
         # and can't be re-captured ("CUDA graph reset is not available.").
         # Particle init mixes calls with and without ``current_state``, so the
-        # main solver runs without them; the refresh solver always gets the
-        # same full-batch warm-seeded call and opts in.
-        use_cuda_graph=use_cuda_graph,
+        # solver runs without them.
+        use_cuda_graph=False,
         # CoM-aware seed-IK residual (fork): pulls the CoM toward the support
         # rectangle while the LM solver reaches the hand pose. The two weights
-        # are the sole on/off gate (the fork derives compute_com from them);
-        # geometry params are passed unconditionally.
-        seed_com_support_weight=(T1_COM_IK_WEIGHT if enable_com_aware_ik else 0.0),
+        # turn it on (the fork derives compute_com from them).
+        seed_com_support_weight=T1_COM_IK_WEIGHT,
         # ponytail: the fork's box has no centre, so it gets the largest frame-centred box inside
         # the support rectangle: on the simplified model, shifted 1 cm ahead of the base, the box
         # is 2 cm short at the toe; give the fork a centre if seeds need that room. On the real
@@ -702,7 +686,7 @@ def get_t1_ik_solver(
         seed_com_half_extents=[h - abs(c) for h, c in zip(support.keyframe_half, support.center)],
         seed_com_inside_margin=COM_INSIDE_MARGIN,
         seed_com_inside_weight=COM_INSIDE_WEIGHT,
-        seed_com_center_weight=(T1_COM_IK_CENTER_WEIGHT if enable_com_aware_ik else 0.0),
+        seed_com_center_weight=T1_COM_IK_CENTER_WEIGHT,
         seed_com_base_link_name=support.link,
     )
     ik_solver = InverseKinematics(cfg)

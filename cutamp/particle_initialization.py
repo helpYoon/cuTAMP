@@ -81,8 +81,6 @@ def _ik_for_pose(
     arm: Optional[str],
     *,
     current_state_q: Optional[torch.Tensor] = None,
-    ik=None,
-    seed_from_current: bool = False,
 ):
     """Solve IK for a batch of EE poses, targeting the active arm's tool frame.
 
@@ -104,15 +102,9 @@ def _ik_for_pose(
     anchors the inactive-frame goal at a non-home pose. cuRobo's
     ``solve_pose`` also makes it the first optimization seed when no
     ``seed_config`` is given (fork solver_ik.py:735-736; the remaining seeds
-    are random), so ``seed_from_current=True``, which passes that seed
-    explicitly, states the warm start rather than adding it. Used by the
-    coupled-reIK refresh, where the previous solution is a near-answer.
-
-    ``ik`` overrides the solver (default ``world.ik_solver``) — the refresh
-    path passes ``world.ik_refresh_solver``.
+    are random).
     """
-    if ik is None:
-        ik = world.ik_solver
+    ik = world.ik_solver
     active_frame = world.tool_frame_for_arm(arm)
     if active_frame not in ik.kinematics.tool_frames:
         raise RuntimeError(
@@ -146,11 +138,8 @@ def _ik_for_pose(
                     ik, model.joint_names[model.right_arm if arm == "left" else model.left_arm],
                 ),
             )
-        seed_config = (
-            current_state.position.unsqueeze(1) if seed_from_current else None
-        )
         return ik.solve_pose(
-            goal_tool_poses=goal, current_state=current_state, seed_config=seed_config,
+            goal_tool_poses=goal, current_state=current_state, seed_config=None,
         )
     finally:
         restore_cspace_target_dof_weight([ik], snapshot)
@@ -302,17 +291,6 @@ def _ik_for_pose_com_safe(
     return result
 
 
-def _ik_for_pose_no_gate(world, world_from_ee, arm, *, context: str = ""):
-    """Ablation (enable_com_init_gate=False): plain IK, no CoM gate or
-    retries — layer L2 off. Same call shape as _ik_for_pose_com_safe."""
-    return _ik_for_pose(world, world_from_ee, arm)
-
-
-def _select_init_ik(config):
-    """The init-IK entry point for this run's config (L2 on/off)."""
-    return _ik_for_pose_com_safe if config.enable_com_init_gate else _ik_for_pose_no_gate
-
-
 def _achieved_pose_errors(
     world: TAMPWorld, q_full: torch.Tensor, world_from_ee: torch.Tensor, arm: str,
 ):
@@ -453,7 +431,7 @@ class ParticleInitializer:
                 obj_from_grasp = obj_from_grasp[good_idxs]
                 world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                ik_result = _select_init_ik(config)(
+                ik_result = _ik_for_pose_com_safe(
                     world, world_from_ee, arm,
                     context=f"pick({arm})",
                 )
@@ -498,7 +476,7 @@ class ParticleInitializer:
                 particles[placement] = sampled_placements
                 obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                ik_result = _select_init_ik(config)(
+                ik_result = _ik_for_pose_com_safe(
                     world, world_from_ee, arm,
                     context=f"place({arm})",
                 )

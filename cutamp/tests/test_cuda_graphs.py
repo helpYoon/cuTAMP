@@ -1,4 +1,4 @@
-"""``--cuda_graphs``: the balance-first Adam step and re-IK refresh, captured
+"""``--cuda_graphs``: the Adam step and the balance-first re-IK refresh, captured
 as G_step and G_refresh and replayed, each replay against its eager counterpart bitwise."""
 
 import gc
@@ -31,15 +31,14 @@ def test_uses_cuda_graphs():
 
 
 def test_cli_defaults_on(monkeypatch):
-    # --reik_balance_first and --cuda_graphs restate the defaults; --no_cuda_graphs turns the graphs off.
+    # --cuda_graphs restates the default; --no_cuda_graphs turns the graphs off.
     import cutamp.scripts.run_cutamp as rc
     seen = []
     monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
-    for argv, balance_first, graphs in (([], True, True), (["--reik_balance_first", "--cuda_graphs"], True, True),
-                                        (["--no_cuda_graphs"], True, False)):
+    for argv, graphs in (([], True), (["--cuda_graphs"], True), (["--no_cuda_graphs"], False)):
         monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
         rc.entrypoint()
-        assert (seen[-1].reik_balance_first, seen[-1].cuda_graphs) == (balance_first, graphs), argv
+        assert seen[-1].cuda_graphs == graphs, argv
 
 
 def test_cli_reaches_cutamp_demo(monkeypatch):
@@ -111,8 +110,8 @@ def test_guard_trips_on_resize():
 
 
 def _graph_config(**kw):
-    return TAMPConfiguration(**{**dict(num_particles=64, early_stop_patience=0, reik_balance_first=True,
-                                       cuda_graphs=True, enable_visualizer=False), **kw})
+    return TAMPConfiguration(**{**dict(num_particles=64, early_stop_patience=0, cuda_graphs=True,
+                                       enable_visualizer=False), **kw})
 
 
 @needs_cuda

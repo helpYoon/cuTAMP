@@ -1,6 +1,6 @@
-"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the ``--robot`` switch and
-its refusals, the support rectangles, and the blocks_t1 world on the real legs, standing on the home stance. The GPU
-tests share conftest's module-scoped ``real_world``: one world per module."""
+"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the ``--robot`` switch, the
+soft-cost default and the removed ablation options, the support rectangles, and the blocks_t1 world on the real legs,
+standing on the home stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
 
 import re
 import xml.etree.ElementTree as ET
@@ -142,11 +142,49 @@ def test_real_legs_are_the_default(monkeypatch):
     assert TAMPConfiguration().robot == seen[0].robot == "real_legs" and DEFAULT_MODEL is REAL_LEGS
 
 
-def test_soft_cost_default_by_robot():
-    real_default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
-    assert TAMPConfiguration().soft_cost == TAMPConfiguration(robot="real_legs").soft_cost == real_default
-    assert TAMPConfiguration(robot="real_legs", soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
+def _cli_config(monkeypatch, *argv) -> TAMPConfiguration:
+    """The TAMPConfiguration run_cutamp's CLI builds from ``argv``, with the run itself stubbed out."""
+    import sys
+
+    import cutamp.scripts.run_cutamp as rc
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
+    monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
+    rc.entrypoint()
+    return seen[-1]
+
+
+def test_soft_cost_default_and_choice(monkeypatch):
+    # CostReducer sums the soft costs in this order, so the order is part of a same-seed run's result.
+    default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
+    assert TAMPConfiguration().soft_cost == default and _cli_config(monkeypatch).soft_cost == default
+    assert TAMPConfiguration(soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
+    assert _cli_config(monkeypatch, "--soft_cost", "joint_limit_margin").soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
+
+
+#: The paper's ablation options, which main fixes at the full system (they live on branch ablation-baseline): each
+#: CLI spelling, with the argument it took, and each config field at its old default.
+REMOVED_CLI_OPTIONS = (["--no_coupled_reik"], ["--reik_balance_first"], ["--no_reik_balance_first"],
+                       ["--no_enable_com_polygon"], ["--no_enable_com_aware_ik"], ["--no_com_all"], ["--force_adam"],
+                       ["--soft_in_adam", "always"])
+REMOVED_FIELDS = {"enable_com_polygon": True, "enable_com_aware_ik": True, "enable_com_init_gate": True,
+                  "enable_com_hard_constraint": True, "coupled_reik": True, "force_adam": False,
+                  "reik_balance_first": True, "soft_in_adam": "auto", "reik_num_seeds": 4, "reik_lbfgs_iters": 40}
+
+
+@pytest.mark.parametrize("argv", REMOVED_CLI_OPTIONS, ids=lambda argv: argv[0])
+def test_removed_options_are_rejected(monkeypatch, capsys, argv):
+    # An old command line fails loudly, even one that only restated a default.
+    with pytest.raises(SystemExit) as exit_info:
+        _cli_config(monkeypatch, *argv)
+    assert exit_info.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", REMOVED_FIELDS)
+def test_removed_fields_are_rejected(name):
+    with pytest.raises(TypeError, match=name):
+        TAMPConfiguration(**{name: REMOVED_FIELDS[name]})
 
 
 def test_joint_limit_margin_is_registered_and_weighted():
@@ -252,16 +290,6 @@ def test_joint_limit_margin_gradient_restores_and_skips_the_initial_confs():
     assert q_pick.grad is not None and bool((q_pick.grad[:, WAIST] < 0.0).all())
     others = [k for k in range(len(REAL_LEGS.joint_names)) if k != WAIST]
     assert torch.all(q_pick.grad[:, others] == 0.0)  # the untouched joints get no gradient
-
-
-@pytest.mark.parametrize("kw", [dict(enable_com_polygon=False), dict(enable_com_aware_ik=False),
-    dict(enable_com_init_gate=False), dict(enable_com_hard_constraint=False), dict(coupled_reik=False),
-    dict(force_adam=True), dict(reik_balance_first=False)])
-def test_real_legs_refuses_ablation_paths(kw):
-    validate_tamp_config(TAMPConfiguration(robot="real_legs"))
-    validate_tamp_config(TAMPConfiguration(robot="simplified", **kw))
-    with pytest.raises(ValueError, match="real_legs"):
-        validate_tamp_config(TAMPConfiguration(robot="real_legs", **kw))
 
 
 def simplified_reads(pattern: re.Pattern, allowed: set) -> list:

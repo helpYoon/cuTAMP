@@ -113,32 +113,12 @@ def entrypoint():
 
     # Soft costs
     parser.add_argument(
-        "--no_coupled_reik", dest="coupled_reik", action="store_false",
-        help="Disable re-IK-coupled Adam (default: on). Coupled mode is required for "
-             "pose-class soft costs (place_close_to_base, dist_from_origin, ...) on T1's 21-DOF cspace.",
-    )
-    parser.set_defaults(coupled_reik=_defaults.coupled_reik)
-    parser.add_argument(
         "--reik_interval", type=int, default=_defaults.reik_interval,
-        help="Re-IK cadence K when --coupled_reik is on. Smaller K bounds KinematicConstraint drift but does more IK calls.",
+        help="Periodic IK projection cadence K. Smaller K bounds KinematicConstraint drift but does more IK calls.",
     )
-    # --reik_balance_first and --cuda_graphs only restate the defaults; the
-    # paper's reproduction commands pass them.
-    parser.add_argument(
-        "--reik_balance_first", dest="reik_balance_first", action="store_true",
-        help="Balance-first GN refresh (CoM in polygon, then pose, then joint-limit margins), "
-             "persistent iterates, no cuRobo during Adam. On by default.",
-    )
-    parser.add_argument(
-        "--no_reik_balance_first", dest="reik_balance_first", action="store_false",
-        help="Use the pose-only GN refresh with cuRobo fallbacks instead; joint-limit margins "
-             "are then not enforced on covered Confs.",
-    )
-    parser.set_defaults(reik_balance_first=_defaults.reik_balance_first)
     parser.add_argument(
         "--cuda_graphs", dest="cuda_graphs", action="store_true",
-        help="Replay the balance-first Adam step and re-IK refresh as CUDA graphs. On by default; "
-             "runs without coupled re-IK or balance-first, or with align_yaw, stay eager.",
+        help="Replay the Adam step and re-IK refresh as CUDA graphs. On by default; align_yaw runs stay eager.",
     )
     parser.add_argument(
         "--no_cuda_graphs", dest="cuda_graphs", action="store_false",
@@ -184,43 +164,8 @@ def entrypoint():
         help="Whether to plan for full motions after using cuTAMP.",
     )
     parser.add_argument(
-        "--no_enable_com_polygon",
-        dest="enable_com_polygon",
-        action="store_false",
-        help="Disable the COM-over-base-polygon soft cost on the motion planner. "
-             "By default the cost is enabled (5e5 weight) and keeps the planner's "
-             "configurations from tipping over the wheelbase.",
-    )
-    parser.set_defaults(enable_com_polygon=_defaults.enable_com_polygon)
-    parser.add_argument(
-        "--no_enable_com_aware_ik",
-        dest="enable_com_aware_ik",
-        action="store_false",
-        help="Disable the CoM-aware seed-IK residual (cuRobo fork). By default "
-             "IK trades hand-pose vs COM and recruits the legs to center the "
-             "COM (validated 2026-06-09; see config.enable_com_aware_ik).",
-    )
-    parser.set_defaults(enable_com_aware_ik=_defaults.enable_com_aware_ik)
-    parser.add_argument(
-        "--no_com_all", action="store_true",
-        help="Ablation umbrella: disable ALL CoM machinery — seed-IK residual "
-             "(L1), init gate+retries (L2), ComPolygon hard constraint (L3), "
-             "trajopt cost (L5). Equivalent to the four individual flags.",
-    )
-    parser.add_argument(
-        "--force_adam", action="store_true",
-        help="Run Phase 1 even when init already satisfies with coupled_reik "
-             "off (fairness fix for the ablation baseline).",
-    )
-    parser.add_argument(
-        "--soft_in_adam", choices=["auto", "always"], default=None,
-        help="'always' puts soft costs in the Adam loss even without "
-             "coupled_reik (upstream-faithful attempt for -reIK arms).",
-    )
-    parser.add_argument(
         "--seed", type=int, default=None,
-        help="torch.manual_seed for reproducible sampling (ablation study "
-             "uses seeds 0..4).",
+        help="torch.manual_seed for reproducible sampling.",
     )
 
     # Visualization and logging
@@ -272,19 +217,11 @@ def entrypoint():
         lr=args.lr,
         conf_lr=args.conf_lr,
         max_loop_dur=args.max_duration,
-        coupled_reik=args.coupled_reik,
         reik_interval=args.reik_interval,
-        reik_balance_first=args.reik_balance_first,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,
         num_initial_plans=args.num_initial_plans,
         curobo_plan=args.motion_plan,
-        enable_com_polygon=args.enable_com_polygon and not args.no_com_all,
-        enable_com_aware_ik=args.enable_com_aware_ik and not args.no_com_all,
-        enable_com_init_gate=not args.no_com_all,
-        enable_com_hard_constraint=not args.no_com_all,
-        force_adam=args.force_adam,
-        soft_in_adam=args.soft_in_adam or TAMPConfiguration.soft_in_adam,
         enable_visualizer=not args.disable_visualizer,
         opt_viz_interval=args.viz_interval,
         viz_robot_mesh=not args.disable_robot_mesh,

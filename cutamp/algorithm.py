@@ -319,16 +319,12 @@ def setup_cutamp(
             collision_activation_distance=0.0,
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
-            enable_com_aware_ik=config.enable_com_aware_ik,
             ik_max_batch_size=config.num_particles,
-            # Balance-first runs no cuRobo during Adam, so it needs no refresh solver.
-            reik_num_seeds=0 if config.reik_balance_first else config.reik_num_seeds,
-            reik_lbfgs_iters=config.reik_lbfgs_iters,
         )
         check_tamp_world_not_in_collision(world)
 
     with timer.time("warmup_ik_solver", log_callback=_log.info):
-        world.warmup_ik_solver(config.num_particles, warm_refresh=config.coupled_reik)
+        world.warmup_ik_solver(config.num_particles)
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -440,11 +436,9 @@ def run_cutamp(
     if config.curobo_plan:
         # Default to False so a run that never reaches motion planning
         # (e.g. no satisfying particles found for any skeleton) still
-        # reports motion_plan_success=False instead of an absent key —
-        # an absent key drops the run from the analyzer's mean entirely,
-        # biasing the per-cell denominator toward runs that got far
-        # enough to attempt planning. Runs without curobo_plan never had
-        # a chance to plan, so the key stays absent for them.
+        # reports motion_plan_success=False instead of an absent key, so
+        # every curobo_plan run reports it. Runs without curobo_plan never
+        # had a chance to plan, so the key stays absent for them.
         overall_metrics["motion_plan_success"] = False
         overall_metrics["motion_plan_failures"] = []  # every failed candidate's message, over the skeletons planned
     curobo_plan = None

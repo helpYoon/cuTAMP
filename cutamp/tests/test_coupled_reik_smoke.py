@@ -8,8 +8,8 @@ from cutamp.tests.conftest import needs_cuda
 @needs_cuda
 @pytest.mark.parametrize("cuda_graphs", [False, True])
 def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
-    """Run cutamp_demo with coupled re-IK for a few Adam steps: no exception, the balance-first
-    refresh runs, and no cuRobo refresh solver is built."""
+    """Run cutamp_demo with coupled re-IK for a few Adam steps: no exception, and the balance-first
+    refresh runs on the run's world."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
     import os
@@ -18,13 +18,13 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.scripts.run_cutamp import cutamp_demo
 
-    seen = []  # per refresh call: (function, its world, that world's refresh solver at the call)
+    seen = []  # per refresh call: (function, its world)
 
     def spy(name, world_arg):
         original = getattr(optimize_plan, name)
 
         def counted(*args, **kwargs):
-            seen.append((name, args[world_arg], args[world_arg]._ik_refresh_solver))
+            seen.append((name, args[world_arg]))
             return original(*args, **kwargs)
 
         monkeypatch.setattr(optimize_plan, name, counted)
@@ -34,7 +34,6 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     config = TAMPConfiguration(
         num_particles=8,
         num_opt_steps=5,
-        coupled_reik=True,
         reik_interval=2,
         cuda_graphs=cuda_graphs,
         soft_cost=["place_close_to_base"],
@@ -52,11 +51,8 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     assert opt_files, "no optimization metrics written"
     opt_metrics = json.load(open(opt_files[-1]))
 
-    # Measure-only metrics, recorded in every run.
-    assert "num_satisfying_com_feasible" in opt_metrics
+    # Measure-only metric, recorded in every run.
     assert "best_com_margin" in opt_metrics
-    assert "best_soft_cost_com_feasible" in opt_metrics
-    assert opt_metrics["num_satisfying_com_feasible"] <= opt_metrics["num_satisfying_final"]
     # What Adam added over step 0 (the IK init), and whether the reported particles are a restored
     # snapshot. Gain 0 with a restore means the run reports its IK init (known-bugs B13).
     assert opt_metrics["adam_gain"] == opt_metrics["best_num_satisfying"] - opt_metrics["num_satisfying"][0] >= 0
@@ -75,14 +71,10 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     assert records, "no reik_refresh records"
     assert seen, "no refresh reached the spies"
     world = seen[0][1]
-    assert all(w is world for _, w, _ in seen)
+    assert all(w is world for _, w in seen)
     # Drift needs a previous target: every record but the first refresh's has it.
     first = min(r["step"] for r in records)
     assert all(("pos_drift_mean" in r) == (r["step"] != first) for r in records)
-    # No refresh solver is built, and the property hands back the main one (no lazy mid-run capture).
-    assert world._reik_num_seeds == 0
-    assert world._ik_refresh_solver is None
-    assert world.ik_refresh_solver is world.ik_solver
 
 
 @needs_cuda

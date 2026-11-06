@@ -37,8 +37,8 @@ class _FKQuatGrad(torch.autograd.Function):
     in quaternion_util.cuh) but dots the result with world-frame joint axes, which need
     Omega = 0.5 (-g_w v + w g_v + v x g_v). Passing g' = 2 q (x) (0, Omega) makes its decode return Omega exactly
     (for unit q, at any angle). cuRobo's own pose costs already encode this way; only PyTorch autograd needs it.
-    If the fork's decode is ever changed to the world-frame formula, drop this: test_fk_orientation_grad.py would
-    then fail on the double correction.
+    If the fork's decode is ever changed to the world-frame formula, drop this:
+    cutamp/tests/test_real_legs_fk_orientation_grad.py would then fail on the double correction.
     """
 
     @staticmethod

@@ -21,7 +21,7 @@ def _install_recorder(monkeypatch) -> dict:
     """Record one optimize call into ``box["rec"]``, the same in both modes and with no eager body
     (a replay bypasses ``_StepBody.__call__``, so the per-step hook is ``_BestSnapshot.update``): each
     step's packed scalars, particles and grads, the final refresh's particles, and its ``_ik_for_pose``
-    results (balance-first calls it only there)."""
+    results (the optimizer calls it only there)."""
     import cutamp.optimize_plan as op
     box = {"rec": None}
     update, refresh, ik = op._BestSnapshot.update, op.ParticleOptimizer._refresh_ik_deps, op._ik_for_pose

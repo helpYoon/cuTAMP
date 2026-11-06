@@ -110,7 +110,7 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_function import CostFunction, _per_object_sum
     from cutamp.cost_reduction import CostReducer
-    from cutamp.optimize_plan import _adam_consider_types
+    from cutamp.optimize_plan import ADAM_CONSIDER_TYPES
     from cutamp.rollout import RolloutFunction
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 
@@ -127,7 +127,7 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
         with torch.no_grad():
             cost_dict = cost_fn(rollout_fn(particles), particles)
             out = {(c, n): v.clone() for c, e in cost_dict.items() for n, v in e["values"].items()}
-            out["costs"] = reducer(cost_dict, consider_types=_adam_consider_types(config)).clone()
+            out["costs"] = reducer(cost_dict, consider_types=ADAM_CONSIDER_TYPES).clone()
             out["mask"] = checker.get_mask(cost_dict, verbose=False).clone()
         return out
 
@@ -164,7 +164,7 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
     def grad_outputs():  # with grad, on fresh leaf clones: TorchScript specializes on requires_grad
         leaves = {k: v.detach().clone().requires_grad_(v.is_floating_point()) for k, v in particles.items()}
         cost_dict = cost_fn(rollout_fn(leaves), leaves)
-        costs = reducer(cost_dict, consider_types=_adam_consider_types(config))
+        costs = reducer(cost_dict, consider_types=ADAM_CONSIDER_TYPES)
         out = {(c, n): v.detach().clone() for c, e in cost_dict.items() for n, v in e["values"].items()}
         out["costs"] = costs.detach().clone()
         out["mask"] = checker.get_mask(cost_dict, verbose=False).clone()

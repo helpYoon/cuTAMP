@@ -415,7 +415,7 @@ class CostFunction:
         gradient toward COM-feasibility instead of a dead-weight 0/1
         Boolean.
         """
-        if not self.config.enable_com_polygon or self._particles is None:
+        if self._particles is None:
             return None
 
         pens = self._com_polygon_penalties()
@@ -577,8 +577,7 @@ class CostFunction:
 
         # COM-over-base-polygon hard filter (mirrors Collision)
         com_polygon_cost = self.com_polygon_constraint()
-        if self.config.enable_com_hard_constraint:
-            add_cost(ComPolygon.type, com_polygon_cost)
+        add_cost(ComPolygon.type, com_polygon_cost)
 
         # Soft costs
         if self.config.soft_cost:

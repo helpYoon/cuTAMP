@@ -95,8 +95,8 @@ def test_retry_keeps_sole_goals_on_the_stance(real_world):
 
     # Off the stance: the old inline retry seed (_inline_seed) holds the base and noises the legs, so its soles
     # swing off the stance. Only _ik_for_pose's stance goals (fixed=world.sole_goals(...)) bring them back: goals
-    # from FK at the seed would hold them there. The refresh's cuRobo fallback and final repair (optimize_plan.py)
-    # rely on this, since they start from particles Adam has moved.
+    # from FK at the seed would hold them there. The final repair (optimize_plan.py) relies on this, since it starts
+    # from particles Adam has moved.
     torch.manual_seed(0)
     off = _inline_seed(world, 4, "left", 0.3)
     pos, _ = _sole_errors(world, off)
@@ -197,7 +197,7 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
     from cutamp.cost_function import CostFunction
     from cutamp.rollout import RolloutFunction
     from cutamp.scripts.utils import default_constraint_to_tol
-    from cutamp.task_planning.constraints import Motion
+    from cutamp.task_planning.constraints import ComPolygon, Motion
     from cutamp.tests.conftest import clone_particles
     skeleton, particles = real_plan
     retracts = [conf for _, conf in _ops(skeleton, "retract")]
@@ -210,6 +210,7 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
         particles[retracts[0]][1, z] = real_world.joint_limits[0][z] - 0.05  # under the base's floor, the legs' reach
         cost_dict = CostFunction(skeleton, real_world, config)(
             RolloutFunction(skeleton, real_world, config)(particles), particles)
+    assert ComPolygon.type in cost_dict  # the CoM is a hard constraint at every conf
     values = cost_dict[Motion.type]["values"]
     joint_limit, self_collision = values["retract_joint_limit"], values["retract_self_collision"]
     assert joint_limit.shape == self_collision.shape == (64, len(retracts))

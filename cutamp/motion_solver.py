@@ -319,7 +319,7 @@ def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
     thread, and cuRobo captures in CUDA's global mode, where the main thread's
     allocations and syncs fail mid-capture. The first ``plan_cspace`` captures
     instead (~1 s), on the main thread after the join; every later segment has
-    the same shape and replays.
+    the same shape and replays. ``config`` reads nothing today; the callers pass the run's.
     """
     return world.get_motion_planner(
         # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (the
@@ -328,7 +328,6 @@ def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
         # (metrics_base.yml). At 0 the optimum hugs obstacles, and retracts after
         # a place grazed the block just released by up to 0.2 mm.
         collision_activation_distance=0.0025,
-        enable_com_polygon=config.enable_com_polygon,
     )
 
 
@@ -377,16 +376,15 @@ def solve_curobo(
     gate_stats: List[dict] = []
 
     def add_segment(plan, dt, arm):
-        # The real robot's balance check (balance arms only): every frame's CoM and ZMP inside the support
+        # The real robot's balance check: every frame's CoM and ZMP inside the support
         # rectangle, slowing the segment down if its ZMP needs it, and on the real legs the segment's pace from its
         # speeds, torques and ZMP; a RuntimeError fails the candidate. A retimed segment also keeps its motion
         # planner's timing, with the held objects along it.
         entry = {"dt": dt, "arm": arm}
-        if config.enable_com_polygon:
-            plan, stats, fast = _balance_gate(world, planner, plan, dt)
-            gate_stats.append(stats)
-            if fast is not None:
-                entry["planner_timing"] = {"plan": fast, "held_objs": state.compute_all_held_obj_poses(fast)}
+        plan, stats, fast = _balance_gate(world, planner, plan, dt)
+        gate_stats.append(stats)
+        if fast is not None:
+            entry["planner_timing"] = {"plan": fast, "held_objs": state.compute_all_held_obj_poses(fast)}
         entry.update(plan=plan, held_objs=state.compute_all_held_obj_poses(plan))
         accum_plans.append(entry)
         return plan
@@ -581,8 +579,8 @@ def solve_curobo(
 
 
 def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
-    """Measure-only trajectory CoM audit (recorded in every ablation arm): the plan's frame count,
-    ``traj_com_frames``, and the fraction of them whose CoM leaves the support rectangle the gate enforces
+    """Measure-only trajectory CoM audit: the plan's frame count, ``traj_com_frames``, and the fraction of them
+    whose CoM leaves the support rectangle the gate enforces
     (``world.model.support.gate_half``, through ``compute_support_mask``), ``traj_com_violation_frac``."""
     # The whole block is exception-isolated: this audit is MEASURE-ONLY
     # and must never change which plans are produced or accepted. Any

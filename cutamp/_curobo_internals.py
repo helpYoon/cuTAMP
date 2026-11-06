@@ -18,13 +18,12 @@ upgrade audit catches them):
 
 * CUDA graphs can't be re-captured ("CUDA graph reset is not available."), so
   a solver whose call structure changes after its first solve must run
-  without them. The main IK solver in ``cutamp.robots.t1`` does (particle init
-  mixes calls with and without ``current_state``); the coupled-reIK refresh
-  solver and the motion planner each see one fixed call shape and use them.
-  cuRobo captures in CUDA's global mode, where another thread's allocations
-  and syncs fail mid-capture, so captures run only on the main thread while
-  the planner-build thread is not running (``TAMPWorld.warmup_ik_solver``,
-  ``motion_solver.build_motion_planner``).
+  without them. The IK solver in ``cutamp.robots.t1`` does (particle init
+  mixes calls with and without ``current_state``); the motion planner sees
+  one fixed call shape and uses them. cuRobo captures in CUDA's global mode,
+  where another thread's allocations and syncs fail mid-capture, so captures
+  run only on the main thread while the planner-build thread is not running
+  (``motion_solver.build_motion_planner``).
 """
 
 from typing import Dict, Iterable, List
