@@ -3,9 +3,11 @@
   free;
 - level 1 holds the CoM in the real legs' keyframe rectangle, and level 3 pulls it toward the centre, so GN IK's
   confs don't sit on the rectangle's edge;
+- level 4 pulls the Trunk toward upright, and GN IK keeps a row's most upright accepted start, so its confs keep
+  less of the tilt that a start or the reach gave them;
 - level 1 holds the Trunk tilt within an envelope's maximum: one row, active where the tilt is past the bound or a
   step would push it past, as a CoM axis is. Route A's envelope sets no tilt bound, so the tilt tests plan on the
-  real legs under an envelope that bounds it at 1.0 rad (``_with_tilt_bound``);
+  real legs under an envelope that bounds it at TILT_MAX, 0.9 rad (``_with_tilt_bound``);
 - each call ends with a closing step, so the soles hold after every call, out-of-reach targets included; under a
   tilt bound a row that starts within REACH of it is within it after one call, and stays within it after
   out-of-reach calls;
@@ -18,6 +20,7 @@ The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: o
 takes its confs from ``real_plan``."""
 
 import dataclasses
+import math
 
 import pytest
 import torch
@@ -30,8 +33,13 @@ from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _poses, _s
 MOVE = (0.03, 0.0, 0.0)
 #: A move no balanced conf standing on the stance can follow: 30 cm forward and 20 cm down.
 FAR = (0.30, 0.0, -0.20)
-#: The tilt tests' maximum Trunk tilt, rad, in an envelope that replaces route A's, which sets none.
-TILT_MAX = 1.0
+#: The tilt tests' maximum Trunk tilt, rad, in an envelope that replaces route A's, which sets none. Low enough that
+#: the init's first pick bows rows past it on both inits (2 and 36 of 64, PYTHONHASHSEED 0 and 1, 2026-11-06): GN IK
+#: keeps each target's least tilted accepted start and level 4 pulls toward upright, so on one init no row passes
+#: 1.0. Not lower: under every bound from 0.6 to 0.85 a test below fails on one init (one call leaves a CoM outside
+#: the rectangle, or a far call the soles over 1 mm off), and main's GN (f71ba85) fails alike from those rows (checked
+#: at 0.7, 0.8 and 0.85).
+TILT_MAX = 0.9
 #: The real legs under that envelope.
 TILTED = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=TILT_MAX))
 
@@ -46,17 +54,24 @@ def _with_tilt_bound(world, monkeypatch, tilt_max=TILT_MAX):
 
 
 #: How far past TILT_MAX, rad, a row may start for one GN call to bring it inside, with margin: on blocks_t1's first
-#: pick one call brings in every row that starts up to 0.026 rad past it on one init (the next starts 0.51 past), and
-#: every row, up to 0.21 rad past, on the other (GN IK's init, PYTHONHASHSEED 0 and 1, 2026-11-06).
+#: pick the rows start at most 0.029 rad past it on one init and 0.139 on the other, and one call brings each inside
+#: with every claim below. Under 0.65-0.7 rad bounds one call brings the tilt inside from up to 0.29-0.34 past (a row
+#: 0.305 past a 0.65 bound stays 0.041 past), though not always with the CoM in the rectangle (GN IK's init,
+#: PYTHONHASHSEED 0 and 1, 2026-11-06).
 REACH = 0.3
 #: The most GN IK's accepted first-place rows' median |CoM| / half may be on either axis, with margin: at most 0.06
 #: on both inits (PYTHONHASHSEED 0 and 1, 2026-11-06).
 CENTRED = 0.25
+#: The least, deg, GN IK's level 4 must lower the median Trunk tilt of the accepted first-place rows by, with margin:
+#: by 5.1 on both inits (PYTHONHASHSEED 0 and 1, 2026-11-06). The first pick's falls by 9.4 on one init and 0.1 on
+#: the other, where at the last clear iteration level 3 still fills the GN_STEP_CLAMP box on 96 of the 256 starts
+#: (all accepted; Left_Hip_Pitch on 83), and level 4 gets only what the box leaves.
+UPRIGHTER = 2.0
 
 
 def _in_reach(q):
-    """The rows of ``q`` whose Trunk tilt starts at most REACH past TILT_MAX. On blocks_t1's first pick that is 52 of
-    64 rows on one init and all 64 on the other."""
+    """The rows of ``q`` whose Trunk tilt starts at most REACH past TILT_MAX. On blocks_t1's first pick that is all 64
+    rows on both inits."""
     return q[_tilt(q) <= TILT_MAX + REACH]
 
 
@@ -183,8 +198,8 @@ def test_gn_holds_the_soles(real_world, real_plan):
 
 @needs_cuda
 def test_gn_brings_the_trunk_tilt_inside_the_bound(real_world, real_plan, monkeypatch):
-    # On the floor scene the init's GN IK bows some first-pick rows past 1.0 rad (17 of 64 on one init, 5 of them in
-    # reach; 15 of 64, all in reach, on the other). Under a 1.0 rad bound, one call, the hand targets moved 3 cm,
+    # On the floor scene the init's GN IK bows some first-pick rows past TILT_MAX (2 of 64 on one init, 36 on the
+    # other, all in reach). Under that bound, one call, the hand targets moved 3 cm,
     # brings every row that starts within REACH of it (``_in_reach``) inside it, with both soles on the stance and the
     # CoM in the keyframe rectangle on every row. Rows further past take more calls.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
@@ -241,9 +256,10 @@ def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, monkeypatch, til
     # did not slide to fake the reach. Reaching for them drives joints into their limits on every call, where a
     # clamped step or the drift of a saturated last step would move the soles. Under a tilt bound the calls start from
     # the rows in reach of it (``_in_reach``) after one 3 cm call has brought them inside it, as in the test above,
-    # and they stay inside it after every call too. A row still past the bound when it reaches out of reach could come
-    # out of that call with its soles off by more than this test's 1 mm, though inside the gate's 5 mm (2 mm, a row
-    # 0.27 rad past, on an earlier init); on today's inits none does (0.04 mm at most, 2026-11-06).
+    # and they stay inside it after every call too. Under lower bounds a far call can leave a row's soles more than
+    # this test's 1 mm off, though inside the gate's 5 mm: 1.0-4.1 mm under 0.65-0.85 rad on one init's first two far
+    # calls, on rows the 3 cm call left inside the bound (main's GN, f71ba85, gives the same at 0.8). Under TILT_MAX the
+    # soles stay within 0.03 mm on both inits (2026-11-06).
     from cutamp.gn_refresh import gn_project_balanced
     arm, _, q = _first_pick(real_world, real_plan)
     _with_tilt_bound(real_world, monkeypatch, tilt_max)
@@ -310,6 +326,49 @@ def test_gn_ik_centres_the_com(real_world, real_plan, monkeypatch):
 
 
 @needs_cuda
+def test_gn_ik_uprights_the_trunk(real_world, real_plan, monkeypatch):
+    # Level 4 pulls the Trunk toward upright in the freedom levels 1-3 leave, and GN IK keeps each target's least
+    # tilted accepted start. Without level 4 GN keeps whatever tilt a start or the reach gave a conf: on blocks_t1's
+    # floor the accepted first-place rows' median tilt is 52.7 deg, and 47.6 with it, on as many rows (both inits,
+    # 2026-11-06). The first pick's falls from 47.8 to 38.4 on one init, but only by 0.1, from 55.6, on the other
+    # (UPRIGHTER says why), so only the place's is bounded.
+    import cutamp.gn_refresh as gn_refresh
+    import cutamp.particle_initialization as pi
+    from cutamp.optimize_plan import _build_ik_deps
+    from cutamp.tests.conftest import default_checker
+    skeleton, particles = real_plan
+    deps = {dep.q_name: dep for dep in _build_ik_deps(skeleton, real_world)}
+    check = pi.ik_check
+    for kind in ("pick", "place"):
+        conf = next(op for op in skeleton if op.operator.metadata.action_type == kind).values[-1]
+        dep = deps[conf]
+        args = (real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles),
+                pi.IKTol.from_checker(default_checker()))
+        seen = {}
+
+        def spy(*a):
+            out = check(*a)
+            seen["q"], seen["ok"] = a[1], out[0]
+            return out
+
+        monkeypatch.setattr(pi, "ik_check", spy)
+        torch.manual_seed(0)
+        q, ok = pi.gn_ik(*args)
+        monkeypatch.undo()
+        # Each target keeps its least tilted accepted start.
+        tilts, oks = _tilt(seen["q"]).view(-1, q.shape[0]), seen["ok"].view(-1, q.shape[0])
+        assert bool(ok.any()) and torch.allclose(_tilt(q)[ok], torch.where(oks, tilts, math.inf).amin(0)[ok], atol=1e-6)
+        monkeypatch.setattr(gn_refresh, "_upright_step", lambda ja, jac, *_: torch.zeros_like(jac[:, 0]))
+        torch.manual_seed(0)
+        q0, ok0 = pi.gn_ik(*args)
+        monkeypatch.undo()
+        assert int(ok.sum()) >= int(ok0.sum()), (kind, int(ok.sum()), int(ok0.sum()))
+        if kind == "place":
+            med, med0 = (math.degrees(float(_tilt(x).median())) for x in (q[ok], q0[ok0]))
+            assert med <= med0 - UPRIGHTER, (med, med0)
+
+
+@needs_cuda
 def test_gn_without_sole_rows_slides_the_soles(real_world, real_plan, monkeypatch):
     # The same reach with the sole rows zeroed: the free base and legs carry the hand, and the soles slide off the
     # stance, so the rows bear the load.
@@ -356,14 +415,13 @@ def test_soles_on_stance_at_the_checker_tolerances(real_world):
 
 
 def test_tilt_within_bound_on_the_motion_values_metric():
-    # The final repair's tilt test, on the Motion value's metric and tolerance: under a 1.0 rad bound, upright and on
-    # the bound (roll 1.0 rad) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, passes every
-    # conf.
+    # The final repair's tilt test, on the Motion value's metric and tolerance: under TILT_MAX, upright and on the
+    # bound (roll TILT_MAX) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, passes every conf.
     from types import SimpleNamespace
     from cutamp.gn_refresh import tilt_within_bound
     names = list(REAL_LEGS.joint_names)
     q = torch.tensor(REAL_LEGS.home).repeat(3, 1)
-    q[1:, names.index("base_j_roll")] = torch.tensor([1.0, 1.01])
+    q[1:, names.index("base_j_roll")] = torch.tensor([TILT_MAX, TILT_MAX + 0.01])
     assert tilt_within_bound(SimpleNamespace(model=TILTED), q, 1e-6).tolist() == [True, True, False]
     assert tilt_within_bound(SimpleNamespace(model=REAL_LEGS), q, 1e-6).all()
 

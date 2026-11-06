@@ -8,6 +8,9 @@ import torch
 from cutamp.gn_refresh import _balanced_step, _rotmat_to_rotvec, _row_layout
 from cutamp.robots.t1 import REAL_LEGS
 
+#: The base's pitch and roll columns, which level 4 pulls toward upright.
+UPRIGHT = (list(REAL_LEGS.joint_names).index("base_j_pitch"), list(REAL_LEGS.joint_names).index("base_j_roll"))
+
 
 def _synthetic(seed, B=64, coll=False):
     """``(stack, blocks)``: one ``_balanced_step`` argument tuple on four dep-major ``B``-row
@@ -62,37 +65,84 @@ def test_rotmat_to_rotvec_matches_roma_bitwise():
 @pytest.mark.parametrize("coll", [False, True])
 def test_balanced_step_stack_matches_per_dep(coll):
     # Every op is row-wise and the active-set rounds always run in full, so
-    # no row's step (levels 1-2's, or with the collision row levels 1-3's) depends on which other deps share
-    # its call.
+    # no row's step (levels 1-2's, or with the collision row levels 1-3's and 1-4's) depends on which other deps
+    # share its call.
     for seed in range(10):
         stack, blocks = _synthetic(seed, coll=coll)      # one [4B] stack + its 4 [B] blocks
-        steps, per_dep = _balanced_step(*stack), [_balanced_step(*b) for b in blocks]
-        for k in range(2):
+        steps = _balanced_step(*stack, upright=UPRIGHT)
+        per_dep = [_balanced_step(*b, upright=UPRIGHT) for b in blocks]
+        for k in range(3):
             assert torch.equal(steps[k], torch.cat([s[k] for s in per_dep]))
 
 
 @pytest.mark.parametrize("coll", [False, True])
 def test_balanced_step_moves_no_pinned_column(coll):
     stack, _ = _synthetic(0, coll=coll)
-    (step, step12), col_mask = _balanced_step(*stack), stack[7]
+    (step, step3, step12), col_mask = _balanced_step(*stack, upright=UPRIGHT), stack[7]
     assert torch.all(step[col_mask == 0] == 0)
     assert torch.any(step[col_mask == 1] != 0)  # not vacuous: the free columns move
-    # Level 3 runs beside the collision row only, and changes none of levels 1-2's active sets: their step is
-    # bitwise the one they take without it, and a row in contact takes it alone.
-    assert torch.equal(step, step12) != coll
+    # Levels 3 and 4 run beside the collision row only, and each changes none of the active sets above it: levels
+    # 1-2's step is bitwise the one they take without level 3, levels 1-3's the one they take without level 4, and a
+    # row in contact takes levels 1-2's alone.
+    assert torch.equal(step3, step12) != coll and torch.equal(step, step3) != coll
+    assert torch.equal(step3, _balanced_step(*stack)[0])
     if coll:
         assert torch.equal(step12, _balanced_step(*stack[:-1], False)[0])
         in_contact = stack[12][0][:, 0] > 0
         assert bool(in_contact.any()) and torch.equal(step[in_contact], step12[in_contact])
-        # Under a tilt bound too, where a row whose full step ends past the bound takes levels 1-2's step.
+        # Under a tilt bound too, where a row whose levels 1-3 step ends past the bound takes levels 1-2's step for
+        # both, and level 4 never carries a row past it (it never comes near here; its veto has its own test below).
         from cutamp.joint_limit_cost import trunk_tilt_cosine
-        names = list(REAL_LEGS.joint_names)
-        tilt = (names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(1.0), math.cos(0.99))
+        tilt = (*UPRIGHT, math.cos(1.0), math.cos(0.99))
         tilted = stack[:11] + (tilt,) + stack[12:]
-        step, step12 = _balanced_step(*tilted)
+        step, step3, step12 = _balanced_step(*tilted, upright=UPRIGHT)
         assert torch.equal(step12, _balanced_step(*tilted[:-1], False)[0])
-        past = trunk_tilt_cosine(stack[0] + step, *tilt[:2]) < tilt[2]
-        assert bool(past.any()) and torch.equal(step[past], step12[past])
+        assert torch.equal(step3, _balanced_step(*tilted)[0])
+        past = trunk_tilt_cosine(stack[0] + step3, *UPRIGHT) < tilt[2]
+        assert bool(past.any()) and torch.equal(step3[past], step12[past]) and torch.equal(step[past], step12[past])
+        assert not bool((trunk_tilt_cosine(stack[0] + step, *UPRIGHT) < tilt[2])[~past].any())
+
+
+def test_level4_moves_no_row_above_it_and_lowers_pitch_and_roll():
+    # Level 4's own step, the full step less levels 1-3's, moves none of the rows above it (the soles, the hand and
+    # both CoM axes) past float32 rounding, and it lowers pitch^2 + roll^2 from where levels 1-3's step leaves them on
+    # every row it moves: it aims from that step, its rows are coordinates moved by a gain below 1, and the box only
+    # shortens it.
+    stack, _ = _synthetic(0, coll=True)
+    step, step3, _ = _balanced_step(*stack, upright=UPRIGHT)
+    q, jac, jac_com, jac_sole = stack[0], stack[2], stack[3], stack[9]
+    d = step - step3
+    size = d.norm(dim=-1)
+    big = size > 1e-3
+    assert int(big.sum()) >= 50 and float(size[big].median()) > 0.1  # not vacuous: 68 rows, 0.13 median
+    for rows in (jac_sole, jac, jac_com):
+        assert float((rows @ d.unsqueeze(-1)).abs().max()) < 1e-6  # 2e-8 here
+    before, after = ((q + s)[:, list(UPRIGHT)].norm(dim=-1) for s in (step3, step))
+    assert bool((after <= before + 1e-6).all())
+    assert bool((after[big] < before[big]).all())
+
+
+def test_level4_never_carries_the_tilt_past_the_bound(monkeypatch):
+    # Under a tilt bound, a row takes levels 1-3's step where level 4's would carry the Trunk tilt that step leaves
+    # inside the bound past it (exact, as level 3's tilt veto). Level 4 never pushes that far on these rows, so here it
+    # pushes outward: without the veto, 3 of the 256 rows end 0.04-0.06 rad past the bound.
+    import cutamp.gn_refresh as gn
+    from cutamp.joint_limit_cost import trunk_tilt_cosine
+    real = gn._upright_step
+    monkeypatch.setattr(gn, "_upright_step", lambda *a: -real(*a))
+    stack, _ = _synthetic(0, coll=True)
+    q, jac_com = stack[0], stack[3]
+    tilt = (*UPRIGHT, math.cos(1.0), math.cos(0.99))
+    step, step3, _ = _balanced_step(*stack[:11], tilt, *stack[12:], upright=UPRIGHT)
+
+    def past(s):
+        return trunk_tilt_cosine(q + s, *UPRIGHT) < tilt[2]
+
+    assert bool((step != step3).any())  # not vacuous: level 4 still moves rows it keeps inside
+    assert not bool((past(step) & ~past(step3)).any())
+    # A row the veto catches takes levels 1-3's step, not levels 1-2's: what level 4 adds moves no CoM axis (2e-9
+    # here), where levels 1-2's step would undo level 3's pull (3e-2).
+    assert float((jac_com @ (step - step3).unsqueeze(-1)).abs().max()) < 1e-6
 
 
 def test_level3_never_carries_a_free_com_axis_out(monkeypatch):
@@ -103,7 +153,7 @@ def test_level3_never_carries_a_free_com_axis_out(monkeypatch):
     real = gn._centring_step
     monkeypatch.setattr(gn, "_centring_step", lambda *a: -real(*a))
     stack, _ = _synthetic(0, coll=True)
-    step, step12 = _balanced_step(*stack)
+    step, _, step12 = _balanced_step(*stack)
     jac_com, com, half = stack[3], stack[4], torch.tensor(stack[8])
 
     def lin(s):
