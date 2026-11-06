@@ -77,8 +77,6 @@ GRIPPER_JOINT_NAMES: Dict[str, Tuple[str, ...]] = {
 # =============================================================================
 
 T1_29DOF_DIR = Path(__file__).parent / "assets" / "t1_29dof"
-# The gripper's folder: gripper.urdf, its meshes, and the spheres particle init loads (get_t1_gripper_spheres).
-T1_ASSETS_DIR = Path(__file__).parent / "assets" / "t1_description"
 
 
 class Support(NamedTuple):
@@ -471,20 +469,14 @@ def get_t1_gripper_spheres(
     arm: Literal["left", "right"],
     device_cfg: DeviceCfg = None,
 ) -> torch.Tensor:
-    """Collision spheres for the named gripper, in the gripper base frame."""
+    """``[n, 4]`` collision spheres of the named gripper, in its base frame: the ``{arm}_base_link`` spheres of
+    ``t1_29dof_spheres.yml``, the file cuRobo loads (the finger links hold none)."""
     if arm not in ("left", "right"):
         raise ValueError(f"Invalid arm: {arm}")
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    spheres_file = T1_ASSETS_DIR / f"{arm}_gripper_spheres.pt"
-    if not spheres_file.exists():
-        raise FileNotFoundError(
-            f"T1 {arm} gripper spheres not found at {spheres_file}. "
-            "Generate via cutamp/scripts/gripper_sphere_editor.py"
-        )
-    spheres = torch.load(spheres_file, map_location=device_cfg.device, weights_only=True)
-    assert spheres.ndim == 2 and spheres.shape[1] == 4, f"Bad shape: {spheres.shape}"
-    return spheres[spheres[:, 3] > 0]
+    spheres = load_yaml(str(T1_29DOF_DIR / "t1_29dof_spheres.yml"))["collision_spheres"][TOOL_FRAME_FOR_ARM[arm]]
+    return torch.tensor([[*s["center"], s["radius"]] for s in spheres], dtype=torch.float32, device=device_cfg.device)
 
 
 # =============================================================================

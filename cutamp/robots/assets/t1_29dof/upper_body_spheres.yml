@@ -1,5 +1,5 @@
-# Upper-body collision spheres (vendor frame), hand-kept and edited by robot_sphere_editor.py and
-# gripper_sphere_editor.py. build_planner_model.py adds the legs' spheres and writes t1_29dof_spheres.yml.
+# Upper-body collision spheres (vendor frame), hand-kept and edited by robot_sphere_editor.py, the grippers' too.
+# build_planner_model.py adds the legs' spheres and writes t1_29dof_spheres.yml.
 collision_spheres:
   Trunk:
   - center: [0.05773648526519537, -3.020884469151497e-05, 0.14906761050224304]

@@ -136,17 +136,16 @@ def test_builder_needs_no_simplified_file(tmp_path):
 
 
 def test_sphere_editor_defaults_exist():
-    # Both editors' default paths exist and none names a simplified file.
-    scripts = REPO / "cutamp" / "scripts"
-    for name in ("robot_sphere_editor", "gripper_sphere_editor"):
-        spec = importlib.util.spec_from_file_location(name, scripts / f"{name}.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        defaults = module.default_paths()
-        assert defaults, name
-        for path in defaults:
-            assert Path(path).exists(), (name, path)
-            assert not any(old in str(path) for old in ("t1_simplified", "t1_spheres", "t1_planar_base")), (name, path)
+    # The editor's default paths exist and none names a simplified file.
+    spec = importlib.util.spec_from_file_location("robot_sphere_editor",
+                                                  REPO / "cutamp" / "scripts" / "robot_sphere_editor.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    defaults = module.default_paths()
+    assert defaults
+    for path in defaults:
+        assert Path(path).exists(), path
+        assert not any(old in str(path) for old in ("t1_simplified", "t1_spheres", "t1_planar_base")), path
 
 
 def test_base_limits_are_the_legs_reach():
