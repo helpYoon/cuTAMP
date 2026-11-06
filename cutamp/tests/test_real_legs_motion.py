@@ -730,35 +730,49 @@ def test_gate_reports_the_smaller_margin_of_its_frames_and_the_planners(real_wor
 
 @functools.lru_cache(maxsize=1)
 def _planner_urdf():
-    """t1_planner.urdf in yourdfpy, float64: the Trunk at its root, each link's inertial as the URDF defines it."""
+    """t1_planner.urdf as yourdfpy parses it, float64: the Trunk at its root, each link's inertial and each joint as the
+    URDF defines them. No scene graph: yourdfpy 0.0.58 builds it through a NumPy conversion deprecated since 1.25 (one
+    DeprecationWarning per revolute joint, an error in a later NumPy), so _reference_zmp chains the joints itself."""
     import yourdfpy
     from cutamp.robots.t1 import T1_29DOF_DIR
-    return yourdfpy.URDF.load(str(T1_29DOF_DIR / "t1_planner.urdf"), load_meshes=False, build_scene_graph=True,
+    return yourdfpy.URDF.load(str(T1_29DOF_DIR / "t1_planner.urdf"), load_meshes=False, build_scene_graph=False,
                               build_collision_scene_graph=False, load_collision_meshes=False)
 
 
 def _reference_zmp(q_of_t, t, h=1e-4, g=9.81):
     """``(zmp_xy, com_xy)`` at time ``t`` of the trajectory ``q_of_t`` (float64 confs in ``REAL_LEGS.joint_names``
-    order), about the home mid-sole on flat ground, from first principles: float64 yourdfpy FK on t1_planner.urdf,
-    the Trunk placed by trunk_pose_from_q and the joints the planner locks (head, fingers) at 0; every link's CoM
-    acceleration by central differences of the true trajectory, its spin L = R I R^T w (w from R' R^T) differentiated
-    the same way; sum m (g + z'') x - m z x'' - L'_y over the links (y: + L'_x), over sum m (g + z''), with z the
-    height above the soles' plane (world z = 0). The mid-sole is the soles' midpoint at home: each foot link's pose
-    times t1_29dof.yml's fixed sole offset."""
+    order), about the home mid-sole on flat ground, from first principles: float64 FK on t1_planner.urdf's joints as
+    yourdfpy parses them (each child at its parent times the joint's origin and its rotation about its axis, yourdfpy's
+    own product), the Trunk placed by trunk_pose_from_q and the joints the planner locks (head, fingers) at 0; every
+    link's CoM acceleration by central differences of the true trajectory, its spin L = R I R^T w (w from R' R^T)
+    differentiated the same way; sum m (g + z'') x - m z x'' - L'_y over the links (y: + L'_x), over sum m (g + z''),
+    with z the height above the soles' plane (world z = 0). The mid-sole is the soles' midpoint at home: each foot
+    link's pose times t1_29dof.yml's fixed sole offset."""
     import yaml
+    from trimesh.transformations import rotation_matrix
 
     from cutamp.robots.t1 import T1_29DOF_DIR, trunk_pose_from_q
     u = _planner_urdf()
+    joint_to = {j.child: j for j in u.robot.joints}
+    assert {j.type for j in u.robot.joints} == {"fixed", "revolute"} and not any(j.mimic for j in u.robot.joints)
+    (root,) = {link.name for link in u.robot.links} - set(joint_to)  # "world", whose fixed joint carries the Trunk
     links = [(n, link.inertial) for n, link in u.link_map.items() if link.inertial is not None and link.inertial.mass]
     m = np.array([i.mass for _, i in links])
     com = np.stack([i.origin[:3, 3] for _, i in links])                                     # in the link frame
     inertia = np.stack([i.origin[:3, :3] @ i.inertia @ i.origin[:3, :3].T for _, i in links])  # about it, too
 
     def poses(q, frames):
-        value = dict(zip(REAL_LEGS.joint_names, q))
-        u.update_cfg({j: value.get(j, 0.0) for j in u.actuated_joint_names})
-        trunk = trunk_pose_from_q(REAL_LEGS, q).numpy()
-        return np.stack([trunk @ u.get_transform(f) for f in frames])
+        value = dict(zip(REAL_LEGS.joint_names, q.tolist()))
+        X = {root: trunk_pose_from_q(REAL_LEGS, q).numpy()}  # the root-Trunk joint is the identity
+
+        def pose(link):
+            if link not in X:
+                j = joint_to[link]
+                motion = rotation_matrix(value.get(j.name, 0.0), j.axis) if j.type == "revolute" else np.eye(4)
+                X[link] = pose(j.parent) @ (np.eye(4) if j.origin is None else j.origin) @ motion
+            return X[link]
+
+        return np.stack([pose(f) for f in frames])
 
     extra = yaml.safe_load((T1_29DOF_DIR / "t1_29dof.yml").read_text())["robot_cfg"]["kinematics"]["extra_links"]
     feet = poses(np.array(REAL_LEGS.home), ("left_foot_link", "right_foot_link"))
@@ -794,7 +808,7 @@ def test_real_legs_zmp_matches_multibody_reference(real_world, planner):
     # yawed -0.4). Every link moves and spins. The gate's CoM and multibody ZMP, from the plan's own velocities and
     # accelerations as _pace takes them, match the float64 first-principles ones at every frame, at rest and at the
     # acceleration peaks, where the ZMP runs 9 cm from the CoM. Measured 2026-11-05: the CoM within 1.3e-8 m and the
-    # ZMP within 2.2e-5 m of the reference, against tolerances of 2e-4 and 3e-4 m.
+    # ZMP within 2.7e-5 m of the reference, against tolerances of 2e-4 and 3e-4 m.
     from cutamp.com_polygon_cost import com_zmp_in_support
     from cutamp.motion_solver import ZMP_STEP, _model_frames, _taylor_positions
     from cutamp.particle_initialization import _stand_on_the_stance
