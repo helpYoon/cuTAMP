@@ -84,9 +84,7 @@ graph LR
    the CoM in the support rectangle, both soles on the stance and no
    collision first, then the pose, every step kept inside the joint limits),
    with no cuRobo during Adam and the Adam step and refresh replayed as CUDA
-   graphs (`cuda_graphs.py`); the final pre-check refresh repairs the rows GN
-   IK's own check (`ik_check`, collision at zero penetration, stricter than the
-   checker's) rejects with GN IK (`gn_ik`) from the stored confs.
+   graphs (`cuda_graphs.py`).
    Adam stops after `early_stop_patience` steps without progress and keeps the
    best-seen particles. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
@@ -380,8 +378,7 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
 - [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
   particles; respects `left_q0` / `right_q0` as fixed initial-state. Holds the
   re-IK dependencies (`IKDep`), the balance-first refresh
-  (`_refresh_balanced`) and the final pre-check refresh's GN IK repair, the
-  best-seen snapshot and early stop (`_BestSnapshot`), per-refresh stats
+  (`_refresh_balanced`), the best-seen snapshot and early stop (`_BestSnapshot`), per-refresh stats
   (`_ReikDriftGate`), and the CUDA step and refresh graphs
   (`G_step`, `G_refresh`; `--no_cuda_graphs` runs them eagerly).
 
@@ -605,8 +602,7 @@ python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/re
 Pose-class soft costs (e.g. `place_close_to_base`) are optimized through the
 re-IK coupling: outer Adam moves pose/grasp particles while their dependent
 confs are re-projected every `reik_interval` steps (balance-first,
-collision-aware Gauss-Newton, no cuRobo during Adam; the final pre-check
-refresh repairs with GN IK).
+collision-aware Gauss-Newton, no cuRobo during Adam).
 
 ## Key Design Decisions
 
@@ -682,9 +678,7 @@ refresh repairs with GN IK).
    - **Balance-first re-IK refresh**: covered confs are outside Adam, so the
      GN refresh puts the CoM, the soles and collision first (the pose is
      least squares inside them, the pull to the centre below the pose, the
-     pull upright below that) and
-     the final pre-check refresh repairs any
-     row `ik_check` rejects with GN IK.
+     pull upright below that).
    - **COM-anchored terminals**: pick/place trajectories end exactly at the
      gate-approved conf (`plan_cspace`), so cuRobo can't re-resolve the
      redundancy at the endpoint.
