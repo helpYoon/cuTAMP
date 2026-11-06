@@ -10,10 +10,9 @@
 """Motion-plan solver for cuTAMP under cuRobo v0.8 single-MotionPlanner.
 
 Per plan-skeleton operator (T1):
-  - Arm ops (Pick/Place/Move/Retract): ``pin_for_arm_action(arm)`` pins the
-    inactive arm's cspace weights, a no-op. Every joint is free, the base
-    included, and trajopt holds the soles on the stance
-    (``get_t1_motion_planner``); nothing holds the inactive hand between confs.
+  - Arm ops (Pick/Place/Retract): every joint is free, the base included, and
+    trajopt holds the soles on the stance (``get_t1_motion_planner``); nothing
+    holds the inactive hand between confs.
   - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
     we plan to the gate-approved particle conf with the grasp-object /
     placement-surface obstacle temporarily disabled.
@@ -39,7 +38,6 @@ from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM
-from cutamp.t1_state import T1State
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.common import (
     Particles,
@@ -309,6 +307,34 @@ def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
         _log.warning(f"update_obstacle_pose({name}) failed: {e}")
 
 
+def _held_obj_poses(planner, tool_from_ee, held: dict, plan: JointState) -> dict:
+    """``{arm: (obj_name, world_from_obj per timestep)}`` along ``plan`` for every arm in ``held``.
+
+    ``held`` maps an arm to ``(obj_name, grasp_from_obj)``; ``tool_from_ee`` is ``{tool_frame: 4x4}``. The body
+    joints (the legs and the Waist) are free during single-arm planning, so an inactive arm's held block still moves
+    through the world with the body; visualization needs poses for both arms. ``plan`` is a planner-output JointState
+    in the planner's active cspace (the head and grippers locked); one that is not is reprojected with
+    ``get_active_js`` before FK through ``planner.kinematics``.
+    """
+    out = {}
+    for arm in ("left", "right"):
+        if arm not in held:
+            continue
+        obj_name, grasp_tf = held[arm]
+        pos = plan.position
+        while pos.dim() > 2:
+            pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
+        if pos.shape[-1] != len(planner.kinematics.joint_names):
+            traj_js = JointState.from_position(pos, joint_names=plan.joint_names)
+            pos = planner.trajopt_solver.get_active_js(traj_js).position
+        js = JointState.from_position(pos.to(grasp_tf.device))
+        kin_state = planner.kinematics.compute_kinematics(js)
+        tool_frame = TOOL_FRAME_FOR_ARM[arm]
+        world_from_ee = kin_state.tool_poses.get_link_pose(tool_frame, make_contiguous=True).get_matrix()
+        out[arm] = (obj_name, world_from_ee @ torch.inverse(tool_from_ee[tool_frame]) @ grasp_tf)
+    return out
+
+
 def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
     """Build the trajopt planner, with CUDA graphs. Safe to run on a background
     thread concurrently with Phase 1 because it runs no solves.
@@ -364,10 +390,7 @@ def solve_curobo(
     last_js = _planner_js_from_full(
         planner, best_particle["left_q0"].clone(), full_joint_names,
     )
-    state = T1State(
-        planner=planner,
-        tool_from_ee=world.tool_from_ee,
-    )
+    held = {}  # {arm: (obj_name, grasp_from_obj)}
     q_init = best_particle["left_q0"]
 
     accum_plans: List[dict] = []
@@ -381,8 +404,10 @@ def solve_curobo(
         plan, stats, fast = _balance_gate(world, planner, plan, dt)
         gate_stats.append(stats)
         if fast is not None:
-            entry["planner_timing"] = {"plan": fast, "held_objs": state.compute_all_held_obj_poses(fast)}
-        entry.update(plan=plan, held_objs=state.compute_all_held_obj_poses(plan))
+            entry["planner_timing"] = {
+                "plan": fast, "held_objs": _held_obj_poses(planner, world.tool_from_ee, held, fast),
+            }
+        entry.update(plan=plan, held_objs=_held_obj_poses(planner, world.tool_from_ee, held, plan))
         accum_plans.append(entry)
         return plan
 
@@ -398,15 +423,9 @@ def solve_curobo(
         metadata = ground_op.operator.metadata
         arm = metadata.arm
 
-        # Pin protocol: arm ops pin the inactive arm's cspace weights. The pin is a no-op and plan_cspace holds
-        # nothing between endpoint confs, so the inactive hand is not held
-        # along the segment (T1State.pin_for_arm_action). Both arms stay in the
-        # collision checks, except against the obstacle a pick or place
-        # segment disables for the whole robot (the grasped block, or the
-        # support surface; _plan_arm_to_conf).
-        if arm is not None:
-            state.pin_for_arm_action(arm)
-
+        # plan_cspace holds nothing between endpoint confs, so the inactive hand is not held along the segment.
+        # Both arms stay in the collision checks, except against the obstacle a pick or place segment disables for
+        # the whole robot (the grasped block, or the support surface; _plan_arm_to_conf).
         try:
             if metadata.is_motion and metadata.action_type is None:
                 # MoveFree / MoveHolding — no trajectory; pick/place chain
@@ -425,7 +444,6 @@ def solve_curobo(
                     raise _plan_failed(world, result, f"Retract plan failed for {ground_op}")
                 plan = add_segment(_interp_plan(result), _plan_dt(planner), arm)
                 last_js = _last_timestep_js(plan, planner)
-                state.current_js = last_js
 
             elif metadata.action_type == "pick":
                 obj_name, grasp_name, q_name = ground_op.values
@@ -452,10 +470,7 @@ def solve_curobo(
                 last_js = _last_timestep_js(grasp_plan, planner)
 
                 _attach_object(planner, obj_name, last_js, arm)
-                grasp_from_obj = torch.inverse(obj_from_grasp).clone()
-                state.current_js = last_js
-                state.arm_holding[arm] = obj_name
-                state.arm_grasp_transform[arm] = grasp_from_obj
+                held[arm] = (obj_name, torch.inverse(obj_from_grasp).clone())
 
             elif metadata.action_type == "place":
                 obj_name, grasp_name, place_name, surface_name, q_name = ground_op.values
@@ -481,9 +496,7 @@ def solve_curobo(
                 last_js = _last_timestep_js(plan, planner)
                 obj_to_current_pose[obj_name] = world_from_obj_target
 
-                state.current_js = last_js
-                state.arm_holding[arm] = None
-                state.arm_grasp_transform[arm] = None
+                held.pop(arm, None)
                 # Detach: resets the gripper link's spheres and re-enables
                 # the world obstacle. But the obstacle's stored pose is
                 # still the original pickup pose, so update it to the
@@ -497,9 +510,6 @@ def solve_curobo(
         except RuntimeError as e:
             e.op_idx = idx  # lets _motion_plan_with_retries skip candidates that repeat ops 0..idx
             raise
-        finally:
-            if arm is not None:
-                state.unpin()
 
         _log.info(f"{idx + 1}. {ground_op.name}")
 

@@ -25,9 +25,7 @@ upgrade audit catches them):
   (``motion_solver.build_motion_planner``).
 """
 
-from typing import Dict, Iterable, List
-
-import torch
+from typing import List
 
 # TODO: file upstream issue against cuRobo. ``MotionPlanner.attachment_manager``
 # is a property that delegates to ``trajopt_solver.attachment_manager``; that
@@ -58,96 +56,9 @@ def cspace_plan_succeeded(result) -> bool:
     return result is not None and bool(result.success.any())
 
 
-# TODO: file upstream issue against cuRobo. The per-DOF target weight tensor
-# lives on each optimizer rollout's cost_manager (one per rollout — sampling +
-# gradient-based) with no public mutator. Direct ``.copy_`` is the only way to
-# update the weights so the kernel picks them up; reassignment would break the
-# device/dtype binding the optimizer captured.
-def iter_rollouts(host) -> List:
-    """Resolve the optimizer rollout list on either a MotionPlanner or an IKSolver.
-
-    MotionPlanner exposes them under ``host.trajopt_solver.optimizer_rollouts``;
-    cuRobo's IKSolver puts them on ``host.core.optimizer_rollouts``.
-    """
-    if hasattr(host, "trajopt_solver"):
-        return list(getattr(host.trajopt_solver, "optimizer_rollouts", []))
-    if hasattr(host, "core"):
-        return list(getattr(host.core, "optimizer_rollouts", []))
-    return list(getattr(host, "optimizer_rollouts", []))
-
-
-# All mutators below share this walk: rollouts → cost_manager → costs["cspace"].
-# The cspace cost reads ``config.joint_limits.position`` and ``self._weight``
-# fresh every iteration (no caching), so in-place mutation takes effect
-# immediately. ``cost._weight`` is the LIVE tensor; ``config.weight`` is the
-# "armed" value ``enable_cost()`` restores from.
-def _cspace_costs_from_rollouts(rollouts: Iterable) -> List:
-    costs = []
-    for r in rollouts:
-        cm = getattr(r, "cost_manager", None)
-        if cm is None:
-            continue
-        cspace_cost = cm.costs.get("cspace") if hasattr(cm, "costs") else None
-        if cspace_cost is not None and hasattr(cspace_cost, "_weight"):
-            costs.append(cspace_cost)
-    return costs
-
-
-def write_cspace_target_dof_weight(hosts: Iterable, weights: torch.Tensor) -> None:
-    """In-place write of ``weights`` to every rollout's cspace target weight."""
-    for h in hosts:
-        for c in _cspace_costs_from_rollouts(iter_rollouts(h)):
-            cfg = c.config
-            cfg.cspace_target_dof_weight.copy_(weights.to(cfg.cspace_target_dof_weight))
-
-
-# Snapshot key uses ``id(host)``: safe within a process for the lifetime of
-# the host objects, not portable across pickling. Only ever held briefly
-# (one IK call or one motion-plan operator), so this is fine.
-def snapshot_cspace_target_dof_weight(hosts: Iterable) -> Dict[int, List[torch.Tensor]]:
-    """Per-host snapshot of the current cspace target weights."""
-    return {
-        id(h): [c.config.cspace_target_dof_weight.clone()
-                for c in _cspace_costs_from_rollouts(iter_rollouts(h))]
-        for h in hosts
-    }
-
-
-def restore_cspace_target_dof_weight(
-    hosts: Iterable, snapshot: Dict[int, List[torch.Tensor]],
-) -> None:
-    """Restore each host's cspace target weights from a prior snapshot."""
-    for h in hosts:
-        saved_list = snapshot.get(id(h))
-        if saved_list is None:
-            continue
-        for c, saved in zip(_cspace_costs_from_rollouts(iter_rollouts(h)), saved_list):
-            cfg = c.config
-            cfg.cspace_target_dof_weight.copy_(saved.to(cfg.cspace_target_dof_weight))
-
-
-def build_pin_weights(
-    host, pin_names: Iterable[str], pin_weight: float = 1000.0, default_weight: float = 1.0,
-) -> torch.Tensor:
-    """Build a per-DOF cspace target weight tensor: ``default_weight``
-    everywhere, ``pin_weight`` on ``pin_names``.
-
-    Sized to the host's active cspace (post-lock_joints); names not in the
-    active cspace are silently skipped. The returned tensor is on the same
-    device/dtype as the host's cspace cost weight.
-    """
-    costs = _cspace_costs_from_rollouts(iter_rollouts(host))
-    if not costs:
-        raise RuntimeError("Host has no rollouts with a cspace cost.")
-    ref = costs[0].config.cspace_target_dof_weight
-    active_names = list(host.kinematics.joint_names)
-    weights = torch.full((len(active_names),), default_weight, device=ref.device, dtype=ref.dtype)
-    name_to_idx = {n: i for i, n in enumerate(active_names)}
-    for n in pin_names:
-        i = name_to_idx.get(n)
-        if i is not None:
-            weights[i] = pin_weight
-    return weights
+def iter_rollouts(planner) -> List:
+    """The MotionPlanner's trajopt optimizer rollouts (one per optimizer: sampling and gradient-based)."""
+    return list(planner.trajopt_solver.optimizer_rollouts)
 
 
 # TODO: file upstream issue against cuRobo. RobotCostManager.compute_costs
@@ -174,19 +85,10 @@ def _ensure_extra_cost_dispatch(manager) -> None:
 
 
 def add_extra_cost(host, name: str, cost) -> None:
-    """Register ``cost`` on every rollout's cost_manager and metrics
-    cost_manager for ``host``. Each manager is wrapped (once) so its
-    ``compute_costs`` invokes any extra costs registered through this helper.
-
-    ``host`` may be a ``MotionPlanner`` (rollouts live at
-    ``host.trajopt_solver.optimizer_rollouts``) or an ``IKSolver``
-    (rollouts at ``host.core.optimizer_rollouts``). ``iter_rollouts``
-    handles both paths.
-
-    NOTE: for IK solve-time costs this path is INERT — the seed-IK LM
-    error calculator never consults the rollout cost managers (use the
-    seed-IK CoM residual fork instead). The planner is the supported
-    target."""
+    """Register ``cost`` on every trajopt rollout's cost_manager and metrics
+    cost_manager for the MotionPlanner ``host``. Each manager is wrapped (once)
+    so its ``compute_costs`` invokes any extra costs registered through this
+    helper."""
     for rollout in iter_rollouts(host):
         for mgr in (
             getattr(rollout, "cost_manager", None),
