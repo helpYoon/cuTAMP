@@ -28,7 +28,6 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.costs import curobo_pose_error
 from cutamp.gn_refresh import gn_gate, gn_project_balanced
-from cutamp.particle_initialization import IKTol, gn_ik, ik_check
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.rollout import RolloutFunction, movable_spheres_fn
 from cutamp.t1_domain import Conf, Pose
@@ -358,8 +357,7 @@ def _refresh_balanced(
 
     Every row's result is written back (a persistent lower-level iterate): an unconverged row resumes
     next refresh, and an unreachable one sits at its closest balanced pose, which the kinematic cost
-    pulls the placement toward. The final pre-check refresh repairs what is left
-    (:func:`~cutamp.particle_initialization.gn_ik`), and the :func:`gn_gate` masks only feed the stats. No host syncs
+    pulls the placement toward. The :func:`gn_gate` masks only feed the stats. No host syncs
     once gn_refresh's constants are cached, since the loop is launch-bound: CUDA events time it, and
     the stats stay on the device until ``gate.flush()``.
     """
@@ -454,48 +452,6 @@ class ParticleOptimizer:
         # Types to optimize
         self.types_to_optimize = {Pose, Conf}
         self.opt_counter = 0
-
-    def _refresh_ik_deps(
-        self,
-        particles: dict,
-        ik_deps: List[IKDep],
-        world: TAMPWorld,
-        gate: "_ReikDriftGate" = None,
-        step: int = None,
-    ) -> None:
-        """Re-solve IK for each ``IKDep`` and write the result into the
-        corresponding Conf particle in-place.
-
-        With a ``gate``, the refresh is :func:`_refresh_balanced`, which writes
-        every row back and records per-dep drift/timing stats. ``gate=None`` is the final pre-check repair:
-        :func:`~cutamp.particle_initialization.gn_ik` over every dep in one call, from the stored confs (and its
-        noisy starts), and only the rows that GN IK's own check rejects now and accepts after take the result
-        (:func:`~cutamp.particle_initialization.ik_check`: the hand, the soles, the CoM and the tilt bound at the
-        checker's tolerances, collision at zero penetration, stricter than its). A blanket overwrite perturbs
-        already-good rows' soft costs (measured best_soft 18.6 -> 22.8 on one run). Covered Confs are out of the
-        optimizer, so neither Adam nor ``apply_grad_masks`` touches them.
-        """
-        if not ik_deps:
-            return
-        if gate is not None:
-            return _refresh_balanced(particles, ik_deps, world, gate, step)
-        tol = IKTol.from_checker(self.constraint_checker)
-        arms = tuple(dep.arm for dep in ik_deps)
-        with torch.no_grad():
-            # Detached: nothing may flow into the Pose / Grasp leaves.
-            targets = torch.cat([dep.target_fn(particles) for dep in ik_deps])
-            movables = torch.cat([dep.movables_fn(particles) for dep in ik_deps])
-            q_now = torch.cat([particles[dep.q_name].detach() for dep in ik_deps])
-            ok_now = ik_check(world, q_now, targets, arms, movables, tol)[0]
-        if bool(ok_now.all()):
-            return  # nothing to repair
-        q_new, ok_new = gn_ik(world, targets, arms, movables, tol, q_start=q_now)
-        with torch.no_grad():
-            merged = torch.where((ok_new & ~ok_now).unsqueeze(-1), q_new, q_now)
-            for dep, q_dep in zip(ik_deps, merged.split(q_now.shape[0] // len(ik_deps))):
-                particles[dep.q_name].copy_(q_dep)
-                # Dropped from the optimizer, so .grad has no consumer.
-                particles[dep.q_name].grad = None
 
     def _capture_step(self, body: _StepBody, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
         """Capture ``body`` as G_step. Each warm-up drops every ``.grad``, so the captured AccumulateGrad
@@ -737,7 +693,7 @@ class ParticleOptimizer:
                     if refresh_graph is not None:
                         refresh_graph(step)
                     else:
-                        self._refresh_ik_deps(particles, ik_deps, world, gate=reik_gate, step=step)
+                        _refresh_balanced(particles, ik_deps, world, reik_gate, step)
                         # G_step exists only once the planner thread has ended for good.
                         if step_graph is not None:
                             refresh_graph = _StaticRefresh(particles, ik_deps, world, reik_gate)
@@ -775,13 +731,10 @@ class ParticleOptimizer:
         )
         opt_metrics["restored"] = restored
 
-        # Final re-IK before downstream satisfaction checks: Adam may have
-        # moved poses since the last periodic refresh. Always FULL (no gate):
-        # restore_if_better may have rewritten particles, making gate refs stale.
-        if ik_deps:
-            with timer.time("final_repair"):
-                self._refresh_ik_deps(particles, ik_deps, world)
-                reik_gate.flush()  # the queued refresh records sit on the device until here
+        # No re-IK after the loop: the satisfaction check below drops any covered conf that drifted off its
+        # target in the steps since the last refresh (a final GN IK repair here changed no blocks_t1 plan, 2026-11-06).
+        if reik_gate is not None:
+            reik_gate.flush()  # the queued refresh records sit on the device until here
         if reik_gate is not None and reik_gate.stats:
             opt_metrics["reik_refresh"] = reik_gate.stats
             total_s = sum(r["solve_s"] for r in reik_gate.stats)

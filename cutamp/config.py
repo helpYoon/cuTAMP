@@ -58,8 +58,8 @@ class TAMPConfiguration:
     # balance-first GN refresh (gn_project_balanced) projects them onto their
     # moved targets: the CoM in the support rectangle, both soles on the
     # stance and the robot clear of collision first, the pose least squares
-    # inside it. Every row's iterate is written back; the final pre-check
-    # refresh (gn_ik, from the stored confs) repairs the rows that still miss.
+    # inside it. Every row's iterate is written back; the satisfaction check
+    # after the loop drops the rows that still miss.
     reik_interval: int = 5
     # Replay the Adam step and the re-IK refresh as CUDA graphs
     # (cutamp/cuda_graphs.py); align_yaw runs stay eager (see

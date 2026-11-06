@@ -11,8 +11,7 @@
 - each call ends with a closing step, so the soles hold after every call, out-of-reach targets included; under a
   tilt bound a row that starts within REACH of it is within it after one call, and stays within it after
   out-of-reach calls;
-- the merge gate (``gn_gate``), the final repair and the kinematic constraint all check the soles against the
-  stance;
+- the merge gate (``gn_gate``), GN IK's check and the kinematic constraint all check the soles against the stance;
 - level 1's collision row is positive exactly where the scene's collision_fn or cuRobo's self-collision kernel is,
   and it clears contact holding the hand; GN IK accepts only confs that pass the checks on their own, and the
   movables it checks sit where the rollout puts them.
@@ -45,8 +44,8 @@ TILTED = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(tru
 
 
 def _with_tilt_bound(world, monkeypatch, tilt_max=TILT_MAX):
-    """``world`` on TILTED until the test ends (``tilt_max`` None: left on REAL_LEGS). GN, the cost function and the
-    final repair read the bound from ``world.model``."""
+    """``world`` on TILTED until the test ends (``tilt_max`` None: left on REAL_LEGS). GN, the cost function and GN
+    IK's check read the bound from ``world.model``."""
     if tilt_max is not None:
         assert tilt_max == TILT_MAX
         monkeypatch.setattr(world, "robot_container", dataclasses.replace(world.robot_container, model=TILTED))
@@ -400,7 +399,7 @@ def test_gate_rejects_drifted_soles(real_world):
 
 @needs_cuda
 def test_soles_on_stance_at_the_checker_tolerances(real_world):
-    # The final repair's sole test, on world.kinematics and the checker's own sole tolerances: home stands on the
+    # GN IK's sole test, on world.kinematics and the checker's own sole tolerances: home stands on the
     # stance, and home shifted 1 cm by base_j_x does not.
     from cutamp.com_polygon_cost import _fk_state
     from cutamp.gn_refresh import soles_on_stance
@@ -415,7 +414,7 @@ def test_soles_on_stance_at_the_checker_tolerances(real_world):
 
 
 def test_tilt_within_bound_on_the_motion_values_metric():
-    # The final repair's tilt test, on the Motion value's metric and tolerance: under TILT_MAX, upright and on the
+    # GN IK's tilt test, on the Motion value's metric and tolerance: under TILT_MAX, upright and on the
     # bound (roll TILT_MAX) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, passes every conf.
     from types import SimpleNamespace
     from cutamp.gn_refresh import tilt_within_bound
@@ -427,46 +426,8 @@ def test_tilt_within_bound_on_the_motion_values_metric():
 
 
 @needs_cuda
-def test_final_repair_takes_only_accepted_repairs(real_world, real_plan, monkeypatch):
-    # The final pre-check repair re-solves the rows the check rejects and takes GN IK's result only where the check
-    # rejected the stored conf and accepts the repair. Two accepted first-pick rows miss their hand once a shoulder
-    # moves 0.3 rad; the stubbed GN IK returns the init's confs, accepted on one of them and on a third row, still
-    # accepted, whose shoulder it moves 0.1 rad: the first takes its repair, the other two keep their stored confs,
-    # and so does every other row.
-    import cutamp.optimize_plan as op
-    from cutamp.config import TAMPConfiguration
-    from cutamp.tests.conftest import make_optimizer
-    skeleton, particles = real_plan
-    particles = clone_particles(particles)
-    arm, conf, _ = _first_pick(real_world, real_plan)
-    a, b, c = _accepted(real_world, real_plan, conf).nonzero().flatten()[:3].tolist()
-    q = particles[conf].detach().clone()
-    j = list(REAL_LEGS.joint_names).index(f"{arm.title()}_Shoulder_Pitch")
-    with torch.no_grad():
-        particles[conf][[a, b], j] += 0.3
-    moved = particles[conf].detach().clone()
-    calls = []
-
-    def gn_ik(world, targets, arms, movables, tol, q_start=None):
-        calls.append(q_start.clone())
-        ok = torch.zeros(len(q), dtype=torch.bool, device=q.device)
-        ok[[b, c]] = True
-        q_ret = q.clone()
-        q_ret[c, j] += 0.1
-        return q_ret, ok
-
-    monkeypatch.setattr(op, "gn_ik", gn_ik)
-    deps = [dep for dep in op._build_ik_deps(skeleton, real_world) if dep.q_name == conf]
-    make_optimizer(TAMPConfiguration(num_particles=64))._refresh_ik_deps(particles, deps, real_world)
-    assert len(calls) == 1 and torch.equal(calls[0], moved)  # GN IK starts from the stored confs
-    want = moved.clone()
-    want[b] = q[b]
-    assert torch.equal(particles[conf], want)
-
-
-@needs_cuda
 def test_ik_check_rejects_a_conf_past_the_tilt_bound(real_world, real_plan, monkeypatch):
-    # GN IK and the final repair accept a conf only inside the envelope's tilt bound, on the Motion value's metric:
+    # GN IK accepts a conf only inside the envelope's tilt bound, on the Motion value's metric:
     # the most tilted accepted first-pick row passes under a bound 0.01 rad above its tilt and fails under one 0.01 rad
     # below it, the conf unchanged.
     import dataclasses

@@ -20,13 +20,12 @@ out of collision with the scene, the objects and itself (one row), and, on a mod
 Trunk tilt, the tilt inside that bound (one row, call 22); level 3, beside the collision row, pulls the CoM
 toward the rectangle's centre, and level 4, below it, the Trunk toward upright. ``gn_gate`` checks the soles too.
 
-Three callers: the particle init (``particle_initialization.gn_ik``: from home and from noisy stance-rooted
+Two callers: the particle init (``particle_initialization.gn_ik``: from home and from noisy stance-rooted
 starts, iterations that reach balance first, then iterations with the collision row on, since only the conf
-the iterates end at must be clear), the periodic refresh inside the Adam loop (``GN_ITERS`` iterations from
-the stored q, the collision row on in every one, captured as G_refresh) and the final pre-check repair
-(``gn_ik`` again, from the stored q). A refresh projects
-all of its deps in one call and makes no host syncs (the Adam loop is host-launch-bound), so its solves are
-the unchecked ``*_ex`` kernels. Strictly local: a row that doesn't converge resumes at the next refresh.
+the iterates end at must be clear) and the periodic refresh inside the Adam loop (``GN_ITERS`` iterations from
+the stored q, the collision row on in every one, captured as G_refresh). A refresh projects all of its deps in
+one call and makes no host syncs (the Adam loop is host-launch-bound), so its solves are the unchecked ``*_ex``
+kernels. Strictly local: a row that doesn't converge resumes at the next refresh.
 """
 
 import math
