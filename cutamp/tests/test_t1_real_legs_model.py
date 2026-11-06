@@ -1,8 +1,7 @@
-"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): ``T1Model``'s two instances, the ``--robot``
-switch and its refusals, the support rectangles, and the blocks_t1 world on the real legs, standing on the home
-stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
+"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the ``--robot`` switch and
+its refusals, the support rectangles, and the blocks_t1 world on the real legs, standing on the home stance. The GPU
+tests share conftest's module-scoped ``real_world``: one world per module."""
 
-import dataclasses
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -12,15 +11,9 @@ import pytest
 import torch
 import yaml
 
-from cutamp.com_polygon_cost import (
-    COM_CENTER,
-    COM_HALF_EXTENTS,
-    LOAD_GUARD_A,
-    SUPPORT_HALF_EXTENTS,
-    support_rectangles,
-)
+from cutamp.com_polygon_cost import LOAD_GUARD_A, support_rectangles
 from cutamp.config import TAMPConfiguration, validate_tamp_config
-from cutamp.robots.t1 import BASE_INDICES, JOINT_NAMES_FULL, REAL_LEGS, SIMPLIFIED, get_model, t1_home
+from cutamp.robots.t1 import REAL_LEGS, get_model
 from cutamp.tests.conftest import needs_cuda
 
 CUTAMP = Path(__file__).resolve().parents[1]
@@ -124,13 +117,11 @@ def test_real_legs_layout():
     assert (m.base, m.left_arm, m.right_arm, m.body) == (slice(0, 6), slice(6, 13), slice(13, 20), slice(20, 33))
     assert not any(m.margin_lower + m.margin_upper) and len(m.margin_lower) == len(m.margin_upper) == 33
     assert len(m.home) == 33 and m.sole_frames == ("left_sole_link", "right_sole_link")
-    assert m.envelope.name == "route_a_start" and SIMPLIFIED.envelope is None
-    assert SIMPLIFIED.home == t1_home and SIMPLIFIED.base == BASE_INDICES and SIMPLIFIED.joint_names == JOINT_NAMES_FULL
-    assert SIMPLIFIED.lock_base and SIMPLIFIED.sole_frames == ()
+    assert m.envelope.name == "route_a_start"
 
 
 def test_unknown_robot():
-    assert get_model("simplified") is SIMPLIFIED and get_model("real_legs") is REAL_LEGS
+    assert get_model("real_legs") is REAL_LEGS
     with pytest.raises(ValueError, match="t2"):
         get_model("t2")
     with pytest.raises(ValueError, match="t2"):
@@ -138,8 +129,8 @@ def test_unknown_robot():
 
 
 def test_real_legs_are_the_default(monkeypatch):
-    # The user, 2026-11-05, once the speed gate passed at n 64: the config, run_cutamp's CLI and conftest's worlds
-    # plan on the real legs unless told otherwise.
+    # The user's decision of 2026-11-05: the config, run_cutamp's CLI and conftest's worlds plan on the real legs
+    # unless told otherwise.
     import sys
 
     import cutamp.scripts.run_cutamp as rc
@@ -154,13 +145,8 @@ def test_real_legs_are_the_default(monkeypatch):
 def test_soft_cost_default_by_robot():
     real_default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
     assert TAMPConfiguration().soft_cost == TAMPConfiguration(robot="real_legs").soft_cost == real_default
-    assert TAMPConfiguration(robot="simplified").soft_cost == ["place_close_to_base", "joint_limit_margin"]
     assert TAMPConfiguration(robot="real_legs", soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
-    # As config.py's soft_cost comment says: replace() keeps the resolved list unless soft_cost=None is passed.
-    simplified = TAMPConfiguration(robot="simplified")
-    assert dataclasses.replace(simplified, robot="real_legs").soft_cost == simplified.soft_cost
-    assert dataclasses.replace(simplified, robot="real_legs", soft_cost=None).soft_cost == real_default
 
 
 @pytest.mark.parametrize("kw", [dict(enable_com_polygon=False), dict(enable_com_aware_ik=False),
@@ -198,7 +184,6 @@ def test_support_rectangles():
     gate, key = support_rectangles((0.2249, 0.100), 0.10625, 0.1)
     assert gate == pytest.approx((0.09245, 0.135)) and key == pytest.approx((0.08745, 0.130))
     assert REAL_LEGS.support == ("stance", (0.0, 0.0), gate, key)
-    assert SIMPLIFIED.support == ("mobile_base_link", COM_CENTER, SUPPORT_HALF_EXTENTS, COM_HALF_EXTENTS)
 
 
 def test_load_guard_is_the_hull_of_its_32_sums():

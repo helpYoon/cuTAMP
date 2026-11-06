@@ -1,7 +1,6 @@
 """Every balance check on the model's support (design 7.4, call 5): on the real legs the masks, margins, penalties
-and the multibody ZMP measure the CoM in the stance frame, against S_a inside the soles' hull shrunk by 2 cm, not
-against the simplified rectangle about ``mobile_base_link``. The GPU tests share conftest's module-scoped
-``real_world``: one world per module."""
+and the multibody ZMP measure the CoM in the stance frame, against S_a inside the soles' hull shrunk by 2 cm. The GPU
+tests share conftest's module-scoped ``real_world``: one world per module."""
 
 import torch
 

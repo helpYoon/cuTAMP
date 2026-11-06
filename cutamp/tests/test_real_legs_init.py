@@ -1,17 +1,13 @@
 """Particle init on the stance (design 7.3). On the real legs:
 - the IK's sole goals are the stance's, never FK at the IK seed;
-- a CoM-gate retry's noisy seed stands on the stance, its base re-solved there (the stance is the noise's root, as
-  the planar base is the simplified model's);
+- a CoM-gate retry's noisy seed stands on the stance, its base re-solved there (the stance is the noise's root);
 - retract confs stand at home, their base and body locked out of Adam, and join the joint-limit and self-collision
   constraints.
-The simplified model keeps its seeds and locks. The GPU tests share conftest's module-scoped ``real_world`` and
-``real_plan``: one world per module."""
-
-from types import SimpleNamespace
+The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module."""
 
 import torch
 
-from cutamp.robots.t1 import REAL_LEGS, SIMPLIFIED
+from cutamp.robots.t1 import REAL_LEGS
 from cutamp.tests.conftest import needs_cuda
 from cutamp.tests.test_t1_real_legs_model import hips_crossed
 
@@ -68,8 +64,6 @@ def test_goal_soles_come_from_the_stance(real_world):
         assert torch.equal(got, world.stance_soles[i].expand(n, 4, 4)), sole
     idle_goal = goal.get_link_pose(idle, make_contiguous=True).get_matrix().reshape(n, 4, 4)
     torch.testing.assert_close(idle_goal, _poses(world, seeds, idle), rtol=0.0, atol=1e-6)
-    from cutamp.tamp_world import TAMPWorld
-    assert TAMPWorld.sole_goals(SimpleNamespace(model=SIMPLIFIED), n) is None  # no soles: today's goals
 
 
 @needs_cuda
@@ -164,26 +158,11 @@ def _inline_seed(world, batch_size, arm, noise_std):
 
 
 @needs_cuda
-def test_simplified_retry_seed_unchanged():
-    from cutamp.particle_initialization import _retry_seed
-    from cutamp.robots.t1 import get_t1_kinematics
-    kin = get_t1_kinematics(SIMPLIFIED)
-    home = torch.as_tensor(SIMPLIFIED.home, dtype=torch.float32, device=kin.device_cfg.device)
-    world = SimpleNamespace(model=SIMPLIFIED, q_init=home, kinematics=kin)
-    for arm in ("left", "right"):
-        for sigma in (0.1, 0.3):
-            torch.manual_seed(0)
-            want = _inline_seed(world, 64, arm, sigma)
-            torch.manual_seed(0)
-            assert torch.equal(_retry_seed(world, 64, arm, sigma), want), (arm, sigma)
-
-
-@needs_cuda
 def test_init_confs_stand_on_the_stance(real_world, real_plan):
     # Rows whose IK failed hold home (_store_ik_q), which stands on the stance too; the IK-solved rows are the rest.
-    # Not checked: their CoM. The init's CoM gate is best effort on both models: it keeps an IK-solved
-    # row that fails every retry, as about half the IK-solved place rows on blocks_t1 do, on either model. GN's
-    # balance-first projection and the balance gate enforce the CoM downstream.
+    # Not checked: their CoM. The init's CoM gate is best effort: it keeps an IK-solved row that fails every retry,
+    # as about half the IK-solved place rows on blocks_t1 do. GN's balance-first projection and the balance gate
+    # enforce the CoM downstream.
     skeleton, particles = real_plan
     home = _home(real_world)
     reaches, retracts = _ops(skeleton, "pick", "place"), _ops(skeleton, "retract")
@@ -200,7 +179,7 @@ def test_init_confs_stand_on_the_stance(real_world, real_plan):
 @needs_cuda
 def test_real_leg_locks(real_plan):
     # On the real legs a retract conf keeps its stance (base and body) and its idle arm; a pick or place conf locks
-    # its idle arm only. The simplified model locks its planar base and the idle arm for both.
+    # its idle arm only.
     from cutamp.conf_locking import get_conf_locked_dofs
     skeleton, _ = real_plan
     retracts, reaches = _ops(skeleton, "retract"), _ops(skeleton, "pick", "place")
@@ -210,7 +189,6 @@ def test_real_leg_locks(real_plan):
             return m.right_arm if arm == "left" else m.left_arm
         stance = (REAL_LEGS.base, REAL_LEGS.body) if (arm, conf) in retracts else ()
         assert set(get_conf_locked_dofs(skeleton, conf, REAL_LEGS)) == _span(*stance, idle(REAL_LEGS)), conf
-        assert set(get_conf_locked_dofs(skeleton, conf, SIMPLIFIED)) == _span(SIMPLIFIED.base, idle(SIMPLIFIED)), conf
 
 
 @needs_cuda
