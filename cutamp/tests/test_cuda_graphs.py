@@ -46,6 +46,22 @@ def test_cli_defaults_on(monkeypatch):
         assert (seen[-1].reik_balance_first, seen[-1].cuda_graphs) == (balance_first, graphs), argv
 
 
+def test_cli_reaches_cutamp_demo(monkeypatch):
+    # The flags a motion-planning run passes: n, the motion plan, no visualizer, a soft cost, an experiment id and an
+    # automatically named saved plan all reach cutamp_demo.
+    import cutamp.scripts.run_cutamp as rc
+    seen = []
+    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append((config, kw)))
+    monkeypatch.setattr(sys, "argv", ["run_cutamp", "-n", "64", "--disable_visualizer", "--motion_plan",
+                                      "--save_plan", "auto", "--soft_cost", "joint_limit_margin",
+                                      "--experiment_id", "cli_run"])
+    rc.entrypoint()
+    config, kw = seen[-1]
+    assert (config.num_particles, config.curobo_plan, config.enable_visualizer) == (64, True, False)
+    assert config.soft_cost == ["joint_limit_margin"]
+    assert kw == {"experiment_id": "cli_run", "save_plan": "auto"}
+
+
 # The failing capture's process: cwd is this tree's root, so ``-c`` imports this tree's cutamp.
 _FAILED_CAPTURE_CHILD = """
 import os

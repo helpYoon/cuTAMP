@@ -1,6 +1,6 @@
 """The real-leg plans' torque, speed and balance report (design 7.4a and section 8).
 
-For every real-leg raw plan (``run_cutamp --robot real_legs --save_plan``, schema ``stage3-raw``) under a study
+For every real-leg raw plan (``run_cutamp --save_plan``, schema ``stage3-raw``) under a study
 directory, it runs cuRobo's two RNEA passes with the floor's push (``SegmentTorques``) on every segment at its saved
 timing, FKs every frame, and writes ``PREFIX.json`` and ``PREFIX.md``:
 
@@ -221,7 +221,7 @@ def _markdown(report: dict) -> str:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--study", required=True, type=Path,
-                    help="a directory whose tree holds the runs' experiment directories (a run_ablation --out)")
+                    help="a directory whose tree holds the runs' experiment directories (run_cutamp's experiments)")
     ap.add_argument("--out", required=True, type=Path, help="output prefix: writes PREFIX.json and PREFIX.md")
     a = ap.parse_args(argv)
     report = build_report(a.study)
