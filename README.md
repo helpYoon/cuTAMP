@@ -65,8 +65,8 @@ graph LR
    on the stance in one batch, first reaching and then clearing any collision
    with the scene, the robot itself and the movable objects, the clearing
    iterations also pulling the CoM toward the keyframe rectangle's centre so
-   a conf doesn't park on its edge. Each target keeps
-   its best start, and a conf is accepted only inside the checker's
+   a conf doesn't park on its edge, and the Trunk toward upright. Each target
+   keeps its most upright accepted start, and a conf is accepted only inside the checker's
    tolerances (`ik_check`): the hand, both soles on the stance, the CoM in the
    model's keyframe rectangle (`world.model.support.keyframe_half`), no
    collision and the tilt bound. Retract confs start at the model's home
@@ -341,7 +341,9 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   reaching iterations without the collision row and 10 with it (the iterates
   are not motions, so only the result must be collision-free), then
   `ik_check` on the checker's tolerances; each target keeps its accepted
-  start with the smallest hand error. The movable objects' spheres at each
+  start whose Trunk tilts least (accepted starts' hand errors tie), else the
+  safe one (every check but the hand's) with the smallest hand error, else
+  the one with the smallest hand error. The movable objects' spheres at each
   conf come from `rollout.movable_spheres_fn`, placed as the rollout places
   them.
 
@@ -390,11 +392,14 @@ through every trajectory (see `T1State.compute_all_held_obj_poses`).
   scene, itself and the movable objects (one row on the summed penetration,
   `collision_penetration`, aimed 5 mm past contact, a solver margin) and the
   Trunk's tilt within an envelope's bound, whose level 2 is the pose, least
-  squares inside it, and whose level 3, beside the collision row, pulls the
+  squares inside it, whose level 3, beside the collision row, pulls the
   CoM toward the rectangle's centre in the freedom left (`_centring_step`; on
   every iteration but the last, and a row in contact, or whose step would end
   in contact, past the tilt bound or with a CoM axis past the rectangle,
-  takes levels 1-2's step), every step
+  takes levels 1-2's step), and whose level 4, below it, pulls the Trunk
+  toward upright, the base's pitch and roll toward 0 (`_upright_step`; a row
+  whose level-3 step is taken back takes neither, and one whose level-4 step
+  would end in contact or past the tilt bound takes levels 1-3's), every step
   scaled inside the joint limits, with no cuRobo during Adam. `gn_gate` checks the result against the checker's
   tolerances for the refresh stats; it checks no collision.
 
@@ -668,14 +673,16 @@ refresh repairs with GN IK).
    frontier:
    - **Balance-first GN IK** (`gn_ik`): the IK itself puts the CoM in the
      keyframe rectangle, the soles on the stance and the robot out of
-     collision first, the hand pose second and the CoM toward the
-     rectangle's centre third, recruiting the legs within joint limits, and
+     collision first, the hand pose second, the CoM toward the
+     rectangle's centre third and the Trunk toward upright fourth, recruiting
+     the legs within joint limits, and
      accepts a conf only inside every tolerance.
    - **Hard `ComPolygon` gate**: every optimizer conf must have COM penalty
      ≤ `COM_TOL`.
    - **Balance-first re-IK refresh**: covered confs are outside Adam, so the
      GN refresh puts the CoM, the soles and collision first (the pose is
-     least squares inside them, the pull to the centre below the pose) and
+     least squares inside them, the pull to the centre below the pose, the
+     pull upright below that) and
      the final pre-check refresh repairs any
      row `ik_check` rejects with GN IK.
    - **COM-anchored terminals**: pick/place trajectories end exactly at the

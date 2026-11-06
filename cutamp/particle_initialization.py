@@ -34,6 +34,7 @@ from cutamp.gn_refresh import (
     soles_on_stance,
     tilt_within_bound,
 )
+from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
 from cutamp.samplers import (
     grasp_4dof_sampler,
@@ -194,10 +195,11 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     in ``arms``' dep-major blocks (a bare ``str`` is one dep), from ``1 + len(GN_IK_START_SIGMAS)`` starts per row
     in one batched call, ``q_start`` (default ``world.q_init``) and :func:`_noisy_start`'s stance-rooted noise:
     ``GN_IK_ITERS`` iterations balance first, then ``GN_IK_CLEAR_ITERS`` that also clear the scene, ``movables``
-    ``[N, M, 4]`` and the robot itself, and pull the CoM toward the keyframe rectangle's centre (GN's level 3).
+    ``[N, M, 4]`` and the robot itself, and pull the CoM toward the keyframe rectangle's centre and the Trunk toward
+    upright (GN's levels 3 and 4).
 
-    Returns ``(q [N, dof], ok [N])``: per row, the accepted start (:func:`ik_check`) closest to the target; where
-    none is, the closest safe one, else the closest, a balanced-first iterate that the periodic refresh keeps
+    Returns ``(q [N, dof], ok [N])``: per row, the accepted start (:func:`ik_check`) whose Trunk tilts least; where
+    none is, the safe one closest to the target, else the closest, a balanced-first iterate that the periodic refresh keeps
     projecting and whose pose error the kinematic cost hands to the placement. ``ok`` marks the accepted rows."""
     arms = (arms,) if isinstance(arms, str) else tuple(arms)
     n = world_from_ee.shape[0]
@@ -209,8 +211,15 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     q = gn_project_balanced(world, torch.cat(starts), targets, rows_arms, iters=GN_IK_ITERS, collision=False)
     q = gn_project_balanced(world, q, targets, rows_arms, iters=GN_IK_CLEAR_ITERS, movables=mov)
     ok, safe, err = ik_check(world, q, targets, rows_arms, mov, tol)
-    # Tiers: accepted, then safe, then the rest, each by hand error (under 10: metres plus radians).
-    best = (err + 100.0 * ~ok + 1e4 * ~safe).view(k, n).argmin(0) * n + torch.arange(n, device=q.device)
+    # Tiers: accepted, by the Trunk's tilt (1 - its cosine, at most 2), then safe, then the rest, by hand error
+    # (under 10: metres plus radians). Accepted starts' hand errors tie to two digits, so by hand error a row took
+    # whichever converged a hair closer: on blocks_t1's floor picks the starts that a noisy start tilts back reach a
+    # second branch, the Trunk 70-115 deg back, and the first left pick kept it on 2 of 64 rows, 10 with level 4,
+    # which shifts the hair (seed 1, 2026-11-06). Level 4 can't bring such a row up: it is local.
+    names = list(world.model.joint_names)
+    tilt = 1.0 - trunk_tilt_cosine(q, names.index("base_j_pitch"), names.index("base_j_roll"))
+    best = (torch.where(ok, tilt, err) + 100.0 * ~ok + 1e4 * ~safe).view(k, n).argmin(0) * n
+    best = best + torch.arange(n, device=q.device)
     return q[best], ok[best]
 
 
