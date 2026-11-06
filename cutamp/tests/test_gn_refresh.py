@@ -2,7 +2,7 @@
 
 CUDA-only: exercises the real T1 kinematics kernel — the Jacobian convention
 check is the load-bearing regression (GN silently diverges if cuRobo ever
-changes row order or frame). The tests run on conftest's default model.
+changes row order or frame). The tests run on the real legs.
 """
 import inspect
 from unittest import mock

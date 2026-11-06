@@ -38,7 +38,8 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
             }],
         }
 
-    The joint values are the planner's own; the joints it locks (the head, the fingers) are left out. A segment without native velocities or accelerations raises rather than having them fabricated."""
+    The joint values are the planner's own; the joints it locks (the head, the fingers) are left out. A segment
+    without native velocities or accelerations raises rather than having them fabricated."""
     names = list(model.joint_names)
 
     def frames(plan_js: JointState) -> Dict[str, np.ndarray]:

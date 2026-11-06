@@ -223,8 +223,8 @@ def _motion_plan_with_retries(
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
       - ``failures``: each planned candidate's failure message, in order. A
-        failed trajopt's message names its reason, so a report can count the
-        candidates lost to torque (design 7.4a).
+        failed trajopt's message names its reason (design 7.4a). The caller
+        records them in ``overall_metrics["motion_plan_failures"]``.
     """
     skeleton = plan_info["plan_skeleton"]
     last_err, tried, failed, failures = None, 0, [], []

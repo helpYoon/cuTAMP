@@ -376,11 +376,10 @@ def get_t1_motion_planner(
     # Tuned on the simplified model (branch ablation-baseline) and kept on the real legs:
     # COM-polygon cost is a SAFETY BARRIER: zero cost anywhere inside
     # the two-foot support rectangle, quadratic-in-distance penalty
-    # outside. ``body_home_posture`` is what keeps the body near upright
-    # at the joint level — having COM ALSO try to pull toward center
-    # produced fighting costs (COM "lean back to recenter" vs body "stay
+    # outside. The joint-level costs are what keep the body near upright
+    # — having COM ALSO try to pull toward center produced fighting costs (COM "lean back to recenter" vs body "stay
     # upright"), which manifested as the trunk pitching backward when
-    # arms reach forward. Boundary-only shape lets body_home_posture
+    # arms reach forward. Boundary-only shape lets those costs
     # dictate posture; COM only intervenes if the body actually drifts
     # to a tipping configuration. Bumped weight 1e5 → 5e5 to push back
     # harder on excursions without re-introducing the inside barrier.
@@ -391,7 +390,7 @@ def get_t1_motion_planner(
     # the inside-barrier here gives the trajopt LBFGS a gradient pull
     # from inside the polygon edge band toward center, flattening the
     # mid-trajectory bumps. The earlier concern (this fighting
-    # body_home_posture) is validated by retesting; if trunk pitches
+    # the joint-level costs) is validated by retesting; if trunk pitches
     # back too much we lower inside_weight from 1.0.
     rollout_device_cfg = planner.trajopt_solver.optimizer_rollouts[0].device_cfg
     cost_cfg = ComOverBasePolygonCostCfg(
@@ -405,7 +404,6 @@ def get_t1_motion_planner(
     )
     add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     if model.envelope.trunk_tilt_max is not None:
-        from cutamp._curobo_internals import add_extra_cost
         from cutamp.joint_limit_cost import TrunkTiltCost, TrunkTiltCostCfg
 
         # The envelope's Trunk tilt bound (call 22) along the trajectory: GN and the Motion value hold it at the confs.

@@ -10,7 +10,7 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple, TypedDict
+from typing import AbstractSet, Callable, Dict, List, Literal, NamedTuple, Optional, Tuple, TypedDict
 
 import torch
 from torch.optim import Adam
@@ -127,7 +127,7 @@ class _StepBody:
     cost_fn: CostFunction
     cost_reducer: CostReducer
     get_mask: Callable[..., torch.Tensor]
-    consider_types: set
+    consider_types: AbstractSet[str]
     params: List[torch.Tensor]
     grad_masks: Dict[int, torch.Tensor]
     keep_vis: bool

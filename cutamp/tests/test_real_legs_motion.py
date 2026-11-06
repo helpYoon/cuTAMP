@@ -891,7 +891,8 @@ def test_failure_reason_names_torque(real_world, monkeypatch):
 def test_plan_failed_names_torque_in_every_torque_form():
     # A failed candidate's message names torque in trajopt's reason (": torque") and in each of the balance gate's
     # torque raises: no time scale up to the cap keeps every effort (_torque_scale), or the frames it returns pass one
-    # (_check_torques). Trajopt's ": other" and the gate's velocity and ZMP raises don't count.
+    # (_check_torques). Trajopt's ": other" and the gate's velocity and ZMP raises don't. The last assert pins which of
+    # the six messages name torque.
     from cutamp.motion_solver import RETIME_MAX, _check_torques, _check_velocity, _plan_failed, _torque_scale
 
     n = len(REAL_LEGS.joint_names)
@@ -921,6 +922,7 @@ def test_plan_failed_names_torque_in_every_torque_form():
                 f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
     assert messages[0].endswith(": torque") and messages[4].endswith(": other")
     assert f"at the {RETIME_MAX}x slowdown cap" in messages[2] and "velocity passes" in messages[3]
+    assert [("torque" in m) for m in messages] == [True, True, True, False, False, False]
 
 
 def test_torque_check_fails_a_nan_torque():
