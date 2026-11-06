@@ -42,15 +42,6 @@ def make_blocks_t1_world(model=None, **tamp_world_kwargs):
     return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, **tamp_world_kwargs)
 
 
-@pytest.fixture
-def t1_planar_base_config():
-    from curobo._src.util.config_io import load_yaml
-    return load_yaml(os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "robots", "assets", "t1_description", "t1_planar_base.yml",
-    ))
-
-
 @pytest.fixture(autouse=True)
 def _free_cuda_between_tests():
     """Release GPU memory after heavy tests. Integration tests build full
@@ -67,33 +58,15 @@ def _free_cuda_between_tests():
 
 
 @pytest.fixture(scope="module")
-def blocks_t1_plan(request):
-    """``[world, skeleton, particles]``: the 64-particle blocks_t1 world as algorithm.py builds it, on
-    :data:`DEFAULT_MODEL`, its first task plan (which follows PYTHONHASHSEED) and its seeded init. A test names another
-    model by its robot name, ``@pytest.mark.parametrize("blocks_t1_plan", ["simplified"], indirect=True)``, and
-    ``None`` names the default model, sharing the world of the tests that pass no parameter; pytest tears one model's
-    world down before it builds the next, so a module keeps each model's cases together. Read-only: tests run on
-    ``clone_particles(particles)``, and a module using it must not build a second world (two OOM a 24 GiB card). A
-    list, so teardown can free the world while pytest still holds the yielded object."""
-    from cutamp.particle_initialization import ParticleInitializer
-    from cutamp.t1_domain import all_t1_operators
-    from cutamp.task_planning import task_plan_generator
-
-    name = getattr(request, "param", None)  # pytest's cache key too: None and no parameter share one world
-    model = DEFAULT_MODEL if name is None else get_model(name)
-    world = make_blocks_t1_world(model, collision_activation_distance=0.0, ik_max_batch_size=64)
-    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
-    torch.manual_seed(0)
-    # robot= here, not dataclasses.replace: __post_init__ resolves the model's default soft costs
-    particles = ParticleInitializer(world, TAMPConfiguration(robot=model.name, num_particles=64))(skeleton)
-    plan = [world, skeleton, particles]
-    del world, skeleton, particles  # the list holds the only references
+def blocks_t1_plan(real_world, real_plan):
+    """``[world, skeleton, particles]``: ``real_world`` and ``real_plan``'s own objects, the 64-particle blocks_t1 world
+    as algorithm.py builds it, its first task plan (which follows PYTHONHASHSEED) and its seeded init. Sharing their
+    build, a module may ask for both (two worlds OOM a 24 GiB card). Read-only: tests run on
+    ``clone_particles(particles)``. A list, so teardown can free the particles while pytest still holds the yielded
+    object; ``real_world``'s slot then frees the world."""
+    plan = [real_world, *real_plan]
     yield plan
     plan.clear()
-    # a failed test's traceback holds its locals; frame.clear() isn't enough on CPython 3.10
-    sys.last_type = sys.last_value = sys.last_traceback = None
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")

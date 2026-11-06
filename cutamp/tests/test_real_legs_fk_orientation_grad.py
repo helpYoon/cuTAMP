@@ -1,5 +1,4 @@
-"""The real legs' FK rotations must carry correct gradients to the configurations, as the simplified model's hands
-do (test_fk_orientation_grad.py).
+"""The real legs' FK rotations must carry correct gradients to the configurations.
 
 cuRobo v2's FK backward gets orientation gradients wrong while positions are exact, and ``_FKQuatGrad`` corrects
 the rotations that autograd differentiates. On the real legs two more rotations can reach autograd: the rollout's
@@ -16,8 +15,7 @@ from cutamp.tests.conftest import clone_particles, needs_cuda
 
 def _fd_check(f, x: dict, d: dict, eps: float = 1e-3) -> tuple:
     """``(sign agreement, median relative error)`` of autograd's derivative of ``f(x)`` ``[N]`` along ``d`` against
-    central differences, for inputs ``x`` ``{name: [N, dof]}``: the measure of test_fk_orientation_grad.py's
-    hand-rotation test."""
+    central differences, for inputs ``x`` ``{name: [N, dof]}``."""
     x = {k: v.detach().clone().requires_grad_(True) for k, v in x.items()}
     grads = torch.autograd.grad(f(x).sum(), list(x.values()))
     autograd = sum((g * d[k]).sum(-1) for g, k in zip(grads, x))
@@ -31,7 +29,8 @@ def _fd_check(f, x: dict, d: dict, eps: float = 1e-3) -> tuple:
 
 
 def _assert_fd(results: dict) -> None:
-    """Each ``{name: (agree, rel)}`` within that hand-rotation test's bounds, all named in the message."""
+    """Each ``{name: (agree, rel)}`` within the bounds (sign agreement above 98%, median relative error below 1e-2),
+    all named in the message."""
     msg = "; ".join(f"{k}: sign agrees on {a:.1%}, median relative error {r:.3g}" for k, (a, r) in results.items())
     assert all(a > 0.98 and r < 1e-2 for a, r in results.values()), msg
 

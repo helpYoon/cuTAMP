@@ -1,6 +1,6 @@
 """GN and the gates on the real legs (design 7.4). On the real legs:
 - 12 sole rows in GN's level 1 hold both soles on the stance, beside the active CoM rows, and the base columns are
-  free (``_row_layout`` freezes them only where ``model.lock_base``);
+  free;
 - level 1 holds the CoM in the real legs' keyframe rectangle;
 - level 1 holds the Trunk tilt within an envelope's maximum: one row, active where the tilt is past the bound or a
   step would push it past, as a CoM axis is. Route A's envelope sets no tilt bound, so the tilt tests plan on the
@@ -297,17 +297,15 @@ def test_soles_on_stance_at_the_checker_tolerances(real_world):
 
 def test_tilt_within_bound_on_the_motion_values_metric():
     # The final repair's tilt test, on the Motion value's metric and tolerance: under a 1.0 rad bound, upright and on
-    # the bound (roll 1.0 rad) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, and a model
-    # without an envelope pass every conf.
+    # the bound (roll 1.0 rad) pass, 0.01 rad past it fails; route A's envelope, which sets no bound, passes every
+    # conf.
     from types import SimpleNamespace
     from cutamp.gn_refresh import tilt_within_bound
-    from cutamp.robots.t1 import SIMPLIFIED
     names = list(REAL_LEGS.joint_names)
     q = torch.tensor(REAL_LEGS.home).repeat(3, 1)
     q[1:, names.index("base_j_roll")] = torch.tensor([1.0, 1.01])
     assert tilt_within_bound(SimpleNamespace(model=TILTED), q, 1e-6).tolist() == [True, True, False]
     assert tilt_within_bound(SimpleNamespace(model=REAL_LEGS), q, 1e-6).all()
-    assert tilt_within_bound(SimpleNamespace(model=SIMPLIFIED), q[:, :len(SIMPLIFIED.joint_names)], 1e-6).all()
 
 
 @needs_cuda

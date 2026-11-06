@@ -150,64 +150,47 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
     return steps
 
 
-# The pose-only refresh (reik_balance_first=False) and the eager-Adam arm (coupled_reik=False) are paper ablation arms,
-# so they run on the simplified model, the only one that takes them (design call 15); the rest on the default model
-# (None). Module scope lets pytest run each model's cases together here and in test_step_body_matches_head, so the
-# module builds three worlds, not one per case.
 @needs_cuda
-@pytest.mark.parametrize("blocks_t1_plan,reik_balance_first,coupled_reik", [
-    pytest.param(None, True, True, id="True-True"),
-    pytest.param("simplified", False, True, id="False-True"),
-    pytest.param("simplified", False, False, id="False-False"),
-], indirect=["blocks_t1_plan"], scope="module")
-def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch, reik_balance_first, coupled_reik):
-    # Dedicated never-reset sites vs HEAD's one shared instance; the sites' buffers never move.
-    # coupled_reik=False lets Adam optimize the FK-fed Confs, so one compared grad comes out of FK.
-    from cutamp.t1_domain import Conf
+def test_blocks_t1_plan_reuses_the_real_world(blocks_t1_plan, real_world, real_plan):
+    # A module that asks for both world fixtures builds one 64-particle world, not two (two OOM a 24 GiB card):
+    # blocks_t1_plan hands back real_world's world and real_plan's own skeleton and particles.
+    assert blocks_t1_plan[0] is real_world
+    assert blocks_t1_plan[1] is real_plan[0] and blocks_t1_plan[2] is real_plan[1]
 
+
+@needs_cuda
+def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch):
+    # Dedicated never-reset sites vs HEAD's one shared instance; the sites' buffers never move. The retract confs, the
+    # FK-fed confs Adam optimizes, get a zero grad at every one of the 50 steps (measured 2026-11-05), so no check here
+    # that a compared grad comes out of an FK backward.
     world, skeleton, base = blocks_t1_plan
-    # The cases on one model share its blocks_t1_plan world, which keeps every site it builds.
+    # The module's tests share one blocks_t1_plan world, which keeps every site it builds.
     monkeypatch.setattr(world, "_site_kinematics", {})
     config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=50, early_stop_patience=0,
-                               reik_balance_first=reik_balance_first, coupled_reik=coupled_reik,
-                               force_adam=not coupled_reik, cuda_graphs=False, enable_visualizer=False)
-    confs = {v for op in skeleton for v, prm in zip(op.values, op.operator.parameters) if prm.type == Conf}
+                               cuda_graphs=False, enable_visualizer=False)
     steps = _install_lockstep(monkeypatch, world)
     # Not the no-op Visualizer, so the body returns vis and each step compares costs, mask and values too.
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
     assert len(steps) == 50
-    names, got, _ = steps[0]
-    if not coupled_reik:  # the gate sees an FK backward
-        assert any(n in confs and g is not None and bool(g.ne(0).any()) for n, g in zip(names, got["grads"])), (
-            f"no optimized Conf has a nonzero grad: {names}")
     ptrs = [p for _, _, p in steps]
-    # A model with soles adds the retract confs' motion site (cost_function.motion_costs).
-    every_step = {"rollout", "retract", "com"} | ({"retract_motion"} if world.model.sole_frames else set())
+    every_step = {"rollout", "retract", "com", "retract_motion"}
     for k, p in enumerate(ptrs):  # a site that is never built fails by name
-        want = every_step | ({"gate"} if reik_balance_first and k >= 5 else set())
+        want = every_step | ({"gate"} if k >= 5 else set())
         assert p.keys() - {"config"} == want, f"step {k}: sites {sorted(p.keys() - {'config'})}, want {sorted(want)}"
     for site in (*sorted(every_step), "config"):
         assert all(p[site] == ptrs[0][site] for p in ptrs), site
-    if reik_balance_first:  # refresh #1, at step 4, builds the gate site
-        assert all(p["gate"] == ptrs[5]["gate"] for p in ptrs[5:]), "gate"
+    # Refresh #1, at step 4, builds the gate site.
+    assert all(p["gate"] == ptrs[5]["gate"] for p in ptrs[5:]), "gate"
 
 
 @needs_cuda
-@pytest.mark.parametrize("blocks_t1_plan,sc,balance_first", [
-    *(pytest.param("simplified", sc, False, id=f"{sc}-False") for sc in ("max_obj_dist", "min_obj_dist", "align_yaw")),
-    pytest.param("simplified", "joint_limit_margin", True, id="joint_limit_margin-True-simplified"),
-    pytest.param(None, None, True, id="no_soft_cost-True"),
-    *(pytest.param(None, sc, True, id=f"{sc}-True") for sc in SUPPORTED_SOFT_COSTS),
-], indirect=["blocks_t1_plan"], scope="module")
-def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc, balance_first):
-    # As test_step_lockstep_vs_head, for each soft cost alone and for none. max_obj_dist, min_obj_dist and align_yaw
-    # also run in pose-only mode, on the simplified model (the ablation arm, design call 15): the default soft costs
-    # never reach their triu gathers. joint_limit_margin also runs on the simplified model: the real legs' margin
-    # bands are zero (decision 6), so only there does JointLimitMarginCost's step-body math compute anything.
+@pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"),
+                                *(pytest.param(sc, id=sc) for sc in SUPPORTED_SOFT_COSTS)])
+def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc):
+    # As test_step_lockstep_vs_head, for each soft cost alone and for none.
     world, skeleton, base = blocks_t1_plan
     config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=5, early_stop_patience=0,
-                               reik_balance_first=balance_first, cuda_graphs=False, enable_visualizer=False,
-                               soft_cost=[] if sc is None else [sc])
+                               cuda_graphs=False, enable_visualizer=False, soft_cost=[] if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
     assert len(steps) == 5

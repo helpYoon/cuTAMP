@@ -22,8 +22,8 @@ SIMPLIFIED_NAMES = ("CUROBO_DOF", "URDF_DOF", "BASE_DOF", "BASE_INDICES", "BODY_
                     "RIGHT_ARM_INDICES", "JOINT_NAMES_FULL", "t1_home", "T1_LIMIT_MARGIN_LOWER",
                     "T1_LIMIT_MARGIN_UPPER")
 SIMPLIFIED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES)})\b")
-#: The definitions, their re-exports, and a script that checks simplified plans only.
-MAY_READ_SIMPLIFIED_CONSTANTS = {"robots/t1.py", "robots/__init__.py", "scripts/check_plan_margins.py"}
+#: The definitions and their re-exports.
+MAY_READ_SIMPLIFIED_CONSTANTS = {"robots/t1.py", "robots/__init__.py"}
 #: The extended list adds the simplified support region and its frame, which ``world.model.support`` replaces.
 SUPPORT_NAMES = ("COM_HALF_EXTENTS", "SUPPORT_HALF_EXTENTS", "COM_CENTER", "mobile_base_link")
 EXTENDED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES + SUPPORT_NAMES)})\b")
@@ -147,6 +147,111 @@ def test_soft_cost_default_by_robot():
     assert TAMPConfiguration().soft_cost == TAMPConfiguration(robot="real_legs").soft_cost == real_default
     assert TAMPConfiguration(robot="real_legs", soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
+
+
+def test_joint_limit_margin_is_registered_and_weighted():
+    # Unregistered names pass through UNWEIGHTED in CostReducer, so the weight entry is mandatory.
+    from cutamp.config import SUPPORTED_SOFT_COSTS
+    from cutamp.scripts.utils import default_constraint_to_mult
+    assert "joint_limit_margin" in SUPPORTED_SOFT_COSTS
+    validate_tamp_config(TAMPConfiguration(soft_cost=["joint_limit_margin"]))
+    assert default_constraint_to_mult["soft"]["joint_limit_margin"] == 1e3
+
+
+def test_shrunken_bounds_penalty_is_zero_strictly_inside():
+    from cutamp.joint_limit_cost import shrunken_bounds_penalty
+    lo, hi = torch.tensor([-1.0, 0.0]), torch.tensor([1.0, 2.0])
+    q = torch.tensor([[0.0, 1.0], [-0.99, 1.99]])
+    assert shrunken_bounds_penalty(q, lo, hi).sum() == 0.0
+
+
+def test_shrunken_bounds_penalty_is_quadratic_in_penetration():
+    # 0.2 below the lower bound -> 0.04; doubling the depth quadruples it.
+    from cutamp.joint_limit_cost import shrunken_bounds_penalty
+    lo, hi = torch.tensor([0.0]), torch.tensor([1.0])
+    p1 = shrunken_bounds_penalty(torch.tensor([[-0.2]]), lo, hi)
+    p2 = shrunken_bounds_penalty(torch.tensor([[-0.4]]), lo, hi)
+    assert torch.allclose(p1, torch.tensor([[0.04]]))
+    assert torch.allclose(p2, 4.0 * p1)
+
+
+def test_shrunken_bounds_penalty_penalizes_both_sides():
+    from cutamp.joint_limit_cost import shrunken_bounds_penalty
+    lo, hi = torch.tensor([0.0]), torch.tensor([1.0])
+    below = shrunken_bounds_penalty(torch.tensor([[-0.1]]), lo, hi)
+    above = shrunken_bounds_penalty(torch.tensor([[1.1]]), lo, hi)
+    assert below.item() > 0.0 and above.item() > 0.0
+    assert torch.allclose(below, above)
+
+
+WAIST = REAL_LEGS.joint_names.index("Waist")
+
+
+def _real_limits() -> torch.Tensor:
+    """The real legs' ``[2, 33]`` limits in the model's joint order, row 0 lower: t1_29dof.yml's, which every factory's
+    kinematics reports (test_factories_keep_the_soft_limits_on_their_joints), so the soft cost's
+    ``world.joint_limits``."""
+    soft = _yaml_soft_limits()
+    return torch.tensor([soft[n] for n in REAL_LEGS.joint_names], dtype=torch.float32).T.contiguous()
+
+
+def _joint_limit_margin(particles: dict, n: int) -> torch.Tensor:
+    """The joint_limit_margin soft cost as cost_function.py computes it on the real legs: their limits, their (zero)
+    margin bands."""
+    from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
+    return joint_limit_margin_soft_cost(
+        particles, _real_limits(), torch.tensor(REAL_LEGS.margin_lower, dtype=torch.float32),
+        torch.tensor(REAL_LEGS.margin_upper, dtype=torch.float32), num_particles=n, device=torch.device("cpu"),
+    )
+
+
+def _real_home(n: int) -> torch.Tensor:
+    return torch.tensor(REAL_LEGS.home, dtype=torch.float32).expand(n, -1).clone()
+
+
+def test_joint_limit_margin_is_zero_inside_the_limits():
+    # The real legs' bands are zero: home, and a conf 1 mrad inside the Waist's upper limit, cost exactly nothing.
+    near = _real_home(4)
+    near[:, WAIST] = _real_limits()[1, WAIST] - 0.001
+    cost = _joint_limit_margin({"q_retract": _real_home(4), "left_q1": near}, 4)
+    assert cost.shape == (4,)
+    assert torch.all(cost == 0.0)
+
+
+def test_joint_limit_margin_penalizes_a_conf_past_its_limit():
+    # The Waist 0.08 rad past its upper limit: penalty 0.08^2 = 6.4e-3.
+    q = _real_home(2)
+    q[:, WAIST] = _real_limits()[1, WAIST] + 0.08
+    assert torch.allclose(_joint_limit_margin({"q_pick": q}, 2), torch.full((2,), 0.08 ** 2), atol=1e-6)
+
+
+def test_joint_limit_margin_excludes_the_initial_confs():
+    # A violating conf under every initial-state name and a clean home under q_pick: the total is exactly 0 (the
+    # exclusion works inside the stacked path, not just via the empty-dict fallback). Initial states must never
+    # acquire margin gradients through the Adam soft loss.
+    bad = _real_home(2)
+    bad[:, WAIST] = _real_limits()[1, WAIST] + 0.08
+    cost = _joint_limit_margin({"q0": bad, "left_q0": bad.clone(), "right_q0": bad.clone(), "q_pick": _real_home(2)}, 2)
+    assert torch.all(cost == 0.0)
+
+
+def test_joint_limit_margin_without_confs_is_zero():
+    cost = _joint_limit_margin({"pose1": torch.zeros(3, 4)}, 3)
+    assert cost.shape == (3,) and torch.all(cost == 0.0)
+
+
+def test_joint_limit_margin_gradient_restores_and_skips_the_initial_confs():
+    # (a) The gradient through the hinge^2 points back toward the interior; (b) an excluded initial-state conf gets
+    # no gradient even when it is in the dict, the safety property the exclusion exists for.
+    bad = _real_home(2)
+    bad[:, WAIST] = _real_limits()[0, WAIST] - 0.08  # 0.08 below the lower limit
+    q_pick, left_q0 = bad.clone().requires_grad_(True), bad.clone().requires_grad_(True)
+    _joint_limit_margin({"q_pick": q_pick, "left_q0": left_q0}, 2).sum().backward()
+    assert left_q0.grad is None or torch.all(left_q0.grad == 0.0)
+    # d/dq of relu(lower - q)^2 is -2 relu(lower - q): pushing q up, toward the interior, lowers the cost.
+    assert q_pick.grad is not None and bool((q_pick.grad[:, WAIST] < 0.0).all())
+    others = [k for k in range(len(REAL_LEGS.joint_names)) if k != WAIST]
+    assert torch.all(q_pick.grad[:, others] == 0.0)  # the untouched joints get no gradient
 
 
 @pytest.mark.parametrize("kw", [dict(enable_com_polygon=False), dict(enable_com_aware_ik=False),

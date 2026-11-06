@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from cutamp.robots.envelope import Envelope, load_envelope
-from cutamp.robots.t1 import REAL_LEGS, SIMPLIFIED
+from cutamp.robots.t1 import REAL_LEGS
 from cutamp.tests.conftest import needs_cuda
 
 ENVELOPES = Path(__file__).resolve().parents[1] / "robots" / "assets" / "envelopes"
@@ -56,7 +56,6 @@ def test_route_a_start_values():
         hold_s={"start_blend": 0.5, "grasp": 0.5, "end": 1.0},
     )
     assert REAL_LEGS.envelope == envelope and REAL_LEGS.envelope.name == "route_a_start"
-    assert SIMPLIFIED.envelope is None
 
 
 def test_load_envelope_refuses_a_misnamed_file_or_another_field(tmp_path, monkeypatch):

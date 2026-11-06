@@ -3,12 +3,11 @@
 The dual-arm-specific assertions from the v0.7 era (DualArmRobotContainer,
 two kinematics models, etc.) are gone. This file now exercises the single-
 container shape: one Kinematics, two tool frames, gripper-spheres dict.
-It also covers the outputs of real-leg runs (decision 9): the raw plan, the
-refusal in check_plan_margins and the Rerun viewer.
+It also covers the outputs of real-leg runs (decision 9): the raw plan and
+the Rerun viewer.
 """
 
 import copy
-import pickle
 
 import numpy as np
 import pytest
@@ -23,8 +22,8 @@ def t1_container():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     from curobo.types import DeviceCfg
-    from cutamp.robots import SIMPLIFIED, load_t1_container
-    return load_t1_container(SIMPLIFIED, DeviceCfg())
+    from cutamp.robots import REAL_LEGS, load_t1_container
+    return load_t1_container(REAL_LEGS, DeviceCfg())
 
 
 def test_t1_container_is_single_robot(t1_container):
@@ -43,19 +42,19 @@ def test_t1_has_two_tool_frames(t1_container):
 
 
 def test_t1_joint_limits_shape(t1_container):
-    from cutamp.robots.t1 import CUROBO_DOF
-    assert t1_container.joint_limits.shape == (2, CUROBO_DOF)
+    from cutamp.robots.t1 import REAL_LEGS
+    assert t1_container.joint_limits.shape == (2, len(REAL_LEGS.joint_names))
 
 
 def test_t1_kinematics_runs(t1_container):
-    from cutamp.robots.t1 import CUROBO_DOF, t1_home
+    from cutamp.robots.t1 import REAL_LEGS
     from curobo.types import JointState
 
-    q = torch.tensor(t1_home, device=t1_container.kinematics.device_cfg.device).unsqueeze(0)
+    q = torch.tensor(REAL_LEGS.home, device=t1_container.kinematics.device_cfg.device).unsqueeze(0)
     js = JointState.from_position(q)
     state = t1_container.kinematics.compute_kinematics(js)
-    # ToolPose covers both arm tool frames plus mobile_base_link (tracked for
-    # the COM-over-base cost; not an IK target).
+    # ToolPose covers both arm tool frames, both soles and the stance (the support
+    # frame of the CoM costs; not IK targets).
     assert state.tool_poses.num_links >= 2
 
 
@@ -118,20 +117,6 @@ def test_mpc_example_refuses_a_raw_plan_until_the_export(tmp_path):
     with pytest.raises(RuntimeError, match="real-leg plans await stage 6's export") as refused:
         example.load_for_mpc(tmp_path / "motion_plan.pkl")
     assert "egenerate" not in str(refused.value)
-
-
-def test_check_plan_margins_refuses_raw(tmp_path):
-    # check_plan_margins gates the simplified model's margin bands: the real legs have none (decision 6), and a raw
-    # plan has no schema-3 keys. It refuses one by name, with a non-zero exit.
-    from cutamp.robots.t1 import REAL_LEGS
-    from cutamp.scripts.check_plan_margins import main
-    from cutamp.utils.plan_processor import raw_motion_plan
-    path = tmp_path / "raw.pkl"
-    path.write_bytes(pickle.dumps(raw_motion_plan(_raw_plan_input(), REAL_LEGS)))
-    with pytest.raises(SystemExit) as stop:
-        main(["--plan", str(path)])
-    assert stop.value.code not in (0, None)
-    assert "simplified model's schema 3 only" in str(stop.value.code)
 
 
 def _poses(translation, mat3x3) -> np.ndarray:
@@ -234,16 +219,3 @@ def test_rerun_robot_real_legs(tmp_path):
 
     columns = robot.get_rr_columns(torch.stack([torch.tensor(REAL_LEGS.home, dtype=torch.float64), q]))
     np.testing.assert_allclose(_column_poses(columns["t1"])[1], fk["Trunk"], rtol=0, atol=1e-5)
-
-
-@yourdfpy_float
-def test_rerun_robot_simplified_unchanged(tmp_path):
-    # The simplified viewer keeps its positional mapping: a 21-DOF conf logs the planar base as the root's
-    # Transform3D and fills the URDF through curobo_to_urdf_joints.
-    from cutamp.robots.t1 import GRIPPER_CLOSED, SIMPLIFIED, base_se3_from_q, curobo_to_urdf_joints, load_t1_rerun
-    q = [0.1, -0.2, 0.3] + [0.01 * k for k in range(1, len(SIMPLIFIED.joint_names) - 2)]
-    path = tmp_path / "viewer.rrd"
-    robot = _record(path, lambda: load_t1_rerun(SIMPLIFIED, load_mesh=False),
-                    lambda r: r.set_grippers(left=GRIPPER_CLOSED), lambda r: r.set_joint_positions(q))
-    np.testing.assert_allclose(_logged_poses(path, "t1")[-1], base_se3_from_q(q).numpy(), rtol=0, atol=1e-6)
-    np.testing.assert_allclose(robot.urdf.cfg, curobo_to_urdf_joints(q, left_gripper=GRIPPER_CLOSED), atol=1e-6)
