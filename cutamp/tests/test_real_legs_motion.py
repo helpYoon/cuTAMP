@@ -110,7 +110,7 @@ def _transition_torques(tm, js) -> torch.Tensor:
 @needs_cuda
 @needs_slow
 def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
-    # cutamp_demo end to end: setup_cutamp builds the world from get_model, load_t1_container and
+    # cutamp_demo end to end: setup_cutamp builds the world from REAL_LEGS, load_t1_container and
     # q_init = REAL_LEGS.home. The spies only record.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
@@ -147,7 +147,7 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, 0.5)
     torch.manual_seed(0)  # run_cutamp's --seed 0
-    config = TAMPConfiguration(robot="real_legs", num_particles=64, curobo_plan=True, enable_visualizer=False,
+    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
                                experiment_root=str(tmp_path))
     rc.cutamp_demo(env, config, experiment_id="e2e", save_plan="auto")
 
@@ -192,7 +192,7 @@ def planner(real_world):
     """``real_world``'s motion planner as solve_curobo builds it, built once."""
     from cutamp.config import TAMPConfiguration
     from cutamp.motion_solver import build_motion_planner
-    with build_motion_planner(real_world, TAMPConfiguration(robot="real_legs")) as mp:
+    with build_motion_planner(real_world, TAMPConfiguration()) as mp:
         yield mp
 
 
@@ -245,7 +245,7 @@ def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner)
     # Route A's envelope sets no tilt bound, so its planner has no TrunkTiltCost; under an envelope with
     # one, trajopt bounds the tilt (weight 1e5, the bound's cosine, on the base's pitch and roll columns).
     from cutamp._curobo_internals import iter_rollouts
-    from cutamp.joint_limit_cost import JointLimitMarginCost, TrunkTiltCost
+    from cutamp.joint_limit_cost import TrunkTiltCost
     from cutamp.robots.t1 import get_t1_motion_planner
     from cutamp.utils.common import get_world_cfg
 
@@ -254,13 +254,13 @@ def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner)
                 for c in getattr(mgr, "_extra_costs", {}).values() if isinstance(c, kind)]
 
     assert REAL_LEGS.envelope.trunk_tilt_max is None
-    assert not extra_costs(planner, TrunkTiltCost) and not extra_costs(planner, JointLimitMarginCost)
+    assert not extra_costs(planner, TrunkTiltCost)
     bounded = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
     with get_t1_motion_planner(bounded, get_world_cfg(real_world.env, include_movables=True),
                                use_cuda_graph=False, device_cfg=real_world.device_cfg) as mp:
         costs = extra_costs(mp, TrunkTiltCost)
         names = list(mp.kinematics.joint_names)
-        assert costs and not extra_costs(mp, JointLimitMarginCost)
+        assert costs
         columns = (names.index("base_j_pitch"), names.index("base_j_roll"))
         for c in costs:
             assert (c.config.pitch_index, c.config.roll_index) == columns
@@ -806,7 +806,7 @@ def test_real_legs_zmp_matches_multibody_reference(real_world, planner):
     # knees bend 0.3 and the ankles 0.15, the Waist turns 0.4, the left shoulder swings 1 rad forward and the right
     # elbow bends 0.8, the base re-solved so that the end conf stands on the stance (its Trunk pitched 0.35 rad and
     # yawed -0.4). Every link moves and spins. The gate's CoM and multibody ZMP, from the plan's own velocities and
-    # accelerations as _pace takes them, match the float64 first-principles ones at every frame, at rest and at the
+    # accelerations as the gate takes them, match the float64 first-principles ones at every frame, at rest and at the
     # acceleration peaks, where the ZMP runs 9 cm from the CoM. Measured 2026-11-05: the CoM within 1.3e-8 m and the
     # ZMP within 2.7e-5 m of the reference, against tolerances of 2e-4 and 3e-4 m.
     from cutamp.com_polygon_cost import com_zmp_in_support
@@ -842,7 +842,7 @@ def test_real_legs_zmp_matches_multibody_reference(real_world, planner):
 @pytest.mark.parametrize("site", ["recheck", "planner"])
 def test_real_legs_gate_rejects_com_outside_support(real_world, planner, site):
     # The CoM follows the path, which no time scale changes: the gate fails a segment whose CoM leaves its rectangle,
-    # with check "com", on the planner's own frames (_pace) and on the frames it returns (_recheck). Leaning 0.25 rad
+    # with check "com", on the planner's own frames and on the frames it returns (_recheck). Leaning 0.25 rad
     # over 2 s, the CoM ends 14.4 cm ahead of the mid-sole, 3.2 cm past the toes (the soles' front edge is at
     # 11.245 cm, the gate's at 9.245); leaning 0.12 rad it ends at 7.6 cm, 1.6 cm inside the gate's edge, and passes.
     import cutamp.motion_solver as ms

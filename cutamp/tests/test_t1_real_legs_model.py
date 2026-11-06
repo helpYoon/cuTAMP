@@ -1,8 +1,7 @@
-"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the ``--robot`` switch, the
-soft-cost default and the removed ablation options, the support rectangles, and the blocks_t1 world on the real legs,
+"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the soft-cost default and
+the removed options (the ablation's and ``--robot``), the support rectangles, and the blocks_t1 world on the real legs,
 standing on the home stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
 
-import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -13,24 +12,11 @@ import yaml
 
 from cutamp.com_polygon_cost import LOAD_GUARD_A, support_rectangles
 from cutamp.config import TAMPConfiguration, validate_tamp_config
-from cutamp.robots.t1 import REAL_LEGS, get_model
+from cutamp.robots.t1 import REAL_LEGS
 from cutamp.tests.conftest import needs_cuda
 
 CUTAMP = Path(__file__).resolve().parents[1]
 T1_29DOF = CUTAMP / "robots" / "assets" / "t1_29dof"
-SIMPLIFIED_NAMES = ("CUROBO_DOF", "URDF_DOF", "BASE_DOF", "BASE_INDICES", "BODY_INDICES", "LEFT_ARM_INDICES",
-                    "RIGHT_ARM_INDICES", "JOINT_NAMES_FULL", "t1_home", "T1_LIMIT_MARGIN_LOWER",
-                    "T1_LIMIT_MARGIN_UPPER")
-SIMPLIFIED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES)})\b")
-#: The definitions and their re-exports.
-MAY_READ_SIMPLIFIED_CONSTANTS = {"robots/t1.py", "robots/__init__.py"}
-#: The extended list adds the simplified support region and its frame, which ``world.model.support`` replaces.
-SUPPORT_NAMES = ("COM_HALF_EXTENTS", "SUPPORT_HALF_EXTENTS", "COM_CENTER", "mobile_base_link")
-EXTENDED_CONSTANTS = re.compile(rf"\b({'|'.join(SIMPLIFIED_NAMES + SUPPORT_NAMES)})\b")
-#: Their definitions, the sphere editor, which edits the simplified model only, and the real legs' build script,
-#: which names the simplified legs it replaces.
-MAY_READ_EXTENDED_CONSTANTS = MAY_READ_SIMPLIFIED_CONSTANTS | {
-    "com_polygon_cost.py", "scripts/robot_sphere_editor.py", "robots/assets/t1_29dof/build_planner_model.py"}
 LEGS = {
     side: {f"{link}_{side.title()}" for link in ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Shank", "Ankle_Cross")}
     | {f"{side}_foot_link", f"{side}_sole_link"}
@@ -109,37 +95,14 @@ def _yaml_soft_limits() -> dict:
 
 def test_real_legs_layout():
     m = REAL_LEGS
-    assert len(m.joint_names) == 33 and not m.lock_base
+    assert len(m.joint_names) == 33
     assert m.joint_names[m.base] == tuple(f"base_j_{n}" for n in ("x", "y", "z", "pitch", "roll", "yaw"))
     assert m.joint_names[m.left_arm][0] == "Left_Shoulder_Pitch" and m.joint_names[m.right_arm][-1] == "Right_Hand_Roll"
     assert set(m.joint_names[m.body]) == {"Waist"} | {f"{s}_{j}" for s in ("Left", "Right") for j in
         ("Hip_Pitch", "Hip_Roll", "Hip_Yaw", "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll")}
     assert (m.base, m.left_arm, m.right_arm, m.body) == (slice(0, 6), slice(6, 13), slice(13, 20), slice(20, 33))
-    assert not any(m.margin_lower + m.margin_upper) and len(m.margin_lower) == len(m.margin_upper) == 33
     assert len(m.home) == 33 and m.sole_frames == ("left_sole_link", "right_sole_link")
     assert m.envelope.name == "route_a_start"
-
-
-def test_unknown_robot():
-    assert get_model("real_legs") is REAL_LEGS
-    with pytest.raises(ValueError, match="t2"):
-        get_model("t2")
-    with pytest.raises(ValueError, match="t2"):
-        validate_tamp_config(TAMPConfiguration(robot="t2"))
-
-
-def test_real_legs_are_the_default(monkeypatch):
-    # The user's decision of 2026-11-05: the config, run_cutamp's CLI and conftest's worlds plan on the real legs
-    # unless told otherwise.
-    import sys
-
-    import cutamp.scripts.run_cutamp as rc
-    from cutamp.tests.conftest import DEFAULT_MODEL
-    seen = []
-    monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append(config))
-    monkeypatch.setattr(sys, "argv", ["run_cutamp"])
-    rc.entrypoint()
-    assert TAMPConfiguration().robot == seen[0].robot == "real_legs" and DEFAULT_MODEL is REAL_LEGS
 
 
 def _cli_config(monkeypatch, *argv) -> TAMPConfiguration:
@@ -167,10 +130,11 @@ def test_soft_cost_default_and_choice(monkeypatch):
 #: CLI spelling, with the argument it took, and each config field at its old default.
 REMOVED_CLI_OPTIONS = (["--no_coupled_reik"], ["--reik_balance_first"], ["--no_reik_balance_first"],
                        ["--no_enable_com_polygon"], ["--no_enable_com_aware_ik"], ["--no_com_all"], ["--force_adam"],
-                       ["--soft_in_adam", "always"])
+                       ["--soft_in_adam", "always"], ["--robot", "real_legs"])
 REMOVED_FIELDS = {"enable_com_polygon": True, "enable_com_aware_ik": True, "enable_com_init_gate": True,
                   "enable_com_hard_constraint": True, "coupled_reik": True, "force_adam": False,
-                  "reik_balance_first": True, "soft_in_adam": "auto", "reik_num_seeds": 4, "reik_lbfgs_iters": 40}
+                  "reik_balance_first": True, "soft_in_adam": "auto", "reik_num_seeds": 4, "reik_lbfgs_iters": 40,
+                  "robot": "real_legs"}
 
 
 @pytest.mark.parametrize("argv", REMOVED_CLI_OPTIONS, ids=lambda argv: argv[0])
@@ -234,13 +198,9 @@ def _real_limits() -> torch.Tensor:
 
 
 def _joint_limit_margin(particles: dict, n: int) -> torch.Tensor:
-    """The joint_limit_margin soft cost as cost_function.py computes it on the real legs: their limits, their (zero)
-    margin bands."""
+    """The joint_limit_margin soft cost as cost_function.py computes it: on the real legs' limits."""
     from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
-    return joint_limit_margin_soft_cost(
-        particles, _real_limits(), torch.tensor(REAL_LEGS.margin_lower, dtype=torch.float32),
-        torch.tensor(REAL_LEGS.margin_upper, dtype=torch.float32), num_particles=n, device=torch.device("cpu"),
-    )
+    return joint_limit_margin_soft_cost(particles, _real_limits(), num_particles=n, device=torch.device("cpu"))
 
 
 def _real_home(n: int) -> torch.Tensor:
@@ -248,7 +208,7 @@ def _real_home(n: int) -> torch.Tensor:
 
 
 def test_joint_limit_margin_is_zero_inside_the_limits():
-    # The real legs' bands are zero: home, and a conf 1 mrad inside the Waist's upper limit, cost exactly nothing.
+    # No margin band: home, and a conf 1 mrad inside the Waist's upper limit, cost exactly nothing.
     near = _real_home(4)
     near[:, WAIST] = _real_limits()[1, WAIST] - 0.001
     cost = _joint_limit_margin({"q_retract": _real_home(4), "left_q1": near}, 4)
@@ -266,7 +226,7 @@ def test_joint_limit_margin_penalizes_a_conf_past_its_limit():
 def test_joint_limit_margin_excludes_the_initial_confs():
     # A violating conf under every initial-state name and a clean home under q_pick: the total is exactly 0 (the
     # exclusion works inside the stacked path, not just via the empty-dict fallback). Initial states must never
-    # acquire margin gradients through the Adam soft loss.
+    # acquire limit gradients through the Adam soft loss.
     bad = _real_home(2)
     bad[:, WAIST] = _real_limits()[1, WAIST] + 0.08
     cost = _joint_limit_margin({"q0": bad, "left_q0": bad.clone(), "right_q0": bad.clone(), "q_pick": _real_home(2)}, 2)
@@ -290,27 +250,6 @@ def test_joint_limit_margin_gradient_restores_and_skips_the_initial_confs():
     assert q_pick.grad is not None and bool((q_pick.grad[:, WAIST] < 0.0).all())
     others = [k for k in range(len(REAL_LEGS.joint_names)) if k != WAIST]
     assert torch.all(q_pick.grad[:, others] == 0.0)  # the untouched joints get no gradient
-
-
-def simplified_reads(pattern: re.Pattern, allowed: set) -> list:
-    """``path:line: text`` of every line of cutamp's modules, comments included, that ``pattern`` matches: tests and
-    the ``allowed`` files (paths relative to cutamp/) aside."""
-    hits = []
-    for path in sorted(CUTAMP.rglob("*.py")):
-        rel = path.relative_to(CUTAMP).as_posix()
-        if rel.startswith("tests/") or rel in allowed:
-            continue
-        hits += [f"{rel}:{k}: {line.strip()}" for k, line in enumerate(path.read_text().splitlines(), 1)
-                 if pattern.search(line)]
-    return hits
-
-
-def test_no_module_reads_simplified_constants():
-    # A simplified slice, home or margin read where world.model should be gives plausible, wrong numbers on the
-    # real legs. Comments count too. The extended list, with its wider allow-list, is
-    # test_real_legs_support.test_extended_grep's.
-    hits = simplified_reads(SIMPLIFIED_CONSTANTS, MAY_READ_SIMPLIFIED_CONSTANTS)
-    assert not hits, "\n".join(hits)
 
 
 def test_support_rectangles():

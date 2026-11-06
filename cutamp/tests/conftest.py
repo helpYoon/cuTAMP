@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from cutamp.config import TAMPConfiguration
-from cutamp.robots.t1 import REAL_LEGS, get_model
+from cutamp.robots.t1 import REAL_LEGS
 
 _cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
 #: Skips unless a GPU is visible; reads no CUDA state, so collection initializes none.
@@ -22,19 +22,12 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-#: The model conftest's worlds stand on unless a test names one: TAMPConfiguration's default robot, so a world built
-#: here and a TAMPConfiguration() plan on the same model.
-DEFAULT_MODEL = get_model(TAMPConfiguration.robot)
-
-
-def make_blocks_t1_world(model=None, **tamp_world_kwargs):
-    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``model`` (default
-    :data:`DEFAULT_MODEL`), starting at its home."""
+def make_blocks_t1_world(model=REAL_LEGS, **tamp_world_kwargs):
+    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``model``, starting at its home."""
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.robots import load_t1_container
     from cutamp.tamp_world import TAMPWorld
-    model = DEFAULT_MODEL if model is None else model
     dc = DeviceCfg()
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     robot = load_t1_container(model, dc)
@@ -99,8 +92,7 @@ def real_plan(real_world):
 
     skeleton = next(task_plan_generator(real_world.initial_state, real_world.goal_state, all_t1_operators))
     torch.manual_seed(0)
-    # robot= here, not dataclasses.replace: __post_init__ resolves the model's default soft costs
-    particles = ParticleInitializer(real_world, TAMPConfiguration(robot="real_legs", num_particles=64))(skeleton)
+    particles = ParticleInitializer(real_world, TAMPConfiguration(num_particles=64))(skeleton)
     plan = [skeleton, particles]
     del skeleton, particles  # the list holds the only references
     yield plan

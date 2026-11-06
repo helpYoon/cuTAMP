@@ -55,7 +55,7 @@ def test_real_legs_rollout_rotation_gradients_match_finite_differences(real_worl
     from cutamp.rollout import RolloutFunction
 
     skeleton, particles = real_plan
-    rollout_fn = RolloutFunction(skeleton, real_world, TAMPConfiguration(robot="real_legs", num_particles=64))
+    rollout_fn = RolloutFunction(skeleton, real_world, TAMPConfiguration(num_particles=64))
     p = clone_particles(particles)
     confs = [c for c in rollout_fn.conf_params if p[c].dtype.is_floating_point]
     gen = torch.Generator(device=real_world.device).manual_seed(0)

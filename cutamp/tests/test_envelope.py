@@ -185,7 +185,7 @@ def test_motion_values_bound_the_tilt_on_the_real_legs(real_world, real_plan, mo
     from cutamp.task_planning.constraints import Motion
     from cutamp.tests.conftest import clone_particles
     skeleton, particles = real_plan
-    config = TAMPConfiguration(robot="real_legs", num_particles=64)
+    config = TAMPConfiguration(num_particles=64)
     rollout_fn = RolloutFunction(skeleton, real_world, config)
     particles = clone_particles(particles)
     with torch.no_grad():

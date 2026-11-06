@@ -130,7 +130,7 @@ def raise_surface_height(env: TAMPEnvironment, height: float) -> TAMPEnvironment
     the boxes and goal pad sit at the given height instead of on the ground.
     ``height == 0`` leaves the env unchanged (the ground variant). cuTAMP is a
     kinematic planner, so the objects simply sit at the new z — no support
-    geometry is added. Used by the ``--surface_height`` height sweep.
+    geometry is added. Used by run_cutamp's ``--surface_height``.
     """
     if height == 0.0:
         return env

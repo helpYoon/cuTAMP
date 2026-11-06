@@ -28,7 +28,7 @@ from cutamp.experiment_logger import ExperimentLogger
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
-from cutamp.robots import get_model, load_t1_container
+from cutamp.robots import REAL_LEGS, load_t1_container
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
@@ -222,9 +222,9 @@ def _motion_plan_with_retries(
       - ``attempts``: number of candidates actually planned (skips excluded).
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
-      - ``failures``: each planned candidate's failure message, in order. On
-        the real legs a failed trajopt's message names its reason, so a report
-        can count the candidates lost to torque (design 7.4a).
+      - ``failures``: each planned candidate's failure message, in order. A
+        failed trajopt's message names its reason, so a report can count the
+        candidates lost to torque (design 7.4a).
     """
     skeleton = plan_info["plan_skeleton"]
     last_err, tried, failed, failures = None, 0, [], []
@@ -300,7 +300,7 @@ def setup_cutamp(
 
     # Loading robot can be done offline, so doesn't count towards timing
     tensor_args = TensorDeviceType()
-    model = get_model(config.robot)
+    model = REAL_LEGS
     robot_container = load_t1_container(model, device_cfg=tensor_args)
 
     # v0.8 single-MotionPlanner: q_init is a single full-DOF vector of the model's cspace.

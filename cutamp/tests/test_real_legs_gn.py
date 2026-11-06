@@ -233,8 +233,7 @@ def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, monkeypatch, til
 
 @needs_cuda
 def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monkeypatch):
-    # _balanced_step's half=None default is the simplified rectangle, so every real-leg call passes the
-    # real legs' own, with the sole rows.
+    # Every iteration passes _balanced_step the support's keyframe rectangle and the sole rows, by name.
     import cutamp.gn_refresh as gn_refresh
     arm, _, q0 = _first_pick(real_world, real_plan)
     targets, _ = _moved_targets(real_world, q0, arm)
@@ -339,7 +338,7 @@ def test_final_repair_takes_no_conf_past_the_tilt_bound(real_world, real_plan, m
     monkeypatch.setattr(op, "_ik_success_mask", lambda result: torch.ones(len(repaired), dtype=torch.bool,
                                                                             device=repaired.device))
     deps = [dep for dep in op._build_ik_deps(skeleton, real_world) if dep.q_name == conf]
-    make_optimizer(TAMPConfiguration(robot="real_legs", num_particles=64))._refresh_ik_deps(particles, deps, real_world)
+    make_optimizer(TAMPConfiguration(num_particles=64))._refresh_ik_deps(particles, deps, real_world)
     assert torch.equal(particles[conf][a], moved[a] if tilt_max is not None else repaired[a])
     assert torch.equal(particles[conf][b], repaired[b])
 
@@ -363,7 +362,7 @@ def test_kinematic_constraint_checks_the_soles(real_world, real_plan):
     assert [reducer._get_multiplier(kc, n) for n in ("sole_pos_err", "sole_rot_err")] == [1.0, 5.0]
 
     skeleton, particles = real_plan
-    config = TAMPConfiguration(robot="real_legs", num_particles=64)
+    config = TAMPConfiguration(num_particles=64)
     rollout_fn, cost_fn = RolloutFunction(skeleton, real_world, config), CostFunction(skeleton, real_world, config)
     checker = ConstraintChecker(default_constraint_to_tol.copy())
     _, conf, _ = _first_pick(real_world, real_plan)

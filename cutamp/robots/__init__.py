@@ -1,7 +1,7 @@
 """Robot containers and loaders for cuTAMP (cuRobo v0.8 single-MotionPlanner).
 
-T1 humanoid is the only supported robot, on one of two planning models
-(:class:`~cutamp.robots.t1.T1Model`). The ``RobotContainer`` holds the model,
+T1 humanoid is the only supported robot, on its real-leg planning model
+(``REAL_LEGS``, a :class:`~cutamp.robots.t1.T1Model`). The ``RobotContainer`` holds the model,
 its kinematics + per-tool-frame gripper spheres / tool transforms.
 """
 
@@ -17,15 +17,12 @@ from .t1 import (
     LEFT_TOOL_FRAME,
     REAL_LEGS,
     RIGHT_TOOL_FRAME,
-    SIMPLIFIED,
     TOOL_FRAMES as T1_TOOL_FRAMES,
     T1Model,
-    get_model,
     get_t1_gripper_spheres,
     get_t1_kinematics,
     get_t1_tool_from_ee,
     load_t1_rerun,
-    t1_home,
 )
 
 
@@ -33,10 +30,9 @@ from .t1 import (
 class RobotContainer:
     """Container for robot kinematics, gripper data, and tool frames.
 
-    T1 has two tool frames (``left_base_link``, ``right_base_link``) on both
-    models; ``tool_from_ee`` and ``gripper_spheres`` are dicts keyed by
-    tool-frame name. The kinematics may track more frames (the real legs'
-    soles and stance).
+    T1 has two tool frames (``left_base_link``, ``right_base_link``);
+    ``tool_from_ee`` and ``gripper_spheres`` are dicts keyed by tool-frame
+    name. The kinematics tracks more frames (the soles and stance).
     """
 
     name: str

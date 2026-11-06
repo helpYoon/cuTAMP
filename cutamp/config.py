@@ -20,17 +20,9 @@ SUPPORTED_SOFT_COSTS = (
     "minimize_body_movement", "joint_limit_margin",
 )
 
-# The planning models (cutamp.robots.t1.get_model); the CLI's --robot choices.
-SUPPORTED_ROBOTS = ("simplified", "real_legs")
-
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
-    # The planning model (SUPPORTED_ROBOTS): "real_legs" (the default since the speed gate passed at n 64,
-    # 2026-11-05), bfm_wm's 33-DOF T1 on the home stance (design 7.2), or "simplified", the 21-DOF CoM-fixed model,
-    # which the paper's ablation arms and the speed gate still need (design call 12). It also sets soft_cost's default.
-    robot: str = "real_legs"
-
     # Number of particles to initialize and optimize over. The IK solver's
     # buffers are sized to this (ik_max_batch_size), so it bounds GPU memory:
     # 1024 OOMs a 24 GB card at solver build, 512 peaks near ~17 GB, 256
@@ -57,18 +49,17 @@ class TAMPConfiguration:
 
     ## Soft Costs
     # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
-    # None (the default) resolves in __post_init__ to place_close_to_base and
-    # joint_limit_margin, plus minimize_body_movement on the real legs, whose
-    # legs move freely (design call 2). [] means no soft costs. A resolved list
-    # stays when the robot changes: dataclasses.replace(cfg, robot=...) needs
-    # soft_cost=None too, or build a fresh TAMPConfiguration(robot=...).
+    # None (the default, and run_cutamp's without --soft_cost) resolves in
+    # __post_init__ to place_close_to_base, joint_limit_margin and
+    # minimize_body_movement, which holds the legs, free to move (design call
+    # 2), in that order: CostReducer sums them in it. [] means no soft costs.
     soft_cost: Optional[List[str]] = None
     # The periodic IK projection (coupled re-IK): Adam optimizes the Poses,
     # Grasps and free Confs, and the Confs an IK target covers (q_pick,
     # q_place, ...) leave the optimizer. Every reik_interval steps the
     # balance-first GN refresh (gn_project_balanced) projects them onto their
-    # moved targets: the CoM in the support rectangle first, the pose least
-    # squares inside it, joint-limit margins with what is left. Every row's
+    # moved targets: the CoM in the support rectangle and both soles on the
+    # stance first, the pose least squares inside it. Every row's
     # iterate is written back, and no cuRobo runs during Adam; the final
     # pre-check refresh repairs the rows that still miss.
     reik_interval: int = 5
@@ -116,9 +107,7 @@ class TAMPConfiguration:
 
     def __post_init__(self):
         if self.soft_cost is None:
-            default = ["place_close_to_base", "joint_limit_margin"]
-            if self.robot == "real_legs":
-                default.append("minimize_body_movement")
+            default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
             object.__setattr__(self, "soft_cost", default)
 
 
@@ -129,9 +118,6 @@ def uses_cuda_graphs(config: TAMPConfiguration) -> bool:
 
 
 def validate_tamp_config(config: TAMPConfiguration):
-    if config.robot not in SUPPORTED_ROBOTS:
-        raise ValueError(f"Unknown robot {config.robot!r}; supported: {SUPPORTED_ROBOTS}")
-
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
 

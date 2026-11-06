@@ -166,7 +166,7 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch):
     world, skeleton, base = blocks_t1_plan
     # The module's tests share one blocks_t1_plan world, which keeps every site it builds.
     monkeypatch.setattr(world, "_site_kinematics", {})
-    config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=50, early_stop_patience=0,
+    config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0,
                                cuda_graphs=False, enable_visualizer=False)
     steps = _install_lockstep(monkeypatch, world)
     # Not the no-op Visualizer, so the body returns vis and each step compares costs, mask and values too.
@@ -189,7 +189,7 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch):
 def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc):
     # As test_step_lockstep_vs_head, for each soft cost alone and for none.
     world, skeleton, base = blocks_t1_plan
-    config = TAMPConfiguration(robot=world.model.name, num_particles=64, num_opt_steps=5, early_stop_patience=0,
+    config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
                                cuda_graphs=False, enable_visualizer=False, soft_cost=[] if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
     run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=SpyVis(config))
@@ -203,7 +203,7 @@ def test_frozen_sum_matches_production(blocks_t1_plan):
     from cutamp.cost_function import CostFunction, _per_object_sum
 
     world, skeleton, _ = blocks_t1_plan
-    layouts = CostFunction(skeleton, world, TAMPConfiguration(robot=world.model.name, num_particles=64)
+    layouts = CostFunction(skeleton, world, TAMPConfiguration(num_particles=64)
                            ).surface_to_sphere_counts.values()
     g = torch.Generator("cuda").manual_seed(0)
     for counts in [*layouts, (37, 50, 13), (200, 56)]:

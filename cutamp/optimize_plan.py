@@ -490,8 +490,8 @@ class ParticleOptimizer:
             world_from_ee = dep.target_fn(particles).detach()
             # Final pre-check refresh: REPAIR-ONLY, on the full-strength
             # main solver. Measure which rows actually fail the checker's
-            # kinematic tolerances (the hand's, and on a model with soles
-            # the soles' against the stance) or the CoM gate, and only
+            # kinematic tolerances (the hand's, and the soles' against the
+            # stance) or the CoM gate, and only
             # overwrite those — a blanket success-masked overwrite perturbs
             # already-good rows' soft costs (measured best_soft 18.6 -> 22.8
             # on one run). Full batch always: cuRobo pads sub-capacity
@@ -504,12 +504,11 @@ class ParticleOptimizer:
                     world, particles[dep.q_name].detach(), world_from_ee, dep.arm,
                 )
                 ok_now = (pos_err < pos_tol) & (rot_err < rot_tol)
-                if world.model.sole_frames:
-                    ok_now &= soles_on_stance(
-                        world, _fk_state(world, particles[dep.q_name].detach()),
-                        self.constraint_checker._get_tol(KinematicConstraint.type, "sole_pos_err"),
-                        self.constraint_checker._get_tol(KinematicConstraint.type, "sole_rot_err"),
-                    )
+                ok_now &= soles_on_stance(
+                    world, _fk_state(world, particles[dep.q_name].detach()),
+                    self.constraint_checker._get_tol(KinematicConstraint.type, "sole_pos_err"),
+                    self.constraint_checker._get_tol(KinematicConstraint.type, "sole_rot_err"),
+                )
                 ok_now &= compute_com_polygon_mask(world, particles[dep.q_name])
             if bool(ok_now.all()):
                 continue  # nothing to repair for this dep
@@ -521,7 +520,7 @@ class ParticleOptimizer:
             success = _ik_success_mask(ik_result)
             # Repair-only merge: already-good rows keep their q.
             success = success & ~ok_now
-            if world.model.envelope is not None and world.model.envelope.trunk_tilt_max is not None:
+            if world.model.envelope.trunk_tilt_max is not None:
                 # cuRobo's IK does not see an envelope's tilt bound, which GN holds: on blocks_t1's floor scene,
                 # under a 1.0 rad bound, it bowed 9 of 11 repaired rows past it, each trading a hand, sole or CoM
                 # failure for a tilt one, so a repair past the bound is not taken.
@@ -536,8 +535,8 @@ class ParticleOptimizer:
     def _capture_step(self, body: _StepBody, world: TAMPWorld) -> cuda_graphs.CapturedGraph:
         """Capture ``body`` as G_step. Each warm-up drops every ``.grad``, so the captured AccumulateGrad
         gives each param a graph-owned ``.grad`` that every replay rewrites in place (never zero_grad it).
-        The guard covers the particles, those grads and the step's FK sites: three, and on the real legs the
-        retract confs' motion site (cost_function.motion_costs)."""
+        The guard covers the particles, those grads and the step's FK sites: three, and the retract confs'
+        motion site (cost_function.motion_costs)."""
         body.clear_autograd()
 
         def warmup() -> None:
@@ -549,8 +548,7 @@ class ParticleOptimizer:
             "G_step", body, warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
                 [*body.particles.values(), *(p.grad for p in body.params)],
-                [world.site_kinematics(s) for s in ("rollout", "retract", "com")
-                 + (("retract_motion",) if world.model.sole_frames else ())],
+                [world.site_kinematics(s) for s in ("rollout", "retract", "com", "retract_motion")],
             ),
         )
 
@@ -569,7 +567,7 @@ class ParticleOptimizer:
         visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
         q_last = rollout["confs"][best_idx, -1].tolist()
 
-        # v0.8: configs are the model's full cspace (T1: 21 or 33 joints) or a
+        # v0.8: configs are the model's full cspace (T1: its 33 joints) or a
         # single chain's DOF (others). T1RerunRobot maps them onto the URDF.
         visualizer.set_joint_positions(q_last)
         for obj in rollout["obj_to_pose"]:

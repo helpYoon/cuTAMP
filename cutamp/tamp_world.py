@@ -16,7 +16,7 @@ frames in ``robot_container.tool_frames``.
 """
 
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 import torch
 
@@ -96,8 +96,8 @@ class TAMPWorld:
         # (matches the planner). Particle init holds the inactive hand where
         # the IK's start conf puts it (home, or a CoM-gate retry's perturbed
         # seed), so that arm's joints counter-rotate as the body bends (the
-        # per-DOF cspace pin is a no-op), and on the real legs both soles on
-        # the stance (sole_goals). A conf whose IK fails starts at home
+        # per-DOF cspace pin is a no-op), and both soles on the stance
+        # (sole_goals). A conf whose IK fails starts at home
         # instead (_store_ik_q). The GN refresh then moves the body
         # with the inactive arm's joints fixed, so that hand rides with the
         # trunk, most at those home confs (known-bugs B15).
@@ -122,7 +122,7 @@ class TAMPWorld:
         # Arm-home end-effector positions in world frame. Used by the
         # arm-affinity priority function in plan-skeleton search to rank
         # which arm should pick which object. Uses palm frames (*_base_link)
-        # because they're already in tool_frames per t1_planar_base.yml;
+        # because they're already in tool_frames per t1_29dof.yml;
         # exact frame doesn't affect ranking, only LEFT-vs-RIGHT direction
         # matters.
         home_js = JointState.from_position(
@@ -141,25 +141,23 @@ class TAMPWorld:
         # The planted soles' world poses at the model's home: every action stands on this one stance. The FK poses
         # stay too, as the soles' IK goals (sole_goals), so those goals are the stance bit for bit.
         self._stance_sole_poses: Dict[str, Pose] = {}
-        self._stance_soles: Optional[torch.Tensor] = None
-        if self.model.sole_frames:
-            stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
-            stance_ks = self.kinematics.compute_kinematics(stance_js)
-            for frame in self.model.sole_frames:
-                pose = stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True)
-                # Copies: a single conf's pose is a view of cuRobo's FK buffers, which the next FK call rewrites.
-                self._stance_sole_poses[frame] = Pose(
-                    position=pose.position.detach().clone(), quaternion=pose.quaternion.detach().clone(),
-                )
-            self._stance_soles = torch.stack([
-                pose.get_matrix().reshape(4, 4) for pose in self._stance_sole_poses.values()
-            ])
+        stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
+        stance_ks = self.kinematics.compute_kinematics(stance_js)
+        for frame in self.model.sole_frames:
+            pose = stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True)
+            # Copies: a single conf's pose is a view of cuRobo's FK buffers, which the next FK call rewrites.
+            self._stance_sole_poses[frame] = Pose(
+                position=pose.position.detach().clone(), quaternion=pose.quaternion.detach().clone(),
+            )
+        self._stance_soles: torch.Tensor = torch.stack([
+            pose.get_matrix().reshape(4, 4) for pose in self._stance_sole_poses.values()
+        ])
 
     # ---- Container delegates ------------------------------------------------
 
     @property
     def model(self) -> T1Model:
-        """The planning model: joint names, slices, home, margins and support region."""
+        """The planning model: joint names, slices, home and support region."""
         return self.robot_container.model
 
     @property
@@ -202,17 +200,13 @@ class TAMPWorld:
         return self._q_init
 
     @property
-    def stance_soles(self) -> Optional[torch.Tensor]:
-        """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction);
-        ``None`` on a model without soles (the simplified one)."""
+    def stance_soles(self) -> torch.Tensor:
+        """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction)."""
         return self._stance_soles
 
-    def sole_goals(self, n: int) -> Optional[Dict[str, Pose]]:
+    def sole_goals(self, n: int) -> Dict[str, Pose]:
         """Each of ``model.sole_frames``' stance pose, repeated ``n`` times: the planted soles' IK goals
-        (design 7.3: from the stance, never from FK at the IK seed). ``None`` on a model without soles
-        (the simplified one)."""
-        if not self.model.sole_frames:
-            return None
+        (design 7.3: from the stance, never from FK at the IK seed)."""
         return {
             frame: Pose(position=pose.position.repeat(n, 1), quaternion=pose.quaternion.repeat(n, 1))
             for frame, pose in self._stance_sole_poses.items()
@@ -298,7 +292,7 @@ class TAMPWorld:
     def segment_torques(self) -> SegmentTorques:
         """cuRobo's two RNEA passes with the floor's push on a plan's frames
         (:class:`cutamp.floor_wrench.SegmentTorques`, lazily built): the balance gate's torque and speed checks, which
-        set each segment's pace, and the reason a trajopt failed. A model standing on soles only (the real legs)."""
+        set each segment's pace, and the reason a trajopt failed."""
         if self._segment_torques is None:
             self._segment_torques = SegmentTorques(self.model, self.device_cfg)
         return self._segment_torques
@@ -335,7 +329,6 @@ class TAMPWorld:
         self,
         collision_activation_distance: float = 0.01,
         use_cuda_graph: bool = True,
-        enable_joint_limit_margin: bool = True,
     ) -> MotionPlanner:
         """Build a single MotionPlanner for the robot using the world's Scene
         with movables included (so attached objects are part of the collision
@@ -348,7 +341,6 @@ class TAMPWorld:
             use_cuda_graph=use_cuda_graph,
             collision_activation_distance=collision_activation_distance,
             device_cfg=self.device_cfg,
-            enable_joint_limit_margin=enable_joint_limit_margin,
         )
 
 

@@ -52,8 +52,8 @@ class T1State:
         """Set per-DOF cspace weights (joints addressed by NAME) on every host.
 
         Joint names that aren't in the planner's active cspace are silently
-        skipped — e.g., a base DOF requested for pinning when the base is
-        already locked has nothing to pin in the active cspace.
+        skipped — e.g., a head or gripper joint, which the planner locks, has
+        nothing to pin in the active cspace.
         """
         hosts = list(hosts)
         weights = build_pin_weights(self.planner, pin_joint_names)
@@ -110,10 +110,9 @@ class T1State:
         """Per-timestep ``world_from_obj`` for a held object along ``plan``.
 
         ``plan`` is a planner-output JointState. Trajectories arrive in the
-        planner's active cspace (e.g., 18-DOF with the mobile base locked) so
-        FK runs through ``planner.kinematics`` after a ``get_active_js``
-        reprojection. Returns ``None`` when ``arm`` is ``None`` or nothing is
-        held on it.
+        planner's active cspace (the head and grippers locked) so FK runs
+        through ``planner.kinematics`` after a ``get_active_js`` reprojection.
+        Returns ``None`` when ``arm`` is ``None`` or nothing is held on it.
         """
         if arm is None:
             return None
@@ -138,7 +137,7 @@ class T1State:
     def compute_all_held_obj_poses(self, plan: JointState) -> Dict[str, tuple]:
         """``{arm: (obj_name, poses)}`` for every arm currently holding.
 
-        The body joints (leg/torso/waist) are unlocked during single-arm
+        The body joints (the legs and the Waist) are unlocked during single-arm
         planning so an inactive arm's held block still translates through
         world as the body moves; visualization needs poses for both arms.
         """

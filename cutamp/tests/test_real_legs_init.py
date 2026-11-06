@@ -201,7 +201,7 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
     from cutamp.tests.conftest import clone_particles
     skeleton, particles = real_plan
     retracts = [conf for _, conf in _ops(skeleton, "retract")]
-    config = TAMPConfiguration(robot="real_legs", num_particles=64)
+    config = TAMPConfiguration(num_particles=64)
     names = list(real_world.model.joint_names)
     particles = clone_particles(particles)
     z = names.index("base_j_z")

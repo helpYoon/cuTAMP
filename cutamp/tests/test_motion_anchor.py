@@ -101,7 +101,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, 0.5)
     torch.manual_seed(0)  # run_cutamp's --seed 0
-    config = TAMPConfiguration(robot="real_legs", num_particles=64, curobo_plan=True, enable_visualizer=False,
+    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
                                experiment_root=str(tmp_path))
     rc.cutamp_demo(env, config, experiment_id="audit", save_plan="auto")
 
