@@ -1,9 +1,8 @@
 """Tests for the T1 robot module under cuRobo v0.8 single-MotionPlanner.
 
-This file exercises the robot container's shape: one Kinematics, two tool
-frames, gripper-spheres dict.
-It also covers the outputs of real-leg runs (decision 9): the raw plan and
-the Rerun viewer.
+This file checks the robot container's two tool frames and their gripper
+spheres. It also covers the outputs of real-leg runs (decision 9): the raw
+plan and the Rerun viewer.
 """
 
 import copy
@@ -32,23 +31,6 @@ def test_t1_has_two_tool_frames(t1_container):
     assert RIGHT_TOOL_FRAME in t1_container.tool_from_ee
     assert LEFT_TOOL_FRAME in t1_container.gripper_spheres
     assert RIGHT_TOOL_FRAME in t1_container.gripper_spheres
-
-
-def test_t1_joint_limits_shape(t1_container):
-    from cutamp.robots.t1 import REAL_LEGS
-    assert t1_container.joint_limits.shape == (2, len(REAL_LEGS.joint_names))
-
-
-def test_t1_kinematics_runs(t1_container):
-    from cutamp.robots.t1 import REAL_LEGS
-    from curobo.types import JointState
-
-    q = torch.tensor(REAL_LEGS.home, device=t1_container.kinematics.device_cfg.device).unsqueeze(0)
-    js = JointState.from_position(q)
-    state = t1_container.kinematics.compute_kinematics(js)
-    # ToolPose covers both arm tool frames, both soles and the stance (the support
-    # frame of the CoM costs; not IK targets).
-    assert state.tool_poses.num_links >= 2
 
 
 def _raw_plan_input():

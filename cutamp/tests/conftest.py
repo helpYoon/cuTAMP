@@ -51,18 +51,6 @@ def _free_cuda_between_tests():
 
 
 @pytest.fixture(scope="module")
-def blocks_t1_plan(real_world, real_plan):
-    """``[world, skeleton, particles]``: ``real_world`` and ``real_plan``'s own objects, the 64-particle blocks_t1 world
-    as algorithm.py builds it, its first task plan (which follows PYTHONHASHSEED) and its seeded init. Sharing their
-    build, a module may ask for both (two worlds OOM a 24 GiB card). Read-only: tests run on
-    ``clone_particles(particles)``. A list, so teardown can free the particles while pytest still holds the yielded
-    object; ``real_world``'s slot then frees the world."""
-    plan = [real_world, *real_plan]
-    yield plan
-    plan.clear()
-
-
-@pytest.fixture(scope="module")
 def _real_world_slot():
     """Holds ``real_world``'s world, so teardown can free it: ``real_world`` is torn down first, and with it pytest's
     own reference to the world."""

@@ -1,17 +1,11 @@
 """Motion planning on the real legs with planted feet and cuRobo's torque check (design 7.4a, 7.5): the floor's push on
 every trajopt transition, SegmentTorques against trajopt's own torques, the balance gate's multibody ZMP against a
-float64 reference, its sole, tilt, CoM and torque checks, the failed-trajopt reason, and blocks_t1 end to end through
-cutamp_demo, with its saved raw plan.
-
-The slow end-to-end test comes first: cutamp_demo builds its own world, and the module's ``real_world`` and ``planner``
-must not exist beside it (two worlds OOM a 24 GiB card). Module fixtures are built at their first use, so pytest's
-file order keeps them apart."""
+float64 reference, its sole, tilt, CoM and torque checks, and the failed-trajopt reason. blocks_t1 end to end on the
+real legs is test_motion_anchor's."""
 
 import dataclasses
 import functools
 import math
-import os
-import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,8 +14,6 @@ import torch
 
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.tests.conftest import needs_cuda
-
-needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
 DT = 0.025  # the hand-built segments' frame spacing, s
 SHOULDERS = ("Left_Shoulder_Pitch", "Right_Shoulder_Pitch")
@@ -68,16 +60,6 @@ def _swing(world):
     return _ramp(world, {j: -2.2 for j in SHOULDERS}, 0.5)
 
 
-def _sole_errors(world, q: torch.Tensor):
-    """``([T, 2] m, [T, 2] rad)``: each sole's pose error at the confs ``q`` ``[T, dof]`` against the stance."""
-    from cutamp.com_polygon_cost import _fk_state
-    from cutamp.costs import curobo_pose_error
-    ks = _fk_state(world, q)
-    soles = torch.stack([ks.tool_poses.get_link_pose(f, make_contiguous=True).get_matrix()
-                         for f in world.model.sole_frames], dim=1)
-    return curobo_pose_error(soles, world.stance_soles.expand_as(soles))
-
-
 def _transitions(planner):
     """Every trajopt transition: each rollout's cost (``transition_model``) and success-test
     (``metrics_transition_model``) ones, and the interpolated re-check's."""
@@ -105,86 +87,6 @@ def _transition_torques(tm, js) -> torch.Tensor:
         tau = tm.compute_augmented_state(chunk).joint_torque.reshape(b * h, -1)
         out.append(tau[: q.shape[0] - start].clone())
     return torch.cat(out)
-
-
-@needs_cuda
-@needs_slow
-def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
-    # cutamp_demo end to end: setup_cutamp builds the world from REAL_LEGS, load_t1_container and
-    # q_init = REAL_LEGS.home. The spies only record.
-    import cutamp.algorithm as alg
-    import cutamp.scripts.run_cutamp as rc
-    from cutamp.com_polygon_cost import soles_planted
-    from cutamp.config import TAMPConfiguration
-    from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
-    from cutamp.motion_solver import _full_positions, _model_frames
-    from cutamp.task_planning.constraints import Motion
-
-    seen = {"retract": []}
-    run, solve, top = rc.run_cutamp, alg.solve_curobo, alg.get_top_satisfying_particles
-
-    def run_spy(*args, **kwargs):
-        seen["run"] = run(*args, **kwargs)
-        return seen["run"]
-
-    def solve_spy(plan_info, particle, world, *args, **kwargs):
-        seen["world"] = world
-        return solve(plan_info, particle, world, *args, **kwargs)
-
-    def top_spy(plan_info, config, constraint_checker, cost_reducer, n):
-        # The satisfying particles' retract values, which the Motion loss and the mask include.
-        particles = plan_info["particles"]
-        with torch.no_grad():
-            cost_dict = plan_info["cost_fn"](plan_info["rollout_fn"](particles), particles)
-        mask = constraint_checker.get_mask(cost_dict, verbose=False)
-        values = cost_dict[Motion.type]["values"]
-        seen["retract"].append({k: values[k][mask].cpu() for k in ("retract_self_collision", "retract_joint_limit")})
-        return top(plan_info, config, constraint_checker, cost_reducer, n)
-
-    monkeypatch.setattr(rc, "run_cutamp", run_spy)
-    monkeypatch.setattr(alg, "solve_curobo", solve_spy)
-    monkeypatch.setattr(alg, "get_top_satisfying_particles", top_spy)
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    raise_surface_height(env, 0.5)
-    torch.manual_seed(0)  # run_cutamp's --seed 0
-    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
-                               experiment_root=str(tmp_path))
-    rc.cutamp_demo(env, config, experiment_id="e2e", save_plan="auto")
-
-    curobo_plan, _, metrics = seen["run"]
-    assert metrics["found_solution"] and metrics["motion_plan_success"], metrics.get("motion_plan_failures")
-    assert metrics["traj_com_violation_frac"] == 0
-    assert seen["retract"] and all(not bool(v.any()) for d in seen["retract"] for v in d.values())
-    world = seen["world"]
-    torques = world.segment_torques
-    for k, entry in enumerate(curobo_plan):
-        pos, rot = _sole_errors(world, _full_positions(world, None, entry["plan"]))
-        assert bool(soles_planted(pos, rot).all()), (k, float(pos.max()), float(rot.max()))
-        excess = (torques(entry["plan"]).abs() - torques.effort).amax(0)
-        assert float(excess.max()) <= 0.0, (k, world.model.joint_names[int(excess.argmax())], float(excess.max()))
-        speed = (_model_frames(world, None, entry["plan"]).velocity.abs() / torques.velocity)[:, _actuated(world)]
-        assert float(speed.max()) <= 1.0, (k, float(speed.max()))  # the pace the gate set keeps every speed limit
-
-    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned, in the model's 33 joints, and
-    # each segment starting where the one before it ends.
-    with open(tmp_path / "e2e" / "motion_plan.pkl", "rb") as f:
-        raw = pickle.load(f)
-    names = list(REAL_LEGS.joint_names)
-    assert len(names) == 33
-    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage3-raw", "real_legs", names)
-    assert len(raw["segments"]) == len(curobo_plan)
-    for k, (seg, entry) in enumerate(zip(raw["segments"], curobo_plan)):
-        assert set(seg) == {"arm", "dt", "position", "velocity", "acceleration", "planner_timing"}, k
-        assert (seg["arm"], seg["dt"]) == (entry["arm"], entry["dt"]), k
-        assert (seg["planner_timing"] is None) == (entry.get("planner_timing") is None), k
-        for timing in [seg] + ([seg["planner_timing"]] if seg["planner_timing"] is not None else []):
-            n = len(timing["position"])
-            for key in ("position", "velocity", "acceleration"):
-                assert timing[key].dtype == np.float32 and timing[key].shape == (n, 33), (k, key)
-        np.testing.assert_array_equal(seg["position"], _full_positions(world, None, entry["plan"]).cpu().numpy())
-        if k:
-            np.testing.assert_allclose(seg["position"][0], raw["segments"][k - 1]["position"][-1], rtol=0, atol=1e-5,
-                                       err_msg=f"segment {k} starts away from segment {k - 1}'s end")
 
 
 @pytest.fixture(scope="module")

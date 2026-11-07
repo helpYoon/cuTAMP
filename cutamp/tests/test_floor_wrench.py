@@ -2,7 +2,6 @@
 map, and RNEA's second pass against virtual work, on a 12-DoF biped hung from a 6-DoF virtual base."""
 
 import copy
-import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,8 +11,6 @@ from scipy.spatial.transform import Rotation
 
 from cutamp.floor_wrench import base_wrench, install_floor_wrench, make_floor_wrench_fn, split_between_soles
 from cutamp.tests.conftest import needs_cuda
-
-needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
 BASE = [("x", "X_PRISM"), ("y", "Y_PRISM"), ("z", "Z_PRISM"), ("pitch", "Y_ROT"), ("roll", "X_ROT"), ("yaw", "Z_ROT")]
 BASE_JOINTS = [f"base_j_{n}" for n, _ in BASE]
@@ -206,33 +203,12 @@ def test_floor_wrench_replays_in_a_cuda_graph(biped):
 
 
 @needs_cuda
-@needs_slow
-def test_install_floor_wrench_hooks_only_trajopt(biped):
+def test_install_floor_wrench_needs_compute_com(biped):
+    # A planner built without compute_com (cuRobo's default trajopt transitions) is refused. That the hook lands
+    # on every trajopt transition and only there is test_real_legs_motion's, on the real planner.
     from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-    from curobo.types import DeviceCfg, JointState
-    from cutamp.robots.t1 import _trajopt_transition_dict_with_compute_com
+    from curobo.types import DeviceCfg
 
-    def planner(**kwargs) -> MotionPlanner:
-        return MotionPlanner(MotionPlannerCfg.create(robot=copy.deepcopy(biped.cfg), self_collision_check=False,
-                                                     device_cfg=DeviceCfg(), **kwargs))
-
-    with planner(trajopt_transition_model=_trajopt_transition_dict_with_compute_com()) as mp:
-        install_floor_wrench(mp, BASE_JOINTS, SOLES)
-        assert all(r.transition_model._external_wrench_fn is None for r in mp.ik_solver.get_all_rollout_instances())
-        start = JointState.from_position(_q(biped.names).view(1, -1), joint_names=biped.names)
-        goal = JointState.from_position(_q(biped.names, CROUCH).view(1, -1), joint_names=biped.names)
-        result = mp.plan_cspace(goal, start)
-        assert result is not None and bool(result.success.all())
-        # What the cost and the success test see (each rollout's cost and metrics transitions, and the
-        # interpolated re-check): at rest the floor holds the robot and the base joints carry nothing.
-        ts = mp.trajopt_solver
-        q = _q(ts.joint_names).view(1, 1, -1)
-        rest = JointState(position=q, velocity=torch.zeros_like(q), acceleration=torch.zeros_like(q),
-                          jerk=torch.zeros_like(q), joint_names=ts.joint_names)
-        base = [ts.joint_names.index(j) for j in BASE_JOINTS]
-        rollouts = list(ts.get_all_rollout_instances()) + list(ts.additional_metrics_rollouts.values())
-        base_load = [float(tm.compute_augmented_state(rest).joint_torque[..., base].abs().max())
-                     for r in rollouts for tm in (r.transition_model, r.metrics_transition_model)]
-        assert max(base_load) <= 0.05, base_load  # [cost, metrics] per rollout
-    with planner() as mp, pytest.raises(ValueError, match="compute_com"):
+    cfg = MotionPlannerCfg.create(robot=copy.deepcopy(biped.cfg), self_collision_check=False, device_cfg=DeviceCfg())
+    with MotionPlanner(cfg) as mp, pytest.raises(ValueError, match="compute_com"):
         install_floor_wrench(mp, BASE_JOINTS, SOLES)

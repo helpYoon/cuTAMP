@@ -145,20 +145,12 @@ def _install_lockstep(monkeypatch, world) -> List[tuple]:
 
 
 @needs_cuda
-def test_blocks_t1_plan_reuses_the_real_world(blocks_t1_plan, real_world, real_plan):
-    # A module that asks for both world fixtures builds one 64-particle world, not two (two OOM a 24 GiB card):
-    # blocks_t1_plan hands back real_world's world and real_plan's own skeleton and particles.
-    assert blocks_t1_plan[0] is real_world
-    assert blocks_t1_plan[1] is real_plan[0] and blocks_t1_plan[2] is real_plan[1]
-
-
-@needs_cuda
-def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch):
+def test_step_lockstep_vs_head(real_world, real_plan, monkeypatch):
     # Dedicated never-reset sites vs HEAD's one shared instance; the sites' buffers never move. The retract confs, the
     # FK-fed confs Adam optimizes, get a zero grad at every one of the 50 steps (measured 2026-11-05), so no check here
     # that a compared grad comes out of an FK backward.
-    world, skeleton, base = blocks_t1_plan
-    # The module's tests share one blocks_t1_plan world, which keeps every site it builds.
+    world, (skeleton, base) = real_world, real_plan
+    # The module's tests share one real_world, which keeps every site it builds.
     monkeypatch.setattr(world, "_site_kinematics", {})
     config = TAMPConfiguration(num_particles=64, num_opt_steps=50, early_stop_patience=0,
                                cuda_graphs=False, enable_visualizer=False)
@@ -180,9 +172,9 @@ def test_step_lockstep_vs_head(blocks_t1_plan, monkeypatch):
 @needs_cuda
 @pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"),
                                 *(pytest.param(sc, id=sc) for sc in SUPPORTED_SOFT_COSTS)])
-def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc):
+def test_step_body_matches_head(real_world, real_plan, monkeypatch, sc):
     # As test_step_lockstep_vs_head, for each soft cost alone and for none.
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=5, early_stop_patience=0,
                                cuda_graphs=False, enable_visualizer=False, soft_cost=[] if sc is None else [sc])
     steps = _install_lockstep(monkeypatch, world)
@@ -191,12 +183,12 @@ def test_step_body_matches_head(blocks_t1_plan, monkeypatch, sc):
 
 
 @needs_cuda
-def test_frozen_sum_matches_production(blocks_t1_plan):
+def test_frozen_sum_matches_production(real_world, real_plan):
     # Dense inputs at the run's layouts and two more: production's goal_in_xy sum
     # equals the frozen copy bitwise, forward and grad with respect to x.
     from cutamp.cost_function import CostFunction, _per_object_sum
 
-    world, skeleton, _ = blocks_t1_plan
+    world, (skeleton, _) = real_world, real_plan
     layouts = CostFunction(skeleton, world, TAMPConfiguration(num_particles=64)
                            ).surface_to_sphere_counts.values()
     g = torch.Generator("cuda").manual_seed(0)

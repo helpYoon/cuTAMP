@@ -15,13 +15,8 @@ _CASES = [(counts, b) for counts in ((50, 50), (37, 50, 13), (200, 56)) for b in
 
 
 def _block_index(counts, b):
-    """HEAD's sphere -> object map, expanded to ``b`` rows."""
+    """The sphere -> object map, expanded to ``b`` rows."""
     return torch.tensor([o for o, n in enumerate(counts) for _ in range(n)], device="cuda")[None].expand(b, -1)
-
-
-def _head_sum(x, idx, k):
-    """HEAD's form: atomic adds in a varying order."""
-    return torch.zeros(x.shape[0], k, dtype=x.dtype, device=x.device).scatter_add_(1, idx, x)
 
 
 def _not_equal(got, want):
@@ -39,8 +34,7 @@ def _grads(out):
 @needs_cuda
 def test_per_object_sum_is_fixed_order():
     from cutamp.cost_function import _per_object_sum
-    cases = []
-    for counts, b in _CASES:  # 1-3 hold whatever HEAD's scatter_add_ does
+    for counts, b in _CASES:
         g = torch.Generator(device="cuda").manual_seed(b + len(counts))
         x = torch.rand(b, sum(counts), device="cuda", generator=g)
         gy = torch.rand(b, len(counts), device="cuda", generator=g)
@@ -48,30 +42,16 @@ def test_per_object_sum_is_fixed_order():
         want = _per_object_sum(x, counts)
         # 1. Determinism over repeats.
         assert all(torch.equal(_per_object_sum(x, counts), want) for _ in range(200)), (counts, b)
-        # 2. Bitwise grads: the gather scatter_add_'s backward gives, for any upstream grad.
+        # 2. Bitwise grads: each sphere gets its object's upstream grad, for any upstream grad.
         xr = x.clone().requires_grad_()
         got, = torch.autograd.grad(_per_object_sum(xr, counts), xr, gy)
-        head_got, = torch.autograd.grad(_head_sum(xr, idx, k), xr, gy)
-        assert torch.equal(got, gy.gather(1, idx)) and torch.equal(got, head_got), (counts, b)
+        assert torch.equal(got, gy.gather(1, idx)), (counts, b)
         # 3. Sync-free, forward and backward (the capture rule).
         with sync_debug_error():
             torch.autograd.grad(_per_object_sum(xr, counts), xr, gy)
-        cases.append((counts, b, x, idx, k, want))
-    if torch.are_deterministic_algorithms_enabled():
-        pytest.skip("deterministic algorithms are on: scatter_add_ has no atomics to measure (checks 1-3 passed)")
-    for counts, b, x, idx, k, want in cases:  # 4-5 measure HEAD's atomics
-        # 4. The positive control: HEAD's form is not deterministic.
-        heads = torch.stack([_head_sum(x, idx, k) for _ in range(200)])
-        assert not all(torch.equal(h, heads[0]) for h in heads[1:]), (
-            f"{counts}, B={b}: HEAD's form repeated bitwise 200 times, so check 1 has no power on this GPU")
-        # 5. The right block sums, no less accurate than HEAD: the float64 error is within
-        #    HEAD's spread over its 200 calls, and within HEAD's own error.
-        ref = torch.zeros(b, k, dtype=torch.float64).scatter_add_(1, idx.cpu(), x.double().cpu())  # CPU: sequential
-        err = (want.double().cpu() - ref).abs().max().item()
-        spread = (heads.amax(0) - heads.amin(0)).max().item()
-        head_err = (heads.double().cpu() - ref).abs().max().item()
-        assert err <= head_err, f"{counts}, B={b}: error {err:.3g} exceeds the atomic form's {head_err:.3g}"
-        assert err <= spread, f"{counts}, B={b}: atomic spread {spread:.3g} is below the error {err:.3g}"
+        # 4. The right block sums: float32's tolerance of a float64 sequential sum on the CPU.
+        ref = torch.zeros(b, k, dtype=torch.float64).scatter_add_(1, idx.cpu(), x.double().cpu())
+        torch.testing.assert_close(want, ref.to(want), msg=f"{counts}, B={b}")
 
 
 @needs_cuda
@@ -105,7 +85,7 @@ def test_per_object_sum_replays_like_eager():
 
 
 @needs_cuda
-def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
+def test_cost_function_is_run_to_run_bitwise(real_world, real_plan, monkeypatch):
     from cutamp.config import TAMPConfiguration
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_function import CostFunction, _per_object_sum
@@ -114,7 +94,7 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
     from cutamp.rollout import RolloutFunction
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 
-    world, skeleton, particles = blocks_t1_plan
+    world, (skeleton, particles) = real_world, real_plan
     where = f"skeleton {' | '.join(map(str, skeleton))}; PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}"
     config = TAMPConfiguration(num_particles=64)
     rollout_fn, cost_fn = RolloutFunction(skeleton, world), CostFunction(skeleton, world, config)
@@ -143,8 +123,8 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
         assert cost_fn.surface_to_sphere_idx_map[surface].tolist() == [
             i for i, n in enumerate(counts) for _ in range(n)]     # the amin's map agrees with the blocks
 
-    # One _per_object_sum call per surface, on its blocks, gives the value: the lockstep oracle and the grad
-    # compare below patch cost_function._per_object_sum, so the call site must go through it.
+    # One _per_object_sum call per surface, on its blocks, gives the value: the lockstep oracle patches
+    # cost_function._per_object_sum, so the call site must go through it.
     calls = []
 
     def recording(x, counts):
@@ -178,13 +158,3 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
     for r in range(8):
         bad = _not_equal(grad_outputs(), want)
         assert not bad, f"grad-enabled repeat {r}: not bitwise run to run: {bad} ({where})"
-
-    # In situ, the fixed-order sum leaves the particle grads as cfa7a46's form gives them: its zeros +
-    # scatter_add_, on each surface's own idx map. Only the grads are compared: that form's values vary.
-    idx_for = {c: cost_fn.surface_to_sphere_idx_map[s][None].expand(64, -1)
-               for s, c in cost_fn.surface_to_sphere_counts.items()}
-    with monkeypatch.context() as m:
-        m.setattr("cutamp.cost_function._per_object_sum", lambda x, c: _head_sum(x, idx_for[c], len(c)))
-        head = grad_outputs()
-    bad = _not_equal(_grads(head), _grads(want))
-    assert not bad, f"particle grads under cfa7a46's scatter_add_ differ from the fixed-order sum's: {bad} ({where})"

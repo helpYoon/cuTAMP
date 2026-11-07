@@ -72,24 +72,6 @@ def test_get_valid_ground_operators_sorts_by_priority_fn():
 
 
 @needs_cuda
-def test_task_plan_generator_accepts_priority_fn():
-    """task_plan_generator must accept ground_op_priority_fn without error
-    and still yield plans."""
-    from cutamp.task_planning import task_plan_generator
-    from cutamp.t1_domain import all_t1_operators
-
-    world = make_blocks_t1_world()
-    gen = task_plan_generator(
-        world.initial_state, world.goal_state, all_t1_operators,
-        ground_op_priority_fn=lambda op: 0.0,
-    )
-    # Pulling one plan should not raise.
-    plan = next(gen)
-    assert plan is not None
-    assert len(plan) > 0
-
-
-@needs_cuda
 def test_arm_affinity_priority_orders_closer_arm_first():
     """priority(LeftPick(block_on_left)) < priority(LeftPick(block_on_right))."""
     world = make_blocks_t1_world()

@@ -697,11 +697,6 @@ DEFAULT_URDF = T1_29DOF / "t1_planner.urdf"
 DEFAULT_YAML = T1_29DOF / "upper_body_spheres.yml"
 
 
-def default_paths() -> list:
-    """The files the defaults read and write."""
-    return [DEFAULT_URDF, DEFAULT_YAML]
-
-
 def main():
     parser = argparse.ArgumentParser(description="Interactive YAML Collision Sphere Editor")
     parser.add_argument(

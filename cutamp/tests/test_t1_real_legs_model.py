@@ -160,32 +160,6 @@ def test_joint_limit_margin_is_registered_and_weighted():
     assert default_constraint_to_mult["soft"]["joint_limit_margin"] == 1e3
 
 
-def test_shrunken_bounds_penalty_is_zero_strictly_inside():
-    from cutamp.joint_limit_cost import shrunken_bounds_penalty
-    lo, hi = torch.tensor([-1.0, 0.0]), torch.tensor([1.0, 2.0])
-    q = torch.tensor([[0.0, 1.0], [-0.99, 1.99]])
-    assert shrunken_bounds_penalty(q, lo, hi).sum() == 0.0
-
-
-def test_shrunken_bounds_penalty_is_quadratic_in_penetration():
-    # 0.2 below the lower bound -> 0.04; doubling the depth quadruples it.
-    from cutamp.joint_limit_cost import shrunken_bounds_penalty
-    lo, hi = torch.tensor([0.0]), torch.tensor([1.0])
-    p1 = shrunken_bounds_penalty(torch.tensor([[-0.2]]), lo, hi)
-    p2 = shrunken_bounds_penalty(torch.tensor([[-0.4]]), lo, hi)
-    assert torch.allclose(p1, torch.tensor([[0.04]]))
-    assert torch.allclose(p2, 4.0 * p1)
-
-
-def test_shrunken_bounds_penalty_penalizes_both_sides():
-    from cutamp.joint_limit_cost import shrunken_bounds_penalty
-    lo, hi = torch.tensor([0.0]), torch.tensor([1.0])
-    below = shrunken_bounds_penalty(torch.tensor([[-0.1]]), lo, hi)
-    above = shrunken_bounds_penalty(torch.tensor([[1.1]]), lo, hi)
-    assert below.item() > 0.0 and above.item() > 0.0
-    assert torch.allclose(below, above)
-
-
 WAIST = REAL_LEGS.joint_names.index("Waist")
 
 

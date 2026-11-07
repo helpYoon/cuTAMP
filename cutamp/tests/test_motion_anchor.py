@@ -1,5 +1,6 @@
-"""COM-anchored pick/place terminals (plan_cspace to the conf), the trajectory audit, and one real-legs blocks_t1
-plan's balance metrics against its exported frames."""
+"""COM-anchored pick/place terminals (plan_cspace to the conf), the trajectory audit, and blocks_t1 end to end on the
+real legs through cutamp_demo: its retract values, planted soles, torques and speeds, saved raw plan, and balance
+metrics against its exported frames."""
 import os
 import pickle
 
@@ -71,22 +72,36 @@ def test_audit_counts_each_junction_frame_once(monkeypatch):
     assert ms._audit_traj_com(world, None, plans) == {"traj_com_violation_frac": 1 / 7, "traj_com_frames": 7}
 
 
+def _sole_errors(world, q: torch.Tensor):
+    """``([T, 2] m, [T, 2] rad)``: each sole's pose error at the confs ``q`` ``[T, dof]`` against the stance."""
+    from cutamp.com_polygon_cost import _fk_state
+    from cutamp.costs import curobo_pose_error
+    ks = _fk_state(world, q)
+    soles = torch.stack([ks.tool_poses.get_link_pose(f, make_contiguous=True).get_matrix()
+                         for f in world.model.sole_frames], dim=1)
+    return curobo_pose_error(soles, world.stance_soles.expand_as(soles))
+
+
 @needs_cuda
 def test_real_legs_plan_audit(tmp_path, monkeypatch):
-    # One real-legs plan as the slow end-to-end test runs it (blocks_t1, seed 0, 64 particles, the surface at 0.5 m,
-    # the motion plan saved raw): the metrics the gate records hold for the exported segments, and the CoM and the
-    # multibody ZMP re-measured on those frames stay inside the gate's rectangle (compute_support_mask's). On the real
-    # legs the gate sets each segment's pace, faster or slower than the planner's (measured 2026-11-05: 0.28x to
-    # 2.47x over 8 segments), so retime_max may be under 1.
+    # One real-legs plan end to end (blocks_t1, seed 0, 64 particles, the surface at 0.5 m, the motion plan saved
+    # raw): setup_cutamp builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the
+    # spies only record. The metrics the gate records hold for the exported segments, and the CoM and the multibody
+    # ZMP re-measured on those frames stay inside the gate's rectangle (compute_support_mask's). On the real legs the
+    # gate sets each segment's pace, faster or slower than the planner's (measured 2026-11-05: 0.28x to 2.47x over 8
+    # segments), so retime_max may be under 1.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
     from curobo.types import JointState
-    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, compute_support_mask
+    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, compute_support_mask, soles_planted
     from cutamp.config import TAMPConfiguration
     from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.task_planning.constraints import Motion
+    from cutamp.tests.test_real_legs_motion import _actuated
 
-    seen = {}
-    run, solve = rc.run_cutamp, alg.solve_curobo
+    seen = {"retract": []}
+    run, solve, top = rc.run_cutamp, alg.solve_curobo, alg.get_top_satisfying_particles
 
     def run_spy(*args, **kwargs):
         seen["run"] = run(*args, **kwargs)
@@ -96,8 +111,19 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         seen["world"] = world
         return solve(plan_info, particle, world, *args, **kwargs)
 
+    def top_spy(plan_info, config, constraint_checker, cost_reducer, n):
+        # The satisfying particles' retract values, which the Motion loss and the mask include.
+        particles = plan_info["particles"]
+        with torch.no_grad():
+            cost_dict = plan_info["cost_fn"](plan_info["rollout_fn"](particles), particles)
+        mask = constraint_checker.get_mask(cost_dict, verbose=False)
+        values = cost_dict[Motion.type]["values"]
+        seen["retract"].append({k: values[k][mask].cpu() for k in ("retract_self_collision", "retract_joint_limit")})
+        return top(plan_info, config, constraint_checker, cost_reducer, n)
+
     monkeypatch.setattr(rc, "run_cutamp", run_spy)
     monkeypatch.setattr(alg, "solve_curobo", solve_spy)
+    monkeypatch.setattr(alg, "get_top_satisfying_particles", top_spy)
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, 0.5)
     torch.manual_seed(0)  # run_cutamp's --seed 0
@@ -105,11 +131,43 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
                                experiment_root=str(tmp_path))
     rc.cutamp_demo(env, config, experiment_id="audit", save_plan="auto")
 
-    _, _, metrics = seen["run"]
+    curobo_plan, _, metrics = seen["run"]
     assert metrics["found_solution"] and metrics["motion_plan_success"], metrics.get("motion_plan_failures")
+    assert metrics["traj_com_violation_frac"] == 0
     assert metrics["traj_com_min_margin"] >= 0 and metrics["traj_zmp_min_margin"] >= 0
+    assert seen["retract"] and all(not bool(v.any()) for d in seen["retract"] for v in d.values())
+    world = seen["world"]
+    torques = world.segment_torques
+    for k, entry in enumerate(curobo_plan):
+        pos, rot = _sole_errors(world, ms._full_positions(world, None, entry["plan"]))
+        assert bool(soles_planted(pos, rot).all()), (k, float(pos.max()), float(rot.max()))
+        excess = (torques(entry["plan"]).abs() - torques.effort).amax(0)
+        assert float(excess.max()) <= 0.0, (k, world.model.joint_names[int(excess.argmax())], float(excess.max()))
+        speed = (ms._model_frames(world, None, entry["plan"]).velocity.abs() / torques.velocity)[:, _actuated(world)]
+        assert float(speed.max()) <= 1.0, (k, float(speed.max()))  # the pace the gate set keeps every speed limit
+
+    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned, in the model's 33 joints, and
+    # each segment starting where the one before it ends.
     with open(tmp_path / "audit" / "motion_plan.pkl", "rb") as f:
-        segments = pickle.load(f)["segments"]
+        raw = pickle.load(f)
+    names = list(REAL_LEGS.joint_names)
+    assert len(names) == 33
+    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage3-raw", "real_legs", names)
+    segments = raw["segments"]
+    assert len(segments) == len(curobo_plan)
+    for k, (seg, entry) in enumerate(zip(segments, curobo_plan)):
+        assert set(seg) == {"arm", "dt", "position", "velocity", "acceleration", "planner_timing"}, k
+        assert (seg["arm"], seg["dt"]) == (entry["arm"], entry["dt"]), k
+        assert (seg["planner_timing"] is None) == (entry.get("planner_timing") is None), k
+        for timing in [seg] + ([seg["planner_timing"]] if seg["planner_timing"] is not None else []):
+            n = len(timing["position"])
+            for key in ("position", "velocity", "acceleration"):
+                assert timing[key].dtype == np.float32 and timing[key].shape == (n, 33), (k, key)
+        np.testing.assert_array_equal(seg["position"], ms._full_positions(world, None, entry["plan"]).cpu().numpy())
+        if k:
+            np.testing.assert_allclose(seg["position"][0], segments[k - 1]["position"][-1], rtol=0, atol=1e-5,
+                                       err_msg=f"segment {k} starts away from segment {k - 1}'s end")
+
     assert metrics["plan_duration_s"] == pytest.approx(sum((len(s["position"]) - 1) * s["dt"] for s in segments))
     scales = []
     for k, seg in enumerate(segments):
@@ -122,7 +180,6 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
                                        err_msg=f"segment {k}")
     assert metrics["retime_max"] == pytest.approx(max(scales))
     # Measured again on the frames actually exported, so a gated segment that never reaches the export fails here.
-    world = seen["world"]
     for k, seg in enumerate(segments):
         js = JointState(position=torch.as_tensor(seg["position"], device=world.device),
                         velocity=torch.as_tensor(seg["velocity"], device=world.device),

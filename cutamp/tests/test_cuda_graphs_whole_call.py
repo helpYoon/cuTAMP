@@ -39,10 +39,10 @@ def _install_recorder(monkeypatch) -> dict:
 
 
 @needs_cuda
-def test_graph_calls_give_the_eager_result(blocks_t1_plan, monkeypatch):
+def test_graph_calls_give_the_eager_result(real_world, real_plan, monkeypatch):
     from cutamp.utils.timer import TorchTimer
     from cutamp.utils.visualizer import Visualizer
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     box = _install_recorder(monkeypatch)
     rng = torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate()
 

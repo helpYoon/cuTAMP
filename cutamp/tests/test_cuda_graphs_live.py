@@ -1,5 +1,5 @@
 """``--cuda_graphs`` end to end through ``cutamp_demo`` (which builds its own world, so no
-blocks_t1_plan), with the real planner thread and the vis block, every spied replay checked bitwise.
+real_world), with the real planner thread and the vis block, every spied replay checked bitwise.
 Slow: runs only with CUTAMP_SLOW=1."""
 
 import json

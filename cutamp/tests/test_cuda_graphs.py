@@ -108,8 +108,8 @@ def _graph_config(**kw):
 
 @needs_cuda
 @pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"), *SUPPORTED_SOFT_COSTS])
-def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
-    world, skeleton, base = blocks_t1_plan
+def test_step_graph_captures_for_soft_cost(real_world, real_plan, monkeypatch, sc):
+    world, (skeleton, base) = real_world, real_plan
     config = _graph_config(num_opt_steps=2, soft_cost=[] if sc is None else [sc])
     replays = install_step_replay_spy(monkeypatch)
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
@@ -118,8 +118,8 @@ def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
 
 
 @needs_cuda
-def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):
-    world, skeleton, base = blocks_t1_plan
+def test_step_graph_lockstep(real_world, real_plan, monkeypatch):
+    world, (skeleton, base) = real_world, real_plan
     config = _graph_config(num_opt_steps=25)
     replays, vis = install_step_replay_spy(monkeypatch), SpyVis(config)
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
@@ -130,8 +130,8 @@ def test_step_graph_lockstep(blocks_t1_plan, monkeypatch):
 
 
 @needs_cuda
-def test_refresh_graph_lockstep(blocks_t1_plan, monkeypatch):
-    world, skeleton, base = blocks_t1_plan
+def test_refresh_graph_lockstep(real_world, real_plan, monkeypatch):
+    world, (skeleton, base) = real_world, real_plan
     config = _graph_config(num_opt_steps=12, reik_interval=1)
     eager = install_refresh_spy(monkeypatch)
     m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
@@ -140,9 +140,9 @@ def test_refresh_graph_lockstep(blocks_t1_plan, monkeypatch):
 
 
 @needs_cuda
-def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
+def test_deferred_capture_after_planner_ends(real_world, real_plan, monkeypatch):
     # SpyVis on: the loop's vis = None must drop an eager step's graph before a later capture.
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     config = _graph_config(num_opt_steps=20)
     replays = install_step_replay_spy(monkeypatch)
     busy = itertools.count()
@@ -152,15 +152,13 @@ def test_deferred_capture_after_planner_ends(blocks_t1_plan, monkeypatch):
     assert next(busy) == 8                           # consulted once per step, until the capture
 
 
-# The leak check is the bytes the tensors request, which is exact. memory_allocated is not compared: the final check
-# repairs with cuRobo's CUDA-graphed IK, whose line search (line_search_strategy.py, jit_get_x_set) reuses cached
-# blocks of one size class, about 1.2 MB each, held on the C++ side. The caching allocator counts each request at the
-# size of the block it lands in, so memory_allocated moves between calls (by 16 to 80 KiB, seen) with nothing new
-# held. (test_cuda_graphs_whole_call compares the calls' results bitwise, not their memory.)
+# The leak check is the bytes the tensors request, which is exact. memory_allocated is not compared: the caching
+# allocator counts each request at the size of the block it lands in, so memory_allocated can move between calls with
+# nothing new held. (test_cuda_graphs_whole_call compares the calls' results bitwise, not their memory.)
 @needs_cuda
-def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
+def test_second_optimize_call_recaptures(real_world, real_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     config = _graph_config(num_opt_steps=10)
     plan_info, mem, sites, released = make_plan_info(world, skeleton, clone_particles(base), config), [], [], []
     orig, req = CapturedGraph.release, []            # req: the bytes the tensors request, after each call
@@ -192,9 +190,9 @@ def test_second_optimize_call_recaptures(blocks_t1_plan, monkeypatch):
 
 
 @needs_cuda
-def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):
+def test_uncaptured_and_short_calls(real_world, real_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     released, orig = [], CapturedGraph.release
     monkeypatch.setattr(CapturedGraph, "release", lambda self: released.append(self.name) or orig(self))
     keys = ("capture_s", "capture_step", "refresh_capture_s", "refresh_capture_step")
@@ -210,6 +208,7 @@ def test_uncaptured_and_short_calls(blocks_t1_plan, monkeypatch):
     assert m["refresh_capture_step"] is None
     m, timer, parts = run(num_opt_steps=50, early_stop_patience=1)     # early stop
     assert m.get("early_stopped_at") is not None and not timer.has_timer("optimization_step")
+    assert timer.get_summaries()["optimization_step"]["count"] == len(m["elapsed"])  # the stopping step is timed too
     assert len(released) == 1 + sum(m[k] is not None for k in ("capture_step", "refresh_capture_step"))
     assert all(v.grad is None for v in parts.values())
 
@@ -245,12 +244,12 @@ class _ProfilingTimer(TorchTimer):
 
 @needs_cuda
 @pytest.mark.parametrize("arm", ["S1", "G"])
-def test_loop_sync_audit(blocks_t1_plan, arm):
+def test_loop_sync_audit(real_world, real_plan, arm):
     # Each profiled step has the loop's 3 device syncs, the profiler's own and packed.tolist()'s copy
     # and stream sync; a refresh step adds 2 timing events. A G step is 1 graph launch (2 with the
     # refresh) plus the eager Adam step (the captured body alone is ~1,000 kernels, hence < 100);
     # inside the graphs, the global-mode capture is the audit, and every soft cost is on.
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     config = _graph_config(num_opt_steps=50, cuda_graphs=arm == "G",
                            soft_cost=list(SUPPORTED_SOFT_COSTS))
     timer = _ProfilingTimer(range(40, 50))

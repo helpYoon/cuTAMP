@@ -17,8 +17,8 @@ pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a 
 
 @needs_cuda
 @pytest.mark.parametrize("cuda_graphs", [False, True])
-def test_noop_visualizer_skips_vis_block(blocks_t1_plan, cuda_graphs):
-    world, skeleton, base = blocks_t1_plan
+def test_noop_visualizer_skips_vis_block(real_world, real_plan, cuda_graphs):
+    world, (skeleton, base) = real_world, real_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=12, early_stop_patience=0,
                                cuda_graphs=cuda_graphs, enable_visualizer=False)
     _, timer = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
@@ -29,13 +29,13 @@ def test_noop_visualizer_skips_vis_block(blocks_t1_plan, cuda_graphs):
 
 
 @needs_cuda
-def test_rollout_viewer_takes_the_conf_and_the_gripper_state(blocks_t1_plan):
+def test_rollout_viewer_takes_the_conf_and_the_gripper_state(real_world, real_plan):
     # The rollout_* timeline shows each conf in the model's cspace, with each hand's gripper set on the rerun robot:
     # both open at the start, then a pick conf's hand closed and a place conf's open, the other hand as it was.
     from types import SimpleNamespace
 
     from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
-    world, skeleton, base = blocks_t1_plan
+    world, (skeleton, base) = real_world, real_plan
     config = TAMPConfiguration(num_particles=64, num_opt_steps=2, early_stop_patience=0, enable_visualizer=False)
 
     class Vis(SpyVis):
@@ -140,11 +140,11 @@ def test_dense_aabb_overlap_matches_masked(monkeypatch):
 
 
 @needs_cuda
-def test_com_fk_skips_identity_reorder(blocks_t1_plan):
+def test_com_fk_skips_identity_reorder(real_world):
     from curobo.types import JointState
     from cutamp.com_polygon_cost import _fk_state
 
-    world = blocks_t1_plan[0]
+    world = real_world
     torch.manual_seed(0)
     q = world.q_init + 0.3 * torch.randn(640, world.q_init.numel(), device="cuda")
     for kin in (world.kinematics, world.site_kinematics("com")):
