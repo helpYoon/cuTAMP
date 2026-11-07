@@ -33,7 +33,6 @@ dependencies = [
     "rerun-sdk==0.27.3",
     "roma==1.5.4",
     "torch==2.9.1",
-    "torchvision==0.24.1; platform_machine == 'x86_64'",  # only GraspGenX needs it; listed so it comes from the cu128 index
     "tqdm",
     "trimesh==4.10.1",
     "warp-lang==1.16.0",
@@ -56,8 +55,10 @@ environments = ["sys_platform == 'linux'"]
 constraint-dependencies = ["cuda-bindings==12.9.6", "cuda-core==0.7.0", "cuda-pathfinder==1.5.4"]  # cuRobo's kernel compile and launch
 # GraspGenX caps torch < 2.7 only for its authors' older driver (its pyproject says the code runs on 2.7) and pins numpy,
 # trimesh and yourdfpy older than cuTAMP's; rerun-sdk needs numpy >= 2. Everything runs on cuTAMP's accepted versions.
-# An override replaces every requirement on that name, markers and extras included: torchvision keeps its x86_64 marker
-# and trimesh keeps the [easy] extras yourdfpy asks for.
+# An override replaces every requirement on that name, markers and extras included, and takes the name's index from
+# tool.uv.sources: torchvision (only GraspGenX needs it) stays off aarch64 and comes from cu128, and trimesh keeps the
+# [easy] extras yourdfpy asks for. The torch override also lifts tensordict 0.15.5's torch >= 2.11 floor: GraspGenX
+# lists tensordict but never imports it.
 override-dependencies = [
     "torch==2.9.1",
     "torchvision==0.24.1; platform_machine == 'x86_64'",
@@ -79,8 +80,9 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.pytest.ini_options]
-# A bare `pytest` must not collect the submodules' own tests: GraspGenX's import graspgenx, whose first import clones
-# about 2 GB of unpinned Hugging Face repos unless GRASPGENX_CHECKPOINT_DIR and GRASPGENX_GRIPPER_CFG_DIR are set.
+# A bare `pytest` must not collect the submodules' own tests: GraspGenX's tests import graspgenx, and its first import
+# clones about 2 GB of unpinned Hugging Face repos unless GRASPGENX_CHECKPOINT_DIR and GRASPGENX_GRIPPER_CFG_DIR both
+# point at existing folders.
 testpaths = ["cutamp/tests"]
 
 [tool.ruff]

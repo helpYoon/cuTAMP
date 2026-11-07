@@ -62,19 +62,23 @@ Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
 which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
 A clone made without `--recursive` gets both submodules with
-`GIT_LFS_SKIP_SMUDGE=1 git submodule update --init`. Both are shallow
+`GIT_LFS_SKIP_SMUDGE=1 git submodule update --init`, and so does a checkout
+that pulls or merges a commit adding a submodule: until then that submodule's
+folder is empty, and `uv sync` and `uv run` fail. Both are shallow
 (`shallow = true` in `.gitmodules`): each fetches its pinned commit only, about
-136 MB for cuRobo, not its whole history.
+136 MB for cuRobo and 18 MB for GraspGenX, not its whole history.
 
 [GraspGenX](https://github.com/NVlabs/GraspGenX) (6-DoF grasps) is pinned at
 `b9429097`. On x86_64, `uv sync` installs it editable into the same env with its
-`serve` extra. On aarch64 it is left out, because its scene tools need
-`usd-core`. Its pins on torch, torchvision, numpy, trimesh and yourdfpy are
+`serve` extra. One of its dependencies, sharedarray, builds from source, so that
+needs a C compiler. On aarch64 GraspGenX is left out, because its scene tools
+need `usd-core`. Its pins on torch, torchvision, numpy, trimesh and yourdfpy are
 overridden to cuTAMP's (`override-dependencies` in `pyproject.toml`). Its
-179 MB of LFS gripper meshes and sample data are not needed, because
-cuTAMP passes the hand as a sweep volume. Before anything imports `graspgenx`,
-point two variables at existing folders: `GRASPGENX_CHECKPOINT_DIR` at the
-model and `GRASPGENX_GRIPPER_CFG_DIR` at any folder, which may be empty.
+179 MB of LFS gripper meshes and sample data are not needed: GraspGenX can take
+the hand as a sweep volume (`GraspGenXSampler.from_sweep_volume`). Before
+anything imports `graspgenx`, point two variables at existing folders:
+`GRASPGENX_CHECKPOINT_DIR` at the model and `GRASPGENX_GRIPPER_CFG_DIR` at any
+folder, which may be empty.
 Otherwise its first import clones the newest heads of two Hugging Face repos,
 about 2 GB, into `GraspGenX/ext/`. The model is
 `adithyamurali/GraspGenXModel` at `7c834043` (1.69 GB):
@@ -84,6 +88,10 @@ M=~/graspgenx-model/7c834043; SHA=7c834043c11a11417e31d6d5ea9355801e40a2c1
 for f in release/gen/config.yaml release/gen/epoch_736.pth release/dis/config.yaml release/dis/epoch_1056.pth; do
   curl -fL --create-dirs -o $M/$f https://huggingface.co/adithyamurali/GraspGenXModel/resolve/$SHA/$f
 done
+sha256sum -c <<EOF
+8b55f31cdb8340a573b4df27b027c15cff326bd6debcb389bf631d2aaab7ac44  $M/release/gen/epoch_736.pth
+cbf3f3bdb2e4c03fca8486ed24de0e6a8a859e6bd22bce2f1434a610335abd3e  $M/release/dis/epoch_1056.pth
+EOF
 mkdir -p ~/graspgenx-model/no-gripper-descriptions
 export GRASPGENX_CHECKPOINT_DIR=$M GRASPGENX_GRIPPER_CFG_DIR=~/graspgenx-model/no-gripper-descriptions
 ```

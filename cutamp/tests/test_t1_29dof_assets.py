@@ -1,7 +1,7 @@
 """The pinned copy of bfm_wm's T1, its MuJoCo fixture and the real-leg planner model derived from it (design 7.2,
 call 18).
 
-cuTAMP's .venv has no MuJoCo, so ``write_mujoco_fixture.py`` stores MuJoCo's FK, masses, inertias and soft limits
+``write_mujoco_fixture.py`` runs once on bfm_wm's own MuJoCo and stores its FK, masses, inertias and soft limits
 on bfm_wm's t1.xml in ``mujoco_fixture.npz``, and the planner model is checked against it. The model is built here
 straight from ``t1_29dof.yml``."""
 

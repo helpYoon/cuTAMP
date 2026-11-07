@@ -1,6 +1,6 @@
 """Write mujoco_fixture.npz: MuJoCo's FK, masses, inertias and soft limits on bfm_wm's T1 (design call 18).
 
-cuTAMP's .venv has no MuJoCo, so this runs once in bfm_wm's venv, and the tests compare the planner model with the
+It runs once in bfm_wm's venv, on bfm_wm's own MuJoCo, and the tests compare the planner model with the
 fixture. It reads bfm_wm's ``mjcf/t1.xml`` (its sha1 must be PROVENANCE.yml's, and the fixture is stamped with it) and
 the pinned ``t1_actuators.npz``; it writes nothing into bfm_wm. Run it from cuTAMP:
 
