@@ -38,28 +38,27 @@ from tag `paper-g1-comfix`.
 
 ## Installation
 
-cuTAMP needs an NVIDIA GPU that
+cuTAMP needs Linux, an NVIDIA GPU that
 [cuRobo supports](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
-(newer than Turing, with a driver >= 580.65.06) and Python 3.10+. Install a
-PyTorch built for your CUDA:
-the [PyTorch site](https://pytorch.org/get-started/locally/) gives the command,
-and [older versions](https://pytorch.org/get-started/previous-versions/) may
-match your driver better. cuRobo v0.9.0 compiles its kernels when they first
-run (NVRTC, with the headers from its `cu12` extra's NVIDIA wheels), so its
-install builds nothing.
+(newer than Turing, with a driver >= 580.65.06) and
+[uv](https://docs.astral.sh/uv/getting-started/installation/). `uv sync`
+builds `.venv` from `uv.lock`: Python 3.10, PyTorch 2.9.1 for CUDA 12.8
+(from the PyTorch index), warp-lang 1.16.0 (warp 1.10.1 fails on
+`launch_bounds`) and the `curobo/` submodule, editable, with its `cu12` extra.
+The exact pins in `pyproject.toml` are the versions the v0.9.0 plans were
+accepted on. cuRobo v0.9.0 compiles its kernels when they first run (NVRTC,
+with the headers from its `cu12` extra's NVIDIA wheels), so its install builds
+nothing.
 
 ```bash
-conda create --name cutamp python=3.10 -y
-conda activate cutamp
-pip install torch torchvision torchaudio  # the build for your CUDA
-
 git clone --recursive https://github.com/helpYoon/cuTAMP.git  # cuRobo v0.9.0 comes as curobo/
 cd cuTAMP
-pip install -e .  # or -e ".[editor]" for the sphere editor's open3d
-
-pip install "warp-lang==1.16.0"  # cuRobo asks for >=0.10; warp 1.10.1 fails on launch_bounds
-pip install -e "curobo[cu12]"  # [cu13] for CUDA 13
+uv sync  # --extra editor adds the sphere editor's open3d
 ```
+
+Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
+`uv run pytest`) or after `source .venv/bin/activate`. Both put `.venv/bin`,
+which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
 A clone made without `--recursive` gets cuRobo with `git submodule update --init`.
 The submodule is shallow (`shallow = true` in `.gitmodules`): it fetches the

@@ -7,33 +7,57 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cuTAMP"
 version = "0.0.1"
 description = "cuTAMP"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.10.*"
 keywords = ["robotics"]
 authors = []
 classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+# The pinned versions are the ones cuTAMP 7238816's plans were accepted on: bump them together and re-check plans.
 dependencies = [
-    "rerun-sdk",
-    "roma",
+    "nvidia-curobo[cu12]",
+    "rerun-sdk==0.27.3",
+    "roma==1.5.4",
+    "torch==2.9.1",
     "tqdm",
-    "trimesh",
-    "yourdfpy",
+    "trimesh==4.10.1",
+    "warp-lang==1.16.0",
+    "yourdfpy==0.0.58",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "ruff",
-]
 editor = [
     "open3d",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.2",  # 9.2's monkeypatch undo deletes torch's allow_tf32 instead of restoring it
+    "ruff",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+constraint-dependencies = ["cuda-bindings==12.9.6", "cuda-core==0.7.0", "cuda-pathfinder==1.5.4"]  # cuRobo's kernel compile and launch
+
+[tool.uv.sources]
+nvidia-curobo = { path = "curobo", editable = true }
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff]
 line-length = 120
