@@ -38,14 +38,6 @@ def _ramp(world, moves, T, start=None):
     return JointState(position=pos, velocity=vel, acceleration=acc, joint_names=names)
 
 
-def _still(world, q: torch.Tensor, T: float):
-    """The conf ``q`` held at rest for T s, every DT s: a JointState in ``world.model.joint_names`` order."""
-    from curobo.types import JointState
-    pos = q.to(world.device, torch.float32).repeat(int(round(T / DT)) + 1, 1)
-    return JointState(position=pos, velocity=torch.zeros_like(pos), acceleration=torch.zeros_like(pos),
-                      joint_names=list(world.model.joint_names))
-
-
 def _shoulder_peak(world, js) -> float:
     """The larger shoulder pitch's peak |torque| over ``js``'s frames, by ``world.segment_torques``."""
     columns = [world.model.joint_names.index(j) for j in SHOULDERS]

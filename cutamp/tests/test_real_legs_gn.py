@@ -463,3 +463,21 @@ def test_kinematic_constraint_checks_the_soles(real_world, real_plan):
     expected = mask_before.clone()
     expected[row] = False
     assert torch.equal(mask_after, expected)
+
+
+@needs_cuda
+def test_trunk_tilt_cosine_is_the_fk_trunks_vertical(real_world):
+    # GN IK ranks starts by trunk_tilt_cosine, the base's cos(pitch) cos(roll): it must be cuRobo FK's Trunk R[2, 2] on
+    # confs that pitch, roll and yaw at once.
+    from cutamp.com_polygon_cost import _fk_state
+    from cutamp.joint_limit_cost import trunk_tilt_cosine
+    names = list(real_world.model.joint_names)
+    g = torch.Generator().manual_seed(0)
+    q = real_world.q_init.detach().cpu().reshape(1, -1).repeat(16, 1)
+    for joint, span in (("base_j_pitch", 0.6), ("base_j_roll", 0.3), ("base_j_yaw", 1.0)):
+        q[:, names.index(joint)] = (2 * torch.rand(16, generator=g) - 1) * span
+    q = q.to(real_world.device)
+    ks = _fk_state(real_world, q, real_world.bodies.kinematics)
+    trunk = ks.tool_poses.get_link_pose("Trunk", make_contiguous=True)
+    cos =trunk_tilt_cosine(q, names.index("base_j_pitch"), names.index("base_j_roll"))
+    assert torch.allclose(trunk.get_matrix()[..., 2, 2], cos, atol=1e-5)

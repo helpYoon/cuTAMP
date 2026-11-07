@@ -540,9 +540,9 @@ reverse SSH tunnel:
 2. Connect with `ssh -R 9876:127.0.0.1:9876 username@server`.
 3. Run cuTAMP on the server as usual; it streams to the local viewer.
 
-`TAMPConfiguration`'s `opt_viz_interval` (default 10 steps) sets how often the
-optimization is drawn, and `viz_robot_mesh=False` skips the robot's meshes;
-both cut bandwidth.
+From Python (no CLI flag), `TAMPConfiguration`'s `opt_viz_interval` (default
+10 steps) sets how often the optimization is drawn, and `viz_robot_mesh=False`
+skips the robot's meshes; both cut bandwidth.
 
 ## Troubleshooting
 
