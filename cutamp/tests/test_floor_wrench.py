@@ -203,12 +203,14 @@ def test_floor_wrench_replays_in_a_cuda_graph(biped):
 
 
 @needs_cuda
-def test_install_floor_wrench_needs_compute_com(biped):
-    # A planner built without compute_com (cuRobo's default trajopt transitions) is refused. That the hook lands
-    # on every trajopt transition and only there is test_real_legs_motion's, on the real planner.
+def test_install_floor_wrench_needs_dynamics(biped):
+    # A planner built without dynamics is refused. That the hook lands on every trajopt transition and only there,
+    # with the CoM on, is test_real_legs_motion's, on the real planner.
     from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
     from curobo.types import DeviceCfg
 
-    cfg = MotionPlannerCfg.create(robot=copy.deepcopy(biped.cfg), self_collision_check=False, device_cfg=DeviceCfg())
-    with MotionPlanner(cfg) as mp, pytest.raises(ValueError, match="compute_com"):
+    robot = copy.deepcopy(biped.cfg)
+    robot["robot_cfg"]["load_dynamics"] = False
+    cfg = MotionPlannerCfg.create(robot=robot, self_collision_check=False, device_cfg=DeviceCfg())
+    with MotionPlanner(cfg) as mp, pytest.raises(ValueError, match="load_dynamics"):
         install_floor_wrench(mp, BASE_JOINTS, SOLES)

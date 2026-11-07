@@ -22,6 +22,8 @@ def test_site_kinematics_are_dedicated():
 @needs_cuda
 def test_same_shape_sites_keep_their_grads():
     # Two same-shape FK calls on one instance before backward corrupt the first's gradient; sites keep them apart.
+    # cuRobo v0.9.0's FK backward sums sphere gradients with float atomics, so a repeated call differs in the last
+    # bits (up to 3e-5 on |g| <= 420, 2026-11-06); the corrupted gradient is off by its own size (491).
     from curobo.kinematics import Kinematics
     from curobo.types import JointState
     world = make_blocks_t1_world()
@@ -37,8 +39,9 @@ def test_same_shape_sites_keep_their_grads():
     solo2 = torch.autograd.grad(fk_loss(world.site_kinematics("retract"), q2), q2)[0].clone()
     g1, g2 = torch.autograd.grad(
         fk_loss(world.site_kinematics("rollout"), q1) + fk_loss(world.site_kinematics("retract"), q2), (q1, q2))
-    assert torch.equal(g1, solo1) and torch.equal(g2, solo2)
+    torch.testing.assert_close(g1, solo1, rtol=0, atol=1e-3)
+    torch.testing.assert_close(g2, solo2, rtol=0, atol=1e-3)
     one = Kinematics(world.kinematics.config, compute_com=True)  # positive control: both calls on one instance
-    assert torch.equal(torch.autograd.grad(fk_loss(one, q1), q1)[0], solo1)
+    torch.testing.assert_close(torch.autograd.grad(fk_loss(one, q1), q1)[0], solo1, rtol=0, atol=1e-3)
     h1, _ = torch.autograd.grad(fk_loss(one, q1) + fk_loss(one, q2), (q1, q2))
-    assert not torch.equal(h1, solo1)
+    assert float((h1 - solo1).abs().max()) > 1.0

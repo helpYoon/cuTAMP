@@ -1,7 +1,7 @@
 """The real legs' FK rotations must carry correct gradients to the configurations.
 
-cuRobo v2's FK backward gets orientation gradients wrong while positions are exact, and ``_FKQuatGrad`` corrects
-the rotations that autograd differentiates. On the real legs two more rotations can reach autograd: the rollout's
+cuRobo v0.8's FK backward got orientation gradients wrong while positions were exact; v0.9.0's kernel is right, and
+these checks guard it. Besides the hands, two rotations reach autograd on the real legs: the rollout's
 soles (``sole_rot_err``, in Adam's loss) and each sole's in the floor wrench (trajopt's transition calls that hook
 under no_grad; the test differentiates it directly). Their CoM, a position, is a sanity check. The error grows with
 the link's rotation from the world's axes, and planted soles have none (the stance's soles sit at the identity), so

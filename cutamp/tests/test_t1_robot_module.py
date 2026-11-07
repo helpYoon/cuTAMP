@@ -1,4 +1,4 @@
-"""Tests for the T1 robot module under cuRobo v0.8 single-MotionPlanner.
+"""Tests for the T1 robot module under cuRobo's single MotionPlanner.
 
 This file checks the robot container's two tool frames and their gripper
 spheres. It also covers the outputs of real-leg runs (decision 9): the raw

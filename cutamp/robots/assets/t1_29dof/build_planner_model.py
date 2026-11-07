@@ -12,7 +12,7 @@ lists below), and are written byte for byte the same each run:
   reach (``_base_limits``), and a ``cutamp:`` block (joint order, home, sole box, sole y, home mid-sole) that cuRobo
   never reads.
 
-Run with the tamp env's python: ``SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0 python build_planner_model.py [--out DIR]``.
+Run with cuTAMP's python: ``python build_planner_model.py [--out DIR]``.
 """
 
 import argparse
@@ -408,7 +408,7 @@ def _kinematics(mid_sole: list, base_limits: dict) -> dict:
 
 def _curobo_joint_order(kinematics: dict, out: Path) -> list:
     """cuRobo's joint order for ``kinematics``: KinematicsLoader._build_chain's walk from the first tool frame
-    (kinematics_loader.py:215-260), which locking joints only shortens (lines 820-826). The loader locks joints only
+    (``_build_kinematics_with_lock_joints`` locks joints on that same chain). The loader locks joints only
     on CUDA, so this builds the model on the CPU without lock_joints or cspace, and drops the locked joints."""
     import torch
     from curobo.kinematics import KinematicsCfg
@@ -457,9 +457,9 @@ def main(argv=None) -> None:
         half = (float(limit.get("upper")) - float(limit.get("lower"))) / 2
         clip[j] = half - SOFT_LIMIT_FACTOR * half
     # cuRobo multiplies the velocity limits by velocity_scale twice: in KinematicsLoader._update_joint_limits
-    # (kinematics_loader.py:1121-1122) and again in KinematicsParams.__post_init__ (kinematics_params.py:162-163,
-    # CSpaceParams.scale_joint_limits). So the scale that caps ankle pitch at v_max is sqrt(v_max / URDF velocity);
-    # test_ankle_pitch_speed_cap checks cuRobo's resulting limit, and fails if the fork ever applies the scale once.
+    # and again in KinematicsParams.__post_init__ (CSpaceParams.scale_joint_limits). So the scale that caps ankle
+    # pitch at v_max is sqrt(v_max / URDF velocity); test_ankle_pitch_speed_cap checks cuRobo's resulting limit,
+    # and fails if cuRobo ever applies the scale once (open PR NVlabs/curobo#729).
     v_max = dict(zip(T1_JOINT_NAMES, actuators["v_max"].astype(np.float64).tolist()))
     velocity_scale = {j: math.sqrt(v_max[j] / float(joints[j].find("limit").get("velocity"))) if j in ANKLE_PITCH
                       else 1.0 for j in order}

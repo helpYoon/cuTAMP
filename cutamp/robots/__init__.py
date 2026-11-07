@@ -1,4 +1,4 @@
-"""Robot containers and loaders for cuTAMP (cuRobo v0.8 single-MotionPlanner).
+"""Robot containers and loaders for cuTAMP (cuRobo single-MotionPlanner).
 
 T1 humanoid is the only supported robot, on its real-leg planning model
 (``REAL_LEGS``, a :class:`~cutamp.robots.t1.T1Model`). The ``RobotContainer`` holds the model,

@@ -1,5 +1,5 @@
 """
-T1 Robot Module — Single-MotionPlanner Humanoid Support for cuTAMP (cuRobo v0.8)
+T1 Robot Module — Single-MotionPlanner Humanoid Support for cuTAMP
 ================================================================================
 
 The planning model of the Booster T1, ``REAL_LEGS`` (a :class:`T1Model`): bfm_wm's pinned 33-DOF T1
@@ -169,7 +169,7 @@ def t1_curobo_cfg(model: T1Model) -> dict:
 def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
     """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: a Trunk
     height floor, where the envelope sets one, raises ``base_j_z``'s lower limit, and each listed joint's range cuts
-    its soft range (the URDF range less ``position_limit_clip`` at both ends, kinematics_loader.py:1119-1120) at
+    its soft range (the URDF range less ``position_limit_clip`` at both ends) at
     either end on its own. cuRobo reads a URDF joint's limits only from the URDF, so a cut joint's range is written into
     a copy of it, clip 0, which ``urdf_path`` then names (meshes resolve against ``asset_root_path``). Raises if a range leaves
     nothing of the soft range."""
@@ -221,7 +221,7 @@ def _check_joint_order(model: T1Model, joint_names) -> None:
     fingers, are not among them).
 
     cuRobo orders the cspace by walking the tool frames, then adds ``position_limit_clip`` (the soft limits,
-    call 17) without reordering it (``CSpaceParams.inplace_reindex``, cspace_params.py:156-171). A build
+    call 17) without reordering it (``CSpaceParams.inplace_reindex``). A build
     in another order would put the soft limits on the wrong joints, silently, and every consumer indexes q by
     ``model``'s slices."""
     if tuple(joint_names) != model.joint_names:
@@ -288,27 +288,15 @@ def get_t1_bodies(model: T1Model, device_cfg: DeviceCfg = None) -> T1Bodies:
     return T1Bodies(kin, mass_com[:, 3], mass_com[:, :3], mass_com.new_tensor(inertia))
 
 
-def _trajopt_transition_dict_with_compute_com() -> dict:
-    """Default trajopt transition YAML with ``compute_com=True`` injected.
-
-    The COM-over-base cost reads ``state.robot_com`` (per-link mass-weighted
-    world COM); cuRobo only populates this when the runtime kinematics is
-    built with ``compute_com=True``. The kernel template is fixed at planner
-    build time, so we have to flip this before MotionPlanner construction.
-    """
-    from curobo._src.util.config_io import resolve_config, join_path
-    from curobo.content import get_task_configs_path
-
-    d = resolve_config(join_path(get_task_configs_path(), "trajopt/transition_bspline_trajopt.yml"))
-    d["transition_model_cfg"]["compute_com"] = True
-    return d
-
-
 TRAJOPT_POSITION_BOUND_WEIGHT = 1e6
 """Trajopt's joint-position bound cost weight, cuRobo's 1e4 times 100. The bound is a soft cost there (active within
 1% of a joint's range of it) and the success test a hard one; home's ankle pitch is the envelope's cap, so every
 return to home ends on it, and at 1e4 paths crossed it mid-motion (by up to 0.014 rad) and failed: 12 of 15 blocks_t1
 cases planned, 15 of 15 at 1e6 (2026-11-06)."""
+
+TRAJOPT_INITIAL_ITERS = 100
+"""L-BFGS iterations in trajopt's first solve: cuRobo v0.8's budget (v0.9.0's is 50). On the five blocks_t1 cases
+v0.9.0 planned worst (timeopt off), 50 planned 4 of 5 and 100 all 5, with 16 candidates for 19 (2026-11-06)."""
 
 
 def _trajopt_optimizer_dict() -> dict:
@@ -340,11 +328,13 @@ def get_t1_motion_planner(
     - holds both soles on the stance at every waypoint (pose tracking at non-terminal scale 1.0, stage 2's verified
       weight), tracks the hands at the terminal only, and leaves the ``stance`` frame untracked (it is world-fixed,
       and the CoM cost's support frame);
-    - bounds the Trunk tilt (``TrunkTiltCost``, weight 1e5) when the envelope sets a maximum. Route A's sets none.
+    - bounds the Trunk tilt (``TrunkTiltCost``, weight 1e5) when the envelope sets a maximum. Route A's sets none;
+    - turns cuRobo's timeopt off (its RNEA has no floor push; the balance gate paces each segment) and gives
+      trajopt's first solve ``TRAJOPT_INITIAL_ITERS``.
 
     The planner gets a soft cost penalizing trajectories whose mass-weighted
     COM projects outside the model's keyframe rectangle (``model.support``),
-    on the kinematics kernel built with ``compute_com=True``.
+    on trajopt's FK with the CoM on (``install_floor_wrench`` turns it on).
 
     The joint limits are bfm_wm's soft limits cut by the envelope, with no further margin (call 17); trajopt bounds
     them at ``TRAJOPT_POSITION_BOUND_WEIGHT``.
@@ -363,10 +353,17 @@ def get_t1_motion_planner(
         max_batch_size=1,
         max_goalset=1,
         device_cfg=device_cfg,
-        trajopt_transition_model=_trajopt_transition_dict_with_compute_com(),
         trajopt_optimizer_configs=[_trajopt_optimizer_dict()],
+        # cuRobo's timeopt retimes each plan to its torque limits on its own RNEA, without the floor's push
+        # (motion_trajectory_timeopt.py), so the soles' load never reaches the legs and the floor-push check rejects
+        # its timing; the balance gate paces each segment instead.
+        enable_timeopt=False,
     )
     planner = MotionPlanner(cfg)
+    # The first solve runs TRAJOPT_INITIAL_ITERS L-BFGS iterations, cuRobo v0.8's budget, where v0.9.0 stops at 50
+    # (MotionPlannerCfg.create doesn't take it; the solver reads its config on every solve).
+    planner.trajopt_solver.config.initial_max_iters = TRAJOPT_INITIAL_ITERS
+    planner.trajopt_solver.config.initial_check_interval = TRAJOPT_INITIAL_ITERS
     _check_joint_order(model, planner.kinematics.joint_names)
     from curobo.types import ToolPoseCriteria
     from cutamp.floor_wrench import install_floor_wrench

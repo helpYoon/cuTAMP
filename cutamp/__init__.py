@@ -6,3 +6,7 @@
 # disclosure or distribution of this material and related documentation
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
+
+from cutamp._curobo_internals import install_curobo_patches
+
+install_curobo_patches()

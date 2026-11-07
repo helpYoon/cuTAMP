@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""TAMPWorld for cuTAMP (cuRobo v0.8 single-MotionPlanner architecture).
+"""TAMPWorld for cuTAMP (cuRobo single-MotionPlanner architecture).
 
 The world wraps a TAMPEnvironment with: collision Scene and T1 Kinematics, on the planning model
 ``world.model``; ``motion_solver.build_motion_planner`` builds the MotionPlanner from it. The IK is GN's

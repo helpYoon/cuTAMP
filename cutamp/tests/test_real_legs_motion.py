@@ -114,7 +114,7 @@ def test_static_home_torques(real_world):
 
 @needs_cuda
 def test_trajopt_caps_ankle_pitch_at_its_top_speed(planner):
-    # The fork applies cspace.velocity_scale twice: t1_29dof.yml carries sqrt(7.29 / 12.57) on both
+    # cuRobo applies cspace.velocity_scale twice: t1_29dof.yml carries sqrt(7.29 / 12.57) on both
     # Ankle_Pitch joints, so every trajopt transition must read 7.29 rad/s, the motor's top speed (design 7.4a).
     for tm in _transitions(planner):
         names = list(tm.joint_names)
@@ -129,8 +129,9 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
     # trajopt transition carries the floor's push, and at rest at home it leaves the base joints nothing.
     transitions = _transitions(planner)
     assert len(transitions) >= 4
-    assert all(tm._external_wrench_fn is not None for tm in transitions)
-    assert all(r.transition_model._external_wrench_fn is None for r in planner.ik_solver.get_all_rollout_instances())
+    assert all(tm._external_wrench_fn is not None and tm.robot_model.compute_com for tm in transitions)
+    assert all(getattr(tm, "_external_wrench_fn", None) is None for r in planner.ik_solver.get_all_rollout_instances()
+               for tm in (r.transition_model, r.metrics_transition_model))
     # The trajopt CoM cost finds its support frame among the planner's tool poses.
     assert "stance" in planner.trajopt_solver.tool_frames
     assert all("stance" in tm.robot_model.tool_frames for tm in transitions)

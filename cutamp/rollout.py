@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Particle-rollout under cuRobo v0.8 single-MotionPlanner architecture.
+"""Particle-rollout under cuRobo's single-MotionPlanner architecture.
 
 Configurations are single vectors in the model's cspace (its 33 joints). One FK
 call covers the whole chain; for multi-tool robots we extract per-timestep
@@ -28,36 +28,6 @@ from cutamp.utils.common import (
     action_4dof_to_mat4x4,
     transform_spheres,
 )
-
-
-class _FKQuatGrad(torch.autograd.Function):
-    """Identity on an FK quaternion ``[..., 4]`` (wxyz) whose backward re-encodes dL/dq for cuRobo v2's FK backward.
-
-    That backward decodes the quaternion gradient with the body-frame map (``quaternion_gradient_to_angular_velocity``
-    in quaternion_util.cuh) but dots the result with world-frame joint axes, which need
-    Omega = 0.5 (-g_w v + w g_v + v x g_v). Passing g' = 2 q (x) (0, Omega) makes its decode return Omega exactly
-    (for unit q, at any angle). cuRobo's own pose costs already encode this way; only PyTorch autograd needs it.
-    If the fork's decode is ever changed to the world-frame formula, drop this:
-    cutamp/tests/test_real_legs_fk_orientation_grad.py would then fail on the double correction.
-    """
-
-    @staticmethod
-    def forward(ctx, quat: torch.Tensor) -> torch.Tensor:
-        ctx.save_for_backward(quat.detach().clone())  # cuRobo may reuse the FK output buffer before backward
-        return quat.clone()
-
-    @staticmethod
-    def backward(ctx, g: torch.Tensor) -> torch.Tensor:
-        (q,) = ctx.saved_tensors
-        w, v, g_v = q[..., :1], q[..., 1:], g[..., 1:]
-        omega = 0.5 * (w * g_v - g[..., :1] * v + torch.cross(v, g_v, dim=-1))
-        return 2.0 * torch.cat((-(v * omega).sum(-1, keepdim=True), w * omega + torch.cross(v, omega, dim=-1)), -1)
-
-
-def _link_matrix(pose) -> torch.Tensor:
-    """``pose.get_matrix()`` for a cuRobo FK link pose, with gradients correct w.r.t. the joint positions."""
-    pose.quaternion = _FKQuatGrad.apply(pose.quaternion)
-    return pose.get_matrix()
 
 
 def get_conf_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
@@ -147,7 +117,7 @@ class Rollout(TypedDict):
 
 
 class RolloutFunction:
-    """Roll out a plan skeleton under the v0.8 single-MotionPlanner kinematics.
+    """Roll out a plan skeleton under the single-MotionPlanner kinematics.
 
     Multi-tool robots (T1) compute FK once over the model's full cspace; per
     timestep we select the active arm's tool-frame pose from the FK output.
@@ -182,7 +152,7 @@ class RolloutFunction:
             for conf_name in self.conf_params
         ]
         frame_to_mat = {
-            frame: _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True))
+            frame: ee_pose.get_link_pose(frame, make_contiguous=True).get_matrix()
             .view(num_particles, confs.shape[1], 4, 4)
             for frame in dict.fromkeys(conf_frames)
         }
@@ -190,9 +160,9 @@ class RolloutFunction:
             [frame_to_mat[frame][:, t] for t, frame in enumerate(conf_frames)], dim=1
         )
         # Both soles at every conf, for the kinematic constraint's check against the stance (design 7.4). Adam
-        # differentiates its sole_rot_err, so they go through _link_matrix like the hands.
+        # differentiates its sole_rot_err.
         world_from_soles = torch.stack([
-            _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True)).view(*confs.shape[:2], 4, 4)
+            ee_pose.get_link_pose(frame, make_contiguous=True).get_matrix().view(*confs.shape[:2], 4, 4)
             for frame in self.world.model.sole_frames
         ], dim=2)
 

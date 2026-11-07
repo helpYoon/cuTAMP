@@ -81,11 +81,13 @@ def _head_step(particles, rollout_fn, cost_fn, cost_reducer, get_mask, consider_
 
 
 # The shared kinematics_config tensors the FK kernels take raw pointers to, besides each site's own buffers: the
-# forward's 9, then the backward's 5 more (curobo's _src/curobolib/cuda_ops/kinematics.py:156-237, :325-355).
+# forward's 9, then the backward's and the Jacobian's 5 more (curobo's _src/curobolib/cuda_ops/kinematics.py:172-237,
+# :339-375).
 _FK_CONFIG_TENSORS = (
     "fixed_transforms", "link_spheres", "link_masses_com", "joint_map_type", "joint_map", "link_map",
     "tool_frame_map", "link_sphere_idx_map", "joint_offset_map",
-    "link_chain_data", "link_chain_offsets", "joint_links_data", "joint_links_offsets", "joint_affects_endeffector",
+    "joint_link_influence_words", "joint_links_data", "joint_links_offsets", "tool_joint_links_data",
+    "tool_joint_links_offsets",
 )
 
 

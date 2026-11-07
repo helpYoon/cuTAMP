@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Motion-plan solver for cuTAMP under cuRobo v0.8 single-MotionPlanner.
+"""Motion-plan solver for cuTAMP under cuRobo's single MotionPlanner.
 
 Per plan-skeleton operator (T1):
   - Arm ops (Pick/Place/Retract): every joint is free, the base included, and
@@ -31,10 +31,7 @@ from curobo.motion_planner import MotionPlanner
 from curobo.sphere_fit import SphereFitType
 from curobo.types import JointState, Pose
 
-from cutamp._curobo_internals import (
-    cspace_plan_succeeded as _cspace_plan_succeeded,
-    get_attachment_manager as _get_attachment_manager,
-)
+from cutamp._curobo_internals import cspace_plan_succeeded as _cspace_plan_succeeded
 from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
@@ -135,7 +132,7 @@ def _disabled_world_obstacle(planner, name):
 
 
 def _interp_plan(result):
-    """Return the trimmed interpolated trajectory from a v0.8 planner result.
+    """Return the trimmed interpolated trajectory from a planner result.
 
     cuRobo's ``interpolated_trajectory`` is padded to a fixed horizon by
     repeating the last pose; ``get_interpolated_plan`` trims that tail so
@@ -190,7 +187,7 @@ def _attach_object(
     arm: str,
     num_spheres: int = 6,
 ):
-    """Attach a scene obstacle to ``arm``'s attach link via cuRobo's v0.8 attach.
+    """Attach a scene obstacle to ``arm``'s attach link via cuRobo's attach.
 
     ``attach_from_scene`` fits spheres for the obstacle, mounts them on the
     attach link (which has reserved sphere slots in t1_29dof.yml), and
@@ -210,7 +207,7 @@ def _attach_object(
     to over-extending into the wrist links than ``MORPHIT``'s optimization
     output. ``num_spheres=6`` is enough coverage for a 5cm cube.
     """
-    am = _get_attachment_manager(planner)
+    am = planner.attachment_manager
     link_name = _ATTACH_LINK_FOR_ARM[arm]
     try:
         am.attach_from_scene(
@@ -244,7 +241,7 @@ def _detach_object(planner, obj_name: str, arm: str):
     one detach its env count is 0, so a named re-enable then does nothing.
     Naming ``obj_name`` stops the stale re-enable; we enable it ourselves.
     """
-    am = _get_attachment_manager(planner)
+    am = planner.attachment_manager
     try:
         am.detach(link_name=_ATTACH_LINK_FOR_ARM[arm], enable_obstacle_names=[obj_name])
         planner.scene_collision_checker.enable_obstacle(name=obj_name, enable=True)
@@ -265,7 +262,7 @@ def _reset_attachment_state(planner, world) -> None:
     links and restore every movable so the next solve starts from a clean
     planner state.
     """
-    am = _get_attachment_manager(planner)
+    am = planner.attachment_manager
     for link in _ATTACH_LINK_FOR_ARM.values():
         try:
             am.detach(link_name=link)

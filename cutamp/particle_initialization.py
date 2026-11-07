@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Particle initialization under cuRobo v0.8 single-MotionPlanner architecture.
+"""Particle initialization under cuRobo's single-MotionPlanner architecture.
 
 Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single vector in
 the model's full cspace order (its 33 joints). A pick's and a place's conf come from :func:`gn_ik`, the

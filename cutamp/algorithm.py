@@ -269,7 +269,7 @@ def setup_cutamp(
     model = REAL_LEGS
     robot_container = load_t1_container(model, device_cfg=tensor_args)
 
-    # v0.8 single-MotionPlanner: q_init is a single full-DOF vector of the model's cspace.
+    # Single-MotionPlanner: q_init is a single full-DOF vector of the model's cspace.
     if q_init is None:
         q_init = model.home
     q_init = tensor_args.to_device(q_init)
@@ -311,8 +311,8 @@ def run_cutamp(
     # Build the trajopt planner on a background thread, overlapped with
     # particle init and the Adam loop. The build runs no solves, so no CUDA graph
     # capture overlaps the main thread (see build_motion_planner). Concurrent
-    # cuRobo use is only safe with the fork's per-stream warp wrapper cache
-    # (curobo/_src/util/warp.py): warp's stream registry is unlocked, and a
+    # cuRobo use is only safe with the per-stream warp wrapper cache
+    # (_curobo_internals._patch_warp_streams): warp's stream registry is unlocked, and a
     # fresh wrapper per launch from two threads corrupts the heap. solve_curobo
     # joins via get_planner; its warmup timer then measures only the residual wait.
     # CUDA graphs capture only after this thread ends (planner_busy): a capture fails on another thread's CUDA work.

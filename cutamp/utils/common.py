@@ -109,7 +109,7 @@ def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
 
 
 def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene:
-    """Build a cuRobo v0.8 Scene from the TAMP environment's obstacles."""
+    """Build a cuRobo Scene from the TAMP environment's obstacles."""
     geoms = defaultdict(list)
     # Copy: `obstacles = env.movables` would ALIAS the env's list and the
     # += below would permanently append every static into env.movables

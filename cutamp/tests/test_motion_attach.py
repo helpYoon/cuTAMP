@@ -10,7 +10,7 @@ def test_attached_spheres_sit_on_the_block():
     # spheres must land back on the block, not ~0.5 m off the hand.
     world = make_blocks_t1_world()
     planner = ms.build_motion_planner(world)
-    kp = ms._get_attachment_manager(planner).kinematics_params
+    kp = planner.attachment_manager.kinematics_params
     js = ms._planner_js_from_full(planner, world.q_init, world.kinematics.joint_names)
     for arm, block in (("left", "block3"), ("right", "block2")):
         ms._attach_object(planner, block, js, arm)

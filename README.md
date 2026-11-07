@@ -5,43 +5,48 @@ The simplified 21-DOF model and the paper's ablation reproduce from branch
 `ablation-baseline` (cuTAMP f29516b with fork f4e4ff2), and the G1-era code
 from tag `paper-g1-comfix`.
 
-> **cuRobo fork dependency:** cuTAMP relies on local edits to the vendored
-> `curobo/` tree: the `compute_com` plumbing and an external-wrench hook
-> between RNEA's two passes (`robot_state_transition[_cfg].py`), the URDF
-> parser's link-CoM, link-mass and link-inertia fixes (`parser_urdf.py`: a
-> link's CoM is its inertial origin's translation, a massless link weighs 0,
-> not 0.01 kg, and each link keeps its inertia), and a thread-safety fix for
-> warp stream wrappers (`util/warp.py`). The edits live on the `main` branch
-> of the cuRobo fork (helpYoon/curobo); a plain NVlabs checkout without them
-> breaks cuTAMP, and its parser puts each link's CoM at R p + p instead of p
-> (twice the offset for an unrotated inertial frame).
-> `git -C curobo diff ac5f931 main` (ac5f931 is the NVlabs base) lists every
-> edit, and grep `cuTAMP` under `curobo/curobo/_src/` finds the tagged ones.
-> Without the `util/warp.py` fix, the background motion-planner build
-> thread can crash the process with heap corruption
-> (`malloc(): unaligned tcache chunk detected`).
+> **cuRobo dependency:** cuTAMP runs on unmodified NVlabs cuRobo v0.9.0 (tag
+> `v0.9.0`, commit 42498cf) with warp-lang 1.16 ([Installation](#installation)).
+> Everything cuTAMP changes in cuRobo lives in
+> [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py), applied on
+> `import cutamp`, which first checks the source of each cuRobo function it
+> patches or relies on and refuses to run on any cuRobo but v0.9.0, the old
+> fork included:
+> - a massless URDF link weighs 0, not cuRobo's 0.01 kg (the T1 has 11:
+>   `world` and the 10 gripper links);
+> - one warp stream wrapper per CUDA stream, kept from the fork: without it,
+>   on warp 1.10.1, the background motion-planner build thread crashed the
+>   process with heap corruption (`malloc(): unaligned tcache chunk detected`);
+> - trajopt's transitions compute the CoM and run RNEA a second time with the
+>   floor's push on the soles (`set_external_wrench_fn`, installed by
+>   `floor_wrench.install_floor_wrench`);
+> - extra trajopt costs get dispatched (cuRobo's cost manager calls only its
+>   own six).
 >
-> Set `SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0` for every command: the fork's
-> tags break setuptools_scm's version lookup, so without it `import curobo`
-> fails with an `AssertionError`. Only `python -m …` and
-> `pytest cutamp/tests/` run from the repo root get by without it (the
-> `curobo/` checkout there shadows the package); `cutamp-demo` fails even
-> there.
+> cuRobo still applies `velocity_scale` twice (open PR NVlabs/curobo#729), so
+> the planner reads joint limits back from cuRobo. Its timeopt (on by default)
+> retimes each plan to torque limits on its own RNEA, without the floor's push,
+> so `get_t1_motion_planner` turns it off and the balance gate paces each
+> segment; trajopt's first solve keeps v0.8's 100 L-BFGS iterations (v0.9.0's
+> default is 50). Its FK backward sums sphere gradients with float atomics,
+> which can differ in the last bits between calls; same-seed plans still came
+> out bit-identical.
+> Branch `ablation-baseline` and tag `paper-g1-comfix` need the old fork
+> (helpYoon/curobo, with `SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0`).
 
 ## Installation
 
 cuTAMP needs an NVIDIA GPU that
-[cuRobo supports](https://curobo.org/get_started/1_install_instructions.html#system-requirements)
-(Volta or newer) and Python 3.10+. Install a PyTorch built for a CUDA version
-no newer than your CUDA Toolkit's (`nvcc --version`), or cuRobo won't compile:
+[cuRobo supports](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
+(newer than Turing, with a driver >= 580.65.06) and Python 3.10+. Install a
+PyTorch built for your CUDA:
 the [PyTorch site](https://pytorch.org/get-started/locally/) gives the command,
 and [older versions](https://pytorch.org/get-started/previous-versions/) may
-match your CUDA better. Install the toolkit from
-[NVIDIA](https://developer.nvidia.com/cuda-downloads) if it is missing, in a
-version your drivers support.
+match your driver better. cuRobo v0.9.0 compiles its kernels when they first
+run (NVRTC, with the headers from its `cu12` extra's NVIDIA wheels), so its
+install builds nothing.
 
 ```bash
-export SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0
 conda create --name cutamp python=3.10 -y
 conda activate cutamp
 pip install torch torchvision torchaudio  # the build for your CUDA
@@ -50,17 +55,13 @@ git clone https://github.com/helpYoon/cuTAMP.git
 cd cuTAMP
 pip install -e .  # or -e ".[editor]" for the sphere editor's open3d
 
-# The cuRobo fork, at cuTAMP/curobo (git-ignored), where cuTAMP expects it;
-# its large assets need git-lfs
-sudo apt install git-lfs
-git lfs install
-git clone https://github.com/helpYoon/curobo.git curobo
-cd curobo
-pip install -e . --no-build-isolation  # up to 20 minutes
-cd ..
+# NVlabs cuRobo v0.9.0, in cuTAMP/curobo (git-ignored)
+git clone --depth 1 --branch v0.9.0 https://github.com/NVlabs/curobo.git curobo
+pip install "warp-lang==1.16.0"  # cuRobo asks for >=0.10; warp 1.10.1 fails on launch_bounds
+pip install -e "curobo[cu12]"  # [cu13] for CUDA 13
 ```
 
-cuRobo's own [install guide](https://curobo.org/get_started/1_install_instructions.html)
+cuRobo's own [install guide](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
 has the details.
 
 ## How it works (end-to-end)
@@ -145,7 +146,7 @@ graph LR
 `run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
 the shared `TAMPWorld`.
 
-## T1 Single-Planner Architecture (cuRobo v0.8)
+## T1 Single-Planner Architecture (cuRobo v0.9.0)
 
 cuTAMP plans for the T1 humanoid through a **single MotionPlanner** on one
 planning model, `REAL_LEGS` (`T1Model` in `robots/t1.py`): bfm_wm's T1
@@ -256,12 +257,14 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   torque and speed checks), and one `site_kinematics(name)` per Adam-loop FK
   site in `FK_SITES`.
 
-- [`_curobo_internals.py`](cutamp/_curobo_internals.py) — the cuRobo
-  private-API helpers shared across modules, in one file (with `# TODO: file
-  upstream issue` markers; one-off workarounds stay beside their callers:
-  `motion_solver._attach_object` / `_detach_object`): `get_attachment_manager`,
-  `cspace_plan_succeeded`, `iter_rollouts` (the planner's trajopt rollouts)
-  and `add_extra_cost` (custom-cost dispatch on those rollouts).
+- [`_curobo_internals.py`](cutamp/_curobo_internals.py) — everything cuTAMP
+  changes in cuRobo, in one file (with `# TODO: file upstream issue` markers;
+  one-off workarounds stay beside their callers: `motion_solver._attach_object`
+  / `_detach_object`): `install_curobo_patches` (run on `import cutamp`: the
+  source check, the parser's mass floor and the warp stream cache),
+  `set_external_wrench_fn` (RNEA's second pass), `cspace_plan_succeeded`,
+  `iter_rollouts` (the planner's trajopt rollouts) and `add_extra_cost`
+  (custom-cost dispatch on those rollouts).
 
 - [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
   truth for the balance geometry: `support_rectangles`, which gives the
@@ -440,7 +443,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 Each test file's docstring says what it checks; shared fixtures and helpers
 live in [`conftest.py`](cutamp/tests/conftest.py). Run with:
-`SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0 python -m pytest -q cutamp/tests`
+`python -m pytest -q cutamp/tests`
 (GPU required for the integration tests). `CUTAMP_SLOW=1` also runs the slow
 live `--cuda_graphs` runs in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py).
@@ -582,11 +585,11 @@ and `--disable_robot_mesh` skips the robot's meshes; both cut bandwidth.
    [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py) so a
    future cuRobo upgrade has one place to audit. The exceptions are the
    one-off workarounds beside their callers (`_attach_object` /
-   `_detach_object`), plain `curobo._src` imports
+   `_detach_object`) and plain `curobo._src` imports
    (the cost base classes and `SelfCollisionCost`, `utils/collision.py`'s
-   scene collision, `config_io`) and the fork edits inside the vendored
-   `curobo/` tree itself (the fork note at the top lists them); those must
-   travel with any cuRobo upgrade, or the link CoMs come back wrong.
+   scene collision, `floor_wrench.py`'s `Dynamics` and quaternion helper,
+   `config_io`). cuRobo itself is unmodified: the patches check its source
+   on import, so an upgrade fails loudly until they are re-audited.
 
 ## Acknowledgements and citation
 

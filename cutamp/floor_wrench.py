@@ -58,14 +58,12 @@ def split_between_soles(F, M, P, s_left, s_right, com):
 def make_floor_wrench_fn(
     base_joints: Sequence[int], sole_tools: tuple[int, int], sole_links: tuple[int, int], n_links: int
 ) -> Callable:
-    """The hook for ``RobotStateTransition.set_external_wrench_fn``.
+    """The hook for ``_curobo_internals.set_external_wrench_fn``.
 
     ``base_joints`` index the six base joints in the joint state, ``sole_tools`` the soles in the
     tool frames, and ``sole_links`` the soles in Dynamics' links. It returns ``f_ext``
     ``[B, H, n_links, 6]``, zero but for the sole rows, each ``[torque, force]`` in that sole's frame.
     """
-    from cutamp.rollout import _FKQuatGrad  # not at the top: rollout.py imports tamp_world.py, which imports this
-
     base_joints = list(base_joints)
 
     def floor_wrench(state, kin_state, tau_free: torch.Tensor) -> torch.Tensor:
@@ -78,9 +76,9 @@ def make_floor_wrench_fn(
         f_ext = q.new_zeros(*q.shape[:-1], n_links, 6)
         for i in range(2):
             f, m = wrenches[2 * i], wrenches[2 * i + 1]
-            # _FKQuatGrad, so a gradient through this rotation is right. Trajopt's transition runs this hook under
-            # no_grad (the fork's robot_state_transition.py) and treats f_ext as fixed; other callers may not.
-            r_t = torch_quaternion_to_matrix(_FKQuatGrad.apply(quat[..., sole_tools[i], :])).transpose(-1, -2)
+            # Trajopt's transition runs this hook under no_grad (set_external_wrench_fn) and treats f_ext as fixed;
+            # other callers may differentiate it, and FK's quaternion gradient is exact.
+            r_t = torch_quaternion_to_matrix(quat[..., sole_tools[i], :]).transpose(-1, -2)
             f_ext[..., sole_links[i], :3] = (r_t @ m[..., None])[..., 0]
             f_ext[..., sole_links[i], 3:] = (r_t @ f[..., None])[..., 0]
         return f_ext
@@ -94,22 +92,26 @@ def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str]
 
     cuRobo gives each rollout two transitions: its cost's (``transition_model``) and its metrics'
     (``metrics_transition_model``, which the success test runs); the interpolated re-check runs on the
-    extra metrics rollouts. All of them get the hook. The IK solver and the graph planner keep RNEA's
-    single pass (7.4a). Raises ``ValueError`` if one has no dynamics or was built without ``compute_com``.
+    extra metrics rollouts. All of them get the hook, and their FK computes the CoM (the split reads it, and so
+    does the planner's CoM cost). The IK solver and the graph planner keep RNEA's single pass (7.4a) and no CoM.
+    Raises ``ValueError`` if a transition has no dynamics.
     """
+    from cutamp._curobo_internals import set_external_wrench_fn
+
     solver = planner.trajopt_solver
     rollouts = list(solver.get_all_rollout_instances()) + list(solver.additional_metrics_rollouts.values())
     transitions = [tm for r in rollouts for tm in (r.transition_model, r.metrics_transition_model)]
     for tm in transitions:
-        if tm.robot_dynamics is None or not tm.config.compute_com:
-            raise ValueError("install_floor_wrench needs trajopt built with load_dynamics and compute_com")
+        if tm.robot_dynamics is None:
+            raise ValueError("install_floor_wrench needs trajopt built with load_dynamics")
+        tm.robot_model.compute_com = True  # read on every FK call; its CoM buffer is always allocated
     names, tools = solver.joint_names, solver.tool_frames
     kp = transitions[0].robot_dynamics.kinematics_config
     fn = make_floor_wrench_fn([names.index(j) for j in base_joint_names],
                               tuple(tools.index(f) for f in sole_frames),
                               tuple(kp.link_name_to_idx_map[f] for f in sole_frames), kp.num_links)
     for tm in transitions:
-        tm.set_external_wrench_fn(fn)
+        set_external_wrench_fn(tm, fn)
 
 
 class SegmentTorques:
@@ -121,7 +123,7 @@ class SegmentTorques:
     ``[T, dof]`` torques in ``model.joint_names`` order. Eager. ``effort`` ``[dof]`` is cuRobo's bound on each
     joint's |torque|: the pinned URDF's effort, and 10,000 on the massless base joints (link_params.py:35).
     ``velocity`` ``[dof]`` is cuRobo's bound on each joint's |velocity| (``get_joint_limits()``, never the URDF's
-    velocity times the YAML's velocity_scale: the fork applies that scale twice).
+    velocity times the YAML's velocity_scale: cuRobo applies that scale twice).
     """
 
     def __init__(self, model: T1Model, device_cfg: DeviceCfg):
@@ -140,7 +142,7 @@ class SegmentTorques:
         self.fn = make_floor_wrench_fn([self.joint_names.index(j) for j in model.joint_names[model.base]],
                                        tuple(tools.index(f) for f in model.sole_frames),
                                        tuple(kp.link_name_to_idx_map[f] for f in model.sole_frames), kp.num_links)
-        limits = self.kin.get_joint_limits()  # each [2, dof]: -bound, +bound (kinematics_loader.py:1090-1093)
+        limits = self.kin.get_joint_limits()  # each [2, dof]: -bound, +bound
         self.effort, self.velocity = limits.effort[1].clone(), limits.velocity[1].clone()
 
     def __call__(self, plan_js: JointState) -> torch.Tensor:

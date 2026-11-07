@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for cuTAMP tests (cuRobo v0.8 single-MotionPlanner)."""
+"""Shared pytest fixtures for cuTAMP tests (cuRobo single-MotionPlanner)."""
 
 import dataclasses
 import gc

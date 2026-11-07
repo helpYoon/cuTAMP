@@ -7,10 +7,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Generic-sphere world-collision cost for cuTAMP (cuRobo v0.8).
+"""Generic-sphere world-collision cost for cuTAMP.
 
 The old API (``PrimitiveCollisionCost`` from ``curobo.rollout.cost.*``) is gone
-in v0.8. We now wrap the lower-level ``SceneCollision`` + ``CollisionChecker``
+since v0.8. We now wrap the lower-level ``SceneCollision`` + ``CollisionChecker``
 to expose a callable ``cost(spheres) -> distance`` matching the prior cuTAMP
 contract: input ``spheres`` is ``[batch, horizon, num_spheres, 4]``, output is
 ``[batch, horizon, num_spheres]`` collision distance.
