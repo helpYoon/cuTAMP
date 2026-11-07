@@ -84,7 +84,8 @@ def test_reset_puts_placed_blocks_back():
     for obj in world.movables:
         placed = world.get_object_pose(obj).clone()
         placed[0, 3] += 0.2
-        ms._update_world_obstacle_pose(planner, obj.name, placed)  # what a Place does
+        # What a Place does.
+        planner.scene_collision_checker.update_obstacle_pose(name=obj.name, w_obj_pose=Pose.from_matrix(placed))
         assert offset(obj) == pytest.approx(0.2, abs=1e-3)
 
     ms._reset_attachment_state(planner, world)  # first thing the retry's solve_curobo does

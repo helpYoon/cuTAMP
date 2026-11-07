@@ -115,7 +115,10 @@ COLLISION_LINK_NAMES = ["Waist", "Trunk", "H1", "H2", "AL1", "AL2", "AL3", "AL4"
     "left_base_link", "left_Link1", "left_Link11", "left_Link2", "left_Link22", "AR1", "AR2", "AR3", "AR4", "AR5",
     "AR6", "right_hand_link", "right_base_link", "right_Link1", "right_Link11", "right_Link2", "right_Link22",
     "attached_object_left", "attached_object_right"]
-EXTRA_COLLISION_SPHERES = {"attached_object_left": 50, "attached_object_right": 50}
+# Each attach link's sphere slots, so the spheres a held block gets: motion_solver._attach_object fits as many as the
+# link has. 6 cover a 5 cm block.
+HELD_OBJECT_SPHERES = 6
+EXTRA_COLLISION_SPHERES = {"attached_object_left": HELD_OBJECT_SPHERES, "attached_object_right": HELD_OBJECT_SPHERES}
 SELF_COLLISION_IGNORE = {
     "Waist": ["Trunk", "H1", "H2", "AL1", "AL2", "AL3", "AR1", "AR2", "AR3"],
     "Trunk": ["Waist", "H1", "H2", "AL1", "AL2", "AL3", "AL4", "AR1", "AR2", "AR3", "AR4"],

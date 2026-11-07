@@ -255,7 +255,7 @@ def test_home_com_over_the_mid_sole(real_world):
 @needs_cuda
 def test_home_clears_itself(real_world):
     kin, home = real_world.kinematics, _home(real_world)
-    assert _fk(kin, home).robot_spheres.shape[-2] == 167
+    assert _fk(kin, home).robot_spheres.shape[-2] == 79  # 67 link spheres and 6 slots per attach link
     assert _self_collision(kin, home) == 0.0  # the gripper clears the thighs (call 11)
     gap = _leg_gap(kin, home)
     assert abs(gap - 0.102) <= 0.005, gap  # section 10: the shanks 0.102 m apart

@@ -147,8 +147,8 @@ def _interp_plan(result):
     return None if result is None else result.get_interpolated_plan()
 
 
-# attached_object_{left,right} extra_link names from t1_29dof.yml.
-# Each has 50 reserved sphere slots; we use only ~6 via VOXEL fit.
+# attached_object_{left,right} extra_link names from t1_29dof.yml. Each has build_planner_model.py's
+# HELD_OBJECT_SPHERES sphere slots, which _attach_object fills.
 _ATTACH_LINK_FOR_ARM = {
     "left": "attached_object_left",
     "right": "attached_object_right",
@@ -186,13 +186,7 @@ def _last_timestep_js(plan, planner=None) -> JointState:
     return js
 
 
-def _attach_object(
-    planner,
-    obj_name: str,
-    last_js: JointState,
-    arm: str,
-    num_spheres: int = 6,
-):
+def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     """Attach a scene obstacle to ``arm``'s attach link via cuRobo's attach.
 
     ``attach_from_scene`` fits spheres for the obstacle, mounts them on the
@@ -211,31 +205,25 @@ def _attach_object(
     ``VOXEL`` (interior-voxel grid with inscribed radii) gives a tight,
     cube-shaped sphere set for the small block geometry — much less prone
     to over-extending into the wrist links than ``MORPHIT``'s optimization
-    output. ``num_spheres=6`` is enough coverage for a 5cm cube.
+    output. It fits as many spheres as the link has slots: build_planner_model.py's
+    ``HELD_OBJECT_SPHERES``, 6, enough coverage for a 5 cm cube.
     """
     am = planner.attachment_manager
     link_name = _ATTACH_LINK_FOR_ARM[arm]
-    try:
-        am.attach_from_scene(
-            joint_states=last_js,
-            obstacle_names=[obj_name],
-            link_name=link_name,
-            num_spheres=num_spheres,
-            sphere_fit_type=SphereFitType.VOXEL,
-        )
-        # The attach link is a FIXED identity child of the arm's tool frame
-        # (t1_29dof.yml), so the tool-frame pose is the link pose.
-        world_from_link = planner.kinematics.compute_kinematics(last_js).tool_poses.get_link_pose(
-            TOOL_FRAME_FOR_ARM[arm]
-        )
-        kp = am.kinematics_params
-        idx = kp.get_sphere_index_from_link_name(link_name)
-        idx = idx[kp.link_spheres[0, idx, 3] > 0]  # fitted spheres, not the radius -100 padding
-        kp.link_spheres[0, idx, :3] = world_from_link.inverse().transform_points(
-            kp.link_spheres[0, idx, :3]
-        ).view(-1, 3)
-    except Exception as e:
-        _log.warning(f"attach({obj_name}) failed: {e}")
+    kp = am.kinematics_params
+    idx = kp.get_sphere_index_from_link_name(link_name)
+    am.attach_from_scene(
+        joint_states=last_js,
+        obstacle_names=[obj_name],
+        link_name=link_name,
+        num_spheres=len(idx),
+        sphere_fit_type=SphereFitType.VOXEL,
+    )
+    # The attach link is a FIXED identity child of the arm's tool frame
+    # (t1_29dof.yml), so the tool-frame pose is the link pose.
+    world_from_link = planner.kinematics.compute_kinematics(last_js).tool_poses.get_link_pose(TOOL_FRAME_FOR_ARM[arm])
+    idx = idx[kp.link_spheres[0, idx, 3] > 0]  # fitted spheres, not the radius -100 padding
+    kp.link_spheres[0, idx, :3] = world_from_link.inverse().transform_points(kp.link_spheres[0, idx, :3]).view(-1, 3)
 
 
 def _detach_object(planner, obj_name: str, arm: str):
@@ -247,12 +235,8 @@ def _detach_object(planner, obj_name: str, arm: str):
     one detach its env count is 0, so a named re-enable then does nothing.
     Naming ``obj_name`` stops the stale re-enable; we enable it ourselves.
     """
-    am = planner.attachment_manager
-    try:
-        am.detach(link_name=_ATTACH_LINK_FOR_ARM[arm], enable_obstacle_names=[obj_name])
-        planner.scene_collision_checker.enable_obstacle(name=obj_name, enable=True)
-    except Exception as e:
-        _log.warning(f"detach failed: {e}")
+    planner.attachment_manager.detach(link_name=_ATTACH_LINK_FOR_ARM[arm], enable_obstacle_names=[obj_name])
+    planner.scene_collision_checker.enable_obstacle(name=obj_name, enable=True)
 
 
 def _reset_attachment_state(planner, world) -> None:
@@ -264,37 +248,15 @@ def _reset_attachment_state(planner, world) -> None:
     ``solve_curobo`` that failed mid-plan can leave stale link spheres on the
     arm whose attach was overwritten, a disabled world obstacle whose
     bookkeeping was lost, and blocks its Places moved to the failed particle's
-    placements (``_update_world_obstacle_pose``). Force-detach both attachment
-    links and restore every movable so the next solve starts from a clean
-    planner state.
+    placements. Force-detach both attachment links and restore every movable
+    so the next solve starts from a clean planner state.
     """
-    am = planner.attachment_manager
+    am, sc = planner.attachment_manager, planner.scene_collision_checker
     for link in _ATTACH_LINK_FOR_ARM.values():
-        try:
-            am.detach(link_name=link)
-        except Exception as e:
-            _log.debug(f"detach({link}) during reset: {e}")
+        am.detach(link_name=link)
     for obj in world.movables:
-        try:
-            planner.scene_collision_checker.enable_obstacle(name=obj.name, enable=True)
-        except Exception as e:
-            _log.debug(f"enable_obstacle({obj.name}) during reset: {e}")
-        _update_world_obstacle_pose(planner, obj.name, world.get_object_pose(obj))
-
-
-def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
-    """Update the stored world pose of an obstacle.
-
-    Needed after place: ``attach_from_scene`` removed the obstacle from the
-    world during carry, and ``detach`` re-enables it — but at its *original*
-    stored pose. Calling this with the placement target tells the planner
-    where the block actually lives now, so subsequent plans treat it as an
-    obstacle at the new location.
-    """
-    try:
-        planner.scene_collision_checker.update_obstacle_pose(name=name, w_obj_pose=Pose.from_matrix(pose_mat))
-    except Exception as e:
-        _log.warning(f"update_obstacle_pose({name}) failed: {e}")
+        sc.enable_obstacle(name=obj.name, enable=True)
+        sc.update_obstacle_pose(name=obj.name, w_obj_pose=Pose.from_matrix(world.get_object_pose(obj)))
 
 
 def _held_obj_poses(planner, tool_from_ee, held: dict, plan: JointState) -> dict:
@@ -497,7 +459,9 @@ def solve_curobo(
                 # still the original pickup pose, so update it to the
                 # placement target before continuing.
                 _detach_object(planner, obj_name, arm)
-                _update_world_obstacle_pose(planner, obj_name, world_from_obj_target)
+                planner.scene_collision_checker.update_obstacle_pose(
+                    name=obj_name, w_obj_pose=Pose.from_matrix(world_from_obj_target),
+                )
 
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")

@@ -7,19 +7,12 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Generic-sphere world-collision cost for cuTAMP.
+"""Sphere-vs-scene collision cost for cuTAMP: spheres ``[batch, horizon, num_spheres, 4]`` in, a cost
+``[batch, horizon]`` out, through cuRobo's ``SceneCollision``.
 
-The old API (``PrimitiveCollisionCost`` from ``curobo.rollout.cost.*``) is gone
-since v0.8. We now wrap the lower-level ``SceneCollision`` + ``CollisionChecker``
-to expose a callable ``cost(spheres) -> distance`` matching the prior cuTAMP
-contract: input ``spheres`` is ``[batch, horizon, num_spheres, 4]``, output is
-``[batch, horizon, num_spheres]`` collision distance.
-
-NOTE: pulls from ``curobo._src.geom.collision`` (private) until cuRobo exposes
-a public sphere-vs-scene query.
+NOTE: ``SceneCollision`` is private (``curobo._src.geom.collision``). cuRobo v0.9.0's only public sphere query,
+``curobo.collision_checking.RobotCollisionChecker.get_collision_constraint``, comes bundled with a robot Kinematics.
 """
-
-import logging
 
 import torch
 
@@ -28,55 +21,23 @@ from curobo._src.geom.collision.collision_scene import SceneCollision, SceneColl
 from curobo.scene import Scene
 from curobo.types import DeviceCfg
 
-_log = logging.getLogger(__name__)
-
 
 class WorldCollisionCost:
-    """Callable: ``cost(spheres) -> [batch, horizon]`` collision cost
-    (non-negative, summed across spheres).
-    """
+    """Callable: ``cost(spheres) -> [batch, horizon]`` collision cost (non-negative, summed across spheres)."""
 
-    def __init__(
-        self,
-        scene: Scene,
-        device_cfg: DeviceCfg,
-        activation_distance: float,
-        weight: float = 1.0,
-    ):
-        if activation_distance < 0.0:
-            raise ValueError(f"Collision activation distance must be >= 0.0, got {activation_distance}")
-        cfg = SceneCollisionCfg(device_cfg=device_cfg, scene_model=scene)
-        self.scene_collision = SceneCollision.from_config(cfg)
+    def __init__(self, scene: Scene, device_cfg: DeviceCfg, activation_distance: float):
+        self.scene_collision = SceneCollision.from_config(SceneCollisionCfg(device_cfg=device_cfg, scene_model=scene))
         self.device_cfg = device_cfg
-        self.weight = device_cfg.to_device([weight])
+        self.weight = device_cfg.to_device([1.0])
         self.activation_distance = device_cfg.to_device([activation_distance])
 
-    def __call__(
-        self, spheres: torch.Tensor, return_loss: bool = True,
-    ) -> torch.Tensor:
-        """Query collision cost for a batch of spheres.
-
-        Args:
-            spheres: Query spheres ``[batch, horizon, num_spheres, 4]``.
-            return_loss: True if caller will scale the result before backward.
-        """
-        if spheres.ndim != 4 or spheres.shape[-1] != 4:
-            raise ValueError(
-                f"spheres must be [batch, horizon, num_spheres, 4], got {tuple(spheres.shape)}"
-            )
-
-        # Fresh buffer per call: the saved-for-backward `gradient` tensor inside
-        # CollisionBuffer is mutated in-place by the underlying autograd
-        # Function, which trips PyTorch's saved-tensor checks if a single
-        # buffer is reused across forward passes.
+    def __call__(self, spheres: torch.Tensor) -> torch.Tensor:
+        """The collision cost of query spheres ``[batch, horizon, num_spheres, 4]``."""
+        # Fresh buffer per call: the query's autograd Function saves the buffer's `gradient` for backward and returns
+        # its `distance` itself, and the Warp kernel writes both in place, past autograd's version counter. A reused
+        # buffer would silently overwrite an earlier query's gradient and result.
         buffer = CollisionBuffer.from_shape(spheres.shape, self.device_cfg)
-
-        per_sphere = self.scene_collision.checker.get_sphere_distance(
-            scene=self.scene_collision.data,
-            query_sphere=spheres,
-            collision_buffer=buffer,
-            weight=self.weight,
-            activation_distance=self.activation_distance,
-            return_loss=return_loss,
+        per_sphere = self.scene_collision.get_sphere_distance_raw(
+            spheres, buffer, self.weight, self.activation_distance, return_loss=True,
         )
-        return per_sphere.clamp(min=0.0).sum(dim=-1)
+        return per_sphere.sum(dim=-1)

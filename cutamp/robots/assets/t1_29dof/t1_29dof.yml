@@ -21,7 +21,7 @@ robot_cfg:
       right_Link2, right_Link22, attached_object_left, attached_object_right, Hip_Yaw_Left, Shank_Left, Hip_Yaw_Right, Shank_Right]
     collision_spheres: t1_29dof_spheres.yml
     collision_sphere_buffer: {}
-    extra_collision_spheres: {attached_object_left: 50, attached_object_right: 50}
+    extra_collision_spheres: {attached_object_left: 6, attached_object_right: 6}
     extra_links:
       base_link_x:
         parent_link_name: world

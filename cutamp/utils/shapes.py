@@ -32,12 +32,8 @@ def sample_greedy_surface_spheres(
     Samples points on the object's surface mesh, constructs a neighborhood graph using a KD-tree,
     and greedily selects points that are far apart (non-overlapping) based on radius.
     """
-    # Need to temporarily override the pose, so the trimesh mesh is at the origin
     start_time = time.perf_counter()
-    og_pose = obj.pose
-    obj.pose = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]  # unit pose
-    mesh = obj.get_trimesh_mesh()
-    obj.pose = og_pose
+    mesh = obj.get_trimesh_mesh()  # in the object's frame: cuRobo applies obj.pose only with transform_with_pose=True
 
     # Sample surface. The fixed seed makes the spheres part of the task's geometry: unseeded, trimesh draws from
     # numpy's global RNG, which nothing seeds, so every process planned against different spheres (known-bugs N4).

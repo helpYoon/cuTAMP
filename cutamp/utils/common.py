@@ -7,11 +7,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from collections import defaultdict
 from typing import Dict
 
 import torch
-from curobo.scene import Cuboid, Cylinder, Mesh, Obstacle, Scene
+from curobo.scene import Cuboid, Mesh, Obstacle, Scene
 from roma import quat_wxyz_to_xyzw, unitquat_to_rotmat
 
 from cutamp.envs import TAMPEnvironment
@@ -109,21 +108,9 @@ def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
 
 
 def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene:
-    """Build a cuRobo Scene from the TAMP environment's obstacles."""
-    geoms = defaultdict(list)
-    # Copy: `obstacles = env.movables` would ALIAS the env's list and the
-    # += below would permanently append every static into env.movables
-    # (latent corruption that became a live race once the motion planner
-    # build moved onto a background thread).
-    obstacles = list(env.movables) if include_movables else []
-    obstacles += env.statics
-    for obj in obstacles:
-        if isinstance(obj, Cuboid):
-            geoms["cuboid"].append(obj)
-        elif isinstance(obj, Cylinder):
-            geoms["cylinder"].append(obj)
-        elif isinstance(obj, Mesh):
-            geoms["mesh"].append(obj)
-        else:
-            raise ValueError(f"Unknown object type: {type(obj)}")
-    return Scene(**geoms)
+    """Build a cuRobo Scene from the TAMP environment's obstacles: the statics, after the movables if
+    ``include_movables``."""
+    scene = Scene()
+    for obj in [*env.movables, *env.statics] if include_movables else env.statics:
+        scene.add_obstacle(obj)
+    return scene

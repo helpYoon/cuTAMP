@@ -65,15 +65,14 @@ class TAMPWorld:
         device_cfg: DeviceCfg,
         robot: RobotContainer,
         q_init: torch.Tensor,
-        coll_n_spheres: int = 50,
-        coll_sphere_radius: float = 0.005,
     ):
         self.env = env
         self.device_cfg = device_cfg
 
         self._name_to_obj = {obj.name: obj for obj in env.movables + env.statics}
 
-        # Static collision Scene (excludes movables; movables get attached at grasp time). The cost activates at 0.
+        # The statics' collision Scene: the costs and GN treat the movables as sphere overlaps (their spheres below).
+        # The cost activates at 0.
         self.world_cfg: Scene = get_world_cfg(env, include_movables=False)
         self.collision_fn = WorldCollisionCost(self.world_cfg, device_cfg, 0.0)
 
@@ -86,13 +85,12 @@ class TAMPWorld:
         self._segment_torques = None
         self._site_kinematics: Dict[str, Kinematics] = {}
 
-        # Pre-fit collision spheres for each movable (used by attachment_manager).
-        self._obj_to_spheres: Dict[str, torch.Tensor] = {}
-        for obj in self.movables:
-            spheres = sample_greedy_surface_spheres(
-                obj, n_spheres=coll_n_spheres, sphere_radius=coll_sphere_radius,
-            )
-            self._obj_to_spheres[obj.name] = spheres.to(device_cfg.device)
+        # Each movable's surface spheres in its own frame, for the rollout, the costs, particle init and the
+        # visualizer (the motion planner's attach fits its own).
+        self._obj_to_spheres: Dict[str, torch.Tensor] = {
+            obj.name: sample_greedy_surface_spheres(obj, n_spheres=50, sphere_radius=0.005).to(device_cfg.device)
+            for obj in self.movables
+        }
 
         self._obj_to_aabb: Dict[str, torch.Tensor] = {}
 

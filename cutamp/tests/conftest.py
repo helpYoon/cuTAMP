@@ -22,7 +22,7 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-def make_blocks_t1_world(**tamp_world_kwargs):
+def make_blocks_t1_world():
     """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home."""
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
@@ -32,7 +32,7 @@ def make_blocks_t1_world(**tamp_world_kwargs):
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     robot = load_t1_container(REAL_LEGS, dc)
     q_init = torch.as_tensor(REAL_LEGS.home, dtype=torch.float32, device=dc.device)
-    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, **tamp_world_kwargs)
+    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init)
 
 
 @pytest.fixture(autouse=True)
