@@ -6,7 +6,8 @@ The simplified 21-DOF model and the paper's ablation reproduce from branch
 from tag `paper-g1-comfix`.
 
 > **cuRobo dependency:** cuTAMP runs on unmodified NVlabs cuRobo v0.9.0 (tag
-> `v0.9.0`, commit 42498cf) with warp-lang 1.16 ([Installation](#installation)).
+> `v0.9.0`, commit 42498cf), pinned as the git submodule `curobo/`, with
+> warp-lang 1.16 ([Installation](#installation)).
 > Everything cuTAMP changes in cuRobo lives in
 > [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py), applied on
 > `import cutamp`, which first checks the source of each cuRobo function it
@@ -32,7 +33,8 @@ from tag `paper-g1-comfix`.
 > which can differ in the last bits between calls; same-seed plans still came
 > out bit-identical.
 > Branch `ablation-baseline` and tag `paper-g1-comfix` need the old fork
-> (helpYoon/curobo, with `SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0`).
+> (helpYoon/curobo, with `SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0`), installed
+> from a checkout of its own: `curobo/` here is the v0.9.0 submodule.
 
 ## Installation
 
@@ -51,15 +53,17 @@ conda create --name cutamp python=3.10 -y
 conda activate cutamp
 pip install torch torchvision torchaudio  # the build for your CUDA
 
-git clone https://github.com/helpYoon/cuTAMP.git
+git clone --recursive https://github.com/helpYoon/cuTAMP.git  # cuRobo v0.9.0 comes as curobo/
 cd cuTAMP
 pip install -e .  # or -e ".[editor]" for the sphere editor's open3d
 
-# NVlabs cuRobo v0.9.0, in cuTAMP/curobo (git-ignored)
-git clone --depth 1 --branch v0.9.0 https://github.com/NVlabs/curobo.git curobo
 pip install "warp-lang==1.16.0"  # cuRobo asks for >=0.10; warp 1.10.1 fails on launch_bounds
 pip install -e "curobo[cu12]"  # [cu13] for CUDA 13
 ```
+
+A clone made without `--recursive` gets cuRobo with `git submodule update --init`.
+The submodule is shallow (`shallow = true` in `.gitmodules`): it fetches the
+pinned commit only, about 136 MB, not cuRobo's whole history.
 
 cuRobo's own [install guide](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
 has the details.

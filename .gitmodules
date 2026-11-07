@@ -1,0 +1,4 @@
+[submodule "curobo"]
+	path = curobo
+	url = https://github.com/NVlabs/curobo.git
+	shallow = true

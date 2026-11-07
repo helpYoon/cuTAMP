@@ -1,6 +1,3 @@
-# Ignore curobo directory
-curobo/
-
 # Ignore docs (internal notes, specs, plans)
 docs/
 
