@@ -9,14 +9,11 @@
 
 import re
 import itertools
-import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Generator, List, Optional, Sequence
 
 from .base_structs import Atom, GroundOperator, Operator, State
-
-_log = logging.getLogger(__name__)
 
 # Maps parameter types to the base string used when sampling literal names (e.g. "q0", "left_q1").
 _BASE_NAMES = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
@@ -72,7 +69,6 @@ def _extract_prefix(s: str, param_type: str) -> str:
 def get_valid_ground_operators(
     node: _Node,
     operators: Sequence[Operator],
-    verbose: bool = False,
     priority_fn: Optional["Callable[[GroundOperator], float]"] = None,
 ) -> list[GroundOperator]:
     """
@@ -170,14 +166,7 @@ def get_valid_ground_operators(
                     param_to_literals[param.name].add(value)
 
         if not pre_check:
-            if verbose:
-                _log.debug(f"Skipping {operator} because not all preconditions are satisfied.")
             continue
-
-        if verbose:
-            _log.debug(
-                f"Preconditions all satisfied for {operator}, parameter to literal bindings: {param_to_literals}"
-            )
 
         # 2. Since we're dealing with funny planning, some of the parameters might not be bound. We need to check and
         # sample placeholder values for them.
@@ -185,8 +174,6 @@ def get_valid_ground_operators(
             if param.name not in param_to_literals:
                 sampled_value = sample_param_type(param.type)
                 param_to_literals[param.name].add(sampled_value)
-                if verbose:
-                    _log.debug(f"Parameter '{param}' not bound, sampled placeholder value {sampled_value}")
 
         if len(param_to_literals) != len(operator.parameters):
             raise RuntimeError(
@@ -202,13 +189,8 @@ def get_valid_ground_operators(
             ground_op = operator.ground(substitutions)
 
             # Check preconditions are satisfied
-            if not ground_op.preconditions.issubset(state):
-                if verbose:
-                    _log.debug(f"Skipping {ground_op} because not all preconditions are satisfied.")
-            else:
+            if ground_op.preconditions.issubset(state):
                 ground_ops.append(ground_op)
-                if verbose:
-                    _log.debug(f"Grounded operator {operator} with substitutions {substitutions} to get {ground_op}")
 
     if priority_fn is not None:
         # Stable sort: equal-priority groundings preserve declaration order.
@@ -220,7 +202,6 @@ def breadth_first_search(
     initial_state: State,
     goal_state: State,
     operators: Sequence[Operator],
-    verbose: bool = False,
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
 ) -> Generator[List[GroundOperator], None, None]:
     """
@@ -232,8 +213,6 @@ def breadth_first_search(
     goal_state: State
     operators: List[Operator]
         The possible operators for the given search problem.
-    verbose: bool
-        Whether to log debugging information. We have a flag so the log doesn't become polluted.
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]]
         Optional priority function for biased BFS sibling ordering.
         When provided, ground operators returned at each expansion are
@@ -260,8 +239,6 @@ def breadth_first_search(
 
     while frontier:
         node = frontier.popleft()
-        if verbose:
-            _log.debug(f"Exploring node: {node}")
 
         # Check if goal is satisfied
         if goal_state.issubset(node.state):
@@ -270,9 +247,7 @@ def breadth_first_search(
             continue  # stop exploring this branch as we already satisfied the goal
 
         # Get successor and add to frontier
-        ground_ops = get_valid_ground_operators(
-            node, operators, verbose=verbose, priority_fn=ground_op_priority_fn,
-        )
+        ground_ops = get_valid_ground_operators(node, operators, priority_fn=ground_op_priority_fn)
         for ground_op in ground_ops:
             successor_state = ground_op.apply(node.state)
 

@@ -295,11 +295,20 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     """``[B]`` stability margins for full-cspace configs via FK, against the keyframes' rectangle
     (``world.model.support.keyframe_half``).
 
-    Measure-only companion to :func:`compute_com_polygon_mask`: the best
-    particle's ``best_com_margin`` (optimize_plan.py) and the planned one's (algorithm.py)."""
+    Measure-only companion to :func:`compute_com_polygon_mask`, through :func:`particle_com_margin`."""
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q_batch)
     return com_margin_from_base(_project_com_to_base(com, base_T, support.center), support.keyframe_half)
+
+
+def particle_com_margin(world, particle: "dict[str, torch.Tensor]") -> float:
+    """One particle's CoM margin: :func:`compute_com_margin`'s min over its confs (``[full_dof]`` entries named
+    ``left_q``/``right_q``/``q``). Measure only: the best particle's ``best_com_margin`` (optimize_plan.py) and
+    the planned one's ``planned_com_margin`` (algorithm.py)."""
+    return min(
+        compute_com_margin(world, v.unsqueeze(0)).item()
+        for k, v in particle.items() if k.startswith(("left_q", "right_q", "q")) and v.ndim == 1
+    )
 
 
 def _vee(m: torch.Tensor) -> torch.Tensor:
@@ -364,8 +373,7 @@ def compute_com_polygon_penalties(
     these values populates ``.grad`` on the input Conf particles.
 
     Used by the hard ``ComPolygon`` constraint (via
-    :meth:`CostFunction.com_polygon_constraint`); the result is cached on
-    the ``CostFunction`` instance so the FK runs once per evaluation.
+    :meth:`CostFunction.com_polygon_constraint`), once per evaluation.
 
     Args:
         world: TAMPWorld instance; the FK runs on its ``site_kinematics("com")``.

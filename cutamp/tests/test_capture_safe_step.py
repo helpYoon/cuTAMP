@@ -11,7 +11,6 @@ from cutamp.costs import _sphere_to_sphere_overlap, get_aabb_from_spheres
 from cutamp.tests.conftest import (
     SpyVis, clone_particles, make_plan_info, needs_cuda, run_optimizer, sync_debug_error,
 )
-from cutamp.tests.test_step_lockstep import _head_upper_sum
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
@@ -161,22 +160,6 @@ def test_com_fk_skips_identity_reorder(blocks_t1_plan):
     assert [n for n in names if "Synchronize" in n] == ["cudaDeviceSynchronize"]   # the profiler's own
 
 
-@needs_cuda
-def test_pairwise_upper_sum_matches_triu_mask():
-    from cutamp.cost_function import _pairwise_upper_sum
-
-    torch.manual_seed(0)
-    for n in (2, 3, 4):
-        x = torch.randn(64, n, n, device="cuda", requires_grad=True)
-        w = torch.rand(64, device="cuda")
-        want = _head_upper_sum(x)
-        gw, = torch.autograd.grad((want * w).sum(), x)
-        with sync_debug_error():
-            got = _pairwise_upper_sum(x)
-            gg, = torch.autograd.grad((got * w).sum(), x)
-        assert torch.equal(got, want) and torch.equal(gg, gw), n
-
-
 def test_constant_builders_never_evict():
     from cutamp.com_polygon_cost import _center, _half_extents
     from cutamp.cost_function import _device_const
@@ -207,20 +190,3 @@ def test_merged_adam_groups_match_per_param():
             assert all(torch.equal(x, y) for x, y in zip(a, b)), step
     assert [len(g["params"]) for g in _adam_param_groups([(a[0], False), (a[1], False)], 0.1)] == [2]
     assert _adam_param_groups([(a[2], True)], 0.1) == [{"params": [a[2]], "lr": 0.1}]
-
-
-@needs_cuda
-def test_align_yaw_syncs_in_roma(blocks_t1_plan):
-    # Why align_yaw runs stay eager under cuda_graphs: its sync is roma's.
-    from cutamp.cost_function import CostFunction
-    from cutamp.rollout import RolloutFunction
-
-    world, skeleton, base = blocks_t1_plan
-    config = TAMPConfiguration(soft_cost=["align_yaw"])
-    # Built first: the constructor's own host-to-device copies would raise first.
-    cf = CostFunction(skeleton, world, config)
-    with torch.no_grad():
-        rollout = RolloutFunction(skeleton, world, config)(clone_particles(base))
-    with pytest.raises(RuntimeError, match="synchroniz") as excinfo, sync_debug_error():
-        cf._compute_soft_cost("align_yaw", rollout)
-    assert any("roma/mappings.py" in str(e.path) for e in excinfo.traceback)   # roma's sync, not cutamp's

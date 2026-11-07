@@ -49,11 +49,6 @@ def _head_fk_state(world, q_batch: torch.Tensor, kin=None):
     return kin.compute_kinematics(kin.get_active_js(js))
 
 
-def _head_upper_sum(x: torch.Tensor) -> torch.Tensor:
-    """cfa7a46's strict-upper-triangle sum, by triu boolean mask (syncs on its nonzero)."""
-    return x[torch.triu(torch.ones_like(x), diagonal=1) == 1].view(x.shape[0], -1).sum(-1)
-
-
 @contextmanager
 def _head_math(world):
     """HEAD's math: every FK site on the one shared ``world.kinematics``, reset before each FK call so two
@@ -62,8 +57,7 @@ def _head_math(world):
     shared = _ResetFK(world.kinematics)
     with mock.patch.object(world, "site_kinematics", lambda name: shared), \
             mock.patch("cutamp.cost_function._per_object_sum", _head_per_object_sum), \
-            mock.patch("cutamp.com_polygon_cost._fk_state", _head_fk_state), \
-            mock.patch("cutamp.cost_function._pairwise_upper_sum", _head_upper_sum):
+            mock.patch("cutamp.com_polygon_cost._fk_state", _head_fk_state):
         yield shared
 
 

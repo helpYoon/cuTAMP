@@ -32,12 +32,6 @@ default_constraint_to_mult = {
     # per-conf name — relies on CostReducer's (type, "default") fallback.
     ComPolygon.type: {"default": 10.0},
     "soft": {
-        "dist_from_origin": 5e-1,
-        "min_y": 1e-1,
-        "max_y": 1e-1,
-        "max_obj_dist": 3e-1,
-        "min_obj_dist": 1e-1,
-        "align_yaw": 5e-2,
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
         # Tuned on the simplified model's 0.1 rad margin band (branch

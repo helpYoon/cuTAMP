@@ -82,7 +82,6 @@ def test_task_plan_generator_accepts_priority_fn():
     gen = task_plan_generator(
         world.initial_state, world.goal_state, all_t1_operators,
         ground_op_priority_fn=lambda op: 0.0,
-        max_plan_skeletons=1,
     )
     # Pulling one plan should not raise.
     plan = next(gen)

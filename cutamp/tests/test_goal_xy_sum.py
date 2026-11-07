@@ -117,7 +117,7 @@ def test_cost_function_is_run_to_run_bitwise(blocks_t1_plan, monkeypatch):
     world, skeleton, particles = blocks_t1_plan
     where = f"skeleton {' | '.join(map(str, skeleton))}; PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}"
     config = TAMPConfiguration(num_particles=64)
-    rollout_fn, cost_fn = RolloutFunction(skeleton, world, config), CostFunction(skeleton, world, config)
+    rollout_fn, cost_fn = RolloutFunction(skeleton, world), CostFunction(skeleton, world, config)
     reducer = CostReducer(default_constraint_to_mult.copy())
     checker = ConstraintChecker(default_constraint_to_tol.copy())
 

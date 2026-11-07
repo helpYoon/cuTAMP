@@ -59,7 +59,6 @@ def test_constraint_checker_filters_com_violators():
     cost_dict = {
         ComPolygon.type: {
             "type": "constraint",
-            "constraints": [],
             "values": {
                 # Penalty values: 0.0 = inside polygon; 1e-2 ≈ 1cm outside.
                 # tol from default_constraint_to_tol[ComPolygon.type] = 4e-4.
@@ -221,7 +220,7 @@ def test_retract_collision_grads_match_per_conf():
     qs = {name: (particles[name] + 0.3 * torch.randn_like(particles[name])).requires_grad_(True)
           for name, _, _ in retract_info}
     particles.update(qs)
-    rollout = RolloutFunction(skeleton, world, config)(particles)
+    rollout = RolloutFunction(skeleton, world)(particles)
     rollout_spheres = rollout["robot_spheres"].detach().clone()
     # One big sphere per movable, around the robot, so every retract conf
     # overlaps the movables and gets a non-zero gradient.

@@ -112,7 +112,7 @@ def make_plan_info(world, skeleton, particles: dict, config) -> dict:
     return {
         "plan_skeleton": skeleton,
         "particles": particles,
-        "rollout_fn": RolloutFunction(skeleton, world, config),
+        "rollout_fn": RolloutFunction(skeleton, world),
         "cost_fn": CostFunction(skeleton, world, config),
     }
 
@@ -274,7 +274,7 @@ def install_step_replay_spy(monkeypatch) -> list:
 
 def install_refresh_spy(monkeypatch) -> list:
     """Check every G_refresh replay bitwise against an eager ``_refresh_balanced`` on clones, run first (it
-    shares the gate site and ``kinematics_jac``): covered confs, slot and refs, and every other particle
+    shares the gate site and ``kinematics_jac``): covered confs and slot, and every other particle
     unchanged. Returns the replays' steps."""
     from cutamp.optimize_plan import _ReikDriftGate, _refresh_balanced, _StaticRefresh
 
@@ -282,14 +282,12 @@ def install_refresh_spy(monkeypatch) -> list:
 
     def spy(self, step):
         clones, before = clone_particles(self.particles), clone_particles(self.particles)
-        g2 = _ReikDriftGate(len(self.q_names), self.gate.pos_tol, self.gate.rot_tol)
-        g2.refs = [r.clone() for r in self.refs]
+        g2 = _ReikDriftGate(self.gate.pos_tol, self.gate.rot_tol)
         _refresh_balanced(clones, self.ik_deps, self.world, g2, step)
         orig(self, step)
         where = f"G_refresh replay at step {step}"
-        assert_bitwise({"q": {n: self.particles[n] for n in self.q_names}, "slot": self.slot, "refs": list(self.refs)},
-                       {"q": {n: clones[n] for n in self.q_names}, "slot": g2._queued[-1].packed, "refs": g2.refs},
-                       where)
+        assert_bitwise({"q": {n: self.particles[n] for n in self.q_names}, "slot": self.slot},
+                       {"q": {n: clones[n] for n in self.q_names}, "slot": g2._queued[-1].packed}, where)
         others = [n for n in self.particles if n not in self.q_names]
         assert_bitwise({n: self.particles[n] for n in others}, {n: before[n] for n in others},
                        f"{where}: a particle outside the covered confs")

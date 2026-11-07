@@ -239,8 +239,8 @@ def test_balanced_refresh_is_sync_free():
     deps = [IKDep(n, a, target_fn=lambda p, Ti=Ti: Ti, movables_fn=lambda p, M=_blocks(world, 8): M)
             for n, a, Ti in zip(names, arms, T.split(8))]
     particles = {n: qi.clone() for n, qi in zip(names, q.split(8))}
-    gate = _ReikDriftGate(4, pos_tol=0.005, rot_tol=0.05)
-    for step in (4, 9):  # warm-up: lazy kinematics, caches, allocations, the drift reference
+    gate = _ReikDriftGate(pos_tol=0.005, rot_tol=0.05)
+    for step in (4, 9):  # warm-up: lazy kinematics, caches, allocations
         _refresh_balanced(particles, deps, world, gate, step)
     for n in names:
         particles[n].grad = torch.ones_like(particles[n])  # stale buffers the refresh must drop
@@ -256,7 +256,6 @@ def test_balanced_refresh_is_sync_free():
     assert all(particles[n].grad is None for n in names)
 
     gate.flush()
-    assert all("pos_drift_mean" in r for r in gate.stats[-4:])  # the profiled refresh took the drift path
 
     # Replayed as G_refresh: one graph launch plus the slot clone's copy, and no eager kernel launch.
     refresh = _StaticRefresh(particles, deps, world, gate)
@@ -287,7 +286,7 @@ def test_balanced_refresh_on_each_dep_layout():
         deps = [IKDep(n, a, target_fn=lambda p, Ti=T_blocks[i]: Ti, movables_fn=lambda p, M=_blocks(world, 8): M)
                 for n, a, i in zip(names, arms_sub, idx)]
         particles = {n: q_blocks[i].clone() for n, i in zip(names, idx)}
-        gate = _ReikDriftGate(len(idx), 0.005, 0.05)
+        gate = _ReikDriftGate(0.005, 0.05)
         _refresh_balanced(particles, deps, world, gate, 4)
         confs = [particles[n] for n in names]
         before = torch.cat(confs)
@@ -297,7 +296,6 @@ def test_balanced_refresh_on_each_dep_layout():
         assert torch.equal(written, gn_project_balanced(world, before, T_sub, arms_sub, movables=movables)), idx
         gate.flush()
         assert [(r["step"], r["conf"]) for r in gate.stats] == [(s, n) for s in (4, 9) for n in names], idx
-        assert ["pos_drift_mean" in r for r in gate.stats] == [False] * len(idx) + [True] * len(idx), idx
         pose_ok, com_ok = gn_gate(world, written, T_sub, arms_sub, 0.005, 0.05)
         misses = (~(pose_ok & com_ok)).view(len(idx), 8).sum(-1).tolist()
         assert [r["gn_fail"] for r in gate.stats[len(idx):]] == misses, idx

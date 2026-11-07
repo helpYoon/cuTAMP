@@ -72,9 +72,6 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     assert seen, "no refresh reached the spies"
     world = seen[0][1]
     assert all(w is world for _, w in seen)
-    # Drift needs a previous target: every record but the first refresh's has it.
-    first = min(r["step"] for r in records)
-    assert all(("pos_drift_mean" in r) == (r["step"] != first) for r in records)
 
 
 @needs_cuda

@@ -17,26 +17,6 @@ class Collision(Constraint):
         super().__init__()
 
 
-class CollisionFree(Constraint):
-    def __init__(self, *params):
-        super().__init__(*params)
-
-
-class CollisionFreeGrasp(Constraint):
-    def __init__(self, obj, grasp):
-        super().__init__(obj, grasp)
-
-
-class CollisionFreeHolding(Constraint):
-    def __init__(self, obj, grasp, *params):
-        super().__init__(obj, grasp, *params)
-
-
-class CollisionFreePlacement(Constraint):
-    def __init__(self, obj, placement, surface):
-        super().__init__(obj, placement, surface)
-
-
 class KinematicConstraint(Constraint):
     def __init__(self, conf, target_pose):
         super().__init__(conf, target_pose)

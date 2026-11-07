@@ -7,30 +7,6 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import itertools
-from typing import Callable, Optional, Sequence
-
 from .base_structs import Atom, Fluent, GroundOperator, Operator, OperatorMetadata, Parameter, State
 from .tamp_structs import Constraint, Cost, GroundTAMPOperator, PlanSkeleton, TAMPOperator
-from .search import breadth_first_search
-
-
-def task_plan_generator(
-    initial: State,
-    goal: State,
-    operators: Sequence[Operator],
-    max_plan_skeletons: int = 99999,
-    ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
-) -> Sequence[PlanSkeleton]:
-    """Iterator that yields task plans.
-
-    When ``ground_op_priority_fn`` is provided, BFS sorts ground operators
-    by ascending priority at each expansion step (closer-arm picks first
-    for the arm-affinity case). Cross-body groundings are still enumerated,
-    just later in the order — BFS naturally backtracks if same-side fails.
-    """
-    plan_iter = breadth_first_search(
-        initial, goal, operators,
-        ground_op_priority_fn=ground_op_priority_fn,
-    )
-    yield from itertools.islice(plan_iter, max_plan_skeletons)
+from .search import breadth_first_search as task_plan_generator  # yields task plans, breadth first

@@ -64,16 +64,5 @@ class Constraint(ABC):
         return f"{name}({', '.join(map(str, self.params))})"
 
 
-class Cost(ABC):
-    def __init__(self, *params):
-        self.params = params
-
-    type = _TypeName()
-
-    def ground(self, substitutions: dict[str, str]) -> "Cost":
-        atoms = [substitutions[param.name] for param in self.params]
-        return self.__class__(*atoms)
-
-    def __repr__(self):
-        name = self.__class__.__name__
-        return f"{name}({', '.join(map(str, self.params))})"
+class Cost(Constraint):
+    """A cost on an operator's parameters; it grounds and prints as a constraint does."""

@@ -10,15 +10,13 @@
 """Core cuTAMP algorithm implementation."""
 
 import logging
-from datetime import datetime
 from typing import Callable, List, Union, Optional, Tuple
-from unittest.mock import Mock
 
 import numpy as np
 import torch
 from curobo.types import DeviceCfg as TensorDeviceType
 
-from cutamp.com_polygon_cost import compute_com_margin
+from cutamp.com_polygon_cost import particle_com_margin
 from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
@@ -135,7 +133,6 @@ def sample_plan_skeleton(
     timer: TorchTimer,
     plan_count: int,
     constraint_checker: ConstraintChecker,
-    cost_reducer: CostReducer,
     particle_initializer: ParticleInitializer,
 ) -> Tuple[Union[dict, None], bool]:
     """
@@ -153,7 +150,7 @@ def sample_plan_skeleton(
         return None, False
 
     # Rollout particles and compute costs
-    rollout_fn = RolloutFunction(plan_skeleton, world, config)
+    rollout_fn = RolloutFunction(plan_skeleton, world)
     cost_fn = CostFunction(plan_skeleton, world, config)
     with timer.time("measure_heuristic"), torch.no_grad():
         rollout = rollout_fn(plan_particles)
@@ -165,15 +162,6 @@ def sample_plan_skeleton(
         satisfying_mask = constraint_checker.get_mask(cost_dict)
     num_satisfying = satisfying_mask.sum().item()
 
-    # Best cost initially
-    with timer.time("compute_best_cost"):
-        costs = cost_reducer(cost_dict, consider_types={"constraint", "cost"})
-        if satisfying_mask.any():
-            best_cost = costs[satisfying_mask].min().item()
-            best_soft_cost = cost_reducer.soft_costs(cost_dict)[satisfying_mask].min().item()
-        else:
-            best_cost, best_soft_cost = float("inf"), float("inf")
-
     plan_info = {
         "idx": plan_count,
         "plan_skeleton": plan_skeleton,
@@ -182,8 +170,6 @@ def sample_plan_skeleton(
         "cost_fn": cost_fn,
         "heuristic": heuristic,
         "num_satisfying": num_satisfying,
-        "best_cost": best_cost,
-        "best_soft_cost": best_soft_cost,
     }
 
     _log.debug(
@@ -201,7 +187,7 @@ def _motion_plan_with_retries(
     timer: TorchTimer,
     visualizer,
     get_planner=None,
-) -> Tuple[Optional[dict], Optional[dict], bool, int, Optional[int], List[str]]:
+) -> Tuple[Optional[dict], Optional[dict], int, Optional[int], List[str]]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
@@ -212,13 +198,11 @@ def _motion_plan_with_retries(
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
 
-    Returns ``(curobo_plan, audit, skip_plan, attempts, rank, failures)``:
+    Returns ``(curobo_plan, audit, attempts, rank, failures)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
         failed.
       - ``audit``: the measure-only trajectory CoM audit dict from
         ``solve_curobo``, or ``None`` if all candidates failed.
-      - ``skip_plan``: ``True`` if a ``NotImplementedError`` was raised — the
-        caller should skip this plan_skeleton entirely and move on.
       - ``attempts``: number of candidates actually planned (skips excluded).
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
@@ -242,12 +226,7 @@ def _motion_plan_with_retries(
                 _log.warning(
                     f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
                 )
-            return curobo_plan, audit, False, tried, rank, failures
-        except NotImplementedError as e:
-            _log.warning(
-                f"Motion planning not supported for this plan: {e}. Trying next plan..."
-            )
-            return None, None, True, tried, None, failures
+            return curobo_plan, audit, tried, rank, failures
         except RuntimeError as e:
             _log.warning(
                 f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
@@ -264,38 +243,25 @@ def _motion_plan_with_retries(
         f"Exhausted {len(candidates)} particle retries ({tried} planned); giving up on this plan. "
         f"Last error: {last_err}"
     )
-    return None, None, False, tried, None, failures
+    return None, None, tried, None, failures
 
 
-def _com_margin(world: TAMPWorld, particle: dict) -> float:
-    """One particle's CoM margin: the min over its confs, as optimize_plan computes ``best_com_margin``."""
-    return min(
-        compute_com_margin(world, v.unsqueeze(0)).item()
-        for k, v in particle.items() if k.startswith(("left_q", "right_q", "q")) and v.ndim == 1
-    )
-
-
-def _planned_metrics(world: TAMPWorld, metrics: dict, candidates: List[dict], rank: int) -> dict:
+def _planned_metrics(world: TAMPWorld, candidates: List[dict], rank: int) -> dict:
     """The planned particle's rank and CoM margin. ``best_com_margin`` is rank 0's; after a retry the plan comes
     from another particle (known-bugs N3)."""
-    out = {"motion_plan_rank": rank}
-    if metrics.get("best_com_margin") is not None:  # the CoM summary ran for this world
-        out["planned_com_margin"] = _com_margin(world, candidates[rank])
-    return out
+    return {"motion_plan_rank": rank, "planned_com_margin": particle_com_margin(world, candidates[rank])}
 
 
 def setup_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
     q_init: Optional[List[float]] = None,
-    experiment_id: Optional[str] = None,
+    *,
+    experiment_id: str,
 ):
     # Validate args and setup experiment logger
     validate_tamp_config(config)
-    if experiment_id is None:
-        experiment_id = datetime.now().isoformat().split(".")[0]
-
-    exp_logger = ExperimentLogger(name=experiment_id, config=config) if config.enable_experiment_logging else Mock()
+    exp_logger = ExperimentLogger(name=experiment_id, config=config)
     exp_logger.save_env(env)
 
     # Loading robot can be done offline, so doesn't count towards timing
@@ -317,8 +283,6 @@ def setup_cutamp(
             robot=robot_container,
             q_init=q_init,
             collision_activation_distance=0.0,
-            coll_n_spheres=config.coll_n_spheres,
-            coll_sphere_radius=config.coll_sphere_radius,
         )
         check_tamp_world_not_in_collision(world)
 
@@ -338,14 +302,15 @@ def run_cutamp(
     cost_reducer: CostReducer,
     constraint_checker: ConstraintChecker,
     q_init: Optional[List[float]] = None,
-    experiment_id: Optional[str] = None,
+    *,
+    experiment_id: str,
 ):
     """Overall cuTAMP algorithm implementation."""
-    exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id)
+    exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
     particle_initializer = ParticleInitializer(world, config, constraint_checker)
 
     # Build the trajopt planner on a background thread, overlapped with
-    # particle init and Phase 1. The build runs no solves, so no CUDA graph
+    # particle init and the Adam loop. The build runs no solves, so no CUDA graph
     # capture overlaps the main thread (see build_motion_planner). Concurrent
     # cuRobo use is only safe with the fork's per-stream warp wrapper cache
     # (curobo/_src/util/warp.py): warp's stream registry is unlocked, and a
@@ -399,7 +364,7 @@ def run_cutamp(
         for idx in range(config.num_initial_plans):
             try:
                 plan_info, has_solution = sample_plan_skeleton(
-                    plan_gen, world, config, timer, idx, constraint_checker, cost_reducer, particle_initializer
+                    plan_gen, world, config, timer, idx, constraint_checker, particle_initializer
                 )
                 if plan_info is None:
                     _log.debug("failed subgraph, skipping...")
@@ -414,11 +379,8 @@ def run_cutamp(
                 break
             plan_count += 1
 
-    def sort_plans():
-        with timer.time("sort_plans"):
-            plan_queue.sort(key=lambda x: x["heuristic"])
-
-    sort_plans()
+    with timer.time("sort_plans"):
+        plan_queue.sort(key=lambda x: x["heuristic"])
     _log.info(f"Num plans: {len(plan_queue)}, num skipped: {num_skipped_plans}")
     overall_metrics = {
         "num_optimized_plans": 0,
@@ -472,17 +434,17 @@ def run_cutamp(
                     plan_info, config, constraint_checker, cost_reducer,
                     n=config.motion_plan_max_retries,
                 )
-                curobo_plan, traj_audit, skip_plan, attempts, rank, failures = _motion_plan_with_retries(
+                curobo_plan, traj_audit, attempts, rank, failures = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
                     get_planner=get_planner,
                 )
                 overall_metrics["motion_plan_success"] = bool(curobo_plan)
                 overall_metrics["motion_plan_attempts"] = attempts
                 overall_metrics["motion_plan_failures"] += failures
-                if skip_plan or curobo_plan is None:
+                if curobo_plan is None:
                     continue
                 overall_metrics.update(traj_audit)
-                overall_metrics.update(_planned_metrics(world, metrics, candidates, rank))
+                overall_metrics.update(_planned_metrics(world, candidates, rank))
             found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
@@ -491,13 +453,6 @@ def run_cutamp(
 
         if should_break:
             break
-
-        # TODO: complete version of our algorithm that adds additional skeletons to the queue, resorts, revisits
-        #  skeletons, etc.
-        # new_plan_info = sample_plan_skeleton()
-        # if new_plan_info is not None:
-        #     plan_queue.append(new_plan_info)
-        #     sort_plans()
 
     opt_elapsed = timer.stop("start_optimization")
     _log.debug(f"Optimization loop took roughly {opt_elapsed:.2f}s")

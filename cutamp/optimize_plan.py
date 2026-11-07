@@ -22,11 +22,11 @@ from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
 )
-from cutamp.config import TAMPConfiguration, uses_cuda_graphs
+from cutamp.com_polygon_cost import particle_com_margin
+from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
-from cutamp.costs import curobo_pose_error
 from cutamp.gn_refresh import gn_gate, gn_project_balanced
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
 from cutamp.rollout import RolloutFunction, movable_spheres_fn
@@ -101,7 +101,7 @@ def _build_ik_deps(
 
 
 #: Cost types in the Adam loss: the hard constraints and the soft costs, which the periodic IK projection makes
-#: trainable (the covered Confs follow the Poses and Grasps that Adam moves).
+#: trainable (the covered Confs follow the Poses that Adam moves; grasps stay as sampled).
 ADAM_CONSIDER_TYPES = frozenset(("constraint", "cost"))
 
 
@@ -147,9 +147,8 @@ class _StepBody:
         return packed, ((rollout, cost_dict, costs, satisfying_mask) if self.keep_vis else None)
 
     def clear_autograd(self) -> None:
-        """Drop the CoM cache and every param's ``.grad``: before a capture, so a deferred one's first warm-up
-        doesn't accumulate into the last eager step's grads, and after G_step's release, when both hold its pool."""
-        self.cost_fn._com_polygon_penalties_cache = None
+        """Drop every param's ``.grad``: before a capture, so a deferred one's first warm-up doesn't accumulate
+        into the last eager step's grads, and after G_step's release, when they hold its pool."""
         for p in self.params:
             p.grad = None
 
@@ -163,7 +162,7 @@ class PlanContainer(TypedDict):
 
 
 class _BestSnapshot:
-    """Track and restore the best-seen particle state during Adam Phase 1.
+    """Track and restore the best-seen particle state during the Adam loop.
 
     The satisfying count oscillates after convergence (±~50 particles with
     period ``reik_interval`` — re-IK repairs kinematic drift each refresh),
@@ -171,7 +170,7 @@ class _BestSnapshot:
     count; reset the early-stop patience clock only on *meaningful* progress:
     a count record beating the previous by ``MIN_DELTA``, or the best
     particle's total loss dropping by ``MIN_LOSS_DELTA`` (proxy for ongoing
-    pose-class soft-cost descent, which trains only in Phase 1).
+    pose-class soft-cost descent).
     """
 
     # ponytail: constants calibrated on one blocks_t1 trace (max record gap 35,
@@ -222,7 +221,7 @@ class _QueuedRefresh(NamedTuple):
     step: int
     q_names: Tuple[str, ...]
     batch: int
-    packed: torch.Tensor  # [D, k]: _ReikDriftGate._pack
+    packed: torch.Tensor  # [D, 3]: _ReikDriftGate._pack
     start: torch.cuda.Event
     end: torch.cuda.Event
 
@@ -231,81 +230,36 @@ class _ReikDriftGate:
     """Per-refresh instrumentation for the re-IK subsystem, plus the checker
     tolerances the GN merge gate tests against.
 
-    Records per dep-refresh: target drift since the previous refresh
-    (``curobo_pose_error``, the checker's own metric), solve time, failure counts, and the pose/CoM split
-    of merge-gate misses. Lands in ``opt_metrics["reik_refresh"]``.
-    Refreshes keep their stats on the device until :meth:`flush`.
-
-    NOTE three removed mechanisms (git history has the code): a
-    triangle-inequality drift-SKIP path (cuRobo pads sub-capacity batches so
-    per-particle skips save nothing, and the all-512-fresh dep-skip never
-    fired in any run), a fallback cooldown (fallbacks are dominated by fresh
-    churn misses; withholding repair starved the satisfying pool and the
-    early-stop signal), and balance-first mode's stall-gated cuRobo fallback
-    (never calling cuRobo during Adam matched or beat it).
+    Records per dep-refresh: solve time and the merge-gate misses, split by pose and CoM. Lands in
+    ``opt_metrics["reik_refresh"]``. Refreshes keep their stats on the device until :meth:`flush`.
     """
 
-    # Drift histogram bucket edges (metres) recorded per refresh.
-    _BUCKETS = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
-
-    def __init__(self, num_deps: int, pos_tol: float, rot_tol: float):
+    def __init__(self, pos_tol: float, rot_tol: float):
         self.pos_tol = pos_tol
         self.rot_tol = rot_tol
-        self.refs = [None] * num_deps  # [B, 4, 4] target at previous refresh; stale once G_refresh is captured
         self.stats: List[dict] = []
         self._queued: List[_QueuedRefresh] = []  # refreshes awaiting flush()
 
-    def measure_drift(self, dep_idx: int, target: torch.Tensor):
-        """``(pos_drift, rot_drift)`` vs the previous refresh's targets
-        (``None`` on the first refresh); advances the reference."""
-        ref = self.refs[dep_idx]
-        self.refs[dep_idx] = target.clone()
-        if ref is None:
-            return None, None
-        return curobo_pose_error(ref, target)
-
-    def _drift_stats(self, pos_drift: torch.Tensor, rot_drift: torch.Tensor) -> List[torch.Tensor]:
-        """Drift summary over the last dim: pos mean, pos max, rot max, then
-        the fraction of pos drift under each ``_BUCKETS`` edge."""
-        return [
-            pos_drift.mean(-1), pos_drift.amax(-1), rot_drift.amax(-1),
-            *((pos_drift < b).float().mean(-1) for b in self._BUCKETS),
-        ]
-
-    def _append_record(self, step, q_name, batch, n_fail, solve_s, drift, gn_fail, gn_fail_pose, gn_fail_com):
-        """Append one ``stats`` record. ``drift`` is :meth:`_drift_stats` as
-        Python floats, or ``None`` on the first refresh."""
+    def _append_record(self, step, q_name, batch, solve_s, gn_fail, gn_fail_pose, gn_fail_com):
+        """Append one ``stats`` record."""
         # solve_s: the refresh's CUDA-event span (a G_refresh replay's also covers the stats packing) split evenly
         # over its deps.
-        rec = {
-            "step": step, "conf": q_name, "batch": batch,
-            "n_ik_fail": n_fail, "solve_s": round(solve_s, 4),
-        }
-        # Rows the projection missed, split by which merge-gate criterion failed (a row can fail both). No cuRobo
-        # runs during Adam, so "n_ik_fail" equals gn_fail.
+        rec = {"step": step, "conf": q_name, "batch": batch, "solve_s": round(solve_s, 4)}
+        # Rows the projection missed, split by which merge-gate criterion failed (a row can fail both).
         rec["gn_fail"] = gn_fail
         rec["gn_fail_pose"] = gn_fail_pose
         rec["gn_fail_com"] = gn_fail_com
-        if drift is not None:
-            pos_mean, pos_max, rot_max, *below = drift
-            rec["pos_drift_mean"] = pos_mean
-            rec["pos_drift_max"] = pos_max
-            rec["rot_drift_max"] = rot_max
-            rec["frac_drift_below"] = {f"{b * 1e3:g}mm": f for b, f in zip(self._BUCKETS, below)}
         self.stats.append(rec)
 
-    def _pack(self, D: int, batch: int, ok, pose_ok, com_ok, pos_drift, rot_drift) -> torch.Tensor:
-        """A balance-first refresh's stats as a ``[D, k]`` float32 device tensor: per dep, each mask's miss
-        count, then :meth:`_drift_stats` when there is drift (``k = 3`` or ``11``)."""
+    def _pack(self, D: int, batch: int, ok, pose_ok, com_ok) -> torch.Tensor:
+        """A balance-first refresh's stats as a ``[D, 3]`` float32 device tensor: per dep, each mask's miss
+        count."""
         cols = [(~m).view(D, batch).sum(-1) for m in (ok, pose_ok, com_ok)]
-        if pos_drift is not None:
-            cols += self._drift_stats(pos_drift.view(D, batch), rot_drift.view(D, batch))
         return torch.stack([c.float() for c in cols], dim=-1)
 
-    def log_batch(self, step: int, q_names: List[str], batch: int, ok, pose_ok, com_ok,
-                  pos_drift, rot_drift, start, end) -> None:
+    def log_batch(self, step: int, q_names: List[str], batch: int, ok, pose_ok, com_ok, start, end) -> None:
         """Queue one balance-first refresh's :meth:`_pack` and timing events for :meth:`flush`: no host read."""
-        packed = self._pack(len(q_names), batch, ok, pose_ok, com_ok, pos_drift, rot_drift)
+        packed = self._pack(len(q_names), batch, ok, pose_ok, com_ok)
         self._queued.append(_QueuedRefresh(step, tuple(q_names), batch, packed, start, end))
 
     def flush(self) -> None:
@@ -316,13 +270,10 @@ class _ReikDriftGate:
         self._queued[-1].end.synchronize()  # elapsed_time needs both events done
         values = iter(torch.cat([r.packed.view(-1) for r in self._queued]).tolist())
         for r in self._queued:
-            D, k = r.packed.shape
-            solve_s = r.start.elapsed_time(r.end) / 1e3 / D  # ms -> s, per dep
+            solve_s = r.start.elapsed_time(r.end) / 1e3 / len(r.q_names)  # ms -> s, per dep
             for q_name in r.q_names:
-                gn_fail, gn_fail_pose, gn_fail_com, *drift = (next(values) for _ in range(k))
-                gn_fail = int(gn_fail)
-                self._append_record(r.step, q_name, r.batch, gn_fail, solve_s, drift or None,
-                                    gn_fail, int(gn_fail_pose), int(gn_fail_com))
+                gn_fail, gn_fail_pose, gn_fail_com = (int(next(values)) for _ in range(3))
+                self._append_record(r.step, q_name, r.batch, solve_s, gn_fail, gn_fail_pose, gn_fail_com)
         self._queued.clear()
 
 
@@ -369,61 +320,45 @@ def _refresh_balanced(
     targets = [dep.target_fn(particles).detach() for dep in ik_deps]
     batch = targets[0].shape[0]
     assert all(t.shape[0] == batch for t in targets), [t.shape[0] for t in targets]
-    pos_drifts, rot_drifts = zip(*(gate.measure_drift(i, t) for i, t in enumerate(targets)))
-    first_refresh = pos_drifts[0] is None
 
     pose_ok, com_ok = _project_and_write_back(particles, ik_deps, world, torch.cat(targets), gate)
     end.record()
 
-    gate.log_batch(
-        step, q_names, batch, pose_ok & com_ok, pose_ok, com_ok,
-        None if first_refresh else torch.cat(pos_drifts),
-        None if first_refresh else torch.cat(rot_drifts),
-        start, end,
-    )
+    gate.log_batch(step, q_names, batch, pose_ok & com_ok, pose_ok, com_ok, start, end)
 
 
 class _StaticRefresh:
     """G_refresh: :func:`_refresh_balanced` captured as a CUDA graph and replayed at each later refresh.
 
-    Static I/O besides the particles: ``refs`` ``[D, B, 4, 4]``, advanced in place because a graph keeps
-    reading the tensor ``measure_drift`` would rebind, and ``slot`` ``[D, 11]``, the packed stats, which
-    :meth:`__call__` queues since a replay runs no Python. Captured right after an eager refresh, which
-    sizes the ``"gate"`` site and ``world.kinematics_jac`` for the ``D*B`` stack, fills gn_refresh's
-    cached constants (a miss is a host-to-device copy, which fails a capture) and sets ``gate.refs``.
+    Static I/O besides the particles: ``slot`` ``[D, 3]``, the packed stats, which :meth:`__call__` queues
+    since a replay runs no Python. Captured right after an eager refresh, which sizes the ``"gate"`` site and
+    ``world.kinematics_jac`` for the ``D*B`` stack and fills gn_refresh's cached constants (a miss is a
+    host-to-device copy, which fails a capture).
     """
 
     def __init__(self, particles: dict, ik_deps: List[IKDep], world: TAMPWorld, gate: _ReikDriftGate):
-        assert all(r is not None for r in gate.refs), "G_refresh is captured after an eager refresh sets gate.refs"
         self.particles, self.ik_deps, self.world, self.gate = particles, ik_deps, world, gate
-        self.refs = torch.stack(gate.refs)
-        self.slot = torch.zeros(len(ik_deps), 3 + 3 + len(gate._BUCKETS), device=self.refs.device)  # _pack's [D, 11]
         self.q_names = tuple(dep.q_name for dep in ik_deps)
-        self.batch = self.refs.shape[1]
+        self.batch = particles[self.q_names[0]].shape[0]
+        self.slot = torch.zeros(len(ik_deps), 3, device=world.device)  # _pack's [D, 3]
 
-        def warmup() -> None:  # on scratch copies: the body writes the confs and the refs
-            self.body({k: v.detach().clone() for k, v in particles.items()}, self.refs.detach().clone(),
-                      self.slot.detach().clone())
+        def warmup() -> None:  # on scratch copies: the body writes the confs
+            self.body({k: v.detach().clone() for k, v in particles.items()}, self.slot.detach().clone())
 
         # Guard every Kinematics the body runs; the eager refresh built both.
         self.graph = cuda_graphs.CapturedGraph(
-            "G_refresh", lambda: self.body(particles, self.refs, self.slot), warmup,
+            "G_refresh", lambda: self.body(particles, self.slot), warmup,
             ptrs=lambda: cuda_graphs.graph_ptrs(
-                [*particles.values(), self.refs, self.slot],
+                [*particles.values(), self.slot],
                 [world.site_kinematics("gate"), world.kinematics_jac],
             ),
         )
 
-    def body(self, particles: dict, refs: torch.Tensor, slot: torch.Tensor) -> None:
+    def body(self, particles: dict, slot: torch.Tensor) -> None:
         """:func:`_refresh_balanced`'s device work on static I/O, sync-free so it can be captured."""
         targets = [dep.target_fn(particles).detach() for dep in self.ik_deps]
-        drifts = [curobo_pose_error(refs[i], t) for i, t in enumerate(targets)]  # measure_drift's metric
-        for i, t in enumerate(targets):
-            refs[i].copy_(t)
-        pos_drifts, rot_drifts = zip(*drifts)
         pose_ok, com_ok = _project_and_write_back(particles, self.ik_deps, self.world, torch.cat(targets), self.gate)
-        slot.copy_(self.gate._pack(len(targets), self.batch, pose_ok & com_ok, pose_ok, com_ok,
-                                   torch.cat(pos_drifts), torch.cat(rot_drifts)))
+        slot.copy_(self.gate._pack(len(targets), self.batch, pose_ok & com_ok, pose_ok, com_ok))
 
     def __call__(self, step: int) -> None:
         """Replay G_refresh as the refresh at ``step`` and queue its stats for ``gate.flush()``."""
@@ -488,8 +423,7 @@ class ParticleOptimizer:
         visualizer.set_time_sequence(f"opt_{self.opt_counter}", step)
         q_last = rollout["confs"][best_idx, -1].tolist()
 
-        # v0.8: configs are the model's full cspace (T1: its 33 joints) or a
-        # single chain's DOF (others). T1RerunRobot maps them onto the URDF.
+        # Configs are the model's full cspace; T1RerunRobot maps them onto the URDF.
         visualizer.set_joint_positions(q_last)
         for obj in rollout["obj_to_pose"]:
             mat4x4_last = rollout["obj_to_pose"][obj][best_idx, -1]
@@ -510,7 +444,6 @@ class ParticleOptimizer:
         opt_metrics = {
             "plan_skeleton": [str(op) for op in plan_skeleton],
             "num_particles": self.config.num_particles,
-            "opt_params": {},
         }
 
         # Create parameter groups for the optimizer
@@ -532,13 +465,11 @@ class ParticleOptimizer:
         # Refresh instrumentation + the GN merge-gate tolerances, taken from
         # the live checker so the gate tracks whatever the run enforces.
         reik_gate = _ReikDriftGate(
-            len(ik_deps),
             pos_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err"),
             rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
         ) if ik_deps else None
 
         pairs = []  # (tensor, is a Conf) per optimized param, for _adam_param_groups
-        param_msg = []
         # Initial configurations that we don't optimize
         initial_confs = {"q0", "left_q0", "right_q0"}
         for param, val in particles.items():
@@ -555,9 +486,7 @@ class ParticleOptimizer:
                 # not by Adam, so nothing reads its gradient; skip computing it.
                 val.requires_grad = False
                 continue
-            param_msg.append(f"(param: {param} = {tuple(val.shape)})")
             pairs.append((val, param_type == Conf))
-            opt_metrics["opt_params"][param] = {"type": param_type, "shape": list(val.shape)}
             val.requires_grad = True
 
         if not pairs:
@@ -571,16 +500,6 @@ class ParticleOptimizer:
         grad_masks = build_grad_masks(
             plan_skeleton, particles, param_to_type, Conf, world.model,
         )
-        num_total_params = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
-        opt_metrics["optimizer"] = {
-            "optimizer_cls": optimizer.__class__.__name__,
-            "lr": self.config.lr,
-            "conf_lr": self.config.conf_lr,
-            "num_params": num_total_params,
-        }
-        _log.debug(f"Optimizing {num_total_params} parameters, {', '.join(param_msg)}")
-        total_dof = sum(p.shape[-1] for group in optimizer.param_groups for p in group["params"])
-        _log.debug(f"Total DOF for each particle: {total_dof}")
 
         indices = torch.arange(self.config.num_particles, device="cuda")
         consider_types = ADAM_CONSIDER_TYPES
@@ -597,7 +516,7 @@ class ParticleOptimizer:
         num_steps = self.config.num_opt_steps
         opt_metrics["num_steps"] = num_steps
 
-        # Phase 1 (Adam): find satisfying particles and descend the soft
+        # Adam: find satisfying particles and descend the soft
         # costs. Adam runs even when the IK init already satisfies, since the
         # goal is to actively move the Pose particles for the soft cost; the
         # init's satisfying particles are step 0's count.
@@ -625,7 +544,7 @@ class ParticleOptimizer:
             keep_vis=type(visualizer) is not Visualizer,
         )
         step_graph = refresh_graph = None
-        use_graphs = uses_cuda_graphs(self.config)
+        use_graphs = self.config.cuda_graphs
         if use_graphs:
             opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
         try:
@@ -742,13 +661,12 @@ class ParticleOptimizer:
                 f"re-IK refresh: {len(reik_gate.stats)} dep-refreshes, {total_s:.1f}s IK time"
             )
 
-        # Now we've finished the optimization loop. Check the satisfying particles and compute soft/hard costs.
+        # Now we've finished the optimization loop. Check the satisfying particles and compute their costs.
         with torch.no_grad():
             rollout = rollout_fn(particles)
             cost_dict = cost_fn(rollout, particles)
             costs = self.cost_reducer(cost_dict, consider_types=consider_types)
             soft_costs = self.cost_reducer.soft_costs(cost_dict)
-            hard_costs = self.cost_reducer.hard_costs(cost_dict)
             satisfying_mask = self.get_satisfying_mask(cost_dict, verbose=True)
         num_satisfying = satisfying_mask.sum().item()
         _log.info(f"{num_satisfying}/{self.config.num_particles} satisfying after optimization")
@@ -758,17 +676,12 @@ class ParticleOptimizer:
         # costs, as the Adam loss does (ADAM_CONSIDER_TYPES).
         best_cost = costs[satisfying_mask].min().item() if num_satisfying > 0 else None
         best_soft_cost = soft_costs[satisfying_mask].min().item() if num_satisfying > 0 else None
-        best_hard_cost = hard_costs[satisfying_mask].min().item() if num_satisfying > 0 else None
         if best_cost is not None:
-            _log.info(
-                f"Best particle cost: {best_cost:04f}, best soft cost: {best_soft_cost:04f}, "
-                f"best hard cost: {best_hard_cost:04f}"
-            )
+            _log.info(f"Best particle cost: {best_cost:04f}, best soft cost: {best_soft_cost:04f}")
         else:
             _log.info("No satisfying particles found at end of optimization")
         opt_metrics["best_cost"] = best_cost
         opt_metrics["best_soft_cost"] = best_soft_cost
-        opt_metrics["best_hard_cost"] = best_hard_cost
 
         # Visualize rollout of the best particle in terms of soft costs, which is just trajectory length if no
         # other soft costs are specified. If no satisfying particles, just visualize lowest overall cost particle.
@@ -778,40 +691,8 @@ class ParticleOptimizer:
         else:
             best_idx = costs.argmin()
         best_idx_int = int(best_idx.item())
-
-        # Post-optimization COM-polygon visibility: report per-conf how many
-        # final particles' configurations are inside the foot-realistic
-        # support polygon. Useful diagnostic — COM is a soft cost (not in
-        # the constraint_checker output) so without this you'd only see the
-        # aggregate soft cost number.
-        try:
-            from cutamp.com_polygon_cost import compute_com_polygon_mask
-            conf_names = sorted(
-                p for p in particles
-                if p.startswith(("left_q", "right_q", "q")) and particles[p].ndim == 2
-            )
-            if conf_names:
-                conf_to_mask = {
-                    cn: compute_com_polygon_mask(rollout_fn.world, particles[cn])
-                    for cn in conf_names
-                }
-                com_summary = [
-                    f"{cn} {int(mask.sum().item())}/{mask.shape[0]}"
-                    for cn, mask in conf_to_mask.items()
-                ]
-                _log.info("COM-in-polygon (per conf): " + ", ".join(com_summary))
-                opt_metrics["com_in_polygon_per_conf"] = {
-                    cn: int(mask.sum().item()) for cn, mask in conf_to_mask.items()
-                }
-                # Margin of the selected best particle: min over its confs.
-                from cutamp.com_polygon_cost import compute_com_margin
-                margins = [
-                    compute_com_margin(rollout_fn.world, particles[cn][best_idx_int : best_idx_int + 1]).item()
-                    for cn in conf_names
-                ]
-                opt_metrics["best_com_margin"] = min(margins) if margins else None
-        except Exception as e:
-            _log.warning(f"COM-in-polygon summary skipped: {e}")
+        # Measure only: the selected best particle's CoM margin, the min over its confs.
+        opt_metrics["best_com_margin"] = particle_com_margin(world, {k: v[best_idx_int] for k, v in particles.items()})
 
         # Log initial state
         timer.start("visualize_rollout")

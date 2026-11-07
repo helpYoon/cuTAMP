@@ -7,9 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True     /home/yoonwoo/miniconda3/envs/tamp/bin/python -m cutamp.scripts.run_cutamp     -n 64 --num_opt_steps 50  --surface_height 0.50 --soft_cost place_close_to_base joint_limit_margin minimize_body_movement  --motion_plan --save_plan data/motion_plan.pkl
-"""
+"""Run cuTAMP on blocks_t1, e.g. ``python -m cutamp.scripts.run_cutamp -n 64 --motion_plan --save_plan``."""
 
 import logging
 import os
@@ -53,8 +51,7 @@ def cutamp_demo(
     constraint_checker = ConstraintChecker(default_constraint_to_tol.copy())
 
     # Resolve experiment_id up front so the --save_plan output path lines up
-    # with the directory ExperimentLogger writes its other artifacts to (it
-    # would otherwise generate its own timestamp inside run_cutamp).
+    # with the directory ExperimentLogger writes its other artifacts to.
     if experiment_id is None:
         from datetime import datetime
         experiment_id = datetime.now().isoformat().split(".")[0]
@@ -113,7 +110,7 @@ def entrypoint():
     )
     parser.add_argument(
         "--cuda_graphs", dest="cuda_graphs", action="store_true",
-        help="Replay the Adam step and re-IK refresh as CUDA graphs. On by default; align_yaw runs stay eager.",
+        help="Replay the Adam step and re-IK refresh as CUDA graphs. On by default.",
     )
     parser.add_argument(
         "--no_cuda_graphs", dest="cuda_graphs", action="store_false",
@@ -138,7 +135,7 @@ def entrypoint():
         help="Stop Adam early after this many steps without meaningful progress (0 disables).",
     )
     parser.add_argument(
-        "--lr", type=float, default=_defaults.lr, help="Adam LR for non-Conf particle params (poses, grasps).",
+        "--lr", type=float, default=_defaults.lr, help="Adam LR for non-Conf particle params (poses).",
     )
     parser.add_argument(
         "--conf_lr", type=float, default=_defaults.conf_lr,

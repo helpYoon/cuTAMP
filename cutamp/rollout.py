@@ -20,7 +20,6 @@ import torch
 
 from curobo.types import JointState
 
-from cutamp.config import TAMPConfiguration
 from cutamp.t1_domain import Conf
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
@@ -139,7 +138,6 @@ class Rollout(TypedDict):
     robot_spheres: torch.Tensor  # [num_particles, *h, n, 4]
     world_from_ee: torch.Tensor  # [num_particles, *h, 4, 4]
     world_from_soles: torch.Tensor  # [num_particles, *h, 2, 4, 4]
-    world_from_tool_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     world_from_ee_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     gripper_close: List[bool]
     action_params: List[str]
@@ -155,65 +153,51 @@ class RolloutFunction:
     timestep we select the active arm's tool-frame pose from the FK output.
     """
 
-    def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration):
+    def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld):
         self.plan_skeleton = plan_skeleton
         self.world = world
-        self.config = config
         self.conf_params = get_conf_parameters(plan_skeleton)
         self.conf_to_arm = get_conf_to_arm(plan_skeleton)
         self.obj_to_initial_pose = {
             obj.name: self.world.get_object_pose(obj) for obj in self.world.movables
         }
 
-        self.grasp_to_mat4x4_fn = action_4dof_to_mat4x4
-
-        self._is_first_rollout = True
-
     def __call__(self, particles: Particles) -> Rollout:
         num_particles = particles["left_q0"].shape[0]
-        sole_frames = self.world.model.sole_frames
 
-        # Stack and FK in one shot. confs shape: (num_particles, num_timesteps, dof).
-        if self.conf_params:
-            confs = torch.stack([particles[c] for c in self.conf_params], dim=1)
-        else:
-            confs = torch.empty(num_particles, 0, 0, device=self.world.device)
+        # Stack and FK in one shot. confs shape: (num_particles, num_timesteps, dof). Every plan picks and places,
+        # so there is at least one actionable conf.
+        confs = torch.stack([particles[c] for c in self.conf_params], dim=1)
+        confs_flat = confs.view(-1, confs.shape[-1])
+        js = JointState.from_position(confs_flat)
+        kin_state = self.world.site_kinematics("rollout").compute_kinematics(js)
+        ee_pose = kin_state.tool_poses  # ToolPose [B*H, 1, num_links, 3/4]
 
-        if confs.shape[1] > 0:
-            confs_flat = confs.view(-1, confs.shape[-1])
-            js = JointState.from_position(confs_flat)
-            kin_state = self.world.site_kinematics("rollout").compute_kinematics(js)
-            ee_pose = kin_state.tool_poses  # ToolPose [B*H, 1, num_links, 3/4]
+        # Per-timestep ee selection: for each conf, pick that arm's tool frame.
+        # Build the 4x4 matrix once per unique tool frame (≤2 for T1), then
+        # index per timestep. ee_pose flattens [num_particles, num_timesteps]
+        # into B*H, so reshaping recovers the per-timestep axis.
+        conf_frames = [
+            self.world.tool_frame_for_arm(self.conf_to_arm.get(conf_name))
+            for conf_name in self.conf_params
+        ]
+        frame_to_mat = {
+            frame: _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True))
+            .view(num_particles, confs.shape[1], 4, 4)
+            for frame in dict.fromkeys(conf_frames)
+        }
+        world_from_ee = torch.stack(
+            [frame_to_mat[frame][:, t] for t, frame in enumerate(conf_frames)], dim=1
+        )
+        # Both soles at every conf, for the kinematic constraint's check against the stance (design 7.4). Adam
+        # differentiates its sole_rot_err, so they go through _link_matrix like the hands.
+        world_from_soles = torch.stack([
+            _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True)).view(*confs.shape[:2], 4, 4)
+            for frame in self.world.model.sole_frames
+        ], dim=2)
 
-            # Per-timestep ee selection: for each conf, pick that arm's tool frame.
-            # Build the 4x4 matrix once per unique tool frame (≤2 for T1), then
-            # index per timestep. ee_pose flattens [num_particles, num_timesteps]
-            # into B*H, so reshaping recovers the per-timestep axis.
-            conf_frames = [
-                self.world.tool_frame_for_arm(self.conf_to_arm.get(conf_name))
-                for conf_name in self.conf_params
-            ]
-            frame_to_mat = {
-                frame: _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True))
-                .view(num_particles, confs.shape[1], 4, 4)
-                for frame in dict.fromkeys(conf_frames)
-            }
-            world_from_ee = torch.stack(
-                [frame_to_mat[frame][:, t] for t, frame in enumerate(conf_frames)], dim=1
-            )
-            # Both soles at every conf, for the kinematic constraint's check against the stance (design 7.4). Adam
-            # differentiates its sole_rot_err, so they go through _link_matrix like the hands.
-            world_from_soles = torch.stack([
-                _link_matrix(ee_pose.get_link_pose(frame, make_contiguous=True)).view(*confs.shape[:2], 4, 4)
-                for frame in sole_frames
-            ], dim=2)
-
-            # Robot spheres: shared across tool frames; reshape directly.
-            robot_spheres = kin_state.robot_spheres.view(num_particles, confs.shape[1], -1, 4)
-        else:
-            world_from_ee = torch.empty(num_particles, 0, 4, 4, device=self.world.device)
-            world_from_soles = torch.empty(num_particles, 0, len(sole_frames), 4, 4, device=self.world.device)
-            robot_spheres = torch.empty(num_particles, 0, 0, 4, device=self.world.device)
+        # Robot spheres: shared across tool frames; reshape directly.
+        robot_spheres = kin_state.robot_spheres.view(num_particles, confs.shape[1], -1, 4)
 
         # Walk operators to produce action targets.
         world_from_tool_desired: List[torch.Tensor] = []
@@ -227,7 +211,7 @@ class RolloutFunction:
 
         def get_grasp_mat4x4(grasp_name_: str) -> torch.Tensor:
             if grasp_name_ not in grasp_to_mat4x4:
-                grasp_to_mat4x4[grasp_name_] = self.grasp_to_mat4x4_fn(particles[grasp_name_])
+                grasp_to_mat4x4[grasp_name_] = action_4dof_to_mat4x4(particles[grasp_name_])
             return grasp_to_mat4x4[grasp_name_]
 
         obj_to_pose = {
@@ -278,37 +262,18 @@ class RolloutFunction:
             ts_to_pose_ts[ts] = pose_ts
             ts += 1
 
-        world_from_tool_desired = (
-            torch.stack(world_from_tool_desired, dim=1)
-            if world_from_tool_desired
-            else torch.empty(num_particles, 0, 4, 4, device=self.world.device)
-        )
+        world_from_tool_desired = torch.stack(world_from_tool_desired, dim=1)
 
         # world_from_ee_desired: per-action arm-specific tool_from_ee.
-        if action_params:
-            ee_desired_list = []
-            for i, action in enumerate(action_params):
-                arm = action_to_arm.get(action)
-                tool_frame = self.world.tool_frame_for_arm(arm)
-                tool_from_ee = self.world.tool_from_ee[tool_frame]
-                ee_desired_list.append(world_from_tool_desired[:, i] @ tool_from_ee)
-            world_from_ee_desired = torch.stack(ee_desired_list, dim=1)
-        else:
-            world_from_ee_desired = torch.empty(num_particles, 0, 4, 4, device=self.world.device)
+        ee_desired_list = []
+        for i, action in enumerate(action_params):
+            arm = action_to_arm.get(action)
+            tool_frame = self.world.tool_frame_for_arm(arm)
+            tool_from_ee = self.world.tool_from_ee[tool_frame]
+            ee_desired_list.append(world_from_tool_desired[:, i] @ tool_from_ee)
+        world_from_ee_desired = torch.stack(ee_desired_list, dim=1)
 
         obj_to_pose = {k: torch.stack(v, dim=1) for k, v in obj_to_pose.items()}
-
-        if self._is_first_rollout:
-            assert (
-                confs.shape[1]
-                == world_from_ee.shape[1]
-                == world_from_ee_desired.shape[1]
-                == world_from_tool_desired.shape[1]
-                == ts
-            ), "Number of timesteps do not match"
-            for obj, poses in obj_to_pose.items():
-                assert poses.shape[1] == pose_ts + 1, f"pose_ts mismatch for {obj}"
-            self._is_first_rollout = False
 
         return Rollout(
             num_particles=num_particles,
@@ -317,7 +282,6 @@ class RolloutFunction:
             robot_spheres=robot_spheres,
             world_from_ee=world_from_ee,
             world_from_soles=world_from_soles,
-            world_from_tool_desired=world_from_tool_desired,
             world_from_ee_desired=world_from_ee_desired,
             gripper_close=gripper_close,
             action_params=action_params,

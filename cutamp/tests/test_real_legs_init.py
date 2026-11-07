@@ -129,7 +129,7 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
         particles[retracts[0]][0] = hips_crossed(real_world)
         particles[retracts[0]][1, z] = real_world.joint_limits[0][z] - 0.05  # under the base's floor, the legs' reach
         cost_dict = CostFunction(skeleton, real_world, config)(
-            RolloutFunction(skeleton, real_world, config)(particles), particles)
+            RolloutFunction(skeleton, real_world)(particles), particles)
     assert ComPolygon.type in cost_dict  # the CoM is a hard constraint at every conf
     values = cost_dict[Motion.type]["values"]
     joint_limit, self_collision = values["retract_joint_limit"], values["retract_self_collision"]

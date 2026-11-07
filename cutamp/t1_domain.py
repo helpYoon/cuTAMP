@@ -19,15 +19,7 @@ parameter names. This keeps the domain compatible with the existing task planner
 from typing import Sequence
 
 from cutamp.task_planning import Fluent, OperatorMetadata, Parameter, TAMPOperator, State
-from cutamp.task_planning.constraints import (
-    CollisionFree,
-    CollisionFreeGrasp,
-    CollisionFreeHolding,
-    CollisionFreePlacement,
-    KinematicConstraint,
-    Motion,
-    StablePlacement,
-)
+from cutamp.task_planning.constraints import KinematicConstraint, Motion, StablePlacement
 from cutamp.task_planning.costs import TrajectoryLength
 
 # Types
@@ -118,7 +110,7 @@ LeftMoveFree = TAMPOperator(
     preconditions=[LeftAt(q_start), LeftHandEmpty(), LeftCanMove(), RightCanMove()],  # Require RightCanMove to prevent interleaving
     add_effects=[LeftAt(q_end), LeftJustMoved()],
     del_effects=[LeftAt(q_start), LeftCanMove(), RightCanMove()],  # Block right arm until LeftPick completes
-    constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    constraints=[Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="left"),
 )
@@ -129,7 +121,7 @@ RightMoveFree = TAMPOperator(
     preconditions=[RightAt(q_start), RightHandEmpty(), RightCanMove(), LeftCanMove()],  # Require LeftCanMove to prevent interleaving
     add_effects=[RightAt(q_end), RightJustMoved()],
     del_effects=[RightAt(q_start), RightCanMove(), LeftCanMove()],  # Block left arm until RightPick completes
-    constraints=[CollisionFree(q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    constraints=[Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="right"),
 )
@@ -147,7 +139,7 @@ LeftMoveHolding = TAMPOperator(
     ],
     add_effects=[LeftAt(q_end), LeftJustMoved()],
     del_effects=[LeftAt(q_start), LeftCanMove(), RightCanMove()],  # Block right arm until LeftPlace completes
-    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    constraints=[Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="left"),
 )
@@ -164,7 +156,7 @@ RightMoveHolding = TAMPOperator(
     ],
     add_effects=[RightAt(q_end), RightJustMoved()],
     del_effects=[RightAt(q_start), RightCanMove(), LeftCanMove()],  # Block left arm until RightPlace completes
-    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_end), Motion(q_start, traj, q_end)],
+    constraints=[Motion(q_start, traj, q_end)],
     costs=[TrajectoryLength(q_start, traj, q_end)],
     metadata=OperatorMetadata(is_motion=True, arm="right"),
 )
@@ -185,7 +177,7 @@ LeftPick = TAMPOperator(
         LeftJustPicked(),  # Trigger retract after pick
     ],
     del_effects=[LeftHandEmpty(), LeftJustMoved(), HasNotPickedUp(obj)],
-    constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
+    constraints=[KinematicConstraint(q, grasp)],
     costs=[],
     metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="left"),
 )
@@ -206,7 +198,7 @@ RightPick = TAMPOperator(
         RightJustPicked(),  # Trigger retract after pick
     ],
     del_effects=[RightHandEmpty(), RightJustMoved(), HasNotPickedUp(obj)],
-    constraints=[KinematicConstraint(q, grasp), CollisionFreeGrasp(obj, grasp)],
+    constraints=[KinematicConstraint(q, grasp)],
     costs=[],
     metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="right"),
 )
@@ -230,7 +222,6 @@ LeftPlace = TAMPOperator(
     constraints=[
         KinematicConstraint(q, placement),
         StablePlacement(obj, grasp, placement, surface),
-        CollisionFreePlacement(obj, placement, surface),
     ],
     costs=[],
     metadata=OperatorMetadata(is_actionable=True, action_type="place", arm="left"),
@@ -255,7 +246,6 @@ RightPlace = TAMPOperator(
     constraints=[
         KinematicConstraint(q, placement),
         StablePlacement(obj, grasp, placement, surface),
-        CollisionFreePlacement(obj, placement, surface),
     ],
     costs=[],
     metadata=OperatorMetadata(is_actionable=True, action_type="place", arm="right"),
@@ -276,7 +266,7 @@ LeftRetractHolding = TAMPOperator(
     ],
     add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
     del_effects=[LeftAt(q_start), LeftJustPicked()],
-    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    constraints=[Motion(q_start, traj, q_retract)],
     costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
 )
@@ -292,7 +282,7 @@ RightRetractHolding = TAMPOperator(
     ],
     add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
     del_effects=[RightAt(q_start), RightJustPicked()],
-    constraints=[CollisionFreeHolding(obj, grasp, q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    constraints=[Motion(q_start, traj, q_retract)],
     costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
 )
@@ -307,7 +297,7 @@ LeftRetractFree = TAMPOperator(
     ],
     add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
     del_effects=[LeftAt(q_start), LeftJustPlaced()],
-    constraints=[CollisionFree(q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    constraints=[Motion(q_start, traj, q_retract)],
     costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
 )
@@ -322,7 +312,7 @@ RightRetractFree = TAMPOperator(
     ],
     add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
     del_effects=[RightAt(q_start), RightJustPlaced()],
-    constraints=[CollisionFree(q_start, traj, q_retract), Motion(q_start, traj, q_retract)],
+    constraints=[Motion(q_start, traj, q_retract)],
     costs=[],
     metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
 )

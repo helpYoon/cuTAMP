@@ -546,11 +546,10 @@ def test_movable_spheres_are_where_the_rollout_puts_the_objects(real_world, real
     # robot_to_movables spheres at that conf: the rollout's object poses at its timestep. TF32 off: the loop's TF32
     # matmuls round the two transforms' shapes differently, up to 0.12 mm.
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    from cutamp.config import TAMPConfiguration
     from cutamp.rollout import RolloutFunction, movable_spheres_fn
     from cutamp.utils.common import transform_spheres
     skeleton, particles = real_plan
-    rollout = RolloutFunction(skeleton, real_world, TAMPConfiguration(num_particles=64))(particles)
+    rollout = RolloutFunction(skeleton, real_world)(particles)
     spheres = torch.cat([transform_spheres(real_world.get_collision_spheres(obj), rollout["obj_to_pose"][obj.name])
                          for obj in real_world.movables], dim=2)
     ops = [(idx, op) for idx, op in enumerate(skeleton) if not op.operator.metadata.is_motion]
@@ -580,7 +579,7 @@ def test_kinematic_constraint_checks_the_soles(real_world, real_plan):
 
     skeleton, particles = real_plan
     config = TAMPConfiguration(num_particles=64)
-    rollout_fn, cost_fn = RolloutFunction(skeleton, real_world, config), CostFunction(skeleton, real_world, config)
+    rollout_fn, cost_fn = RolloutFunction(skeleton, real_world), CostFunction(skeleton, real_world, config)
     checker = ConstraintChecker(default_constraint_to_tol.copy())
     _, conf, _ = _first_pick(real_world, real_plan)
     t = rollout_fn.conf_params.index(conf)

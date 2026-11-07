@@ -13,21 +13,13 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration, uses_cuda_graphs, validate_tamp_config
+from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
     SpyVis, clone_particles, cupti_sync_events, install_refresh_spy, install_step_replay_spy, make_optimizer,
     make_plan_info, needs_cuda, run_optimizer,
 )
 from cutamp.tests.test_step_lockstep import _site_ptrs
 from cutamp.utils.timer import TorchTimer
-
-
-def test_uses_cuda_graphs():
-    # On by default; runs the graphs can't capture stay eager and still validate.
-    assert uses_cuda_graphs(TAMPConfiguration())
-    for kw in ({"cuda_graphs": False}, {"soft_cost": ["align_yaw"]}):
-        validate_tamp_config(TAMPConfiguration(**kw))
-        assert not uses_cuda_graphs(TAMPConfiguration(**kw)), kw
 
 
 def test_cli_defaults_on(monkeypatch):
@@ -115,8 +107,7 @@ def _graph_config(**kw):
 
 
 @needs_cuda
-@pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"),
-                                *(s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw")])
+@pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"), *SUPPORTED_SOFT_COSTS])
 def test_step_graph_captures_for_soft_cost(blocks_t1_plan, monkeypatch, sc):
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=2, soft_cost=[] if sc is None else [sc])
@@ -258,10 +249,10 @@ def test_loop_sync_audit(blocks_t1_plan, arm):
     # Each profiled step has the loop's 3 device syncs, the profiler's own and packed.tolist()'s copy
     # and stream sync; a refresh step adds 2 timing events. A G step is 1 graph launch (2 with the
     # refresh) plus the eager Adam step (the captured body alone is ~1,000 kernels, hence < 100);
-    # inside the graphs, the global-mode capture is the audit, and every capturable soft cost is on.
+    # inside the graphs, the global-mode capture is the audit, and every soft cost is on.
     world, skeleton, base = blocks_t1_plan
     config = _graph_config(num_opt_steps=50, cuda_graphs=arm == "G",
-                           soft_cost=[s for s in SUPPORTED_SOFT_COSTS if s != "align_yaw"])
+                           soft_cost=list(SUPPORTED_SOFT_COSTS))
     timer = _ProfilingTimer(range(40, 50))
     try:
         m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, timer=timer)
