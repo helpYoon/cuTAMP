@@ -62,9 +62,12 @@ _PINNED_SOURCES = {
     "curobo._src.util.warp:get_warp_device_stream": "ba0736c58155",
     "curobo._src.robot.kinematics.kinematics:Kinematics._forward": "c77db1c18ed6",
     "curobo._src.robot.dynamics.dynamics:Dynamics.compute_inverse_dynamics": "88bc59d7b638",
+    "curobo._src.solver.solver_trajopt:TrajOptSolver.get_all_rollout_instances": "284a926d8db7",
     "curobo._src.solver.solver_core:SolverCore.get_all_rollout_instances": "87a2594a222f",
     "curobo._src.rollout.cost_manager.cost_manager_robot:RobotCostManager.compute_costs": "06ce73fe202f",
     "curobo._src.collision.attachment_manager:AttachmentManager.attach_from_scene": "c11743a31b72",
+    "curobo._src.collision.attachment_manager:AttachmentManager.attach": "decf92a8d1f3",
+    "curobo._src.collision.attachment_manager:AttachmentManager._obstacles_to_trimesh": "db3f10e800cf",
     "curobo._src.collision.attachment_manager:AttachmentManager.update": "70e3f1f9c584",
 }
 
@@ -80,7 +83,8 @@ def add_extra_cost(planner, name: str, cost) -> None:
     for manager in (rollout.cost_manager for rollout in planner.trajopt_solver.optimizer_rollouts):
         def with_extra(state, cost_collection=None, goal=None, _compute=manager.compute_costs, **kwargs):
             cc = _compute(state, cost_collection=cost_collection, goal=goal, **kwargs)
-            cc.add(cost.forward(state), name)
+            if cost.enabled:
+                cc.add(cost.forward(state), name)
             return cc
 
         manager.compute_costs = with_extra

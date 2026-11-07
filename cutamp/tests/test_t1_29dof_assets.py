@@ -110,6 +110,7 @@ def test_copy_and_fixture_match_bfm_wm():
     assert str(_fixture()["t1_xml_sha1"]) == prov["not_copied"]["t1.xml"]["sha1"]
 
 
+@needs_cuda  # the builder probes cuRobo's joint order on CUDA
 def test_planner_model_regenerates_byte_identical(tmp_path):
     run = subprocess.run([sys.executable, str(T1_29DOF / "build_planner_model.py"), "--out", str(tmp_path)],
                          capture_output=True, text=True)

@@ -16,6 +16,20 @@ from cutamp.tests.conftest import needs_cuda
 _NAMES = [f"j{i}" for i in range(33)]
 
 
+def test_cspace_plan_succeeded_trusts_curobo_success():
+    """A plan cuRobo rejected stays rejected even though its trajectory ends exactly on the goal (cuRobo pins the last
+    waypoint there): Left_Ankle_Pitch past its limit mid-path, endpoint exact, ``cspace_error`` never set."""
+    ends_on_goal = SimpleNamespace(position=torch.zeros(1, 1, 4, 18), joint_names=None)
+
+    def result(success):
+        return SimpleNamespace(success=torch.tensor([[success]]), cspace_error=None,
+                               interpolated_trajectory=ends_on_goal, js_solution=ends_on_goal)
+
+    assert ms._cspace_plan_succeeded(result(False)) is False
+    assert ms._cspace_plan_succeeded(result(True)) is True
+    assert ms._cspace_plan_succeeded(None) is False
+
+
 def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
     # _plan_arm_to_conf must plan with plan_cspace to a target built FROM the
     # conf (not a Cartesian pose), and return the cuRobo result on success.

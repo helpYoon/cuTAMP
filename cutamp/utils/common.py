@@ -10,7 +10,7 @@
 from typing import Dict
 
 import torch
-from curobo.scene import Obstacle, Scene
+from curobo.scene import Cuboid, Cylinder, Mesh, Obstacle, Scene
 from roma import quat_wxyz_to_xyzw, unitquat_to_rotmat
 
 from cutamp.envs import TAMPEnvironment
@@ -88,8 +88,11 @@ def transform_points(
 
 
 def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
-    """World-frame AABB [[lower], [upper]] (float32, [2, 3]) of any obstacle: the bounds of cuRobo's posed trimesh,
-    so a rotated cuboid gets the box around all eight corners (a cylinder's or sphere's uses its tessellation)."""
+    """World-frame AABB [[lower], [upper]] (float32, [2, 3]) of a cuboid or mesh: the bounds of cuRobo's posed
+    trimesh, so a rotated cuboid gets the box around all eight corners. trimesh normalizes the pose's quaternion;
+    pose_list_to_mat4x4 does not. Other types raise (cuRobo's capsule trimesh ignores base/tip)."""
+    if not isinstance(goal, (Cuboid, Mesh)):
+        raise NotImplementedError(f"Goal type {type(goal)} not supported yet.")
     return torch.tensor(goal.get_trimesh_mesh(transform_with_pose=True).bounds, dtype=torch.float32)
 
 
@@ -98,5 +101,7 @@ def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene
     ``include_movables``."""
     scene = Scene()
     for obj in [*env.movables, *env.statics] if include_movables else env.statics:
+        if not isinstance(obj, (Cuboid, Cylinder, Mesh)):  # add_obstacle drops other types without raising
+            raise ValueError(f"Unknown object type: {type(obj)}")
         scene.add_obstacle(obj)
     return scene
