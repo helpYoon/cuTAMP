@@ -190,9 +190,8 @@ def test_real_legs_blocks_t1_end_to_end(tmp_path, monkeypatch):
 @pytest.fixture(scope="module")
 def planner(real_world):
     """``real_world``'s motion planner as solve_curobo builds it, built once."""
-    from cutamp.config import TAMPConfiguration
     from cutamp.motion_solver import build_motion_planner
-    with build_motion_planner(real_world, TAMPConfiguration()) as mp:
+    with build_motion_planner(real_world) as mp:
         yield mp
 
 

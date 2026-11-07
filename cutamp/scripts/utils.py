@@ -71,8 +71,8 @@ default_constraint_to_tol = {
     },
     # ComPolygon per-conf values are continuous penalty in m² from
     # compute_com_polygon_penalties. With the max-over-axes barrier, the
-    # on-boundary penalty (edge OR corner) == COM_TOL == inside_weight *
-    # inside_margin² = 4e-4, so "at the boundary or inside" satisfies and any
+    # on-boundary penalty (edge OR corner) == COM_TOL == COM_INSIDE_WEIGHT *
+    # COM_INSIDE_MARGIN² = 4e-4, so "at the boundary or inside" satisfies and any
     # excursion past an edge fails. "default" applies to every per-conf name
     # (left_q0, right_q1, ...).
     ComPolygon.type: {"default": COM_TOL},

@@ -66,6 +66,19 @@ def _without_com_level(monkeypatch):
     monkeypatch.setattr(gn_refresh, "_balanced_step", no_com)
 
 
+def _pose_errors(world, q, target, arm):
+    """``([B] pos_err, [B] rot_err)`` of ``q`` ``[B, dof]`` against ``target`` ``[B, 4, 4]`` on ``arm``'s tool frame,
+    from one FK on ``world.kinematics``, in the constraint checker's metric (``curobo_pose_error``)."""
+    from curobo.types import JointState, Pose
+    from cutamp.costs import curobo_pose_error
+    kin = world.kinematics
+    state = kin.compute_kinematics(JointState.from_position(q, joint_names=list(kin.joint_names)))
+    ee = state.tool_poses.get_link_pose(world.tool_frame_for_arm(arm))
+    # get_link_pose returns strided views; get_matrix requires contiguous.
+    ee = Pose(position=ee.position.contiguous(), quaternion=ee.quaternion.contiguous()).get_matrix()
+    return curobo_pose_error(ee, target)
+
+
 def _quat_to_mat(q_wxyz):
     return roma.unitquat_to_rotmat(q_wxyz[..., [1, 2, 3, 0]].contiguous())
 
@@ -118,7 +131,6 @@ def test_gn_project_balanced_keeps_com_in_and_closes_pose():
     # started (closest balanced pose, not an unbalanced exact one).
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_project_balanced
-    from cutamp.particle_initialization import _achieved_pose_errors
 
     world = make_blocks_t1_world()
     B = 8
@@ -129,15 +141,15 @@ def test_gn_project_balanced_keeps_com_in_and_closes_pose():
     moved[:, 0, 3] += 0.003
     moved[:, 2, 3] += 0.0025
     q1 = gn_project_balanced(world, q0, moved, "left")
-    pos, rot = _achieved_pose_errors(world, q1, moved, "left")
+    pos, rot = _pose_errors(world, q1, moved, "left")
     assert bool((pos < 0.005).all() & (rot < 0.05).all()), f"pos {pos.max().item():.4f}"
     assert bool(compute_com_polygon_mask(world, q1).all())
 
     far = target.clone()
     far[:, 0, 3] = 0.9
-    pos0, _ = _achieved_pose_errors(world, q0, far, "left")
+    pos0, _ = _pose_errors(world, q0, far, "left")
     q2 = gn_project_balanced(world, q0, far, "left", iters=30)
-    pos2, _ = _achieved_pose_errors(world, q2, far, "left")
+    pos2, _ = _pose_errors(world, q2, far, "left")
     assert bool(compute_com_polygon_mask(world, q2).all())
     assert bool((pos2 < pos0 - 0.05).all()), f"{pos0.min().item():.3f} -> {pos2.max().item():.3f}"
 
@@ -148,7 +160,7 @@ def test_gn_project_balanced_keeps_com_in_and_closes_pose():
     with pytest.MonkeyPatch.context() as m:
         _without_com_level(m)
         q3 = gn_project_balanced(world, q0, far, "left", iters=30)
-    pos3, _ = _achieved_pose_errors(world, q3, far, "left")
+    pos3, _ = _pose_errors(world, q3, far, "left")
     out = ~compute_com_polygon_mask(world, q3)
     assert int(out.sum()) >= B // 2
     assert bool((pos3[out] < pos2[out]).all()), f"{pos3[out].max().item():.3f} vs {pos2[out].min().item():.3f}"
@@ -159,7 +171,6 @@ def test_gn_project_balanced_pins_per_row():
     # Each row keeps its own dep's frozen columns and tool frame (a right row on the left frame
     # would chase a target half a metre away).
     from cutamp.gn_refresh import gn_project_balanced
-    from cutamp.particle_initialization import _achieved_pose_errors
 
     world = make_blocks_t1_world()
     model = world.model
@@ -173,7 +184,7 @@ def test_gn_project_balanced_pins_per_row():
     assert torch.equal(q1[16:, model.left_arm], q[16:, model.left_arm])
     assert not torch.equal(q1[:16, model.left_arm], q[:16, model.left_arm])
     for rows, arm in ((slice(0, 8), "left"), (slice(16, 24), "right")):
-        pos, rot = _achieved_pose_errors(world, q1[rows], T[rows], arm)
+        pos, rot = _pose_errors(world, q1[rows], T[rows], arm)
         assert bool((pos < 2e-3).all() & (rot < 2e-2).all()), (
             f"{arm}: pos {pos.max().item():.4f} rot {rot.max().item():.4f}"
         )
@@ -192,7 +203,6 @@ def test_gn_gate_matches_checker_helpers():
     # finds.
     from cutamp.com_polygon_cost import _fk_state, compute_com_polygon_mask
     from cutamp.gn_refresh import gn_gate, gn_project_balanced, soles_on_stance
-    from cutamp.particle_initialization import _achieved_pose_errors
 
     world = make_blocks_t1_world()
     q, T, arms = _four_dep_stack(world)
@@ -212,7 +222,7 @@ def test_gn_gate_matches_checker_helpers():
     with mock.patch.object(kin, "compute_kinematics", wraps=kin.compute_kinematics) as fk:
         pose_ok, com_ok = gn_gate(world, q, T, arms, 0.005, 0.05)
     assert fk.call_count == 1  # both masks from one FK
-    ref = [_achieved_pose_errors(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)]
+    ref = [_pose_errors(world, qi, Ti, a) for qi, Ti, a in zip(q.split(8), T.split(8), arms)]
     want_pose = torch.cat([(p < 0.005) & (r < 0.05) for p, r in ref])
     want_pose &= soles_on_stance(world, _fk_state(world, q), 0.005, 0.05)
     assert torch.equal(pose_ok, want_pose)

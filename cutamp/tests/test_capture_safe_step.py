@@ -161,11 +161,11 @@ def test_com_fk_skips_identity_reorder(blocks_t1_plan):
 
 
 def test_constant_builders_never_evict():
-    from cutamp.com_polygon_cost import _center, _half_extents
+    from cutamp.com_polygon_cost import _half_extents
     from cutamp.cost_function import _device_const
     from cutamp.gn_refresh import _row_layout
 
-    assert [f.cache_info().maxsize for f in (_row_layout, _device_const, _half_extents, _center)] == [None] * 4
+    assert [f.cache_info().maxsize for f in (_row_layout, _device_const, _half_extents)] == [None] * 3
 
 
 @needs_cuda

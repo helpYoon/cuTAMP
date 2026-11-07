@@ -27,19 +27,11 @@ upgrade audit catches them):
 
 from typing import List
 
-# TODO: file upstream issue against cuRobo. ``MotionPlanner.attachment_manager``
-# is a property that delegates to ``trajopt_solver.attachment_manager``; that
-# attribute does not exist on v0.8. The actual manager lives on
-# ``trajopt_solver.core.attachment_manager``.
+# TODO: file upstream issue against cuRobo. ``MotionPlanner.attachment_manager`` delegates to
+# ``trajopt_solver.attachment_manager``, which does not exist on v0.8: the manager lives on the solver's core.
 def get_attachment_manager(planner):
-    """Resolve the attachment_manager via the working access path."""
-    am = getattr(planner, "attachment_manager", None)
-    if am is not None:
-        return am
-    core = getattr(planner.trajopt_solver, "core", None)
-    if core is not None and hasattr(core, "attachment_manager"):
-        return core.attachment_manager
-    return None
+    """The planner's AttachmentManager, by the access path that works on v0.8."""
+    return planner.trajopt_solver.core.attachment_manager
 
 
 # Kept here for the upgrade audit: in cuRobo 0.8, ``result.success`` from

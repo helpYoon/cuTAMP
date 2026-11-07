@@ -102,9 +102,9 @@ class CostFunction:
             aabb_xy = aabb[:, :2]
             self.surface_to_aabb[surface] = aabb_xy
 
-            # For the target z, need to take collision activation distance into account
+            # The target z: the surface's top plus a buffer (the world collision cost activates at 0)
             surface_z = aabb[1, 2]
-            target_z = surface_z + world.collision_activation_distance + 2e-3  # add some buffer
+            target_z = surface_z + 2e-3
             self.surface_to_target_z[surface] = target_z
 
         self.surface_to_sphere_idx_map = {}

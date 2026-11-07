@@ -11,11 +11,6 @@ EXTREME_LEAN = {"base_j_x": 0.3}
 #: rectangle's edge: the trunk rides the floating base, whose x and y carry the CoM across the stance's edges.
 EDGE_SPREAD = {"base_j_x": 0.1, "base_j_y": 0.1}
 
-#: A support centre for the penalty tests, in the base frame: the real legs' is (0, 0), and a nonzero one keeps the
-#: penalty's subtraction of it tested.
-CENTER = (0.01, 0.0)
-
-
 def _moved(world, moves: dict):
     """``world``'s home with each joint in ``moves`` ({name: delta}) moved."""
     names = list(world.kinematics.joint_names)
@@ -241,13 +236,10 @@ def test_retract_collision_grads_match_per_conf():
         torch.testing.assert_close(g, grads([info])[0])
 
 
-def _support_centre_at_origin():
-    """A base pose that puts the support rectangle's centre (CENTER) at the world origin, so the
-    points below are offsets from it."""
+def _support_at_origin():
+    """The support frame at the world origin, so the points below are offsets from the rectangle's centre."""
     import torch
-    base_T = torch.eye(4).unsqueeze(0)
-    base_T[0, :2, 3] = -torch.tensor(CENTER)
-    return base_T
+    return torch.eye(4).unsqueeze(0)
 
 
 def test_com_polygon_penalty_corner_equals_single_edge():
@@ -259,10 +251,10 @@ def test_com_polygon_penalty_corner_equals_single_edge():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = _support_centre_at_origin()
+    base_T = _support_at_origin()
     e = 0.001  # 1mm inside each edge
     com_world = torch.tensor([[0.10 - e, 0.15 - e, 0.0]])
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half)
     # nearest-edge barrier: weight * (margin - e)**2 = 1 * 0.019**2 = 3.61e-4
     assert pen.item() == pytest.approx((margin - e) ** 2, rel=1e-3)
     assert pen.item() < 4e-4  # passes the COM tol; the summed bug gave 7.22e-4
@@ -274,9 +266,9 @@ def test_com_polygon_penalty_corner_on_boundary_equals_tol():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = _support_centre_at_origin()
+    base_T = _support_at_origin()
     com_world = torch.tensor([[0.10, 0.15, 0.0]])
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half)
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
@@ -288,9 +280,9 @@ def test_com_polygon_penalty_single_edge_equals_tol():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = _support_centre_at_origin()
+    base_T = _support_at_origin()
     com_world = torch.tensor([[0.10, 0.0, 0.0]])  # on X edge, centered in Y
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half)
     assert pen.item() == pytest.approx(weight * margin ** 2, rel=1e-4)  # 4e-4
 
 
@@ -307,9 +299,9 @@ def test_com_polygon_penalty_deep_inside_is_zero():
     import torch
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
-    base_T = _support_centre_at_origin()
+    base_T = _support_at_origin()
     com_world = torch.tensor([[0.03, 0.04, 0.0]])  # well inside inset rect
-    pen = com_polygon_penalty(com_world, base_T, half, 0.02, 1.0, CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half)
     assert pen.item() == 0.0
 
 
@@ -319,9 +311,9 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
     from cutamp.com_polygon_cost import com_polygon_penalty
     half = torch.tensor([0.10, 0.15])
     margin, weight = 0.02, 1.0
-    base_T = _support_centre_at_origin()
+    base_T = _support_at_origin()
     com_world = torch.tensor([[0.101, 0.0, 0.0]])  # 1mm past X edge
-    pen = com_polygon_penalty(com_world, base_T, half, margin, weight, CENTER)
+    pen = com_polygon_penalty(com_world, base_T, half)
     # outside=0.001 -> 0.001**2; inside barrier saturates at (0.001+0.02)**2.
     # Sum: 1e-6 + 4.41e-4 ≈ 4.42e-4 > tol 4e-4.
     assert pen.item() > 4e-4
@@ -332,7 +324,7 @@ def test_com_polygon_penalty_just_outside_exceeds_tol():
 def test_mask_matches_penalty_gate():
     # The mask must equal (penalty <= COM_TOL) elementwise, so ik_check (GN
     # IK's acceptance) and the ConstraintChecker can never disagree.
-    # COM_TOL is inside_weight * inside_margin^2 = 4e-4, calibrating the hard
+    # COM_TOL is COM_INSIDE_WEIGHT * COM_INSIDE_MARGIN^2 = 4e-4, calibrating the hard
     # constraint's tolerance against the mask's definition of 'inside'.
     import torch
     from cutamp.com_polygon_cost import (

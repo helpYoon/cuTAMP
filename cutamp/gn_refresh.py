@@ -697,7 +697,7 @@ def gn_project_balanced(
                     state.tool_poses.get_link_pose(support.link, make_contiguous=True)
                     .get_matrix().reshape(N, 4, 4)
                 )
-            com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T, support.center)
+            com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
             # Clone: cuRobo's backward writes into a reused buffer, so without
             # it the next grad call overwrites the x row with the y row.
             jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
@@ -746,7 +746,7 @@ def gn_gate(
     """Merge gate for :func:`gn_project_balanced`'s output (same ``arms``), from
     one FK pass on ``kin`` (default ``world.kinematics``) and with no host syncs.
 
-    Returns ``(pose_ok [N], com_ok [N])``: ``_achieved_pose_errors`` (the
+    Returns ``(pose_ok [N], com_ok [N])``: the hand's pose errors (``curobo_pose_error``, the
     checker's metric, on each row's own arm) strictly under ``pos_tol`` and
     ``rot_tol``, both soles' errors against the stance too
     (:func:`soles_on_stance`, at most the same tolerances), and

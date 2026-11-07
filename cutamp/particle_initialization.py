@@ -135,8 +135,8 @@ def _stand_on_the_stance(
 
 
 #: The GN IK (:func:`gn_ik`): GN_IK_ITERS iterations that reach balance first, then GN_IK_CLEAR_ITERS with the
-#: collision row, and the noise std (rad) of the stance-rooted starts that run beside the first (home, or the
-#: stored conf), one start per value. The iterates are not motions, so only the conf they end at must be clear;
+#: collision row, and the noise std (rad) of the stance-rooted starts that run beside the first (home), one start
+#: per value. The iterates are not motions, so only the conf they end at must be clear;
 #: with the row on from the start, an arm that met the body on its way pressed against it, and the picks of
 #: blocks_t1's first plan fell from 64 to 49 of 64 targets (20 + 10 iterations: 52; 25 + 5 and 30 + 10: 64).
 #: Places reached 42 of 64 on two plans at every split; their misses are out of balanced reach (still about 6 cm
@@ -171,7 +171,7 @@ def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arm
     stands balanced (the CoM inside the support rectangle, both soles on the stance within ``tol``), clear of the
     scene, of ``movables`` ``[N, M, 4]`` and of itself (:func:`~cutamp.gn_refresh.collision_penetration` is 0)
     and inside the envelope's tilt bound. ``ok``: safe, with the hand on ``world_from_ee`` within ``tol``, all at
-    the checker's ``<=``. ``hand_err``: the hand's position plus rotation error, cuRobo IK's ranking."""
+    the checker's ``<=``. ``hand_err``: the hand's position plus rotation error, :func:`gn_ik`'s ranking."""
     from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
     from cutamp.costs import curobo_pose_error
 
@@ -190,10 +190,10 @@ def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arm
 
 
 def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequence[str]], movables: torch.Tensor,
-          tol: IKTol, q_start: Optional[torch.Tensor] = None):
+          tol: IKTol):
     """The planner's IK: :func:`~cutamp.gn_refresh.gn_project_balanced` of ``world_from_ee`` ``[N, 4, 4]``, rows
     in ``arms``' dep-major blocks (a bare ``str`` is one dep), from ``1 + len(GN_IK_START_SIGMAS)`` starts per row
-    in one batched call, ``q_start`` (default ``world.q_init``) and :func:`_noisy_start`'s stance-rooted noise:
+    in one batched call, ``world.q_init`` and :func:`_noisy_start`'s stance-rooted noise:
     ``GN_IK_ITERS`` iterations balance first, then ``GN_IK_CLEAR_ITERS`` that also clear the scene, ``movables``
     ``[N, M, 4]`` and the robot itself, and pull the CoM toward the keyframe rectangle's centre and the Trunk toward
     upright (GN's levels 3 and 4).
@@ -204,8 +204,8 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     arms = (arms,) if isinstance(arms, str) else tuple(arms)
     n = world_from_ee.shape[0]
     batch = n // len(arms)
-    first = world.q_init.expand(n, -1) if q_start is None else q_start
-    starts = [first] + [torch.cat([_noisy_start(world, batch, arm, s) for arm in arms]) for s in GN_IK_START_SIGMAS]
+    noisy = [torch.cat([_noisy_start(world, batch, arm, s) for arm in arms]) for s in GN_IK_START_SIGMAS]
+    starts = [world.q_init.expand(n, -1)] + noisy
     k = len(starts)
     targets, mov, rows_arms = world_from_ee.repeat(k, 1, 1), movables.repeat(k, 1, 1), arms * k
     q = gn_project_balanced(world, torch.cat(starts), targets, rows_arms, iters=GN_IK_ITERS, collision=False)
@@ -221,27 +221,6 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     best = (torch.where(ok, tilt, err) + 100.0 * ~ok + 1e4 * ~safe).view(k, n).argmin(0) * n
     best = best + torch.arange(n, device=q.device)
     return q[best], ok[best]
-
-
-def _achieved_pose_errors(
-    world: TAMPWorld, q_full: torch.Tensor, world_from_ee: torch.Tensor, arm: str,
-):
-    """``([B] pos_err, [B] rot_err)`` of ``q_full`` against ``world_from_ee``
-    on ``arm``'s tool frame, in the constraint checker's own metric
-    (``curobo_pose_error``).
-    """
-    from cutamp.costs import curobo_pose_error
-    js = JointState.from_position(
-        q_full, joint_names=list(world.kinematics.joint_names),
-    )
-    kin_state = world.kinematics.compute_kinematics(js)
-    ee_pose = kin_state.tool_poses.get_link_pose(world.tool_frame_for_arm(arm))
-    # get_link_pose returns strided views; get_matrix requires contiguous.
-    ee = Pose(
-        position=ee_pose.position.contiguous(),
-        quaternion=ee_pose.quaternion.contiguous(),
-    ).get_matrix()
-    return curobo_pose_error(ee, world_from_ee)
 
 
 class ParticleInitializer:

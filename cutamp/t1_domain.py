@@ -14,6 +14,7 @@ This domain uses generic parameter names (q, q_start, q_end, traj) instead of
 arm-prefixed names (left_q, right_q). The arm information is encoded in the
 fluent/operator names (LeftAt vs RightAt, LeftPick vs RightPick), not in the
 parameter names. This keeps the domain compatible with the existing task planner.
+One factory builds each arm's fluents and one its operators, so the two sides stay mirror images.
 """
 
 from typing import Sequence
@@ -31,53 +32,35 @@ Grasp = "grasp"
 Movable = "movable"
 Surface = "surface"
 
+
 # Fluents (aka predicates)
-LeftAt = Fluent("LeftAt", [Parameter("q", Conf)])
-RightAt = Fluent("RightAt", [Parameter("q", Conf)])
-LeftHandEmpty = Fluent("LeftHandEmpty")
-RightHandEmpty = Fluent("RightHandEmpty")
+def _arm_fluents(arm: str) -> dict[str, Fluent]:
+    """One arm's fluents, named <Arm><key> (LeftAt, RightAt, LeftHandEmpty, ...)."""
+    s = arm.capitalize()
+    return {
+        "At": Fluent(f"{s}At", [Parameter("q", Conf)]),
+        "HandEmpty": Fluent(f"{s}HandEmpty"),
+        "CanMove": Fluent(f"{s}CanMove"),
+        "JustMoved": Fluent(f"{s}JustMoved"),
+        "JustPicked": Fluent(f"{s}JustPicked"),
+        "JustPlaced": Fluent(f"{s}JustPlaced"),
+        # Deliberately redundant with *HoldingWithGrasp: these are the grasp-free goal predicates
+        # reachable from env YAML goals (which can name an object but not a grasp literal).
+        "Holding": Fluent(f"{s}Holding", [Parameter("obj", Movable)]),
+        "HoldingWithGrasp": Fluent(f"{s}HoldingWithGrasp", [Parameter("obj", Movable), Parameter("grasp", Grasp)]),
+    }
 
-LeftCanMove = Fluent("LeftCanMove")
-RightCanMove = Fluent("RightCanMove")
 
-LeftJustMoved = Fluent("LeftJustMoved")
-RightJustMoved = Fluent("RightJustMoved")
-
-LeftJustPicked = Fluent("LeftJustPicked")
-RightJustPicked = Fluent("RightJustPicked")
-LeftJustPlaced = Fluent("LeftJustPlaced")
-RightJustPlaced = Fluent("RightJustPlaced")
-
-# Deliberately redundant with *HoldingWithGrasp: these are the grasp-free goal predicates
-# reachable from env YAML goals (which can name an object but not a grasp literal).
-LeftHolding = Fluent("LeftHolding", [Parameter("obj", Movable)])
-RightHolding = Fluent("RightHolding", [Parameter("obj", Movable)])
-
-LeftHoldingWithGrasp = Fluent("LeftHoldingWithGrasp", [Parameter("obj", Movable), Parameter("grasp", Grasp)])
-RightHoldingWithGrasp = Fluent("RightHoldingWithGrasp", [Parameter("obj", Movable), Parameter("grasp", Grasp)])
+_ARM_FLUENTS = {arm: _arm_fluents(arm) for arm in ("left", "right")}
+_LEFT, _RIGHT = _ARM_FLUENTS["left"], _ARM_FLUENTS["right"]
 
 IsMovable = Fluent("IsMovable", [Parameter("obj", Movable)])
 IsSurface = Fluent("IsSurface", [Parameter("surface", Surface)])
 HasNotPickedUp = Fluent("HasNotPickedUp", [Parameter("obj", Movable)])
 On = Fluent("On", [Parameter("obj", Movable), Parameter("surface", Surface)])
 
-all_t1_fluents = [
-    LeftAt,
-    RightAt,
-    LeftHandEmpty,
-    RightHandEmpty,
-    LeftCanMove,
-    RightCanMove,
-    LeftJustMoved,
-    RightJustMoved,
-    LeftJustPicked,
-    RightJustPicked,
-    LeftJustPlaced,
-    RightJustPlaced,
-    LeftHolding,
-    RightHolding,
-    LeftHoldingWithGrasp,
-    RightHoldingWithGrasp,
+# LeftAt, RightAt, LeftHandEmpty, RightHandEmpty, ..., then the arm-free fluents
+all_t1_fluents = [f for pair in zip(_LEFT.values(), _RIGHT.values()) for f in pair] + [
     IsMovable,
     IsSurface,
     HasNotPickedUp,
@@ -100,222 +83,86 @@ placement = Parameter("placement", Pose)
 
 
 # Operators - this is the important part!
-# Left arm operators use LeftAt, LeftHandEmpty, etc.
-# Right arm operators use RightAt, RightHandEmpty, etc.
-# The arm information is now stored in metadata.arm, not encoded in the operator name.
+def _arm_operators(arm: str) -> list[TAMPOperator]:
+    """One arm's six operators, named <Arm><op>: MoveFree, MoveHolding, Pick, Place, RetractHolding, RetractFree.
 
-LeftMoveFree = TAMPOperator(
-    "LeftMoveFree",
-    [q_start, traj, q_end],
-    preconditions=[LeftAt(q_start), LeftHandEmpty(), LeftCanMove(), RightCanMove()],  # Require RightCanMove to prevent interleaving
-    add_effects=[LeftAt(q_end), LeftJustMoved()],
-    del_effects=[LeftAt(q_start), LeftCanMove(), RightCanMove()],  # Block right arm until LeftPick completes
-    constraints=[Motion(q_start, traj, q_end)],
-    costs=[TrajectoryLength(q_start, traj, q_end)],
-    metadata=OperatorMetadata(is_motion=True, arm="left"),
-)
+    They use only this arm's fluents (LeftAt, LeftHandEmpty, ...), except that a move needs and clears both arms'
+    CanMove, so the arms never interleave: the other arm waits until this arm's retract, after its pick or place, gives
+    CanMove back to both. metadata.arm records the arm.
+    """
+    me, other = _ARM_FLUENTS[arm], _ARM_FLUENTS["right" if arm == "left" else "left"]
+    s = arm.capitalize()
+    at, empty, can_move, other_can_move = me["At"], me["HandEmpty"], me["CanMove"], other["CanMove"]
+    holding, holding_grasp = me["Holding"], me["HoldingWithGrasp"]
+    just_moved, just_picked, just_placed = me["JustMoved"], me["JustPicked"], me["JustPlaced"]
 
-RightMoveFree = TAMPOperator(
-    "RightMoveFree",
-    [q_start, traj, q_end],
-    preconditions=[RightAt(q_start), RightHandEmpty(), RightCanMove(), LeftCanMove()],  # Require LeftCanMove to prevent interleaving
-    add_effects=[RightAt(q_end), RightJustMoved()],
-    del_effects=[RightAt(q_start), RightCanMove(), LeftCanMove()],  # Block left arm until RightPick completes
-    constraints=[Motion(q_start, traj, q_end)],
-    costs=[TrajectoryLength(q_start, traj, q_end)],
-    metadata=OperatorMetadata(is_motion=True, arm="right"),
-)
-
-
-LeftMoveHolding = TAMPOperator(
-    "LeftMoveHolding",
-    [obj, grasp, q_start, traj, q_end],
-    preconditions=[
-        LeftAt(q_start),
-        LeftHolding(obj),
-        LeftHoldingWithGrasp(obj, grasp),
-        LeftCanMove(),
-        RightCanMove(),  # Require RightCanMove to prevent interleaving
-    ],
-    add_effects=[LeftAt(q_end), LeftJustMoved()],
-    del_effects=[LeftAt(q_start), LeftCanMove(), RightCanMove()],  # Block right arm until LeftPlace completes
-    constraints=[Motion(q_start, traj, q_end)],
-    costs=[TrajectoryLength(q_start, traj, q_end)],
-    metadata=OperatorMetadata(is_motion=True, arm="left"),
-)
-
-RightMoveHolding = TAMPOperator(
-    "RightMoveHolding",
-    [obj, grasp, q_start, traj, q_end],
-    preconditions=[
-        RightAt(q_start),
-        RightHolding(obj),
-        RightHoldingWithGrasp(obj, grasp),
-        RightCanMove(),
-        LeftCanMove(),  # Require LeftCanMove to prevent interleaving
-    ],
-    add_effects=[RightAt(q_end), RightJustMoved()],
-    del_effects=[RightAt(q_start), RightCanMove(), LeftCanMove()],  # Block left arm until RightPlace completes
-    constraints=[Motion(q_start, traj, q_end)],
-    costs=[TrajectoryLength(q_start, traj, q_end)],
-    metadata=OperatorMetadata(is_motion=True, arm="right"),
-)
-
-LeftPick = TAMPOperator(
-    "LeftPick",
-    [obj, grasp, q],
-    preconditions=[
-        LeftAt(q),
-        LeftHandEmpty(),
-        IsMovable(obj),
-        LeftJustMoved(),
-        HasNotPickedUp(obj),
-    ],
-    add_effects=[
-        LeftHolding(obj),
-        LeftHoldingWithGrasp(obj, grasp),
-        LeftJustPicked(),  # Trigger retract after pick
-    ],
-    del_effects=[LeftHandEmpty(), LeftJustMoved(), HasNotPickedUp(obj)],
-    constraints=[KinematicConstraint(q, grasp)],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="left"),
-)
-
-RightPick = TAMPOperator(
-    "RightPick",
-    [obj, grasp, q],
-    preconditions=[
-        RightAt(q),
-        RightHandEmpty(),
-        IsMovable(obj),
-        RightJustMoved(),
-        HasNotPickedUp(obj),
-    ],
-    add_effects=[
-        RightHolding(obj),
-        RightHoldingWithGrasp(obj, grasp),
-        RightJustPicked(),  # Trigger retract after pick
-    ],
-    del_effects=[RightHandEmpty(), RightJustMoved(), HasNotPickedUp(obj)],
-    constraints=[KinematicConstraint(q, grasp)],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm="right"),
-)
-
-LeftPlace = TAMPOperator(
-    "LeftPlace",
-    [obj, grasp, placement, surface, q],
-    preconditions=[
-        LeftAt(q),
-        LeftHolding(obj),
-        LeftHoldingWithGrasp(obj, grasp),
-        IsSurface(surface),
-        LeftJustMoved(),
-    ],
-    add_effects=[LeftHandEmpty(), LeftJustPlaced(), On(obj, surface)],  # Trigger retract after place
-    del_effects=[
-        LeftHolding(obj),
-        LeftHoldingWithGrasp(obj, grasp),
-        LeftJustMoved(),
-    ],
-    constraints=[
-        KinematicConstraint(q, placement),
-        StablePlacement(obj, grasp, placement, surface),
-    ],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="place", arm="left"),
-)
-
-RightPlace = TAMPOperator(
-    "RightPlace",
-    [obj, grasp, placement, surface, q],
-    preconditions=[
-        RightAt(q),
-        RightHolding(obj),
-        RightHoldingWithGrasp(obj, grasp),
-        IsSurface(surface),
-        RightJustMoved(),
-    ],
-    add_effects=[RightHandEmpty(), RightJustPlaced(), On(obj, surface)],  # Trigger retract after place
-    del_effects=[
-        RightHolding(obj),
-        RightHoldingWithGrasp(obj, grasp),
-        RightJustMoved(),
-    ],
-    constraints=[
-        KinematicConstraint(q, placement),
-        StablePlacement(obj, grasp, placement, surface),
-    ],
-    costs=[],
-    metadata=OperatorMetadata(is_actionable=True, action_type="place", arm="right"),
-)
+    move_free = TAMPOperator(
+        f"{s}MoveFree",
+        [q_start, traj, q_end],
+        preconditions=[at(q_start), empty(), can_move(), other_can_move()],
+        add_effects=[at(q_end), just_moved()],
+        del_effects=[at(q_start), can_move(), other_can_move()],
+        constraints=[Motion(q_start, traj, q_end)],
+        costs=[TrajectoryLength(q_start, traj, q_end)],
+        metadata=OperatorMetadata(is_motion=True, arm=arm),
+    )
+    move_holding = TAMPOperator(
+        f"{s}MoveHolding",
+        [obj, grasp, q_start, traj, q_end],
+        preconditions=[at(q_start), holding(obj), holding_grasp(obj, grasp), can_move(), other_can_move()],
+        add_effects=[at(q_end), just_moved()],
+        del_effects=[at(q_start), can_move(), other_can_move()],
+        constraints=[Motion(q_start, traj, q_end)],
+        costs=[TrajectoryLength(q_start, traj, q_end)],
+        metadata=OperatorMetadata(is_motion=True, arm=arm),
+    )
+    pick = TAMPOperator(
+        f"{s}Pick",
+        [obj, grasp, q],
+        preconditions=[at(q), empty(), IsMovable(obj), just_moved(), HasNotPickedUp(obj)],
+        add_effects=[holding(obj), holding_grasp(obj, grasp), just_picked()],  # JustPicked triggers the retract
+        del_effects=[empty(), just_moved(), HasNotPickedUp(obj)],
+        constraints=[KinematicConstraint(q, grasp)],
+        costs=[],
+        metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm=arm),
+    )
+    place = TAMPOperator(
+        f"{s}Place",
+        [obj, grasp, placement, surface, q],
+        preconditions=[at(q), holding(obj), holding_grasp(obj, grasp), IsSurface(surface), just_moved()],
+        add_effects=[empty(), just_placed(), On(obj, surface)],  # JustPlaced triggers the retract
+        del_effects=[holding(obj), holding_grasp(obj, grasp), just_moved()],
+        constraints=[KinematicConstraint(q, placement), StablePlacement(obj, grasp, placement, surface)],
+        costs=[],
+        metadata=OperatorMetadata(is_actionable=True, action_type="place", arm=arm),
+    )
+    # Retracts move the arm back towards home after a pick or place; the optimizer's soft costs pick the closest
+    # collision-free configuration to home.
+    retract_holding = TAMPOperator(
+        f"{s}RetractHolding",
+        [obj, grasp, q_start, traj, q_retract],
+        preconditions=[at(q_start), holding(obj), holding_grasp(obj, grasp), just_picked()],
+        add_effects=[at(q_retract), can_move(), other_can_move()],
+        del_effects=[at(q_start), just_picked()],
+        constraints=[Motion(q_start, traj, q_retract)],
+        costs=[],
+        metadata=OperatorMetadata(is_motion=True, action_type="retract", arm=arm),
+    )
+    retract_free = TAMPOperator(
+        f"{s}RetractFree",
+        [q_start, traj, q_retract],
+        preconditions=[at(q_start), empty(), just_placed()],
+        add_effects=[at(q_retract), can_move(), other_can_move()],
+        del_effects=[at(q_start), just_placed()],
+        constraints=[Motion(q_start, traj, q_retract)],
+        costs=[],
+        metadata=OperatorMetadata(is_motion=True, action_type="retract", arm=arm),
+    )
+    return [move_free, move_holding, pick, place, retract_holding, retract_free]
 
 
-# Retract operators - move arm to home configuration after pick/place
-# These use soft costs to find the closest collision-free configuration to home
-
-LeftRetractHolding = TAMPOperator(
-    "LeftRetractHolding",
-    [obj, grasp, q_start, traj, q_retract],
-    preconditions=[
-        LeftAt(q_start),
-        LeftHolding(obj),
-        LeftHoldingWithGrasp(obj, grasp),
-        LeftJustPicked(),
-    ],
-    add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
-    del_effects=[LeftAt(q_start), LeftJustPicked()],
-    constraints=[Motion(q_start, traj, q_retract)],
-    costs=[],
-    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
-)
-
-RightRetractHolding = TAMPOperator(
-    "RightRetractHolding",
-    [obj, grasp, q_start, traj, q_retract],
-    preconditions=[
-        RightAt(q_start),
-        RightHolding(obj),
-        RightHoldingWithGrasp(obj, grasp),
-        RightJustPicked(),
-    ],
-    add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
-    del_effects=[RightAt(q_start), RightJustPicked()],
-    constraints=[Motion(q_start, traj, q_retract)],
-    costs=[],
-    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
-)
-
-LeftRetractFree = TAMPOperator(
-    "LeftRetractFree",
-    [q_start, traj, q_retract],
-    preconditions=[
-        LeftAt(q_start),
-        LeftHandEmpty(),
-        LeftJustPlaced(),
-    ],
-    add_effects=[LeftAt(q_retract), LeftCanMove(), RightCanMove()],
-    del_effects=[LeftAt(q_start), LeftJustPlaced()],
-    constraints=[Motion(q_start, traj, q_retract)],
-    costs=[],
-    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="left"),
-)
-
-RightRetractFree = TAMPOperator(
-    "RightRetractFree",
-    [q_start, traj, q_retract],
-    preconditions=[
-        RightAt(q_start),
-        RightHandEmpty(),
-        RightJustPlaced(),
-    ],
-    add_effects=[RightAt(q_retract), RightCanMove(), LeftCanMove()],
-    del_effects=[RightAt(q_start), RightJustPlaced()],
-    constraints=[Motion(q_start, traj, q_retract)],
-    costs=[],
-    metadata=OperatorMetadata(is_motion=True, action_type="retract", arm="right"),
-)
+LeftMoveFree, LeftMoveHolding, LeftPick, LeftPlace, LeftRetractHolding, LeftRetractFree = _arm_operators("left")
+RightMoveFree, RightMoveHolding, RightPick, RightPlace, RightRetractHolding, RightRetractFree = _arm_operators("right")
 
 all_t1_operators = [
     LeftMoveFree, RightMoveFree,
@@ -334,12 +181,12 @@ def get_initial_state(movables: Sequence[str] = (), surfaces: Sequence[str] = ()
     The fluent (LeftAt vs RightAt) determines which arm the configuration belongs to.
     """
     initial_state = {
-        LeftAt.ground("left_q0"),
-        RightAt.ground("right_q0"),
-        LeftHandEmpty.ground(),
-        RightHandEmpty.ground(),
-        LeftCanMove.ground(),
-        RightCanMove.ground(),
+        _LEFT["At"].ground("left_q0"),
+        _RIGHT["At"].ground("right_q0"),
+        _LEFT["HandEmpty"].ground(),
+        _RIGHT["HandEmpty"].ground(),
+        _LEFT["CanMove"].ground(),
+        _RIGHT["CanMove"].ground(),
     }
     for movable in movables:
         initial_state.add(IsMovable.ground(movable))

@@ -73,7 +73,7 @@ def test_reset_puts_placed_blocks_back():
     from curobo.types import Pose
 
     world = make_blocks_t1_world()
-    planner = world.get_motion_planner(use_cuda_graph=False)
+    planner = ms.build_motion_planner(world, use_cuda_graph=False)
     cuboids = planner.scene_collision_checker.data.cuboids
 
     def offset(obj):  # start-pose center in the obstacle's frame; 0 = obstacle at start pose

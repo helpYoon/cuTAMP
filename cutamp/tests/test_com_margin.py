@@ -25,20 +25,6 @@ def test_margin_sign_matches_polygon_mask_semantics():
     assert com_margin_from_base(outside, REAL_LEGS.support.keyframe_half).item() < 0
 
 
-def test_projection_subtracts_center():
-    # The rectangle sits at the support's centre in its frame: (0, 0) on the real legs' stance, so this one is
-    # synthetic. Centred 1 cm ahead, the gate's rectangle has its front edge at x 0.01 + 0.09245 and its back edge
-    # at 0.01 - 0.09245.
-    from cutamp.com_polygon_cost import _project_com_to_base
-    hx, _ = REAL_LEGS.support.gate_half
-    base_T = torch.eye(4).expand(3, 4, 4)
-    com = torch.tensor([[0.01, 0.0, 0.5], [0.01 + hx + 1e-4, 0.0, 0.5], [0.01 - hx + 1e-4, 0.0, 0.5]])
-    c = _project_com_to_base(com, base_T, (0.01, 0.0))
-    assert torch.allclose(c[0], torch.zeros(2), atol=1e-7)
-    m = com_margin_from_base(c, REAL_LEGS.support.gate_half)
-    assert m[1].item() < 0 and m[2].item() > 0
-
-
 def test_support_mask_uses_the_gate_rectangle(monkeypatch):
     # The trajectory audit counts a frame as outside only when it leaves the rectangle the gate enforces
     # (support.gate_half, 0.09245 x 0.135), not the keyframes' tighter one (0.08745 x 0.130): x 9.0 cm from the

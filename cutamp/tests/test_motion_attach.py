@@ -9,7 +9,7 @@ def test_attached_spheres_sit_on_the_block():
     # Attach each arm's block at q, then FK at the same q: the link-local
     # spheres must land back on the block, not ~0.5 m off the hand.
     world = make_blocks_t1_world()
-    planner = world.get_motion_planner()
+    planner = ms.build_motion_planner(world)
     kp = ms._get_attachment_manager(planner).kinematics_params
     js = ms._planner_js_from_full(planner, world.q_init, world.kinematics.joint_names)
     for arm, block in (("left", "block3"), ("right", "block2")):
@@ -27,7 +27,7 @@ def test_place_reenables_only_the_placed_block():
     # Both arms hold a block, as after RightPick. Placing the left one must
     # re-enable block3 only: block2 is still in the right hand.
     world = make_blocks_t1_world()
-    planner = world.get_motion_planner()
+    planner = ms.build_motion_planner(world)
     cub = planner.scene_collision_checker.data.cuboids
     js = ms._planner_js_from_full(planner, world.q_init, world.kinematics.joint_names)
     ms._attach_object(planner, "block3", js, "left")

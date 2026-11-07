@@ -12,7 +12,7 @@ from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 @needs_cuda
 def test_plan_dt_labels_interpolated_spacing():
     world = make_blocks_t1_world()
-    planner = world.get_motion_planner(collision_activation_distance=0.0025)
+    planner = ms.build_motion_planner(world)
     for obj in world.movables:
         planner.scene_collision_checker.enable_obstacle(name=obj.name, enable=False)
     names = list(world.kinematics.joint_names)

@@ -255,7 +255,7 @@ def test_joint_limit_margin_gradient_restores_and_skips_the_initial_confs():
 def test_support_rectangles():
     gate, key = support_rectangles((0.2249, 0.100), 0.10625, 0.1)
     assert gate == pytest.approx((0.09245, 0.135)) and key == pytest.approx((0.08745, 0.130))
-    assert REAL_LEGS.support == ("stance", (0.0, 0.0), gate, key)
+    assert REAL_LEGS.support == ("stance", gate, key)
 
 
 def test_load_guard_is_the_hull_of_its_32_sums():

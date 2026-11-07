@@ -9,10 +9,10 @@
 
 """TAMPWorld for cuTAMP (cuRobo v0.8 single-MotionPlanner architecture).
 
-The world wraps a TAMPEnvironment with: collision Scene, T1 Kinematics and a MotionPlanner
-factory, all on the planning model ``world.model``. The IK is GN's (``particle_initialization.gn_ik``), on
-these kinematics. T1 exposes two tool
-frames in ``robot_container.tool_frames``.
+The world wraps a TAMPEnvironment with: collision Scene and T1 Kinematics, on the planning model
+``world.model``; ``motion_solver.build_motion_planner`` builds the MotionPlanner from it. The IK is GN's
+(``particle_initialization.gn_ik``), on these kinematics. T1 exposes two tool frames in
+``robot_container.tool_frames``.
 """
 
 import logging
@@ -21,7 +21,6 @@ from typing import Dict, List, Union
 import torch
 
 from curobo.kinematics import Kinematics
-from curobo.motion_planner import MotionPlanner
 from curobo.scene import Obstacle, Scene
 from curobo.types import DeviceCfg, JointState, Pose
 
@@ -33,7 +32,6 @@ from cutamp.robots.t1 import (
     T1Model,
     get_t1_bodies,
     get_t1_kinematics,
-    get_t1_motion_planner,
 )
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
@@ -54,7 +52,7 @@ FK_SITES = ("rollout", "retract", "com", "gate", "retract_motion")
 
 
 class TAMPWorld:
-    """A TAMPEnvironment plus T1 kinematics, a Scene, and motion-planner factory.
+    """A TAMPEnvironment plus T1 kinematics and a Scene.
 
     T1 exposes two tool frames (left + right base_link) via the
     ``RobotContainer``. ``q_init`` is a single full-cspace vector of the
@@ -67,22 +65,17 @@ class TAMPWorld:
         device_cfg: DeviceCfg,
         robot: RobotContainer,
         q_init: torch.Tensor,
-        collision_activation_distance: float = 0.0,
         coll_n_spheres: int = 50,
         coll_sphere_radius: float = 0.005,
     ):
         self.env = env
         self.device_cfg = device_cfg
 
-        self._movable_names = {obj.name for obj in env.movables}
         self._name_to_obj = {obj.name: obj for obj in env.movables + env.statics}
 
-        # Static collision Scene (excludes movables; movables get attached at grasp time).
+        # Static collision Scene (excludes movables; movables get attached at grasp time). The cost activates at 0.
         self.world_cfg: Scene = get_world_cfg(env, include_movables=False)
-        self.collision_fn = WorldCollisionCost(
-            self.world_cfg, device_cfg, collision_activation_distance,
-        )
-        self.collision_activation_distance = collision_activation_distance
+        self.collision_fn = WorldCollisionCost(self.world_cfg, device_cfg, 0.0)
 
         # Robot container (kinematics, joint_limits, tool frames, gripper spheres).
         self.robot_container = robot
@@ -197,11 +190,6 @@ class TAMPWorld:
     def statics(self) -> List[Obstacle]:
         return self.env.statics
 
-    def is_movable(self, obj: Union[Obstacle, str]) -> bool:
-        if isinstance(obj, Obstacle):
-            obj = obj.name
-        return obj in self._movable_names
-
     def get_object(self, name: str) -> Obstacle:
         if name not in self._name_to_obj:
             raise ValueError(f"Object '{name}' not found in environment")
@@ -286,24 +274,6 @@ class TAMPWorld:
         if name not in self._site_kinematics:
             self._site_kinematics[name] = Kinematics(self.kinematics.config, compute_com=True)
         return self._site_kinematics[name]
-
-    def get_motion_planner(
-        self,
-        collision_activation_distance: float = 0.01,
-        use_cuda_graph: bool = True,
-    ) -> MotionPlanner:
-        """Build a single MotionPlanner for the robot using the world's Scene
-        with movables included (so attached objects are part of the collision
-        world during planning).
-        """
-        scene_with_movables = get_world_cfg(self.env, include_movables=True)
-        return get_t1_motion_planner(
-            self.model,
-            scene_with_movables,
-            use_cuda_graph=use_cuda_graph,
-            collision_activation_distance=collision_activation_distance,
-            device_cfg=self.device_cfg,
-        )
 
 
 def check_tamp_world_not_in_collision(world: TAMPWorld, collision_tol: float = 1e-6):

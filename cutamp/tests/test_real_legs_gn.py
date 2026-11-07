@@ -88,8 +88,7 @@ def _com_frac(world, q):
     from cutamp.com_polygon_cost import _fk_com_and_base, _project_com_to_base
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q)
-    return _project_com_to_base(com, base_T, support.center)[:, :2] / torch.tensor(support.keyframe_half,
-                                                                                  device=q.device)
+    return _project_com_to_base(com, base_T)[:, :2] / torch.tensor(support.keyframe_half, device=q.device)
 
 
 def _accepted(world, plan, conf):

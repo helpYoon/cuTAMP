@@ -282,7 +282,6 @@ def setup_cutamp(
             device_cfg=tensor_args,
             robot=robot_container,
             q_init=q_init,
-            collision_activation_distance=0.0,
         )
         check_tamp_world_not_in_collision(world)
 
@@ -326,7 +325,7 @@ def run_cutamp(
 
         def _build_planner_bg():
             try:
-                planner_box["planner"] = build_motion_planner(world, config)
+                planner_box["planner"] = build_motion_planner(world)
             except BaseException as e:  # noqa: BLE001 — surfaced at join time
                 planner_box["error"] = e
 

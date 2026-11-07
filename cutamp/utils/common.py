@@ -10,17 +10,8 @@
 from collections import defaultdict
 from typing import Dict
 
-import roma
 import torch
-from curobo.scene import (
-    Capsule,
-    Cuboid,
-    Cylinder,
-    Mesh,
-    Obstacle,
-    Scene,
-    Sphere,
-)
+from curobo.scene import Cuboid, Cylinder, Mesh, Obstacle, Scene
 from roma import quat_wxyz_to_xyzw, unitquat_to_rotmat
 
 from cutamp.envs import TAMPEnvironment
@@ -97,26 +88,9 @@ def transform_points(
     return out_points
 
 
-def sample_between_bounds(num_samples: int, bounds: torch.Tensor) -> torch.Tensor:
-    """
-    Sample uniformly between bounds.
-    The bounds should be a (2, d) tensor where the first row is the lower bound and the second row is the upper bound.
-    """
-    lower, upper = bounds
-    samples = torch.rand(num_samples, *lower.shape, device=bounds.device, dtype=bounds.dtype)
-    samples = lower + samples * (upper - lower)
-    return samples
-
-
 def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
     """Approximate the goal AABB from the goal object."""
-    # Compute transformation matrix for object pose
-    pose = torch.tensor(goal.pose)
-    pos, wxyz = pose[:3], pose[3:]
-    xyzw = roma.quat_wxyz_to_xyzw(wxyz)
-    mat4x4 = torch.eye(4)
-    mat4x4[:3, :3] = roma.unitquat_to_rotmat(xyzw)
-    mat4x4[:3, 3] = pos
+    mat4x4 = pose_list_to_mat4x4(goal.pose)
     if isinstance(goal, Mesh):
         vertices = torch.tensor(goal.vertices, dtype=mat4x4.dtype)
         vertices = transform_points(vertices, mat4x4)
@@ -146,12 +120,8 @@ def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene
     for obj in obstacles:
         if isinstance(obj, Cuboid):
             geoms["cuboid"].append(obj)
-        elif isinstance(obj, Sphere):
-            geoms["sphere"].append(obj)
         elif isinstance(obj, Cylinder):
             geoms["cylinder"].append(obj)
-        elif isinstance(obj, Capsule):
-            geoms["capsule"].append(obj)
         elif isinstance(obj, Mesh):
             geoms["mesh"].append(obj)
         else:

@@ -66,7 +66,7 @@ def blocks_t1_plan(real_world, real_plan):
 def _real_world_slot():
     """Holds ``real_world``'s world, so teardown can free it: ``real_world`` is torn down first, and with it pytest's
     own reference to the world."""
-    slot = [make_blocks_t1_world(collision_activation_distance=0.0)]
+    slot = [make_blocks_t1_world()]
     yield slot
     slot.clear()
     sys.last_type = sys.last_value = sys.last_traceback = None  # a failed test's traceback holds its locals

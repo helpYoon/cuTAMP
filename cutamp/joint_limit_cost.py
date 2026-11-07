@@ -7,8 +7,6 @@ it has no margin band. Empirical analysis of saved plans showed 100% of near-lim
 comes from endpoint configs (IK/particle output), never from trajopt
 excursions.
 
-Spec: docs/superpowers/specs/2026-06-11-joint-limit-margin-design.md
-
 The Trunk tilt bound (design call 22), which an envelope may set (route A's sets none), has three consumers of
 :func:`trunk_tilt_cosine`: the Motion value ``trunk_tilt`` over the confs (cutamp/cost_function.py) and
 :class:`TrunkTiltCost` on the motion planner, both through :func:`trunk_tilt_excess`, and GN's tilt row
@@ -42,7 +40,7 @@ def shrunken_bounds_penalty(q: torch.Tensor, lower: torch.Tensor, upper: torch.T
 # Initial-state confs are frozen at the robot's actual current state: the
 # initial state must never acquire limit gradients.
 # Keep in sync with the initial-conf set in optimize_plan.py (q0/left_q0/
-# right_q0) and cost_function.py — bare "q0" appears in single-arm domains.
+# right_q0).
 _EXCLUDED_CONF_NAMES = ("q0", "left_q0", "right_q0")
 
 

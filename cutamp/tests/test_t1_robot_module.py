@@ -1,8 +1,7 @@
 """Tests for the T1 robot module under cuRobo v0.8 single-MotionPlanner.
 
-The dual-arm-specific assertions from the v0.7 era (DualArmRobotContainer,
-two kinematics models, etc.) are gone. This file now exercises the single-
-container shape: one Kinematics, two tool frames, gripper-spheres dict.
+This file exercises the robot container's shape: one Kinematics, two tool
+frames, gripper-spheres dict.
 It also covers the outputs of real-leg runs (decision 9): the raw plan and
 the Rerun viewer.
 """
@@ -24,12 +23,6 @@ def t1_container():
     from curobo.types import DeviceCfg
     from cutamp.robots import REAL_LEGS, load_t1_container
     return load_t1_container(REAL_LEGS, DeviceCfg())
-
-
-def test_t1_container_is_single_robot(t1_container):
-    from cutamp.robots import RobotContainer
-    assert isinstance(t1_container, RobotContainer)
-    assert t1_container.name == "t1"
 
 
 def test_t1_has_two_tool_frames(t1_container):

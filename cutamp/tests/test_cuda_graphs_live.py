@@ -69,10 +69,10 @@ def test_live_capture_waits_for_the_planner_thread(tmp_path, monkeypatch):
         stepped.set()
         return update(self, *args, **kwargs)
 
-    def slow_build(world, config):
+    def slow_build(world):
         assert stepped.wait(timeout=120), "no optimize call ran a step"
         builds.append(threading.current_thread().name)
-        return build(world, config)
+        return build(world)
 
     monkeypatch.setattr(optimize_plan._BestSnapshot, "update", update_spy)
     monkeypatch.setattr(cutamp.algorithm, "build_motion_planner", slow_build)

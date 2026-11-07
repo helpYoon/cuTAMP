@@ -27,6 +27,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from curobo.motion_planner import MotionPlanner
 from curobo.sphere_fit import SphereFitType
 from curobo.types import JointState, Pose
 
@@ -37,12 +38,9 @@ from cutamp._curobo_internals import (
 from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
-from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM
+from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM, get_t1_motion_planner
 from cutamp.tamp_world import TAMPWorld
-from cutamp.utils.common import (
-    Particles,
-    action_4dof_to_mat4x4,
-)
+from cutamp.utils.common import Particles, action_4dof_to_mat4x4, get_world_cfg
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -125,10 +123,10 @@ def _disabled_world_obstacle(planner, name):
     on so the held block can sit on it). Re-enables on exit even if the body
     raises.
     """
-    sc = getattr(planner, "scene_collision_checker", None)
-    if sc is None or name is None:
+    if name is None:
         yield
         return
+    sc = planner.scene_collision_checker
     sc.enable_obstacle(name=name, enable=False)
     try:
         yield
@@ -213,9 +211,6 @@ def _attach_object(
     output. ``num_spheres=6`` is enough coverage for a 5cm cube.
     """
     am = _get_attachment_manager(planner)
-    if am is None:
-        _log.warning(f"attach({obj_name}) skipped: no attachment_manager")
-        return
     link_name = _ATTACH_LINK_FOR_ARM[arm]
     try:
         am.attach_from_scene(
@@ -250,8 +245,6 @@ def _detach_object(planner, obj_name: str, arm: str):
     Naming ``obj_name`` stops the stale re-enable; we enable it ourselves.
     """
     am = _get_attachment_manager(planner)
-    if am is None:
-        return
     try:
         am.detach(link_name=_ATTACH_LINK_FOR_ARM[arm], enable_obstacle_names=[obj_name])
         planner.scene_collision_checker.enable_obstacle(name=obj_name, enable=True)
@@ -273,20 +266,17 @@ def _reset_attachment_state(planner, world) -> None:
     planner state.
     """
     am = _get_attachment_manager(planner)
-    if am is not None:
-        for link in _ATTACH_LINK_FOR_ARM.values():
-            try:
-                am.detach(link_name=link)
-            except Exception as e:
-                _log.debug(f"detach({link}) during reset: {e}")
-    sc = getattr(planner, "scene_collision_checker", None)
-    if sc is not None:
-        for obj in world.movables:
-            try:
-                sc.enable_obstacle(name=obj.name, enable=True)
-            except Exception as e:
-                _log.debug(f"enable_obstacle({obj.name}) during reset: {e}")
-            _update_world_obstacle_pose(planner, obj.name, world.get_object_pose(obj))
+    for link in _ATTACH_LINK_FOR_ARM.values():
+        try:
+            am.detach(link_name=link)
+        except Exception as e:
+            _log.debug(f"detach({link}) during reset: {e}")
+    for obj in world.movables:
+        try:
+            planner.scene_collision_checker.enable_obstacle(name=obj.name, enable=True)
+        except Exception as e:
+            _log.debug(f"enable_obstacle({obj.name}) during reset: {e}")
+        _update_world_obstacle_pose(planner, obj.name, world.get_object_pose(obj))
 
 
 def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
@@ -298,11 +288,8 @@ def _update_world_obstacle_pose(planner, name: str, pose_mat) -> None:
     where the block actually lives now, so subsequent plans treat it as an
     obstacle at the new location.
     """
-    sc = getattr(planner, "scene_collision_checker", None)
-    if sc is None:
-        return
     try:
-        sc.update_obstacle_pose(name=name, w_obj_pose=Pose.from_matrix(pose_mat))
+        planner.scene_collision_checker.update_obstacle_pose(name=name, w_obj_pose=Pose.from_matrix(pose_mat))
     except Exception as e:
         _log.warning(f"update_obstacle_pose({name}) failed: {e}")
 
@@ -335,23 +322,28 @@ def _held_obj_poses(planner, tool_from_ee, held: dict, plan: JointState) -> dict
     return out
 
 
-def build_motion_planner(world: TAMPWorld, config: TAMPConfiguration):
-    """Build the trajopt planner, with CUDA graphs. Safe to run on a background
+def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> MotionPlanner:
+    """Build the trajopt planner on ``world.model``, colliding with the world's Scene with the movables included
+    (so attached objects are part of the collision world during planning). Safe to run on a background
     thread concurrently with Phase 1 because it runs no solves.
 
     No ``planner.warmup()``: its solves would capture CUDA graphs on this
     thread, and cuRobo captures in CUDA's global mode, where the main thread's
     allocations and syncs fail mid-capture. The first ``plan_cspace`` captures
     instead (~1 s), on the main thread after the join; every later segment has
-    the same shape and replays. ``config`` reads nothing today; the callers pass the run's.
+    the same shape and replays.
     """
-    return world.get_motion_planner(
+    return get_t1_motion_planner(
+        world.model,
+        get_world_cfg(world.env, include_movables=True),
+        use_cuda_graph=use_cuda_graph,
         # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (the
         # planner's own default, 0.01, is untested here). It only shapes the
         # optimizers' collision cost: cuRobo still judges success at 0
         # (metrics_base.yml). At 0 the optimum hugs obstacles, and retracts after
         # a place grazed the block just released by up to 0.2 mm.
         collision_activation_distance=0.0025,
+        device_cfg=world.device_cfg,
     )
 
 
@@ -374,7 +366,7 @@ def solve_curobo(
     plan_skeleton = plan_info["plan_skeleton"]
 
     with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
-        planner = get_planner() if get_planner is not None else build_motion_planner(world, config)
+        planner = get_planner() if get_planner is not None else build_motion_planner(world)
 
     # Defensive reset in case a prior solve_curobo aborted mid-plan and left the
     # planner with stale attached objects, disabled world obstacles, or placed
@@ -513,12 +505,8 @@ def solve_curobo(
 
         _log.info(f"{idx + 1}. {ground_op.name}")
 
-    # Play back the accumulated trajectories on the visualizer's "curobo"
-    # axis. Each entry's `plan.position` is a JointState in cuRobo full-DOF
-    # form ([..., time, full_dof]); we squeeze leading length-1 dims, convert
-    # to active DOF (which T1RerunRobot maps to URDF joints internally), and
-    # log frame-by-frame so Rerun shows the leg/arms animating.
-    #
+    # Play back the accumulated trajectories on the visualizer's "curobo" axis, frame by frame, in the model's full
+    # cspace (its 33 joints, the form T1RerunRobot takes: _full_positions), so Rerun shows the legs and arms animating.
     rr_robot = getattr(visualizer, "robot", None)
     grippers = {"left": list(GRIPPER_OPEN), "right": list(GRIPPER_OPEN)}
 
@@ -534,24 +522,7 @@ def solve_curobo(
         dt = entry.get("dt", 0.05)
         traj_arm = entry.get("arm")
         held_objs = entry.get("held_objs", {})
-        pos = plan.position
-        while pos.dim() > 2:
-            pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
-        # Reproject to the model's full cspace (its 33 joints), the form
-        # T1RerunRobot takes. Planner trajectories arrive in either the active
-        # cspace or the fully articulated form (with the head and grippers)
-        # depending on which planner method produced them.
-        full_dof = len(full_joint_names)
-        if pos.shape[-1] != full_dof:
-            src_names = getattr(plan, "joint_names", None)
-            if src_names is None:
-                src_names = (
-                    list(planner.kinematics.joint_names)
-                    if pos.shape[-1] == len(planner.kinematics.joint_names)
-                    else list(planner.kinematics.all_articulated_joint_names)
-                )
-            traj_js = JointState.from_position(pos, joint_names=src_names)
-            pos = traj_js.reorder(list(full_joint_names)).position
+        pos = _full_positions(world, planner, plan)
 
         if traj_arm in ("left", "right"):
             _set_gripper(traj_arm, traj_arm in held_objs)
@@ -614,17 +585,10 @@ def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
 
     accum_plans entries carry trajectories in different DOF forms depending on which planner method
     produced them: the planner's active cspace or the fully articulated form (a superset of
-    world.kinematics's 33 joints); a plain reorder handles both. ``plan.joint_names`` may be None, then the
-    planner's names are picked by shape, as in ``_last_timestep_js``."""
+    world.kinematics's 33 joints); a plain reorder by ``plan_js.joint_names``, which every planner trajectory
+    carries, handles both. ``planner`` is unused."""
     pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
-    src_names = getattr(plan_js, "joint_names", None)
-    if src_names is None:
-        src_names = (
-            list(planner.kinematics.joint_names)
-            if pos.shape[-1] == len(planner.kinematics.joint_names)
-            else list(planner.kinematics.all_articulated_joint_names)
-        )
-    js = JointState.from_position(pos, joint_names=list(src_names))
+    js = JointState.from_position(pos, joint_names=list(plan_js.joint_names))
     return js.reorder(list(world.kinematics.joint_names)).position
 
 
@@ -733,16 +697,12 @@ def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
 
 
 def _model_frames(world: TAMPWorld, planner, plan_js: JointState) -> JointState:
-    """``plan_js``'s frames: ``[T, n]`` positions, velocities and accelerations in ``world.model.joint_names`` order. A
-    plan may also carry the joints the planner locks (the head, the fingers); a plan without joint names takes
-    the planner's, picked by shape as in ``_full_positions``."""
+    """``plan_js``'s frames: ``[T, n]`` positions, velocities and accelerations in ``world.model.joint_names`` order, by
+    its joint names. A plan may also carry the joints the planner locks (the head, the fingers). ``planner`` is
+    unused."""
     names = list(world.model.joint_names)
     dof = plan_js.position.shape[-1]
-    src = plan_js.joint_names
-    if src is None:
-        src = (planner.kinematics.joint_names if dof == len(planner.kinematics.joint_names)
-               else planner.kinematics.all_articulated_joint_names)
-    cols = [list(src).index(j) for j in names]
+    cols = [list(plan_js.joint_names).index(j) for j in names]
     q, v, a = (x.reshape(-1, dof)[:, cols] for x in (plan_js.position, plan_js.velocity, plan_js.acceleration))
     return JointState(position=q, velocity=v, acceleration=a, joint_names=names)
 

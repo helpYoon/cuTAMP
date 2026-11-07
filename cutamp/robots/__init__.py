@@ -35,7 +35,6 @@ class RobotContainer:
     name. The kinematics tracks more frames (the soles and stance).
     """
 
-    name: str
     model: T1Model
     kinematics: Kinematics
     joint_limits: torch.Tensor  # [2, d]
@@ -59,7 +58,6 @@ def load_t1_container(model: T1Model, device_cfg: DeviceCfg = None) -> RobotCont
     }
 
     return RobotContainer(
-        name="t1",
         model=model,
         kinematics=kin,
         joint_limits=joint_limits,

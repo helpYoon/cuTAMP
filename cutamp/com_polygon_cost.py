@@ -1,19 +1,19 @@
 """Center-of-mass over the support rectangle: the cost and every balance check.
 
 Penalizes the projected COM (in the model's support frame, ``T1Model.support.link``) when it leaves an
-axis-aligned support rectangle about ``support.center``, with a soft inside-margin barrier so the
+axis-aligned support rectangle about that frame's origin, with a soft inside-margin barrier so the
 optimizer steers away from the edge instead of bouncing off it.
 
 Three regions:
 
-* Strictly inside the inset rectangle (more than ``inside_margin`` from any
+* Strictly inside the inset rectangle (more than ``COM_INSIDE_MARGIN`` from any
   edge): cost = 0.
-* Within ``inside_margin`` of any edge from inside: only the barrier term is
+* Within ``COM_INSIDE_MARGIN`` of any edge from inside: only the barrier term is
   active.
 * Outside the rectangle: both the outside-quadratic and the saturated barrier
   contribute (steepest gradient back to feasibility).
 
-Every helper takes the support (its frame, centre and half-extents) or reads ``world.model.support``: confs
+Every helper takes the support (its frame and half-extents) or reads ``world.model.support``: confs
 (masks, margins, penalties, GN, the trajopt cost) use ``keyframe_half``, trajectory frames (the balance gate and
 its audit) ``gate_half``.
 
@@ -92,44 +92,29 @@ def _half_extents(half: Tuple[float, float], device: torch.device, dtype: torch.
     return torch.tensor(half, device=device, dtype=dtype)
 
 
-@lru_cache(maxsize=None)
-def _center(center: Tuple[float, float], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """A support's ``center`` (in its frame) on ``device``, made once per value, like :func:`_half_extents`."""
-    return torch.tensor(center, device=device, dtype=dtype)
-
-
 @dataclass
 class ComOverBasePolygonCostCfg(BaseCostCfg):
     #: Half-extents of the rectangle in the ``base_link_name`` frame (X, Y) in
-    #: meters, as a ``[2]`` tensor, about ``center``: the model's
+    #: meters, as a ``[2]`` tensor, about the frame's origin: the model's
     #: ``support.keyframe_half``.
     half_extents: torch.Tensor = None
-    #: Distance inside the edge at which the soft barrier starts (meters).
-    #: ``0`` disables the barrier (outside-only penalization).
-    inside_margin: float = COM_INSIDE_MARGIN
-    #: Relative scale of the inside barrier vs the outside quadratic.
-    inside_weight: float = COM_INSIDE_WEIGHT
     #: Tool frame the rectangle is measured in: the model's ``support.link``.
     base_link_name: str = None
-    #: The rectangle's centre (X, Y) in that frame, meters: the model's ``support.center``.
-    center: Tuple[float, float] = None
 
     class_type: Type = None  # set after ComOverBasePolygonCost definition below
 
     def __post_init__(self):
         super().__post_init__()
-        if any(v is None for v in (self.half_extents, self.base_link_name, self.center)):
-            raise ValueError("ComOverBasePolygonCostCfg takes half_extents, base_link_name and center from the "
-                             "model's support")
+        if self.half_extents is None or self.base_link_name is None:
+            raise ValueError("ComOverBasePolygonCostCfg takes half_extents and base_link_name from the model's support")
         self.half_extents = self.half_extents.to(
             self.device_cfg.device, dtype=self.device_cfg.dtype
         )
-        self.center = tuple(float(c) for c in self.center)  # hashable: _center caches it by value
 
 
-def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor, center: Tuple[float, float]) -> torch.Tensor:
-    """Project world-frame COM points into the support frame's XY plane, about
-    the support's ``center`` in that frame.
+def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor) -> torch.Tensor:
+    """Project world-frame COM points into the support frame's XY plane. The support rectangle is centred on the
+    frame's origin (the stance sits at the home mid-sole).
 
     Closed-form SE(3) inverse-transform: ``T_inv @ [p; 1] = R^T (p - t)``.
     Single home of the projection, used by :func:`com_polygon_penalty`.
@@ -137,48 +122,36 @@ def _project_com_to_base(com_world: torch.Tensor, base_T: torch.Tensor, center: 
     Args:
         com_world: ``[N, 3]`` COM in world frame.
         base_T: ``[N, 4, 4]`` SE(3) world pose of the support frame.
-        center: the support's ``(x, y)`` centre in that frame.
 
     Returns:
         ``[N, 2]`` (x, y) COM offset from the support centre, in the support frame's axes.
     """
     R = base_T[:, :3, :3]
     t = base_T[:, :3, 3]
-    xy = (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
-    return xy - _center(center, xy.device, xy.dtype)
+    return (R.transpose(-1, -2) @ (com_world - t).unsqueeze(-1)).squeeze(-1)[:, :2]
 
 
-def com_polygon_penalty(
-    com_world: torch.Tensor,
-    base_T: torch.Tensor,
-    half_extents: torch.Tensor,
-    inside_margin: float,
-    inside_weight: float,
-    center: Tuple[float, float],
-) -> torch.Tensor:
-    """Per-sample COM-over-rectangle penalty in the support frame.
+def com_polygon_penalty(com_world: torch.Tensor, base_T: torch.Tensor, half_extents: torch.Tensor) -> torch.Tensor:
+    """Per-sample COM-over-rectangle penalty in the support frame, with the inside barrier ``COM_INSIDE_MARGIN``
+    wide at ``COM_INSIDE_WEIGHT`` times the outside quadratic.
 
     Args:
         com_world: ``[N, 3]`` COM in world frame.
         base_T: ``[N, 4, 4]`` SE(3) world pose of the support frame.
         half_extents: ``[2]`` rectangle half-sizes (x, y) in that frame.
-        inside_margin: width of the inside soft-barrier band (meters).
-        inside_weight: relative scale of the inside barrier vs the outside
-            quadratic.
-        center: the rectangle's ``(x, y)`` centre in that frame.
 
     Returns:
         ``[N]`` non-negative penalty.
     """
-    com_in_base = _project_com_to_base(com_world, base_T, center)
+    com_in_base = _project_com_to_base(com_world, base_T)
     offset = torch.abs(com_in_base) - half_extents
     outside = torch.clamp(offset, min=0.0)
-    inside = torch.clamp(offset + inside_margin, min=0.0)
+    inside = torch.clamp(offset + COM_INSIDE_MARGIN, min=0.0)
     # Inside barrier uses MAX over axes (distance to the NEAREST edge), not sum:
     # near a corner the nearest-edge margin — not the sum of both — is what
     # bounds tip-over. Summing double-counts corners and wrongly rejects
     # COM-feasible configs (see test_com_polygon_penalty_corner_*).
-    return (outside ** 2).sum(dim=-1) + inside_weight * (inside ** 2).max(dim=-1).values
+    return (outside ** 2).sum(dim=-1) + COM_INSIDE_WEIGHT * (inside ** 2).max(dim=-1).values
 
 
 class ComOverBasePolygonCost(BaseCost):
@@ -197,9 +170,7 @@ class ComOverBasePolygonCost(BaseCost):
             .get_matrix()
             .reshape(n, 4, 4)
         )
-        cost = com_polygon_penalty(
-            com_world, base_T, cfg.half_extents, cfg.inside_margin, cfg.inside_weight, cfg.center,
-        )
+        cost = com_polygon_penalty(com_world, base_T, cfg.half_extents)
         return cost.reshape(b, h, 1) * self._weight
 
 
@@ -247,7 +218,7 @@ def com_polygon_mask_from_state(ks, support) -> torch.Tensor:
     # GN IK acceptance check and ConstraintChecker can never diverge. With the
     # max-over-axes barrier, (penalty <= COM_TOL) == "COM inside-or-on the hull".
     half = _half_extents(support.keyframe_half, com.device, com.dtype)
-    pen = com_polygon_penalty(com, base_T, half, COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, support.center)
+    pen = com_polygon_penalty(com, base_T, half)
     return pen <= COM_TOL
 
 
@@ -258,7 +229,7 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     (which is built with ``compute_com=True``), projects it into the
     support frame of ``world.model.support``, and returns a boolean mask of
     which batch elements have their COM inside its ``keyframe_half``
-    rectangle around its ``center``.
+    rectangle.
 
     Args:
         world: TAMPWorld instance. Must have ``world.kinematics`` (built with ``compute_com=True``)
@@ -288,7 +259,7 @@ def compute_support_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
     (``world.model.support.gate_half``), for full-cspace configs via FK. Measure-only (the trajectory audit)."""
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q_batch)
-    return com_margin_from_base(_project_com_to_base(com, base_T, support.center), support.gate_half) >= 0
+    return com_margin_from_base(_project_com_to_base(com, base_T), support.gate_half) >= 0
 
 
 def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
@@ -298,7 +269,7 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     Measure-only companion to :func:`compute_com_polygon_mask`, through :func:`particle_com_margin`."""
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q_batch)
-    return com_margin_from_base(_project_com_to_base(com, base_T, support.center), support.keyframe_half)
+    return com_margin_from_base(_project_com_to_base(com, base_T), support.keyframe_half)
 
 
 def particle_com_margin(world, particle: "dict[str, torch.Tensor]") -> float:
@@ -318,7 +289,7 @@ def _vee(m: torch.Tensor) -> torch.Tensor:
 
 
 def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
-    """``(com_xy [T, 2], zmp_xy [T, 2])`` in the support frame, about ``world.model.support.center``. ``q3``
+    """``(com_xy [T, 2], zmp_xy [T, 2])`` in the support frame, about its origin, the rectangle's centre. ``q3``
     ``[3, T, full_dof]`` holds each frame's configuration ``h`` s before, at and after it along the plan's own
     velocity and acceleration (motion_solver._taylor_positions), so central differences give every link's
     acceleration and angular acceleration as the plan moves, to O(h^2); one FK on ``world.bodies``, whose first
@@ -352,10 +323,9 @@ def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
     f = m * (g + a[..., 2])
     zmp = torch.stack([(f * x[..., 0] - m * x[..., 2] * a[..., 0]).sum(-1) - spin[:, 1],
                        (f * x[..., 1] - m * x[..., 2] * a[..., 1]).sum(-1) + spin[:, 0]], dim=-1)
-    centre = _center(world.model.support.center, x.device, x.dtype)
     com = (m.unsqueeze(-1) * x[..., :2]).sum(-2) / m.sum()
     load = f.sum(-1, keepdim=True)  # [T, 1]: the floor's vertical push
-    return com - centre, torch.where(load > 0, zmp / load - centre, math.inf)
+    return com, torch.where(load > 0, zmp / load, math.inf)
 
 
 def compute_com_polygon_penalties(
@@ -395,8 +365,6 @@ def compute_com_polygon_penalties(
     q_all = torch.cat(qs)
     support = world.model.support
     com_world, base_T = _fk_com_and_base(world, q_all, world.site_kinematics("com"))
-    pen = com_polygon_penalty(
-        com_world, base_T, _half_extents(support.keyframe_half, com_world.device, com_world.dtype),
-        COM_INSIDE_MARGIN, COM_INSIDE_WEIGHT, support.center,
-    )
+    half = _half_extents(support.keyframe_half, com_world.device, com_world.dtype)
+    pen = com_polygon_penalty(com_world, base_T, half)
     return dict(zip(conf_names, pen.split([q.shape[0] for q in qs])))

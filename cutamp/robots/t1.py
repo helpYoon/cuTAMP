@@ -76,9 +76,8 @@ T1_29DOF_DIR = Path(__file__).parent / "assets" / "t1_29dof"
 
 
 class Support(NamedTuple):
-    """Where the CoM must stay: axis-aligned half-extents about ``center``, in the frame of ``link``."""
-    link: str                            # the support frame, z = 0 on the sole plane
-    center: Tuple[float, float]          # the region's centre in that frame
+    """Where the CoM must stay: axis-aligned half-extents about the origin of ``link``'s frame."""
+    link: str                            # the support frame, z = 0 on the sole plane, its origin the region's centre
     gate_half: Tuple[float, float]       # per-frame trajectory gate
     keyframe_half: Tuple[float, float]   # confs: masks, penalties, GN, trajopt cost
 
@@ -136,7 +135,7 @@ def _load_real_legs() -> T1Model:
         right_arm=right_arm,
         home=home,
         # The stance link sits at the home mid-sole, on the floor: the rectangle is centred on it.
-        support=Support("stance", (0.0, 0.0), gate_half, keyframe_half),
+        support=Support("stance", gate_half, keyframe_half),
         sole_frames=("left_sole_link", "right_sole_link"),
         envelope=load_envelope("route_a_start"),  # by name: route A has no checkpoint to pick it by (design 7.10)
     )
@@ -231,7 +230,7 @@ def _check_joint_order(model: T1Model, joint_names) -> None:
 
 
 # =============================================================================
-# Kinematics, IK, and MotionPlanner factories
+# Kinematics and MotionPlanner factories
 # =============================================================================
 
 def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None, compute_jacobian: bool = False) -> Kinematics:
@@ -384,40 +383,16 @@ def get_t1_motion_planner(
     criteria[model.support.link] = ToolPoseCriteria.disabled()
     planner.update_tool_pose_criteria(criteria)
     from cutamp._curobo_internals import add_extra_cost
-    from cutamp.com_polygon_cost import (
-        ComOverBasePolygonCost,
-        ComOverBasePolygonCostCfg,
-        COM_INSIDE_MARGIN,
-        COM_INSIDE_WEIGHT,
-    )
-    # Tuned on the simplified model (branch ablation-baseline) and kept on the real legs:
-    # COM-polygon cost is a SAFETY BARRIER: zero cost anywhere inside
-    # the two-foot support rectangle, quadratic-in-distance penalty
-    # outside. The joint-level costs are what keep the body near upright
-    # — having COM ALSO try to pull toward center produced fighting costs (COM "lean back to recenter" vs body "stay
-    # upright"), which manifested as the trunk pitching backward when
-    # arms reach forward. Boundary-only shape lets those costs
-    # dictate posture; COM only intervenes if the body actually drifts
-    # to a tipping configuration. Bumped weight 1e5 → 5e5 to push back
-    # harder on excursions without re-introducing the inside barrier.
-    # Inside-barrier ON for the planner rollouts too: keyframe-only COM
-    # filter (Adam side) is satisfied, but the saved trajectory's mid-
-    # waypoint COM was excursing up to 5cm out of polygon (89% inside,
-    # ~58/528 frames out, peak penalty 2.4e-3 in place segments). Adding
-    # the inside-barrier here gives the trajopt LBFGS a gradient pull
-    # from inside the polygon edge band toward center, flattening the
-    # mid-trajectory bumps. The earlier concern (this fighting
-    # the joint-level costs) is validated by retesting; if trunk pitches
-    # back too much we lower inside_weight from 1.0.
+    from cutamp.com_polygon_cost import ComOverBasePolygonCost, ComOverBasePolygonCostCfg
+
+    # A barrier on the trajectory's CoM: zero inside the keyframe rectangle less COM_INSIDE_MARGIN, quadratic past it,
+    # at weight 5e5 (tuned on the simplified model, branch ablation-baseline, and kept on the real legs).
     rollout_device_cfg = planner.trajopt_solver.optimizer_rollouts[0].device_cfg
     cost_cfg = ComOverBasePolygonCostCfg(
         weight=[5.0e5],
         device_cfg=rollout_device_cfg,
         half_extents=torch.tensor(model.support.keyframe_half),
-        inside_margin=COM_INSIDE_MARGIN,
-        inside_weight=COM_INSIDE_WEIGHT,
         base_link_name=model.support.link,
-        center=model.support.center,
     )
     add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
     if model.envelope.trunk_tilt_max is not None:
