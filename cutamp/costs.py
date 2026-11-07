@@ -92,8 +92,9 @@ def curobo_pose_error(
     """Translational and rotational errors between two batched 4x4 pose tensors.
 
     Computes element-wise distances. Avoids ``curobo.types.Pose.distance``
-    because v0.8's ``angular_distance_axis_angle`` has a broadcast bug that
-    produces an ``[N, N]`` pairwise tensor for matching ``[N, 4]`` inputs.
+    because its ``angular_distance_axis_angle`` has a broadcast bug, still in
+    v0.9.0, that produces an ``[N, N]`` pairwise tensor for matching ``[N, 4]``
+    inputs.
     """
     # Translation: L2 distance in [b, *h]
     p_dist = torch.linalg.norm(pose_a_mat4x4[..., :3, 3] - pose_b_mat4x4[..., :3, 3], dim=-1)

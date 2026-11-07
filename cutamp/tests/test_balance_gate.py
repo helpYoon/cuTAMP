@@ -61,7 +61,8 @@ def test_retime_without_slowdown_is_the_motion_planners_timing():
 def test_bodies_leave_the_robot_config_alone():
     # The bodies' kinematics is built from the cached robot config, whose tool frames every later IK solver
     # and motion planner reads: rewritten to the bodies' links, the next run in the process found no IK solution.
-    from cutamp.robots.t1 import get_t1_bodies, t1_curobo_cfg
+    from cutamp.robots.t1 import get_t1_bodies, get_t1_kinematics, t1_curobo_cfg
+    config = get_t1_kinematics(REAL_LEGS).config
     before = list(t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"]["tool_frames"])
-    get_t1_bodies(REAL_LEGS)
+    get_t1_bodies(REAL_LEGS, config)
     assert t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"]["tool_frames"] == before

@@ -15,6 +15,9 @@ def test_site_kinematics_are_dedicated():
     assert len({id(k) for k in (*kins, world.kinematics, world.kinematics_jac)}) == len(FK_SITES) + 2 == 7
     assert all(world.site_kinematics(s) is k for s, k in zip(FK_SITES, kins))
     assert all(k.config is world.kinematics.config and k.compute_com and not k.compute_jacobian for k in kins)
+    jac = world.kinematics_jac  # the Jacobian twin and the gate's torques share that config too
+    assert jac.config is world.kinematics.config and jac.compute_com and jac.compute_jacobian
+    assert world.segment_torques.kin.config is world.kinematics.config
     with pytest.raises(ValueError, match="rollout"):
         world.site_kinematics("refresh")
 

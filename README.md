@@ -227,8 +227,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
     envelope, to which `t1_curobo_cfg` cuts the model's limits (each end on
     its own, in a copy of the planner URDF, since cuRobo reads a URDF joint's
     limits only from the URDF).
-  - cuRobo loaders: `get_t1_kinematics` (always `compute_com=True`;
-    `compute_jacobian=True` for GN), `get_t1_motion_planner` (the
+  - cuRobo loaders: `get_t1_kinematics` (always `compute_com=True`; the
+    world builds its other `Kinematics` on its config),
+    `get_t1_motion_planner` (the
     single planner: cuRobo's RNEA in trajopt with the floor's push on the
     planted soles and each joint's torque bounded at its effort, the joint
     limits bounded at `TRAJOPT_POSITION_BOUND_WEIGHT` (1e6, cuRobo's 1e4
@@ -236,8 +237,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
     on the stance at every waypoint and the COM-over-polygon rollout soft
     cost), and
     `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
-    masses and CoMs and the URDF's inertias, for the balance gate's
-    multibody ZMP).
+    masses, CoMs and inertias, for the balance gate's multibody ZMP).
   - The arm joint names (`LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`), the
     tool frames and the grippers' open and closed states.
   - `T1RerunRobot` for visualization: sets the URDF's joints by name from a
@@ -257,7 +257,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   (`get_t1_bodies`: a second `Kinematics` whose tool frames are every massive
   link, for the balance gate's multibody ZMP), `segment_torques` (the gate's
   torque and speed checks), and one `site_kinematics(name)` per Adam-loop FK
-  site in `FK_SITES`.
+  site in `FK_SITES`; all but `bodies` run on the single `Kinematics`'s
+  config.
 
 - [`_curobo_internals.py`](cutamp/_curobo_internals.py) — everything cuTAMP
   changes in cuRobo, in one file (with a `# TODO: file upstream issue` marker;

@@ -31,7 +31,6 @@ from cutamp.robots.t1 import (
     TOOL_FRAME_FOR_ARM,
     T1Model,
     get_t1_bodies,
-    get_t1_kinematics,
 )
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
@@ -230,15 +229,15 @@ class TAMPWorld:
     def kinematics_jac(self) -> Kinematics:
         """Jacobian-enabled twin of ``kinematics`` (lazily built).
 
-        Same model, but ``compute_jacobian=True`` so every FK call
-        also fills ``tool_jacobians``. Separate instance because the flag is
+        Same config, but ``compute_jacobian=True`` so every FK call
+        also fills ``tool_jacobians`` ``[b, h, num_tool_frames, 6, dof]``
+        (rows 0-2 linear / 3-5 angular, world frame; verified against finite
+        differences). Separate instance because the flag is
         baked into the kernel buffers at construction. Used by the GN reIK
         refresh (``cutamp/gn_refresh.py``).
         """
         if self._kinematics_jac is None:
-            self._kinematics_jac = get_t1_kinematics(
-                self.model, device_cfg=self.device_cfg, compute_jacobian=True,
-            )
+            self._kinematics_jac = Kinematics(self.kinematics.config, compute_com=True, compute_jacobian=True)
         return self._kinematics_jac
 
     @property
@@ -246,7 +245,7 @@ class TAMPWorld:
         """Every massive link of the robot (:func:`cutamp.robots.t1.get_t1_bodies`, lazily built): the
         balance gate's multibody ZMP."""
         if self._bodies is None:
-            self._bodies = get_t1_bodies(self.model, device_cfg=self.device_cfg)
+            self._bodies = get_t1_bodies(self.model, self.kinematics.config)
         return self._bodies
 
     @property
@@ -255,7 +254,7 @@ class TAMPWorld:
         (:class:`cutamp.floor_wrench.SegmentTorques`, lazily built): the balance gate's torque and speed checks, which
         set each segment's pace, and the reason a trajopt failed."""
         if self._segment_torques is None:
-            self._segment_torques = SegmentTorques(self.model, self.device_cfg)
+            self._segment_torques = SegmentTorques(self.model, self.kinematics.config)
         return self._segment_torques
 
     def site_kinematics(self, name: str) -> Kinematics:

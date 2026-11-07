@@ -13,8 +13,9 @@ import torch
 from curobo._src.geom.transform import torch_quaternion_to_matrix
 
 if TYPE_CHECKING:
+    from curobo.kinematics import KinematicsCfg
     from curobo.motion_planner import MotionPlanner
-    from curobo.types import DeviceCfg, JointState
+    from curobo.types import JointState
 
     from cutamp.robots.t1 import T1Model
 
@@ -117,25 +118,26 @@ class SegmentTorques:
     balance gate's torque check, which with the speed limits sets each segment's pace, and the reason a trajopt
     failed (design 7.4a).
 
-    Calling it on a ``plan_js`` (position, velocity and acceleration, by joint name) returns the second pass's
-    ``[T, dof]`` torques in ``model.joint_names`` order. Eager. ``effort`` ``[dof]`` is cuRobo's bound on each
-    joint's |torque|: the pinned URDF's effort, and 10,000 on the massless base joints (link_params.py:35).
+    It runs on ``config``, ``model``'s KinematicsCfg (``TAMPWorld.kinematics``'s, which
+    :func:`cutamp.robots.t1.get_t1_kinematics` builds and checks the joint order of). Calling it on a ``plan_js``
+    (position, velocity and acceleration, by joint name) returns the second pass's ``[T, dof]`` torques in
+    ``model.joint_names`` order. Eager. ``effort`` ``[dof]`` is cuRobo's bound on each joint's |torque|: the pinned
+    URDF's effort, and 10,000 on the massless base joints (link_params.py:35).
     ``velocity`` ``[dof]`` is cuRobo's bound on each joint's |velocity| (``get_joint_limits()``, never the URDF's
     velocity times the YAML's velocity_scale: cuRobo applies that scale twice).
     """
 
-    def __init__(self, model: T1Model, device_cfg: DeviceCfg):
+    def __init__(self, model: T1Model, config: KinematicsCfg):
         from curobo._src.robot.dynamics.dynamics import Dynamics
         from curobo._src.robot.dynamics.dynamics_cfg import DynamicsCfg
-
-        from cutamp.robots.t1 import get_t1_kinematics
+        from curobo.kinematics import Kinematics
 
         self.joint_names = list(model.joint_names)
         # The robot config's load_dynamics only makes RobotCfg build a DynamicsCfg like this one from the same
         # kinematics (types/robot.py); KinematicsCfg reads the URDF's inertias either way.
-        self.kin = get_t1_kinematics(model, device_cfg)  # compute_com, and the joint order checked against model's
-        kp = self.kin.config.kinematics_config
-        self.dyn = Dynamics(DynamicsCfg(kinematics_config=kp, device_cfg=device_cfg))
+        self.kin = Kinematics(config, compute_com=True)  # get_t1_kinematics' flags
+        kp = config.kinematics_config
+        self.dyn = Dynamics(DynamicsCfg(kinematics_config=kp, device_cfg=config.device_cfg))
         tools = list(self.kin.tool_frames)
         self.fn = make_floor_wrench_fn([self.joint_names.index(j) for j in model.joint_names[model.base]],
                                        tuple(tools.index(f) for f in model.sole_frames),

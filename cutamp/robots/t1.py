@@ -219,23 +219,18 @@ def _check_joint_order(model: T1Model, joint_names) -> None:
 # Kinematics and MotionPlanner factories
 # =============================================================================
 
-def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None, compute_jacobian: bool = False) -> Kinematics:
+def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None) -> Kinematics:
     """``model``'s Kinematics over its whole cspace (both arms and the base, which nothing here locks).
 
     Always built with ``compute_com=True`` so ``KinematicsState.robot_com``
-    is populated on every FK call (COM constraint/gate consumers). Measured
-    overhead vs the plain kernel: none (0.126 vs 0.127 ms per 1024-batch FK).
-
-    ``compute_jacobian=True`` additionally populates
-    ``KinematicsState.tool_jacobians`` ``[b, h, num_tool_frames, 6, dof]``
-    (rows 0-2 linear / 3-5 angular, world frame; verified against finite
-    differences). Used by the Gauss-Newton reIK refresh.
+    is populated on every FK call (COM constraint/gate consumers). ``TAMPWorld`` builds its other Kinematics (the
+    Jacobian twin, the FK sites, the gate's torques) on this one's config.
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
     cfg = t1_curobo_cfg(model)
     kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg)
-    kin = Kinematics(kin_cfg, compute_com=True, compute_jacobian=compute_jacobian)
+    kin = Kinematics(kin_cfg, compute_com=True)
     _check_joint_order(model, kin.joint_names)
     return kin
 
@@ -248,30 +243,25 @@ class T1Bodies(NamedTuple):
     inertia: torch.Tensor   # [L, 3, 3] about the CoM, in the link frame, kg m^2
 
 
-def get_t1_bodies(model: T1Model, device_cfg: DeviceCfg = None) -> T1Bodies:
-    """:class:`T1Bodies` of ``model``: its support frame (``model.support.link``), then every massive link. Masses
-    and CoMs are cuRobo's, the ones every ``robot_com`` sums; inertias are read from the URDF, and equal the ones
-    cuRobo keeps (``test_curobo_link_inertias_match_the_urdf``). A frame the URDF lacks, such as ``stance``, weighs
-    nothing."""
-    if device_cfg is None:
-        device_cfg = DeviceCfg()
-    cfg = copy.deepcopy(t1_curobo_cfg(model))  # from_robot_yaml_file writes tool_frames into the dict it is given
-    kp = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg).kinematics_config
+def get_t1_bodies(model: T1Model, config: KinematicsCfg) -> T1Bodies:
+    """:class:`T1Bodies` of ``model``: its support frame (``model.support.link``), then every massive link of
+    ``config`` (``model``'s, as :func:`get_t1_kinematics` builds it). Masses, CoMs and inertias are cuRobo's
+    (``link_masses_com``, ``link_inertias``): the masses and CoMs every ``robot_com`` sums. The support frame
+    (``stance``, which the URDF lacks) weighs nothing: no mass, and no inertia where cuRobo keeps LinkParams' 1e-4
+    default."""
+    kp = config.kinematics_config
     support = model.support.link
     names = [support] + [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0 and n != support]
-    kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=names, device_cfg=device_cfg),
+    cfg = copy.deepcopy(t1_curobo_cfg(model))  # from_robot_yaml_file writes tool_frames into the dict it is given
+    kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=names, device_cfg=config.device_cfg),
                      compute_spheres=False)
     _check_joint_order(model, kin.joint_names)
     kp = kin.config.kinematics_config
-    mass_com = kp.link_masses_com[[kp.link_name_to_idx_map[n] for n in names]]
-    urdf = URDF.load(cfg["robot_cfg"]["kinematics"]["urdf_path"], load_meshes=False, build_scene_graph=False)
-    inertia = np.zeros((len(names), 3, 3))
-    for k, n in enumerate(names):
-        inertial = urdf.link_map[n].inertial if n in urdf.link_map else None
-        if inertial is not None:
-            r = inertial.origin[:3, :3]
-            inertia[k] = r @ inertial.inertia @ r.T
-    return T1Bodies(kin, mass_com[:, 3], mass_com[:, :3], mass_com.new_tensor(inertia))
+    idx = [kp.link_name_to_idx_map[n] for n in names]
+    mass_com = kp.link_masses_com[idx]
+    six = kp.link_inertias[idx, :6]  # ixx, iyy, izz, ixy, ixz, iyz
+    inertia = torch.where((mass_com[:, 3] > 0)[:, None, None], six[:, [[0, 3, 4], [3, 1, 5], [4, 5, 2]]], 0.0)
+    return T1Bodies(kin, mass_com[:, 3], mass_com[:, :3], inertia)
 
 
 TRAJOPT_POSITION_BOUND_WEIGHT = 1e6

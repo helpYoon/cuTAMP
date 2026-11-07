@@ -6,10 +6,11 @@ timing, FKs every frame, and writes ``PREFIX.json`` and ``PREFIX.md``:
 
 - per joint, the peak |torque| against its effort, and the peak |velocity| against its motor's knee speed (bfm_wm's
   ``t1_actuators.npz``, ``v_knee``: above it the motor's torque falls) and cuRobo's velocity limit;
-- per run, the largest Trunk tilt and sole drift from the stance, by FK; how many segments the balance gate slowed and
-  sped up (a retimed segment keeps the planner's timing), its smallest CoM and ZMP margins, its time scales and the
-  checks that bound them (``overall_metrics.json``); and every segment the gate left at the planner's timing whose
-  torque passes an effort. The gate checks those segments' torques too, so one here means a check missed it.
+- per run, the largest Trunk tilt (from the base's pitch and roll) and sole drift from the stance (by FK); how many
+  segments the balance gate slowed and sped up (a retimed segment keeps the planner's timing), its smallest CoM and
+  ZMP margins, its time scales and the checks that bound them (``overall_metrics.json``); and every segment the gate
+  left at the planner's timing whose torque passes an effort. The gate checks those segments' torques too, so one
+  here means a check missed it.
 
 Usage:
     python -m cutamp.scripts.real_legs_report --study /home/yoonwoo/cutamp-runs/<study> --out <prefix>
@@ -40,19 +41,18 @@ def find_plans(study: Path) -> list:
 
 
 class _RealLegs:
-    """cuRobo's view of the real legs: the balance gate's torques (``SegmentTorques``) and FK of the soles and the
-    Trunk, the stance soles at home, and each joint's effort, velocity limit and knee speed."""
+    """cuRobo's view of the real legs: the balance gate's torques (``SegmentTorques``) and FK of the soles, the
+    stance soles at home, and each joint's effort, velocity limit and knee speed."""
 
     def __init__(self, device_cfg=None):
         from curobo.types import DeviceCfg
 
         from cutamp.floor_wrench import SegmentTorques
-        from cutamp.robots.t1 import REAL_LEGS, T1_29DOF_DIR, get_t1_bodies
+        from cutamp.robots.t1 import REAL_LEGS, T1_29DOF_DIR, get_t1_kinematics
 
         device_cfg = DeviceCfg() if device_cfg is None else device_cfg
         self.model, self.names, self.device = REAL_LEGS, list(REAL_LEGS.joint_names), device_cfg.device
-        self.torques = SegmentTorques(REAL_LEGS, device_cfg)
-        self.trunk_kin = get_t1_bodies(REAL_LEGS, device_cfg).kinematics  # the gate's Trunk FK (_check_planted)
+        self.torques = SegmentTorques(REAL_LEGS, get_t1_kinematics(REAL_LEGS, device_cfg).config)
         self.effort = self.torques.effort.cpu().numpy()
         self.velocity_limit = self.torques.velocity.cpu().numpy()  # cuRobo's own, as the gate reads it
         with torch.no_grad():
@@ -78,16 +78,15 @@ class _RealLegs:
                             for f in self.model.sole_frames], dim=1)
 
     def planted(self, q: torch.Tensor):
-        """The largest sole drift from the stance (m, rad) and Trunk tilt from the vertical (rad) over confs ``q``."""
-        from curobo.types import JointState
-
+        """The largest sole drift from the stance (m, rad) and Trunk tilt from the vertical (rad) over confs ``q``.
+        The tilt is the base's (``trunk_tilt_cosine``), in float64."""
         from cutamp.costs import curobo_pose_error
+        from cutamp.joint_limit_cost import trunk_tilt_cosine
 
         soles = self._soles(q)
         pos, rot = curobo_pose_error(soles, self.stance.expand_as(soles))
-        ks = self.trunk_kin.compute_kinematics(JointState.from_position(q, joint_names=self.names))
-        trunk_z = ks.tool_poses.get_link_pose("Trunk", make_contiguous=True).get_matrix()[..., 2, 2]
-        return pos.max().item(), rot.max().item(), torch.acos(trunk_z.clamp(-1.0, 1.0)).max().item()
+        cos = trunk_tilt_cosine(q.double(), self.names.index("base_j_pitch"), self.names.index("base_j_roll"))
+        return pos.max().item(), rot.max().item(), torch.acos(cos.clamp(-1.0, 1.0)).max().item()
 
     def run(self, run_dir: Path, plan: dict) -> dict:
         """One run's peaks over every segment at its saved timing, and its balance gate's numbers."""

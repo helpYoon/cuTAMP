@@ -89,13 +89,10 @@ def _noisy_start(world: TAMPWorld, batch_size: int, arm: Optional[str], noise_st
         for side in ("Left", "Right"):
             noise[:, col(f"{side}_{joint}")] = 0.0
     seed = seed + noise
-    # Clamp the perturbed seed to joint limits, which GN keeps every iterate inside. Limits come from the same
-    # full-cspace kinematics that defines world.q_init's joint order
-    # (JointLimits.joint_names == kinematics.joint_names, verified [2, full_dof]).
+    # Clamp the perturbed seed to joint limits, which GN keeps every iterate inside. world.joint_limits are the
+    # full-cspace kinematics' ([2, full_dof]), in world.q_init's joint order.
     # The left and right pitch limits are equal, so the clamp keeps the legs mirrored.
-    _limits = world.kinematics.get_joint_limits().position  # [2, full_dof]
-    _lower = _limits[0].to(seed.device, seed.dtype)
-    _upper = _limits[1].to(seed.device, seed.dtype)
+    _lower, _upper = world.joint_limits.to(seed.device, seed.dtype)
     seed = torch.clamp(seed, min=_lower, max=_upper)
     return _stand_on_the_stance(world, seed, _lower, _upper)
 

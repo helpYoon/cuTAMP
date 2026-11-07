@@ -127,9 +127,7 @@ def _setup(world, q_full: torch.Tensor, arms: tuple[str, ...]):
     joint_names = list(kin.config.kinematics_config.joint_names)
     q = q_full.detach().clone()
 
-    limits = world.kinematics.get_joint_limits().position
-    lower = limits[0].to(q.device, q.dtype)
-    upper = limits[1].to(q.device, q.dtype)
+    lower, upper = world.joint_limits.to(q.device, q.dtype)
     col_mask, is_left = _row_layout(world.model, arms, q.shape[0], q.shape[1], q.device, q.dtype)
     return kin, frames, joint_names, q, lower, upper, col_mask, is_left
 

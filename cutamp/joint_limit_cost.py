@@ -3,9 +3,7 @@
 :func:`joint_limit_margin_soft_cost` is cuTAMP's particle-side soft cost over
 segment-endpoint configurations: a hinge² penalty for leaving the joint
 limits, which are bfm_wm's soft limits cut by the envelope (robots/t1.py), so
-it has no margin band. Empirical analysis of saved plans showed 100% of near-limit danger
-comes from endpoint configs (IK/particle output), never from trajopt
-excursions.
+it has no margin band.
 
 :func:`trunk_tilt_cosine` is the cosine of the Trunk's tilt, by which GN IK ranks each target's accepted starts
 (cutamp/particle_initialization.py).
@@ -16,18 +14,6 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
-
-
-def shrunken_bounds_penalty(q: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
-    """Elementwise hinge² penalty for leaving the bounds.
-
-    Zero strictly inside ``[lower, upper]``; quadratic in the penetration
-    depth outside. ``q`` is ``[..., dof]``; bounds are ``[dof]`` (broadcast).
-    Pure fixed-shape tensor ops — CUDA-graph capture-safe.
-    """
-    lower_pen = torch.relu(lower - q)
-    upper_pen = torch.relu(q - upper)
-    return lower_pen.square() + upper_pen.square()
 
 
 # Initial-state confs are frozen at the robot's actual current state: the
@@ -43,7 +29,8 @@ def joint_limit_margin_soft_cost(
     num_particles: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Per-particle limit penalty summed over Conf particles and DOFs.
+    """Per-particle limit penalty summed over Conf particles and DOFs: each conf's hinge², zero inside the limits
+    and quadratic in the depth past them. Pure fixed-shape tensor ops — CUDA-graph capture-safe.
 
     Args:
         particles: particle dict. Conf entries are ``[B, dof]`` named
@@ -67,7 +54,8 @@ def joint_limit_margin_soft_cost(
     if not config_params:
         return torch.zeros(num_particles, device=device)
     qs = torch.stack([particles[name] for name in config_params], dim=1)  # [B, n_confs, dof]
-    return shrunken_bounds_penalty(qs, joint_limits[0], joint_limits[1]).sum(dim=(1, 2))
+    lower, upper = joint_limits[0], joint_limits[1]
+    return (torch.relu(lower - qs).square() + torch.relu(qs - upper).square()).sum(dim=(1, 2))
 
 
 def trunk_tilt_cosine(q: torch.Tensor, pitch_index: int, roll_index: int) -> torch.Tensor:
