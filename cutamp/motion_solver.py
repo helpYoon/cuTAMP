@@ -325,7 +325,7 @@ def _held_obj_poses(planner, tool_from_ee, held: dict, plan: JointState) -> dict
 def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> MotionPlanner:
     """Build the trajopt planner on ``world.model``, colliding with the world's Scene with the movables included
     (so attached objects are part of the collision world during planning). Safe to run on a background
-    thread concurrently with Phase 1 because it runs no solves.
+    thread concurrently with the Adam loop because it runs no solves.
 
     No ``planner.warmup()``: its solves would capture CUDA graphs on this
     thread, and cuRobo captures in CUDA's global mode, where the main thread's

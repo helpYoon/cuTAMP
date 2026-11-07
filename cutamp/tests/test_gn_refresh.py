@@ -309,3 +309,13 @@ def test_balanced_refresh_on_each_dep_layout():
         pose_ok, com_ok = gn_gate(world, written, T_sub, arms_sub, 0.005, 0.05)
         misses = (~(pose_ok & com_ok)).view(len(idx), 8).sum(-1).tolist()
         assert [r["gn_fail"] for r in gate.stats[len(idx):]] == misses, idx
+
+
+def test_pose_error_resolves_sub_mrad_rotations_in_float32():
+    # The checker's atan2 angle must see a 4e-4 rad rotation (an acos form collapses to 0 below ~5e-4 rad in float32).
+    from cutamp.costs import curobo_pose_error
+
+    a = torch.eye(4).expand(2, 4, 4).clone()
+    b = a.clone()
+    b[:, :3, :3] = roma.rotvec_to_rotmat(torch.tensor([0.0, 0.0, 4e-4]))
+    assert curobo_pose_error(a, b)[1].min().item() > 1e-4

@@ -318,8 +318,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
   particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. `gn_ik` is
-  the planner's only IK: multi-start balance-first GN (home or the stored
-  confs, plus noisy starts that stand on the stance, `_noisy_start`), 30
+  the planner's only IK: multi-start balance-first GN (home, plus
+  noisy starts that stand on the stance, `_noisy_start`), 30
   reaching iterations without the collision row and 10 with it (the iterates
   are not motions, so only the result must be collision-free), then
   `ik_check` on the checker's tolerances; each target keeps its accepted
@@ -525,7 +525,7 @@ python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/re
   drift from home.
 
 Pose-class soft costs (e.g. `place_close_to_base`) are optimized through the
-re-IK coupling: outer Adam moves pose/grasp particles while their dependent
+re-IK coupling: outer Adam moves pose particles while their dependent
 confs are re-projected every `reik_interval` steps (balance-first,
 collision-aware Gauss-Newton, no cuRobo during Adam).
 

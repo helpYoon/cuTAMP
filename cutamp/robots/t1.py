@@ -11,7 +11,7 @@ Consumers read names, slices, home and the support region from ``world.model``.
 
 The head (2 DOF) and grippers (4+4 DOF) are construction-time lock_joints in
 ``t1_29dof.yml``. Both arms expose tool frames ``left_base_link`` and
-``right_base_link``; multi-tool-frame planning uses ``GoalToolPose``.
+``right_base_link``.
 """
 
 import copy
