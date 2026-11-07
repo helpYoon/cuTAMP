@@ -278,9 +278,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   `particle_com_margin` (a particle's static margin through
   `compute_com_margin`, for the run metrics' measure-only `best_com_margin`
   after Adam and `planned_com_margin` for the planned particle), and for the
-  trajectory gate `com_zmp_in_support` (each frame's CoM and multibody ZMP)
-  and `compute_support_mask` (the audit's mask on
-  `world.model.support.gate_half`).
+  trajectory gate `com_zmp_in_support` (each frame's CoM and multibody ZMP).
 
 - [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) —
   `joint_limit_margin_soft_cost` (the `joint_limit_margin` soft cost: a
@@ -313,8 +311,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   up), `retime_binding` (segments per binding check: `velocity <joint>`,
   `torque <joint>`, `zmp`, or `none` where none binds),
   `traj_com_min_margin` and `traj_zmp_min_margin`, plus
-  `plan_duration_s` and the measure-only audit `traj_com_violation_frac` /
-  `traj_com_frames` against the gate's rectangle.
+  `plan_duration_s`.
 
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
   particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. `gn_ik` is
@@ -543,8 +540,9 @@ reverse SSH tunnel:
 2. Connect with `ssh -R 9876:127.0.0.1:9876 username@server`.
 3. Run cuTAMP on the server as usual; it streams to the local viewer.
 
-`--viz_interval` (default 10 steps) sets how often the optimization is drawn,
-and `--disable_robot_mesh` skips the robot's meshes; both cut bandwidth.
+`TAMPConfiguration`'s `opt_viz_interval` (default 10 steps) sets how often the
+optimization is drawn, and `viz_robot_mesh=False` skips the robot's meshes;
+both cut bandwidth.
 
 ## Troubleshooting
 

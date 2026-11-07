@@ -25,19 +25,6 @@ def test_margin_sign_matches_polygon_mask_semantics():
     assert com_margin_from_base(outside, REAL_LEGS.support.keyframe_half).item() < 0
 
 
-def test_support_mask_uses_the_gate_rectangle(monkeypatch):
-    # The trajectory audit counts a frame as outside only when it leaves the rectangle the gate enforces
-    # (support.gate_half, 0.09245 x 0.135), not the keyframes' tighter one (0.08745 x 0.130): x 9.0 cm from the
-    # centre is inside, x 9.3 cm and y 13.6 cm are outside.
-    from types import SimpleNamespace
-
-    import cutamp.com_polygon_cost as cpc
-    com = torch.tensor([[0.090, 0.0, 0.5], [0.093, 0.0, 0.5], [0.0, 0.136, 0.5]])
-    monkeypatch.setattr(cpc, "_fk_com_and_base", lambda world, q: (com, torch.eye(4).expand(3, 4, 4)))
-    world = SimpleNamespace(model=REAL_LEGS)
-    assert cpc.compute_support_mask(world, torch.zeros(3, 1)).tolist() == [True, False, False]
-
-
 def test_margin_takes_any_half_extents_sequence():
     # A list or a tensor gives the tuple's margin, and the same values again add no cached device tensor.
     import cutamp.com_polygon_cost as cpc

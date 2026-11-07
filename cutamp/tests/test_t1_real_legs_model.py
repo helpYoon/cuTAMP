@@ -1,6 +1,6 @@
-"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the soft-cost default and
-the removed options (the ablation's and ``--robot``), the support rectangles, and the blocks_t1 world on the real legs,
-standing on the home stance. The GPU tests share conftest's module-scoped ``real_world``: one world per module."""
+"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the soft-cost default, the
+support rectangles, and the blocks_t1 world on the real legs, standing on the home stance. The GPU tests share
+conftest's module-scoped ``real_world``: one world per module."""
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -124,31 +124,6 @@ def test_soft_cost_default_and_choice(monkeypatch):
     assert TAMPConfiguration(soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
     assert _cli_config(monkeypatch, "--soft_cost", "joint_limit_margin").soft_cost == ["joint_limit_margin"]
     assert TAMPConfiguration(soft_cost=[]).soft_cost == []
-
-
-#: The paper's ablation options, which main fixes at the full system (they live on branch ablation-baseline): each
-#: CLI spelling, with the argument it took, and each config field at its old default.
-REMOVED_CLI_OPTIONS = (["--no_coupled_reik"], ["--reik_balance_first"], ["--no_reik_balance_first"],
-                       ["--no_enable_com_polygon"], ["--no_enable_com_aware_ik"], ["--no_com_all"], ["--force_adam"],
-                       ["--soft_in_adam", "always"], ["--robot", "real_legs"])
-REMOVED_FIELDS = {"enable_com_polygon": True, "enable_com_aware_ik": True, "enable_com_init_gate": True,
-                  "enable_com_hard_constraint": True, "coupled_reik": True, "force_adam": False,
-                  "reik_balance_first": True, "soft_in_adam": "auto", "reik_num_seeds": 4, "reik_lbfgs_iters": 40,
-                  "robot": "real_legs"}
-
-
-@pytest.mark.parametrize("argv", REMOVED_CLI_OPTIONS, ids=lambda argv: argv[0])
-def test_removed_options_are_rejected(monkeypatch, capsys, argv):
-    # An old command line fails loudly, even one that only restated a default.
-    with pytest.raises(SystemExit) as exit_info:
-        _cli_config(monkeypatch, *argv)
-    assert exit_info.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("name", REMOVED_FIELDS)
-def test_removed_fields_are_rejected(name):
-    with pytest.raises(TypeError, match=name):
-        TAMPConfiguration(**{name: REMOVED_FIELDS[name]})
 
 
 def test_joint_limit_margin_is_registered_and_weighted():

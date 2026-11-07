@@ -14,8 +14,8 @@ Three regions:
   contribute (steepest gradient back to feasibility).
 
 Every helper takes the support (its frame and half-extents) or reads ``world.model.support``: confs
-(masks, margins, penalties, GN, the trajopt cost) use ``keyframe_half``, trajectory frames (the balance gate and
-its audit) ``gate_half``.
+(masks, margins, penalties, GN, the trajopt cost) use ``keyframe_half``, trajectory frames (the balance gate)
+``gate_half``.
 
 Requires:
 
@@ -251,14 +251,6 @@ def com_margin_from_base(com_in_base: torch.Tensor, half_extents: Tuple[float, f
     rectangle, zero on an edge, negative outside. Metres."""
     half = _half_extents(tuple(map(float, half_extents)), com_in_base.device, com_in_base.dtype)
     return (half - com_in_base[..., :2].abs()).min(dim=-1).values
-
-
-def compute_support_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
-    """``[B]`` bool: the CoM is inside or on the support rectangle the trajectory gate enforces
-    (``world.model.support.gate_half``), for full-cspace configs via FK. Measure-only (the trajectory audit)."""
-    support = world.model.support
-    com, base_T = _fk_com_and_base(world, q_batch)
-    return com_margin_from_base(_project_com_to_base(com, base_T), support.gate_half) >= 0
 
 
 def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:

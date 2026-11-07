@@ -148,9 +148,6 @@ def entrypoint():
         help="Maximum duration for optimization in seconds. Overrides --num_opt_steps if set.",
     )
     parser.add_argument(
-        "--num_initial_plans", type=int, default=_defaults.num_initial_plans, help="Number of initial plans to sample with task planner."
-    )
-    parser.add_argument(
         "--motion_plan",
         action="store_true",
         help="Whether to plan for full motions after using cuTAMP.",
@@ -165,14 +162,6 @@ def entrypoint():
         "--disable_visualizer",
         action="store_true",
         help="Disable the rerun visualizer. Note if you want accurate timing information, you should disable the visualizer.",
-    )
-    parser.add_argument(
-        "--viz_interval", type=int, default=_defaults.opt_viz_interval, help="Interval for visualizing optimization state in steps."
-    )
-    parser.add_argument(
-        "--disable_robot_mesh",
-        action="store_true",
-        help="Disable robot mesh visualization to save visualization bandwidth.",
     )
     parser.add_argument(
         "--experiment_root", type=str, default=_defaults.experiment_root, help="Root directory for experiment logging."
@@ -211,11 +200,8 @@ def entrypoint():
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,
-        num_initial_plans=args.num_initial_plans,
         curobo_plan=args.motion_plan,
         enable_visualizer=not args.disable_visualizer,
-        opt_viz_interval=args.viz_interval,
-        viz_robot_mesh=not args.disable_robot_mesh,
         experiment_root=args.experiment_root,
     )
     validate_tamp_config(config)

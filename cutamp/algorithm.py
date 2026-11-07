@@ -198,11 +198,12 @@ def _motion_plan_with_retries(
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
 
-    Returns ``(curobo_plan, audit, attempts, rank, failures)``:
+    Returns ``(curobo_plan, traj_metrics, attempts, rank, failures)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
         failed.
-      - ``audit``: the measure-only trajectory CoM audit dict from
-        ``solve_curobo``, or ``None`` if all candidates failed.
+      - ``traj_metrics``: the plan's metrics dict from ``solve_curobo`` (its
+        duration and the balance gate's retimes and margins), or ``None`` if
+        all candidates failed.
       - ``attempts``: number of candidates actually planned (skips excluded).
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
@@ -218,7 +219,7 @@ def _motion_plan_with_retries(
             continue
         tried += 1
         try:
-            curobo_plan, audit = solve_curobo(
+            curobo_plan, traj_metrics = solve_curobo(
                 plan_info, particle, world, config, timer, visualizer,
                 get_planner=get_planner,
             )
@@ -226,7 +227,7 @@ def _motion_plan_with_retries(
                 _log.warning(
                     f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
                 )
-            return curobo_plan, audit, tried, rank, failures
+            return curobo_plan, traj_metrics, tried, rank, failures
         except RuntimeError as e:
             _log.warning(
                 f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
@@ -433,7 +434,7 @@ def run_cutamp(
                     plan_info, config, constraint_checker, cost_reducer,
                     n=config.motion_plan_max_retries,
                 )
-                curobo_plan, traj_audit, attempts, rank, failures = _motion_plan_with_retries(
+                curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
                     get_planner=get_planner,
                 )
@@ -442,7 +443,7 @@ def run_cutamp(
                 overall_metrics["motion_plan_failures"] += failures
                 if curobo_plan is None:
                     continue
-                overall_metrics.update(traj_audit)
+                overall_metrics.update(traj_metrics)
                 overall_metrics.update(_planned_metrics(world, candidates, rank))
             found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]

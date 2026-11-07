@@ -390,7 +390,7 @@ def solve_curobo(
         # segment's pace from its speeds, torques and ZMP; a RuntimeError fails the candidate. A retimed segment
         # also keeps its motion planner's timing, with the held objects along it.
         entry = {"dt": dt, "arm": arm}
-        plan, stats, fast = _balance_gate(world, planner, plan, dt)
+        plan, stats, fast = _balance_gate(world, plan, dt)
         gate_stats.append(stats)
         if fast is not None:
             entry["planner_timing"] = {
@@ -519,7 +519,7 @@ def solve_curobo(
         dt = entry.get("dt", 0.05)
         traj_arm = entry.get("arm")
         held_objs = entry.get("held_objs", {})
-        pos = _full_positions(world, planner, plan)
+        pos = _full_positions(world, plan)
 
         if traj_arm in ("left", "right"):
             _set_gripper(traj_arm, traj_arm in held_objs)
@@ -536,8 +536,7 @@ def solve_curobo(
             )
         cur_t += pos.shape[0] * dt
 
-    metrics = _audit_traj_com(world, planner, accum_plans)
-    metrics["plan_duration_s"] = sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)
+    metrics = {"plan_duration_s": sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)}
     if gate_stats:
         metrics["retime_max"] = max(g["retime"] for g in gate_stats)
         metrics["retime_min"] = min(g["retime"] for g in gate_stats)  # below 1 where the gate sped one up
@@ -547,43 +546,13 @@ def solve_curobo(
     return accum_plans, metrics
 
 
-def _audit_traj_com(world: TAMPWorld, planner, accum_plans: List[dict]) -> dict:
-    """Measure-only trajectory CoM audit: the plan's frame count, ``traj_com_frames``, and the fraction of them
-    whose CoM leaves the support rectangle the gate enforces
-    (``world.model.support.gate_half``, through ``compute_support_mask``), ``traj_com_violation_frac``."""
-    # The whole block is exception-isolated: this audit is MEASURE-ONLY
-    # and must never change which plans are produced or accepted. Any
-    # failure here (e.g. an unexpected DOF/joint-name mismatch) is logged
-    # and swallowed, returning an empty audit dict so
-    # ``overall_metrics.update(audit)`` is a no-op and the keys are simply
-    # absent — downstream already reads them with ``.get(...)``.
-    from cutamp.com_polygon_cost import compute_support_mask
-    try:
-        total_frames, violation_frames = 0, 0
-        with torch.no_grad():
-            for i, entry in enumerate(accum_plans):
-                # A later segment's frame 0 is the previous one's last (it is planned from last_js): count it
-                # once, not once per segment (known-bugs N3).
-                full = _full_positions(world, planner, entry["plan"])[1 if i else 0:]
-                ok = compute_support_mask(world, full)
-                total_frames += int(ok.numel())
-                violation_frames += int((~ok).sum().item())
-        return {
-            "traj_com_violation_frac": (violation_frames / total_frames) if total_frames else 0.0,
-            "traj_com_frames": total_frames,
-        }
-    except Exception as e:
-        _log.warning(f"Trajectory CoM audit failed (measure-only, ignoring): {e}")
-        return {}
-
-
-def _full_positions(world: TAMPWorld, planner, plan_js) -> torch.Tensor:
+def _full_positions(world: TAMPWorld, plan_js) -> torch.Tensor:
     """``[T, full_dof]`` positions of a planner trajectory in ``world.kinematics.joint_names`` order.
 
     accum_plans entries carry trajectories in different DOF forms depending on which planner method
     produced them: the planner's active cspace or the fully articulated form (a superset of
     world.kinematics's 33 joints); a plain reorder by ``plan_js.joint_names``, which every planner trajectory
-    carries, handles both. ``planner`` is unused."""
+    carries, handles both."""
     pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
     js = JointState.from_position(pos, joint_names=list(plan_js.joint_names))
     return js.reorder(list(world.kinematics.joint_names)).position
@@ -610,13 +579,13 @@ def _gate_error(check: str, message: str) -> RuntimeError:
     return error
 
 
-def _taylor_positions(world: TAMPWorld, planner, plan_js, h: float = ZMP_STEP) -> torch.Tensor:
+def _taylor_positions(world: TAMPWorld, plan_js, h: float = ZMP_STEP) -> torch.Tensor:
     """``[3, T, full_dof]``: each frame's configuration ``h`` s before, at and after it along the plan's own
     velocity and acceleration, ``q + tau q' + tau^2 / 2 q''`` (com_zmp_in_support's input)."""
     q, v, a = plan_js.position, plan_js.velocity, plan_js.acceleration
     return torch.stack([
-        _full_positions(world, planner, JointState.from_position(q + tau * v + 0.5 * tau**2 * a,
-                                                                 joint_names=plan_js.joint_names))
+        _full_positions(world, JointState.from_position(q + tau * v + 0.5 * tau**2 * a,
+                                                        joint_names=plan_js.joint_names))
         for tau in (-h, 0.0, h)
     ])
 
@@ -684,10 +653,9 @@ def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
                       f"{torques.effort[j].item():.1f} N m effort by {excess[j].item():.2f} N m")
 
 
-def _model_frames(world: TAMPWorld, planner, plan_js: JointState) -> JointState:
+def _model_frames(world: TAMPWorld, plan_js: JointState) -> JointState:
     """``plan_js``'s frames: ``[T, n]`` positions, velocities and accelerations in ``world.model.joint_names`` order, by
-    its joint names. A plan may also carry the joints the planner locks (the head, the fingers). ``planner`` is
-    unused."""
+    its joint names. A plan may also carry the joints the planner locks (the head, the fingers)."""
     names = list(world.model.joint_names)
     dof = plan_js.position.shape[-1]
     cols = [list(plan_js.joint_names).index(j) for j in names]
@@ -758,23 +726,23 @@ def _torque_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tup
     return u**-0.5, names[int(upper.argmin())]
 
 
-def _zmp_margins(world: TAMPWorld, planner, js: JointState, scales: torch.Tensor) -> torch.Tensor:
+def _zmp_margins(world: TAMPWorld, js: JointState, scales: torch.Tensor) -> torch.Tensor:
     """``[K]``: the multibody ZMP's smallest margin to the gate's support rectangle over the frames of ``js`` under each
     uniform time scale in ``scales`` (negative outside, -inf where a frame would need the floor to pull; a NaN fails),
     from the scaled frames' Taylor positions."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
-    _, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, _at_scales(js, scales)), ZMP_STEP)
+    _, zmp = com_zmp_in_support(world, _taylor_positions(world, _at_scales(js, scales)), ZMP_STEP)
     return com_margin_from_base(zmp, world.model.support.gate_half).reshape(len(scales), -1).amin(-1)
 
 
-def _zmp_scale(world: TAMPWorld, planner, js: JointState, lo: float, hi: float) -> Tuple[float, bool]:
+def _zmp_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tuple[float, bool]:
     """The smallest uniform time scale in [lo, hi] at which every frame's multibody ZMP stays inside the gate's support
     rectangle, to within RETIME_TOL above it, and whether the ZMP sets it (False where ``lo`` passes): a geometric
     bisection testing RETIME_SEARCH_POINTS scales per batched round, which assumes the ZMP's excursion falls as s
     grows. Raises a RuntimeError when ``hi`` fails."""
     def first_pass(grid: list) -> Optional[int]:
-        ok = (_zmp_margins(world, planner, js, torch.tensor(grid, dtype=torch.float64)) >= 0).tolist()
+        ok = (_zmp_margins(world, js, torch.tensor(grid, dtype=torch.float64)) >= 0).tolist()
         return ok.index(True) if True in ok else None
 
     grid = [lo * (hi / lo) ** (k / (RETIME_SEARCH_POINTS - 1)) for k in range(RETIME_SEARCH_POINTS - 1)] + [hi]
@@ -791,7 +759,7 @@ def _zmp_scale(world: TAMPWorld, planner, js: JointState, lo: float, hi: float) 
     return b, True
 
 
-def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) -> Tuple[float, float]:
+def _recheck(world: TAMPWorld, js: JointState, planted: bool = True) -> Tuple[float, float]:
     """The gate's checks on the frames it returns, from their own velocities and accelerations: both soles on the
     stance (``_check_planted``; ``planted`` False skips it on the planner's own frames, which
     passed it already), the CoM and the multibody ZMP inside the gate's support rectangle (a frame that would need the
@@ -802,8 +770,8 @@ def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) ->
 
     half = world.model.support.gate_half
     if planted:
-        _check_planted(world, _full_positions(world, planner, js))
-    com, zmp = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
+        _check_planted(world, _full_positions(world, js))
+    com, zmp = com_zmp_in_support(world, _taylor_positions(world, js), ZMP_STEP)
     com_m, zmp_m = com_margin_from_base(com, half).min().item(), com_margin_from_base(zmp, half).min().item()
     if not com_m >= 0:
         raise _gate_error("com", f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
@@ -814,11 +782,11 @@ def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) ->
     if not zmp_m >= 0:
         raise _gate_error("zmp", f"retimed trajectory ZMP leaves the support region by {-100 * zmp_m:.1f} cm")
     _check_torques(world, js)
-    _check_velocity(world, _model_frames(world, planner, js))
+    _check_velocity(world, _model_frames(world, js))
     return com_m, zmp_m
 
 
-def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
+def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
     """The real robot's balance check on every interpolated frame of a segment, and the segment at the pace the
     robot allows. Returns ``(plan_js, stats, planner_timing)``: the plan at that pace; its stats; and, for a retimed
     segment, the same spline sampled at the motion planner's own timing: its positions exactly, with the spline's
@@ -844,9 +812,9 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     with torch.no_grad():
-        _check_planted(world, _full_positions(world, planner, plan_js))
-        js = _model_frames(world, planner, plan_js)
-        com, _ = com_zmp_in_support(world, _taylor_positions(world, planner, js), ZMP_STEP)
+        _check_planted(world, _full_positions(world, plan_js))
+        js = _model_frames(world, plan_js)
+        com, _ = com_zmp_in_support(world, _taylor_positions(world, js), ZMP_STEP)
         com_planner = com_margin_from_base(com, world.model.support.gate_half).min().item()
         if not com_planner >= 0:
             raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_planner:.1f} cm")
@@ -857,7 +825,7 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
         s_t, joint = _torque_scale(world, js, s, RETIME_MAX)
         if joint is not None:
             s, binding = s_t, f"torque {joint}"
-        s_z, zmp_binds = _zmp_scale(world, planner, js, s, RETIME_MAX)
+        s_z, zmp_binds = _zmp_scale(world, js, s, RETIME_MAX)
         if zmp_binds:
             s, binding = s_z, "zmp"
         while True:
@@ -865,7 +833,7 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
             if out is not plan_js:  # the spline's end values miss a joint that moves to 0 by a rounding error
                 out.position[..., [0, -1], :] = plan_js.position[..., [0, -1], :]
             try:
-                com_m, zmp_m = _recheck(world, planner, out, planted=out is not plan_js)
+                com_m, zmp_m = _recheck(world, out, planted=out is not plan_js)
                 break
             except RuntimeError as e:
                 check = getattr(e, "check", None) or ""
@@ -874,7 +842,7 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
                 s, binding = min(RETIME_RECHECK_STEP * s, RETIME_MAX), check
         n_out = out.position.shape[-2]
         s_eff = (n_out - 1) / (n - 1) if n_out != n else 1.0
-        zmp_planner = float(_zmp_margins(world, planner, js, torch.tensor([s_eff]))[0])
+        zmp_planner = float(_zmp_margins(world, js, torch.tensor([s_eff]))[0])
     stats = {"retime": s_eff, "binding": binding, "com_min_margin": min(com_m, com_planner),
              "zmp_min_margin": min(zmp_m, zmp_planner)}
     return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)
