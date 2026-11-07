@@ -13,11 +13,12 @@ from tag `paper-g1-comfix`.
 > `import cutamp`, which first checks the source of each cuRobo function it
 > patches or relies on and refuses to run on any cuRobo but v0.9.0, the old
 > fork included:
-> - a massless URDF link weighs 0, not cuRobo's 0.01 kg (the T1 has 11:
->   `world` and the 10 gripper links);
-> - one warp stream wrapper per CUDA stream, kept from the fork: without it,
->   on warp 1.10.1, the background motion-planner build thread crashed the
->   process with heap corruption (`malloc(): unaligned tcache chunk detected`);
+> - a URDF link with no inertial weighs 0, not cuRobo's 0.01 kg (the T1 has
+>   11: `world` and the 10 gripper links);
+> - one warp stream wrapper per CUDA stream, kept from the fork: warp 1.16.0
+>   registers every new wrapper in a native stream map with no lock, so the
+>   background motion-planner build thread, launching beside the main thread,
+>   would corrupt the heap (`malloc(): unaligned tcache chunk detected`);
 > - trajopt's transitions compute the CoM and run RNEA a second time with the
 >   floor's push on the soles (`set_external_wrench_fn`, installed by
 >   `floor_wrench.install_floor_wrench`);
@@ -259,13 +260,12 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   site in `FK_SITES`.
 
 - [`_curobo_internals.py`](cutamp/_curobo_internals.py) — everything cuTAMP
-  changes in cuRobo, in one file (with `# TODO: file upstream issue` markers;
+  changes in cuRobo, in one file (with a `# TODO: file upstream issue` marker;
   one-off workarounds stay beside their callers: `motion_solver._attach_object`
   / `_detach_object`): `install_curobo_patches` (run on `import cutamp`: the
   source check, the parser's mass floor and the warp stream cache),
-  `set_external_wrench_fn` (RNEA's second pass), `cspace_plan_succeeded`,
-  `iter_rollouts` (the planner's trajopt rollouts) and `add_extra_cost`
-  (custom-cost dispatch on those rollouts).
+  `set_external_wrench_fn` (RNEA's second pass) and `add_extra_cost`
+  (custom-cost dispatch on the planner's trajopt optimizer rollouts).
 
 - [`com_polygon_cost.py`](cutamp/com_polygon_cost.py) — single source of
   truth for the balance geometry: `support_rectangles`, which gives the

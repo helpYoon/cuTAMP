@@ -120,8 +120,8 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
     # trajopt transition carries the floor's push, and at rest at home it leaves the base joints nothing.
     transitions = _transitions(planner)
     assert len(transitions) >= 4
-    assert all(tm._external_wrench_fn is not None and tm.robot_model.compute_com for tm in transitions)
-    assert all(getattr(tm, "_external_wrench_fn", None) is None for r in planner.ik_solver.get_all_rollout_instances()
+    assert all("compute_augmented_state" in vars(tm) and tm.robot_model.compute_com for tm in transitions)
+    assert all("compute_augmented_state" not in vars(tm) for r in planner.ik_solver.get_all_rollout_instances()
                for tm in (r.transition_model, r.metrics_transition_model))
     # The trajopt CoM cost finds its support frame among the planner's tool poses.
     assert "stance" in planner.trajopt_solver.tool_frames

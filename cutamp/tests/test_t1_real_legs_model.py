@@ -302,9 +302,8 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
         assert np.abs(lo - want_lo).max() < 1e-6 and np.abs(hi - want_hi).max() < 1e-6, what
     assert real_world.bodies.kinematics.tool_frames[0] == "stance" and float(real_world.bodies.mass[0]) == 0.0
     # Trajopt bounds those limits at TRAJOPT_POSITION_BOUND_WEIGHT, on its live cost (cuRobo's would be 1e4).
-    from cutamp._curobo_internals import iter_rollouts
     from cutamp.robots.t1 import TRAJOPT_POSITION_BOUND_WEIGHT
-    costs = [r.cost_manager.costs["cspace"] for r in iter_rollouts(planner)]
+    costs = [r.cost_manager.costs["cspace"] for r in planner.trajopt_solver.optimizer_rollouts]
     assert costs and all(float(c._weight[0]) == TRAJOPT_POSITION_BOUND_WEIGHT == 1e6 for c in costs)
     # The planner keeps the YAML's tool frames in the YAML's order; the floor hook and the CoM cost find theirs.
     yml = yaml.safe_load((T1_29DOF / "t1_29dof.yml").read_text())["robot_cfg"]["kinematics"]["tool_frames"]

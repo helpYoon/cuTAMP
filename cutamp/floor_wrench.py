@@ -76,8 +76,6 @@ def make_floor_wrench_fn(
         f_ext = q.new_zeros(*q.shape[:-1], n_links, 6)
         for i in range(2):
             f, m = wrenches[2 * i], wrenches[2 * i + 1]
-            # Trajopt's transition runs this hook under no_grad (set_external_wrench_fn) and treats f_ext as fixed;
-            # other callers may differentiate it, and FK's quaternion gradient is exact.
             r_t = torch_quaternion_to_matrix(quat[..., sole_tools[i], :]).transpose(-1, -2)
             f_ext[..., sole_links[i], :3] = (r_t @ m[..., None])[..., 0]
             f_ext[..., sole_links[i], 3:] = (r_t @ f[..., None])[..., 0]

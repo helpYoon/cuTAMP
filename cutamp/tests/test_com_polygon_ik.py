@@ -71,17 +71,7 @@ def test_constraint_checker_filters_com_violators():
 
 @needs_cuda
 def test_curobo_batched_com_kernel_returns_per_batch_distinct():
-    """Regression test for cuRobo's batched COM kernel.
-
-    History: at the NVlabs PR #626 base, the kernel double-offset the
-    cumulative-transform address for batch slots > 0 (pre-offset pointer
-    AND nonzero matAddrBase passed to process_center_of_mass) — only batch
-    index 0 of robot_com was correct for robots with num_spheres >= 100
-    (T1=164). Our fork patched it; PR #678 then rewrote the kernel
-    (write_center_of_mass_tile) with the single-offset convention applied
-    everywhere, fixing it upstream, and the fork patch was dropped. This
-    test remains as the guard: a B=4 batched COM call must return the SAME
-    per-batch COMs as four separate B=1 calls."""
+    """A B=4 batched robot_com must equal four B=1 calls: cuRobo's CoM kernel (CUDA) is outside the source guard."""
     import torch
     from curobo.types import JointState
     world = make_blocks_t1_world()

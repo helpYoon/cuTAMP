@@ -31,7 +31,6 @@ from curobo.motion_planner import MotionPlanner
 from curobo.sphere_fit import SphereFitType
 from curobo.types import JointState, Pose
 
-from cutamp._curobo_internals import cspace_plan_succeeded as _cspace_plan_succeeded
 from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
@@ -42,6 +41,13 @@ from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
 _log = logging.getLogger(__name__)
+
+
+def _cspace_plan_succeeded(result) -> bool:
+    """True iff ``plan_cspace`` returned a plan cuRobo calls converged and feasible over the optimized and the
+    interpolated trajectory (timeopt off, as get_t1_motion_planner sets it). Trust it: ``cspace_error`` is never set,
+    and the last waypoint is pinned to the goal, so neither shows a mid-path violation."""
+    return result is not None and bool(result.success.any())
 
 
 def _planner_js_from_full(planner, full_pos, full_joint_names):

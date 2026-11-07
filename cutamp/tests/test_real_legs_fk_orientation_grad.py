@@ -1,11 +1,10 @@
 """The real legs' FK rotations must carry correct gradients to the configurations.
 
-cuRobo v0.8's FK backward got orientation gradients wrong while positions were exact; v0.9.0's kernel is right, and
-these checks guard it. Besides the hands, two rotations reach autograd on the real legs: the rollout's
-soles (``sole_rot_err``, in Adam's loss) and each sole's in the floor wrench (trajopt's transition calls that hook
-under no_grad; the test differentiates it directly). Their CoM, a position, is a sanity check. The error grows with
-the link's rotation from the world's axes, and planted soles have none (the stance's soles sit at the identity), so
-those checks run on tilted confs (``_tilt``). One world, ``real_world``: a module using it must not build a second.
+These checks guard cuRobo's FK backward, a CUDA kernel that the source guard does not cover. Besides the hands, the
+rollout's soles (``sole_rot_err``, in Adam's loss) carry rotation gradients on the real legs; their CoM, a position,
+is a sanity check. A wrong orientation gradient grows with the link's rotation from the world's axes, and planted soles
+have none (the stance's soles sit at the identity), so the checks run on tilted confs (``_tilt``). One world,
+``real_world``: a module using it must not build a second.
 """
 
 import torch
@@ -37,8 +36,8 @@ def _assert_fd(results: dict) -> None:
 
 def _tilt(q: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
     """``q`` plus N(0, 0.3 rad) noise on every joint, which tilts a real-leg conf's soles by about 0.8 rad (median)
-    from the stance. The kernel's body-frame decode is the world-frame one at the identity rotation, so at planted
-    soles their gradients come out right without the fix (sign right on every particle, median relative error 3e-4)."""
+    from the stance: at planted soles a body-frame decode is the world-frame one, so an FK backward that confused
+    them would still pass."""
     return q.detach() + 0.3 * torch.randn(q.shape, device=q.device, generator=gen)
 
 
@@ -71,35 +70,8 @@ def test_real_legs_rollout_rotation_gradients_match_finite_differences(real_worl
 
 
 @needs_cuda
-def test_real_legs_floor_wrench_gradient_matches_finite_differences(real_plan):
-    from curobo.types import DeviceCfg, JointState
-
-    from cutamp.floor_wrench import SegmentTorques
-    from cutamp.robots.t1 import REAL_LEGS
-
-    device_cfg = DeviceCfg()
-    seg = SegmentTorques(REAL_LEGS, device_cfg)  # the real legs' FK with the CoM, RNEA and the floor-wrench hook
-    gen = torch.Generator(device=device_cfg.device).manual_seed(0)
-    q0 = _real_confs(real_plan, gen)
-    n, names = q0.shape[0], seg.joint_names
-    zero = torch.zeros_like(q0).view(1, n, -1)
-    with torch.no_grad():  # the first pass's support load at q0, held fixed: the check is of the hook and its FK
-        seg.dyn.setup_batch_size(1, n)
-        tau_free = seg.dyn.compute_inverse_dynamics(JointState(
-            position=q0.view(1, n, -1), velocity=zero, acceleration=zero, jerk=zero, joint_names=names)).clone()
-    W = torch.randn(1, n, seg.kin.config.kinematics_config.num_links, 6, device=q0.device, generator=gen)
-
-    def weighted_wrench(x) -> torch.Tensor:
-        js = JointState.from_position(x["q"].view(1, n, -1), joint_names=names)
-        return (seg.fn(js, seg.kin.compute_kinematics(js), tau_free) * W).sum((-2, -1)).view(n)
-
-    d = torch.randn(q0.shape, device=q0.device, generator=gen)
-    _assert_fd({"f_ext": _fd_check(weighted_wrench, {"q": q0}, {"q": d})})
-
-
-@needs_cuda
 def test_real_legs_com_gradient_matches_finite_differences(real_world, real_plan):
-    # A sanity check, not a fix: the CoM is a position, which cuRobo's FK backward gets right. All 33 joints move,
+    # A sanity check: the CoM is a position, which cuRobo's FK backward gets right. All 33 joints move,
     # the floating base's six among them, on the FK that the ComPolygon constraint differentiates.
     from cutamp.com_polygon_cost import _fk_state
 
