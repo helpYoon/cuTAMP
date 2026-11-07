@@ -1,7 +1,6 @@
 # Route A's starting envelope (design 7.10, call 22): what the planner may send route A's policy. bfm_wm has no
 # envelope file yet, so cuTAMP writes this one; once route A's training writes its own, cuTAMP pins that copy here
-# instead. The planner enforces the joint ranges, and a Trunk floor and tilt bound when they are set; payload, stance
-# range and holds are stored only.
+# instead. The planner enforces the joint ranges; payload, stance range and holds are stored only.
 name: route_a_start
 # No Trunk floor or tilt bound: route A's policy is trained on the motions this planner makes, so robot facts bound
 # them: the joints' soft limits (bfm_wm's 0.9 of each range) and the Waist range below, the vendor's speed limits
@@ -9,10 +8,8 @@ name: route_a_start
 # 2 cm where each foot can carry a tenth of the weight, collisions and planted soles. Trajopt's acceleration and jerk
 # caps and the base's speed limit (t1_29dof.yml), which are not robot facts, shape each path and its time profile:
 # the balance gate keeps that profile and sets only each segment's uniform time scale, the smallest at which speed,
-# effort and the ZMP pass (to 2%, at most 4x slower than trajopt's). A value here would be a guess that the training
-# then learns as a limit.
-trunk_height_min: null
-trunk_tilt_max: null
+# effort and the ZMP pass (to 2%, at most 4x slower than trajopt's). A floor or tilt bound would be a guess that the
+# training then learns as a limit.
 # The ankle pitch's upper end is its home value: no plan pitches a shin back past the home stance's 11.5 degree
 # forward lean (the user, 2026-11-05); the lower end is the soft limit, so a shin may lean further forward.
 joint_ranges: {Waist: [-0.911, 0.911], Left_Ankle_Pitch: [-0.809, -0.2], Right_Ankle_Pitch: [-0.809, -0.2]}

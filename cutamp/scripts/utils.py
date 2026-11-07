@@ -54,15 +54,11 @@ default_constraint_to_tol = {
         "pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": SOLE_POS_TOL, "sole_rot_err": SOLE_ROT_TOL,
     },
     # retract_*: the retract confs, which join the motion constraints (design 7.3).
-    # trunk_tilt: the Trunk tilt past the envelope's maximum, at every conf, where the envelope sets one (call 22;
-    # route A's sets none), in cosine: 1e-6 is 1.2e-6 rad of tilt at a 1.0 rad bound and 17 float32 ulps of its
-    # cosine, so the rounding of cos(1.0) does not reject a conf on the bound.
     Motion.type: {
         "joint_limit": 0.0,
         "self_collision": 0.0,
         "retract_joint_limit": 0.0,
         "retract_self_collision": 0.0,
-        "trunk_tilt": 1e-6,
     },
     StablePlacement.type: {
         # You might need to add additional tolerances if your support surfaces have different names

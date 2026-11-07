@@ -16,7 +16,6 @@ The head (2 DOF) and grippers (4+4 DOF) are construction-time lock_joints in
 
 import copy
 import hashlib
-import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
@@ -167,24 +166,11 @@ def t1_curobo_cfg(model: T1Model) -> dict:
 
 
 def _cut_to_envelope(kinematics: dict, envelope: Envelope) -> None:
-    """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: a Trunk
-    height floor, where the envelope sets one, raises ``base_j_z``'s lower limit, and each listed joint's range cuts
-    its soft range (the URDF range less ``position_limit_clip`` at both ends) at
+    """Narrow the limits in ``kinematics`` to ``envelope``'s (call 22), in place, never widening one: each listed
+    joint's range cuts its soft range (the URDF range less ``position_limit_clip`` at both ends) at
     either end on its own. cuRobo reads a URDF joint's limits only from the URDF, so a cut joint's range is written into
     a copy of it, clip 0, which ``urdf_path`` then names (meshes resolve against ``asset_root_path``). Raises if a range leaves
     nothing of the soft range."""
-    if envelope.trunk_height_min is not None:
-        base_z = next((link for link in kinematics.get("extra_links", {}).values()
-                       if link.get("joint_name") == "base_j_z"), None)
-        if base_z is None:
-            raise ValueError(f"envelope {envelope.name!r}: no extra link carries base_j_z, whose lower limit is the "
-                             "Trunk floor")
-        lower, upper = base_z["joint_limits"]
-        if envelope.trunk_height_min >= upper:
-            raise ValueError(f"envelope {envelope.name!r}: Trunk floor {envelope.trunk_height_min} m >= base_j_z's "
-                             f"{upper}")
-        base_z["joint_limits"] = [max(lower, envelope.trunk_height_min), upper]
-
     urdf = ET.parse(kinematics["urdf_path"]).getroot()
     urdf_limits = {joint.get("name"): joint.find("limit") for joint in urdf.findall("joint")}
     cspace = kinematics["cspace"]
@@ -328,7 +314,6 @@ def get_t1_motion_planner(
     - holds both soles on the stance at every waypoint (pose tracking at non-terminal scale 1.0, stage 2's verified
       weight), tracks the hands at the terminal only, and leaves the ``stance`` frame untracked (it is world-fixed,
       and the CoM cost's support frame);
-    - bounds the Trunk tilt (``TrunkTiltCost``, weight 1e5) when the envelope sets a maximum. Route A's sets none;
     - turns cuRobo's timeopt off (its RNEA has no floor push; the balance gate paces each segment) and gives
       trajopt's first solve ``TRAJOPT_INITIAL_ITERS``.
 
@@ -392,19 +377,6 @@ def get_t1_motion_planner(
         base_link_name=model.support.link,
     )
     add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
-    if model.envelope.trunk_tilt_max is not None:
-        from cutamp.joint_limit_cost import TrunkTiltCost, TrunkTiltCostCfg
-
-        # The envelope's Trunk tilt bound (call 22) along the trajectory: GN and the Motion value hold it at the confs.
-        active_names = list(planner.kinematics.joint_names)
-        tilt_cfg = TrunkTiltCostCfg(
-            weight=[1.0e5],
-            device_cfg=planner.trajopt_solver.optimizer_rollouts[0].device_cfg,
-            pitch_index=active_names.index("base_j_pitch"),
-            roll_index=active_names.index("base_j_roll"),
-            cos_max=math.cos(model.envelope.trunk_tilt_max),
-        )
-        add_extra_cost(planner, "trunk_tilt", TrunkTiltCost(tilt_cfg))
     return planner
 
 

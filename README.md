@@ -93,8 +93,8 @@ graph LR
    a conf doesn't park on its edge, and the Trunk toward upright. Each target
    keeps its most upright accepted start, and a conf is accepted only inside the checker's
    tolerances (`ik_check`): the hand, both soles on the stance, the CoM in the
-   model's keyframe rectangle (`world.model.support.keyframe_half`), no
-   collision and the tilt bound. Retract confs start at the model's home
+   model's keyframe rectangle (`world.model.support.keyframe_half`) and no
+   collision. Retract confs start at the model's home
    (`REAL_LEGS.home`).
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
@@ -123,8 +123,7 @@ graph LR
    cuRobo's RNEA, the floor's push on the soles included
    (`install_floor_wrench`). Each
    segment then passes `_balance_gate`: every frame must keep both soles on
-   the stance (and the Trunk's tilt within the envelope's bound, where it sets
-   one), and its CoM inside the model's support rectangle
+   the stance and its CoM inside the model's support rectangle
    (`world.model.support.gate_half`: the home stance's two soles, shrunk 2 cm
    and kept where each foot carries at least a tenth of the weight). A CoM
    outside fails the candidate and the next one is tried. The gate then sets
@@ -206,8 +205,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 - **[`assets/envelopes/`](cutamp/robots/assets/envelopes/)** —
   `route_a_start.yml`, route A's envelope: the joint ranges the planner
   enforces (the Waist's, and the ankle pitches' up to home, so no plan pitches
-  a shin back past the home stance) and a Trunk floor and tilt bound, both
-  unset; the rest is stored for later stages.
+  a shin back past the home stance); the rest is stored for later stages.
 
 - [`__init__.py`](cutamp/robots/__init__.py) — `RobotContainer` and its
   factory `load_t1_container(model)`. The container's tool frames are the two
@@ -231,8 +229,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
     planted soles and each joint's torque bounded at its effort, the joint
     limits bounded at `TRAJOPT_POSITION_BOUND_WEIGHT` (1e6, cuRobo's 1e4
     times 100, so paths that end on the ankle cap stay inside it), the soles held
-    on the stance at every waypoint, the COM-over-polygon rollout soft cost,
-    and the Trunk-tilt cost where the envelope sets a bound), and
+    on the stance at every waypoint and the COM-over-polygon rollout soft
+    cost), and
     `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
     masses and CoMs and the URDF's inertias, for the balance gate's
     multibody ZMP).
@@ -287,9 +285,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 - [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) —
   `joint_limit_margin_soft_cost` (the `joint_limit_margin` soft cost: a
   hinge² penalty on segment-endpoint confs past the joint limits, which are
-  bfm_wm's soft limits cut by the envelope, so there is no band), and the Trunk tilt bound an
-  envelope may set: `trunk_tilt_excess` (the Motion value `trunk_tilt`),
-  `TrunkTiltCost` on the planner, and GN's tilt row.
+  bfm_wm's soft limits cut by the envelope, so there is no band), and
+  `trunk_tilt_cosine`, the cosine of the Trunk's tilt, by which `gn_ik` ranks
+  each target's accepted starts.
 
 - [`floor_wrench.py`](cutamp/floor_wrench.py) — the floor's push on the
   planted soles: `install_floor_wrench` hooks it into trajopt's RNEA, and
@@ -298,8 +296,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
   through the single planner (`build_motion_planner`). Per operator: plan to
   the particle's conf with `plan_cspace`, then pass
-  `_balance_gate`: every frame keeps both soles on the stance (and the
-  Trunk's tilt within the envelope's bound, where it sets one) and its CoM
+  `_balance_gate`: every frame keeps both soles on the stance and its CoM
   inside `world.model.support.gate_half`, and the gate times each segment at
   the smallest uniform scale its speed, torque and ZMP checks pass: the
   speed's and the torque's exactly, the ZMP's by a batched search to within
@@ -373,16 +370,16 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   `gn_project_balanced`, whose level 1 keeps the CoM in the keyframe
   rectangle, both soles on the stance, the robot out of collision with the
   scene, itself and the movable objects (one row on the summed penetration,
-  `collision_penetration`, aimed 5 mm past contact, a solver margin) and the
-  Trunk's tilt within an envelope's bound, whose level 2 is the pose, least
+  `collision_penetration`, aimed 5 mm past contact, a solver margin), whose
+  level 2 is the pose, least
   squares inside it, whose level 3, beside the collision row, pulls the
   CoM toward the rectangle's centre in the freedom left (`_centring_step`; on
   every iteration but the last, and a row in contact, or whose step would end
-  in contact, past the tilt bound or with a CoM axis past the rectangle,
+  in contact or with a CoM axis past the rectangle,
   takes levels 1-2's step), and whose level 4, below it, pulls the Trunk
   toward upright, the base's pitch and roll toward 0 (`_upright_step`; a row
   whose level-3 step is taken back takes neither, and one whose level-4 step
-  would end in contact or past the tilt bound takes levels 1-3's), every step
+  would end in contact takes levels 1-3's), every step
   scaled inside the joint limits, with no cuRobo during Adam. `gn_gate` checks the result against the checker's
   tolerances for the refresh stats; it checks no collision.
 

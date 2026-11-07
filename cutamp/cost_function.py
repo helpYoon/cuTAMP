@@ -8,7 +8,6 @@
 # its affiliates is strictly prohibited.
 
 import itertools
-import math
 from collections import defaultdict
 from functools import lru_cache
 from typing import Dict, Tuple, Union
@@ -21,7 +20,7 @@ from curobo.types import JointState
 from cutamp.com_polygon_cost import compute_com_polygon_penalties
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
-from cutamp.joint_limit_cost import joint_limit_margin_soft_cost, trunk_tilt_excess
+from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
 from cutamp.rollout import Rollout, get_retract_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
@@ -76,12 +75,6 @@ class CostFunction:
         # The retract confs join the joint-limit and self-collision constraints (design 7.3), on a cost of their
         # own: an instance rewrites its output and gradient buffers on every call of one shape.
         self.retract_self_collision_cost_fn = SelfCollisionCost(self_collision_config) if self.retract_info else None
-        # The envelope's Trunk tilt bound (call 22), as trunk_tilt_excess's arguments after the confs: the base's pitch
-        # and roll columns, and the cosine of the maximum tilt. None when the envelope sets no bound.
-        envelope, names = world.model.envelope, world.model.joint_names
-        self.trunk_tilt_args = None if envelope.trunk_tilt_max is None else (
-            names.index("base_j_pitch"), names.index("base_j_roll"), math.cos(envelope.trunk_tilt_max)
-        )
 
         # Compute the AABB and surface z-position for the placement surfaces of the plan's StablePlacement
         # constraints. Also precompute the static per-surface placement grouping used by
@@ -128,8 +121,7 @@ class CostFunction:
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
         """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and of the
-        retract confs too (``retract_joint_limit``, ``retract_self_collision``); with an envelope that bounds the
-        tilt, also the rollout confs' Trunk tilt past its maximum (``trunk_tilt``)."""
+        retract confs too (``retract_joint_limit``, ``retract_self_collision``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 
@@ -144,9 +136,6 @@ class CostFunction:
         values = {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals}
         if self.retract_self_collision_cost_fn is not None:
             values.update(self._retract_motion_values())
-        if self.trunk_tilt_args is not None:
-            # ponytail: the retract confs are left out: their base and body are locked at home, which stands upright.
-            values["trunk_tilt"] = trunk_tilt_excess(confs, *self.trunk_tilt_args)
         return {"type": "constraint", "values": values}
 
     def _retract_motion_values(self) -> Dict[str, torch.Tensor]:

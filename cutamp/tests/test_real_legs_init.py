@@ -138,6 +138,6 @@ def test_retract_confs_join_the_motion_constraints(real_world, real_plan):
     at_home = torch.ones_like(joint_limit, dtype=torch.bool)
     at_home[:2, 0] = False
     assert not bool(joint_limit[at_home].any()) and not bool(self_collision[at_home].any())
-    # Exact, as the other Motion values (route A's envelope sets no tilt bound, so there is no trunk_tilt value).
+    # Exact, as the other Motion values.
     tols = {k: default_constraint_to_tol[Motion.type][k] for k in values}
     assert tols == dict.fromkeys(tols, 0.0)

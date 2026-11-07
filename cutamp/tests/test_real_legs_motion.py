@@ -1,9 +1,8 @@
 """Motion planning on the real legs with planted feet and cuRobo's torque check (design 7.4a, 7.5): the floor's push on
 every trajopt transition, SegmentTorques against trajopt's own torques, the balance gate's multibody ZMP against a
-float64 reference, its sole, tilt, CoM and torque checks, and the failed-trajopt reason. blocks_t1 end to end on the
+float64 reference, its sole, CoM and torque checks, and the failed-trajopt reason. blocks_t1 end to end on the
 real legs is test_motion_anchor's."""
 
-import dataclasses
 import functools
 import math
 from types import SimpleNamespace
@@ -142,33 +141,6 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
     assert max(loads) <= 0.05, loads
 
 
-@needs_cuda
-def test_planner_registers_the_tilt_cost_only_under_a_bound(real_world, planner):
-    # Route A's envelope sets no tilt bound, so its planner has no TrunkTiltCost; under an envelope with
-    # one, trajopt bounds the tilt (weight 1e5, the bound's cosine, on the base's pitch and roll columns).
-    from cutamp._curobo_internals import iter_rollouts
-    from cutamp.joint_limit_cost import TrunkTiltCost
-    from cutamp.robots.t1 import get_t1_motion_planner
-    from cutamp.utils.common import get_world_cfg
-
-    def extra_costs(mp, kind):
-        return [c for r in iter_rollouts(mp) for mgr in (r.cost_manager, r.metrics_cost_manager)
-                for c in getattr(mgr, "_extra_costs", {}).values() if isinstance(c, kind)]
-
-    assert REAL_LEGS.envelope.trunk_tilt_max is None
-    assert not extra_costs(planner, TrunkTiltCost)
-    bounded = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
-    with get_t1_motion_planner(bounded, get_world_cfg(real_world.env, include_movables=True),
-                               use_cuda_graph=False, device_cfg=real_world.device_cfg) as mp:
-        costs = extra_costs(mp, TrunkTiltCost)
-        names = list(mp.kinematics.joint_names)
-        assert costs
-        columns = (names.index("base_j_pitch"), names.index("base_j_roll"))
-        for c in costs:
-            assert (c.config.pitch_index, c.config.roll_index) == columns
-            assert c.config.cos_max == math.cos(1.0) and float(c._weight.max()) == 1e5
-
-
 def _plan_reach(world, real_plan, planner):
     """A planned home -> reach segment: plan_cspace's result for the first pick conf of ``real_plan`` that plans."""
     from cutamp.motion_solver import _plan_arm_to_conf, _planner_js_from_full
@@ -253,9 +225,9 @@ def test_gate_fails_a_slowed_segment_past_a_torque_limit(real_world, planner, mo
 
 
 @needs_cuda
-def test_gate_checks_the_soles_and_tilt_of_the_frames_it_returns(real_world, planner, monkeypatch):
+def test_gate_checks_the_soles_of_the_frames_it_returns(real_world, planner, monkeypatch):
     # A slowed segment's frames are spline resamples between the planned ones, and they are what is saved and
-    # executed: the gate checks their soles and tilt as well as the planned frames'.
+    # executed: the gate checks their soles as well as the planned frames'.
     import cutamp.motion_solver as ms
     checked, check = [], ms._check_planted
 
@@ -294,57 +266,6 @@ def test_gate_rejects_sole_drift(real_world, planner, monkeypatch):
     # The whole robot slides 1 cm with the legs fixed: the soles leave the stance.
     with pytest.raises(RuntimeError, match="sole"):
         _balance_gate(real_world, planner, _ramp(real_world, {"base_j_x": 0.01}, 1.0), DT)
-
-
-def _bowed(world, real_plan, planner):
-    """A still segment at a bowed conf the gate passes under route A's envelope, and the conf's tilt, acos(cos p cos
-    r) of the base's pitch p and roll r (YXZ): an IK-solved pick conf whose base both pitches and rolls."""
-    from cutamp.motion_solver import _balance_gate
-    skeleton, particles = real_plan
-    names = list(world.model.joint_names)
-    pitch, roll = names.index("base_j_pitch"), names.index("base_j_roll")
-    for op in skeleton:
-        if op.operator.metadata.action_type != "pick":
-            continue
-        q = particles[op.values[-1]].double()
-        tilt = torch.acos(torch.cos(q[:, pitch]) * torch.cos(q[:, roll]))
-        for k in torch.nonzero((tilt > 0.2) & (q[:, roll].abs() > 0.05)).flatten().tolist():
-            still = _still(world, q[k], 0.5)
-            try:
-                _balance_gate(world, planner, still, DT)
-            except RuntimeError:  # its soles or CoM fail on their own
-                continue
-            return still, float(tilt[k])
-    raise AssertionError("no bowed pick conf passes the gate")
-
-
-@needs_cuda
-def test_gate_bounds_a_bowed_confs_tilt(real_world, real_plan, planner, monkeypatch):
-    # Under an envelope with a tilt bound the gate checks every frame's Trunk tilt: a bound 1e-3 rad under a bowed
-    # conf's acos(cos p cos r) fails it, and one 1e-3 rad over passes it.
-    from cutamp.motion_solver import _balance_gate
-    still, tilt = _bowed(real_world, real_plan, planner)
-    for bound, passes in ((tilt + 1e-3, True), (tilt - 1e-3, False)):
-        model = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=bound))
-        monkeypatch.setattr(real_world, "robot_container", dataclasses.replace(real_world.robot_container, model=model))
-        if passes:
-            _balance_gate(real_world, planner, still, DT)
-        else:
-            with pytest.raises(RuntimeError, match="tilt"):
-                _balance_gate(real_world, planner, still, DT)
-
-
-@needs_cuda
-def test_gate_tilt_check_fails_a_nan_tilt(real_world, monkeypatch):
-    # A NaN Trunk pose fails the tilt check (the soles stay finite here, so the tilt check is the one that runs).
-    import cutamp.com_polygon_cost as cpc
-    from cutamp.motion_solver import _check_planted
-    fk = cpc._fk_state
-    monkeypatch.setattr(cpc, "_fk_state", lambda world, q, kin=None: fk(world, q if kin is None else q * math.nan, kin))
-    bounded = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
-    monkeypatch.setattr(real_world, "robot_container", dataclasses.replace(real_world.robot_container, model=bounded))
-    with pytest.raises(RuntimeError, match="tilt"):
-        _check_planted(real_world, _ramp(real_world, {}, 2 * DT).position)
 
 
 def _actuated(world) -> list:
@@ -497,8 +418,8 @@ def test_gate_raises_naming_the_check_no_scale_passes(real_world, planner, monke
 def test_gate_slows_a_resampled_segment_that_fails_its_recheck(real_world, planner, monkeypatch):
     # The frames _retime returns are spline samples, so a speed, torque or ZMP check can fail on them where it passed
     # on the planner's frames: the gate slows that segment by RETIME_RECHECK_STEP until its re-check passes (the
-    # elbow sweep: 16 steps, then 17 for 1.05 x 15.95). The soles, the tilt and the CoM follow the path, which no time
-    # scale changes, so their re-check failure raises at once.
+    # elbow sweep: 16 steps, then 17 for 1.05 x 15.95). The soles and the CoM follow the path, which no time scale
+    # changes, so their re-check failure raises at once.
     import cutamp.motion_solver as ms
     calls, recheck = [], ms._recheck
 

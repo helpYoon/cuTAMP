@@ -32,7 +32,6 @@ from cutamp.gn_refresh import (
     collision_penetration,
     gn_project_balanced,
     soles_on_stance,
-    tilt_within_bound,
 )
 from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
@@ -42,7 +41,7 @@ from cutamp.samplers import (
 )
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
-from cutamp.task_planning.constraints import KinematicConstraint, Motion
+from cutamp.task_planning.constraints import KinematicConstraint
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
@@ -150,18 +149,16 @@ GN_IK_START_SIGMAS = (0.1, 0.2, 0.3)
 
 class IKTol(NamedTuple):
     """The constraint checker's tolerances an IK conf must meet: the hand's and the soles' pose errors
-    (KinematicConstraint) and the Trunk tilt past the envelope's bound (Motion)."""
+    (KinematicConstraint)."""
     pos: float
     rot: float
     sole_pos: float
     sole_rot: float
-    tilt: float
 
     @classmethod
     def from_checker(cls, checker: ConstraintChecker) -> "IKTol":
         kc = KinematicConstraint.type
-        return cls(*(checker._get_tol(kc, n) for n in ("pos_err", "rot_err", "sole_pos_err", "sole_rot_err")),
-                   checker._get_tol(Motion.type, "trunk_tilt"))
+        return cls(*(checker._get_tol(kc, n) for n in ("pos_err", "rot_err", "sole_pos_err", "sole_rot_err")))
 
 
 def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arms: Union[str, Sequence[str]],
@@ -169,8 +166,8 @@ def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arm
     """``(ok, safe, hand_err)``, each ``[N]``, from one FK of ``q`` ``[N, dof]`` on ``world.kinematics``, with rows
     in ``arms``' dep-major blocks (:func:`~cutamp.gn_refresh.gn_project_balanced`'s layout). ``safe``: the conf
     stands balanced (the CoM inside the support rectangle, both soles on the stance within ``tol``), clear of the
-    scene, of ``movables`` ``[N, M, 4]`` and of itself (:func:`~cutamp.gn_refresh.collision_penetration` is 0)
-    and inside the envelope's tilt bound. ``ok``: safe, with the hand on ``world_from_ee`` within ``tol``, all at
+    scene, of ``movables`` ``[N, M, 4]`` and of itself (:func:`~cutamp.gn_refresh.collision_penetration` is 0).
+    ``ok``: safe, with the hand on ``world_from_ee`` within ``tol``, all at
     the checker's ``<=``. ``hand_err``: the hand's position plus rotation error, :func:`gn_ik`'s ranking."""
     from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
     from cutamp.costs import curobo_pose_error
@@ -184,8 +181,7 @@ def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arm
     )
     safe = (com_polygon_mask_from_state(state, world.model.support)
             & soles_on_stance(world, state, tol.sole_pos, tol.sole_rot)
-            & (collision_penetration(world, state.robot_spheres, movables) <= 0)
-            & tilt_within_bound(world, q, tol.tilt))
+            & (collision_penetration(world, state.robot_spheres, movables) <= 0))
     return safe & (pos_err <= tol.pos) & (rot_err <= tol.rot), safe, pos_err + rot_err
 
 

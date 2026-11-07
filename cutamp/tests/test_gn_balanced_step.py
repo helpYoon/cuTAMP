@@ -42,8 +42,8 @@ def _synthetic(seed, B=64, coll=False):
 
     def args(dep, c):
         q, r, jac, jac_com, com, jac_sole, r_sole, pen, jac_pen = dep
-        return (q, r, jac, jac_com, com, lower, upper, c, half, jac_sole, r_sole, None,
-                (pen, jac_pen) if coll else None, coll)
+        return (q, r, jac, jac_com, com, lower, upper, c, half, jac_sole, r_sole, (pen, jac_pen) if coll else None,
+                coll)
 
     stack = args([torch.cat(x) for x in zip(*deps)], col_mask)
     blocks = [args(d, c) for d, c in zip(deps, col_mask.split(B))]
@@ -88,19 +88,8 @@ def test_balanced_step_moves_no_pinned_column(coll):
     assert torch.equal(step3, _balanced_step(*stack)[0])
     if coll:
         assert torch.equal(step12, _balanced_step(*stack[:-1], False)[0])
-        in_contact = stack[12][0][:, 0] > 0
+        in_contact = stack[11][0][:, 0] > 0
         assert bool(in_contact.any()) and torch.equal(step[in_contact], step12[in_contact])
-        # Under a tilt bound too, where a row whose levels 1-3 step ends past the bound takes levels 1-2's step for
-        # both, and level 4 never carries a row past it (it never comes near here; its veto has its own test below).
-        from cutamp.joint_limit_cost import trunk_tilt_cosine
-        tilt = (*UPRIGHT, math.cos(1.0), math.cos(0.99))
-        tilted = stack[:11] + (tilt,) + stack[12:]
-        step, step3, step12 = _balanced_step(*tilted, upright=UPRIGHT)
-        assert torch.equal(step12, _balanced_step(*tilted[:-1], False)[0])
-        assert torch.equal(step3, _balanced_step(*tilted)[0])
-        past = trunk_tilt_cosine(stack[0] + step3, *UPRIGHT) < tilt[2]
-        assert bool(past.any()) and torch.equal(step3[past], step12[past]) and torch.equal(step[past], step12[past])
-        assert not bool((trunk_tilt_cosine(stack[0] + step, *UPRIGHT) < tilt[2])[~past].any())
 
 
 def test_level4_moves_no_row_above_it_and_lowers_pitch_and_roll():
@@ -120,29 +109,6 @@ def test_level4_moves_no_row_above_it_and_lowers_pitch_and_roll():
     before, after = ((q + s)[:, list(UPRIGHT)].norm(dim=-1) for s in (step3, step))
     assert bool((after <= before + 1e-6).all())
     assert bool((after[big] < before[big]).all())
-
-
-def test_level4_never_carries_the_tilt_past_the_bound(monkeypatch):
-    # Under a tilt bound, a row takes levels 1-3's step where level 4's would carry the Trunk tilt that step leaves
-    # inside the bound past it (exact, as level 3's tilt veto). Level 4 never pushes that far on these rows, so here it
-    # pushes outward: without the veto, 3 of the 256 rows end 0.04-0.06 rad past the bound.
-    import cutamp.gn_refresh as gn
-    from cutamp.joint_limit_cost import trunk_tilt_cosine
-    real = gn._upright_step
-    monkeypatch.setattr(gn, "_upright_step", lambda *a: -real(*a))
-    stack, _ = _synthetic(0, coll=True)
-    q, jac_com = stack[0], stack[3]
-    tilt = (*UPRIGHT, math.cos(1.0), math.cos(0.99))
-    step, step3, _ = _balanced_step(*stack[:11], tilt, *stack[12:], upright=UPRIGHT)
-
-    def past(s):
-        return trunk_tilt_cosine(q + s, *UPRIGHT) < tilt[2]
-
-    assert bool((step != step3).any())  # not vacuous: level 4 still moves rows it keeps inside
-    assert not bool((past(step) & ~past(step3)).any())
-    # A row the veto catches takes levels 1-3's step, not levels 1-2's: what level 4 adds moves no CoM axis (2e-9
-    # here), where levels 1-2's step would undo level 3's pull (3e-2).
-    assert float((jac_com @ (step - step3).unsqueeze(-1)).abs().max()) < 1e-6
 
 
 def test_level3_never_carries_a_free_com_axis_out(monkeypatch):
@@ -178,30 +144,3 @@ def test_level3_never_carries_a_free_com_axis_out(monkeypatch):
         _row_layout(REAL_LEGS, ("left", "right"), 5, dof, torch.device("cpu"), torch.float32)
     with pytest.raises(ValueError):  # an arm that is neither left nor right
         _row_layout(REAL_LEGS, ("left", "up"), 4, dof, torch.device("cpu"), torch.float32)
-
-
-def test_tilt_row_is_the_tilt_cosine_and_its_gradient():
-    # The tilt row: the Motion value's cosine and its analytic Jacobian, autograd's gradient on the base's pitch and
-    # roll columns and zero elsewhere, masked by the column mask. Route A's envelope sets no tilt bound, so it has no
-    # row; an envelope that bounds the tilt at 1.0 rad has one.
-    import dataclasses
-    from cutamp.gn_refresh import GN_TILT_MARGIN, _tilt_bound, _tilt_row
-    from cutamp.joint_limit_cost import trunk_tilt_cosine
-
-    assert _tilt_bound(REAL_LEGS) is None
-    names = list(REAL_LEGS.joint_names)
-    tilted = dataclasses.replace(REAL_LEGS, envelope=REAL_LEGS.envelope._replace(trunk_tilt_max=1.0))
-    pitch, roll, cos_max, cos_target = _tilt_bound(tilted)
-    assert (pitch, roll) == (names.index("base_j_pitch"), names.index("base_j_roll"))
-    assert (cos_max, cos_target) == (math.cos(1.0), math.cos(1.0 - GN_TILT_MARGIN))
-    g = torch.Generator().manual_seed(0)
-    q = 2 * torch.rand(16, len(names), generator=g, dtype=torch.float64) - 1
-    col_mask = torch.ones_like(q)
-    col_mask[8:, roll] = 0.0
-    c, jac = _tilt_row(q, pitch, roll, col_mask)
-    qg = q.clone().requires_grad_(True)
-    grad = torch.autograd.grad(trunk_tilt_cosine(qg, pitch, roll).sum(), qg)[0]
-    assert c.shape == (16, 1) and jac.shape == (16, 1, len(names))
-    torch.testing.assert_close(c[:, 0], trunk_tilt_cosine(q, pitch, roll), rtol=0, atol=0)
-    torch.testing.assert_close(jac[:, 0], grad * col_mask, rtol=1e-12, atol=1e-12)
-    assert bool(jac[:8, 0, roll].abs().gt(0).all()) and not bool(jac[8:, 0, roll].any())

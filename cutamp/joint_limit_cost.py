@@ -1,4 +1,4 @@
-"""The joint-limit soft cost, and the Trunk tilt bound.
+"""The joint-limit soft cost, and the Trunk tilt's cosine.
 
 :func:`joint_limit_margin_soft_cost` is cuTAMP's particle-side soft cost over
 segment-endpoint configurations: a hinge² penalty for leaving the joint
@@ -7,22 +7,15 @@ it has no margin band. Empirical analysis of saved plans showed 100% of near-lim
 comes from endpoint configs (IK/particle output), never from trajopt
 excursions.
 
-The Trunk tilt bound (design call 22), which an envelope may set (route A's sets none), has three consumers of
-:func:`trunk_tilt_cosine`: the Motion value ``trunk_tilt`` over the confs (cutamp/cost_function.py) and
-:class:`TrunkTiltCost` on the motion planner, both through :func:`trunk_tilt_excess`, and GN's tilt row
-(cutamp/gn_refresh.py), which projects the covered confs onto the bound. A box on the base's pitch and roll would
-cut a pure bow to the bound over sqrt(2), so the tilt is a cost.
+:func:`trunk_tilt_cosine` is the cosine of the Trunk's tilt, by which GN IK ranks each target's accepted starts
+(cutamp/particle_initialization.py).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Type
+from typing import Dict
 
 import torch
-
-from curobo._src.cost.cost_base import BaseCost
-from curobo._src.cost.cost_base_cfg import BaseCostCfg
 
 
 def shrunken_bounds_penalty(q: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
@@ -83,32 +76,3 @@ def trunk_tilt_cosine(q: torch.Tensor, pitch_index: int, roll_index: int) -> tor
     The base's chain is pitch, then roll, then yaw (YXZ), so the Trunk's z axis keeps ``cos(pitch) cos(roll)``
     of the vertical, whatever the yaw. ``q`` is ``[..., dof]``. Capture-safe."""
     return torch.cos(q[..., pitch_index]) * torch.cos(q[..., roll_index])
-
-
-def trunk_tilt_excess(q: torch.Tensor, pitch_index: int, roll_index: int, cos_max: float) -> torch.Tensor:
-    """``q.shape[:-1]``: ``relu(cos_max - trunk_tilt_cosine(q))``, positive where the Trunk tilts past the bound
-    whose cosine is ``cos_max``. Capture-safe."""
-    return torch.relu(cos_max - trunk_tilt_cosine(q, pitch_index, roll_index))
-
-
-@dataclass
-class TrunkTiltCostCfg(BaseCostCfg):
-    #: The base's pitch and roll columns in the planner's active cspace.
-    pitch_index: int = field(kw_only=True)
-    roll_index: int = field(kw_only=True)
-    #: The cosine of the envelope's maximum tilt.
-    cos_max: float = field(kw_only=True)
-
-    class_type: Type = None  # set after TrunkTiltCost definition below
-
-
-class TrunkTiltCost(BaseCost):
-    def forward(self, state) -> torch.Tensor:
-        """``[batch, horizon, 1]``: ``weight * trunk_tilt_excess(q)**2``, zero while the tilt is within the bound."""
-        excess = trunk_tilt_excess(
-            state.joint_state.position, self.config.pitch_index, self.config.roll_index, self.config.cos_max
-        )
-        return excess.square().unsqueeze(-1) * self._weight
-
-
-TrunkTiltCostCfg.class_type = TrunkTiltCost

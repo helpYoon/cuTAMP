@@ -603,8 +603,8 @@ RETIME_RECHECK_STEP = 1.05
 
 
 def _gate_error(check: str, message: str) -> RuntimeError:
-    """The balance gate's RuntimeError, whose ``check`` names the check that failed: ``"soles"``, ``"tilt"``,
-    ``"com"``, ``"zmp"``, ``"torque <joint>"`` or ``"velocity <joint>"``."""
+    """The balance gate's RuntimeError, whose ``check`` names the check that failed: ``"soles"``, ``"com"``,
+    ``"zmp"``, ``"torque <joint>"`` or ``"velocity <joint>"``."""
     error = RuntimeError(message)
     error.check = check
     return error
@@ -654,9 +654,8 @@ def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
 
 def _check_planted(world: TAMPWorld, q: torch.Tensor) -> None:
     """Raise a RuntimeError, naming its check, unless every frame ``q`` ``[T, dof]`` keeps both soles on the stance
-    (``world.stance_soles``) within the kinematic constraint's sole tolerances (``soles_planted``) and, where the
-    envelope sets a maximum, the Trunk's tilt within it. The tilt is the angle between the Trunk's z axis, by FK, and
-    the vertical. A NaN fails either check."""
+    (``world.stance_soles``) within the kinematic constraint's sole tolerances (``soles_planted``). A NaN fails the
+    check."""
     from cutamp.com_polygon_cost import _fk_state
     from cutamp.costs import curobo_pose_error
 
@@ -668,14 +667,6 @@ def _check_planted(world: TAMPWorld, q: torch.Tensor) -> None:
         pos_max, rot_max = pos.max().item(), rot.max().item()
         raise _gate_error("soles", f"trajectory soles leave the stance by up to {1000 * pos_max:.1f} mm and "
                                    f"{rot_max:.3f} rad")
-    envelope = world.model.envelope
-    if envelope.trunk_tilt_max is None:
-        return
-    trunk = _fk_state(world, q, world.bodies.kinematics).tool_poses.get_link_pose("Trunk", make_contiguous=True)
-    tilt = torch.acos(trunk.get_matrix()[..., 2, 2].clamp(-1.0, 1.0)).max().item()
-    if not tilt <= envelope.trunk_tilt_max:
-        raise _gate_error("tilt", f"trajectory Trunk tilt reaches {tilt:.3f} rad, past the envelope's "
-                                  f"{envelope.trunk_tilt_max:.3f} rad")
 
 
 def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
@@ -802,7 +793,7 @@ def _zmp_scale(world: TAMPWorld, planner, js: JointState, lo: float, hi: float) 
 
 def _recheck(world: TAMPWorld, planner, js: JointState, planted: bool = True) -> Tuple[float, float]:
     """The gate's checks on the frames it returns, from their own velocities and accelerations: both soles on the
-    stance and the Trunk's tilt (``_check_planted``; ``planted`` False skips it on the planner's own frames, which
+    stance (``_check_planted``; ``planted`` False skips it on the planner's own frames, which
     passed it already), the CoM and the multibody ZMP inside the gate's support rectangle (a frame that would need the
     floor to pull has no ZMP and fails it), every joint's torque within its effort and every actuated joint's speed
     within its limit. Returns the CoM's and the ZMP's smallest margins; a failed check raises a RuntimeError whose
@@ -834,8 +825,8 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
     velocities and accelerations (the timing test runs both), else None. Each check raises a RuntimeError that names
     it, so the planner moves to its next candidate or skeleton.
 
-    Every frame must keep both soles on the stance and the Trunk's tilt within the envelope's bound
-    (``_check_planted``), and its CoM inside the gate's support rectangle; no time scale changes either. The gate then
+    Every frame must keep both soles on the stance (``_check_planted``) and its CoM inside the gate's support
+    rectangle; no time scale changes either. The gate then
     finds the smallest uniform time scale s in [s_v, RETIME_MAX] (below 1 speeds the segment up, above 1 slows it down)
     at which every actuated joint keeps its speed within cuRobo's limit (s_v, exact: ``_check_velocity``), every joint
     its torque within its effort (exact: ``_torque_scale``) and the multibody ZMP stays inside (``_zmp_scale``, to
@@ -879,7 +870,7 @@ def _balance_gate(world: TAMPWorld, planner, plan_js: JointState, dt: float):
             except RuntimeError as e:
                 check = getattr(e, "check", None) or ""
                 if check.split(" ")[0] not in ("velocity", "torque", "zmp") or s >= RETIME_MAX:
-                    raise  # the soles, the tilt and the CoM follow the path, which no time scale changes
+                    raise  # the soles and the CoM follow the path, which no time scale changes
                 s, binding = min(RETIME_RECHECK_STEP * s, RETIME_MAX), check
         n_out = out.position.shape[-2]
         s_eff = (n_out - 1) / (n - 1) if n_out != n else 1.0
