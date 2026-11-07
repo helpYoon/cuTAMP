@@ -13,7 +13,7 @@ import yaml
 from cutamp.com_polygon_cost import LOAD_GUARD_A, support_rectangles
 from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.tests.conftest import needs_cuda
+from cutamp.tests.conftest import link_kinematics, needs_cuda
 
 CUTAMP = Path(__file__).resolve().parents[1]
 T1_29DOF = CUTAMP / "robots" / "assets" / "t1_29dof"
@@ -232,7 +232,7 @@ def test_home_soles_flat_on_the_floor(real_world):
     tilt = soles[:, :2, 2].double().norm(dim=-1)  # sine of the angle between each sole's z axis and the vertical
     assert p[:, 2].abs().max() <= 1e-6 and tilt.max() <= 1e-6, (p, tilt)
     assert abs(p[0, 1] - 0.10625) <= 1e-4 and abs(p[1, 1] + 0.10625) <= 1e-4 and abs(p[0, 0] - p[1, 0]) <= 1e-6, p
-    ankles = _matrices(_fk(real_world.bodies.kinematics, home), ["Ankle_Cross_Left", "Ankle_Cross_Right"])
+    ankles = _matrices(_fk(link_kinematics(real_world), home), ["Ankle_Cross_Left", "Ankle_Cross_Right"])
     assert ankles[:, :2, 3].double().mean(0).abs().max() <= 1e-6, ankles[:, :3, 3]  # decision 3: today's footprint
     assert abs(m.home[m.joint_names.index("base_j_z")] - 0.6791) <= 1e-4  # call 11: Trunk 0.6791 m above the soles
     fixture_names = [str(j) for j in np.load(T1_29DOF / "mujoco_fixture.npz")["joint_names"]]
@@ -293,14 +293,13 @@ def test_factories_keep_the_soft_limits_on_their_joints(real_world):
         soft[joint] = (max(soft[joint][0], lo), min(soft[joint][1], hi))
     planner = get_t1_motion_planner(REAL_LEGS, real_world.world_cfg, use_cuda_graph=False)
     builds = {"kinematics": real_world.kinematics, "kinematics_jac": real_world.kinematics_jac,
-              "bodies": real_world.bodies.kinematics, "planner": planner.kinematics}
+              "planner": planner.kinematics}
     for what, kin in builds.items():
         names = list(kin.joint_names)
         assert names == list(REAL_LEGS.joint_names), what
         lo, hi = kin.get_joint_limits().position.double().cpu().numpy()
         want_lo, want_hi = np.array([soft[n] for n in names]).T
         assert np.abs(lo - want_lo).max() < 1e-6 and np.abs(hi - want_hi).max() < 1e-6, what
-    assert real_world.bodies.kinematics.tool_frames[0] == "stance" and float(real_world.bodies.mass[0]) == 0.0
     # Trajopt bounds those limits at TRAJOPT_POSITION_BOUND_WEIGHT, on its live cost (cuRobo's would be 1e4).
     from cutamp.robots.t1 import TRAJOPT_POSITION_BOUND_WEIGHT
     costs = [r.cost_manager.costs["cspace"] for r in planner.trajopt_solver.optimizer_rollouts]

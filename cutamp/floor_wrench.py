@@ -116,7 +116,7 @@ def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str]
 class SegmentTorques:
     """cuRobo's two RNEA passes with the floor's push, as trajopt's transitions run them, on a plan's frames: the
     balance gate's torque check, which with the speed limits sets each segment's pace, and the reason a trajopt
-    failed (design 7.4a).
+    failed (design 7.4a); and the floor's wrench from the first pass (``floor``), the gate's ZMP.
 
     It runs on ``config``, ``model``'s KinematicsCfg (``TAMPWorld.kinematics``'s, which
     :func:`cutamp.robots.t1.get_t1_kinematics` builds and checks the joint order of). Calling it on a ``plan_js``
@@ -139,13 +139,16 @@ class SegmentTorques:
         kp = config.kinematics_config
         self.dyn = Dynamics(DynamicsCfg(kinematics_config=kp, device_cfg=config.device_cfg))
         tools = list(self.kin.tool_frames)
-        self.fn = make_floor_wrench_fn([self.joint_names.index(j) for j in model.joint_names[model.base]],
-                                       tuple(tools.index(f) for f in model.sole_frames),
+        self.base = [self.joint_names.index(j) for j in model.joint_names[model.base]]
+        self.support = model.support.link
+        self.fn = make_floor_wrench_fn(self.base, tuple(tools.index(f) for f in model.sole_frames),
                                        tuple(kp.link_name_to_idx_map[f] for f in model.sole_frames), kp.num_links)
         limits = self.kin.get_joint_limits()  # each [2, dof]: -bound, +bound
         self.effort, self.velocity = limits.effort[1].clone(), limits.velocity[1].clone()
 
-    def __call__(self, plan_js: JointState) -> torch.Tensor:
+    def _free_pass(self, plan_js: JointState):
+        """``(js, tau_free, ks)``: ``plan_js`` as ``[1, T, dof]`` in ``joint_names`` order, RNEA's first pass (nothing
+        touching the robot) and FK, each a clone of cuRobo's reused buffers."""
         from curobo.types import JointState
 
         if plan_js.joint_names is not None and list(plan_js.joint_names) != self.joint_names:
@@ -153,8 +156,23 @@ class SegmentTorques:
         n = len(self.joint_names)
         p, v, a = (x.reshape(1, -1, n).contiguous() for x in (plan_js.position, plan_js.velocity, plan_js.acceleration))
         js = JointState(position=p, velocity=v, acceleration=a, jerk=torch.zeros_like(p), joint_names=self.joint_names)
+        self.dyn.setup_batch_size(1, p.shape[1])
+        return js, self.dyn.compute_inverse_dynamics(js).clone(), self.kin.compute_kinematics(js).clone()
+
+    def __call__(self, plan_js: JointState) -> torch.Tensor:
         with torch.no_grad():
-            self.dyn.setup_batch_size(1, p.shape[1])
-            tau_free = self.dyn.compute_inverse_dynamics(js).clone()  # Dynamics and Kinematics hand back reused buffers
-            ks = self.kin.compute_kinematics(js).clone()
+            js, tau_free, ks = self._free_pass(plan_js)
             return self.dyn.compute_inverse_dynamics(js, f_ext=self.fn(js, ks, tau_free)).clone()[0]
+
+    def floor(self, plan_js: JointState):
+        """``(force, moment, com)``, each ``[T, 3]`` in the support frame (``model.support.link``): the floor's wrench
+        on the robot, which is the first pass's base wrench (``base_wrench``), with its moment about the support
+        frame's origin, and the CoM about that origin. Linear in the first pass's torques, so at a uniform time scale s
+        the wrench is w_0 + (w_1 - w_0) / s^2, as the torques are (motion_solver._torque_scale)."""
+        with torch.no_grad():
+            js, tau_free, ks = self._free_pass(plan_js)
+            F, M, P = base_wrench(js.position[0][:, self.base], tau_free[0][:, self.base])
+            X = ks.tool_poses.get_link_pose(self.support, make_contiguous=True).get_matrix().reshape(-1, 4, 4)
+            Rt, o = X[:, :3, :3].transpose(-1, -2), X[:, :3, 3]
+            local = lambda w: (Rt @ w[..., None])[..., 0]  # noqa: E731
+            return local(F), local(M + torch.cross(P - o, F, dim=-1)), local(ks.robot_com[0, :, :3] - o)

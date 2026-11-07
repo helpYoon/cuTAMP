@@ -184,7 +184,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
                         velocity=torch.as_tensor(seg["velocity"], device=world.device),
                         acceleration=torch.as_tensor(seg["acceleration"], device=world.device),
                         joint_names=list(world.model.joint_names))
-        com, zmp = com_zmp_in_support(world, ms._taylor_positions(world, js), ms.ZMP_STEP)
+        com, zmp = com_zmp_in_support(world, js)
         half = world.model.support.gate_half
         margin = com_margin_from_base(com, half).min().item()
         assert margin >= 0, f"segment {k}: an exported CoM is {-100 * margin:.2f} cm outside the gate's rectangle"

@@ -18,7 +18,7 @@ import math
 import torch
 
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.tests.conftest import clone_particles, needs_cuda
+from cutamp.tests.conftest import clone_particles, link_kinematics, needs_cuda
 from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _poses, _sole_errors
 
 #: The 3 cm move of every hand target in the GN tests.
@@ -477,7 +477,7 @@ def test_trunk_tilt_cosine_is_the_fk_trunks_vertical(real_world):
     for joint, span in (("base_j_pitch", 0.6), ("base_j_roll", 0.3), ("base_j_yaw", 1.0)):
         q[:, names.index(joint)] = (2 * torch.rand(16, generator=g) - 1) * span
     q = q.to(real_world.device)
-    ks = _fk_state(real_world, q, real_world.bodies.kinematics)
+    ks = _fk_state(real_world, q, link_kinematics(real_world))
     trunk = ks.tool_poses.get_link_pose("Trunk", make_contiguous=True)
-    cos =trunk_tilt_cosine(q, names.index("base_j_pitch"), names.index("base_j_roll"))
+    cos = trunk_tilt_cosine(q, names.index("base_j_pitch"), names.index("base_j_roll"))
     assert torch.allclose(trunk.get_matrix()[..., 2, 2], cos, atol=1e-5)

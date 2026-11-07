@@ -22,6 +22,23 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
+def link_kinematics(world):
+    """A Kinematics of ``world``'s model whose tool frames are its support frame, then every massive link, for FK of
+    links the planner does not track (cuRobo's FK returns tool frames only). cuRobo orders the joints by walking the
+    tool frames; in its own link order they keep the model's. Built on a copy of the robot config, whose tool frames
+    every later solver reads."""
+    import copy
+    from curobo.kinematics import Kinematics, KinematicsCfg
+    from cutamp.robots.t1 import _check_joint_order, t1_curobo_cfg
+    kp, support = world.kinematics.kinematics_config, world.model.support.link
+    tools = [support] + [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0 and n != support]
+    cfg = copy.deepcopy(t1_curobo_cfg(world.model))
+    kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=tools, device_cfg=world.kinematics.device_cfg),
+                     compute_spheres=False)
+    _check_joint_order(world.model, kin.joint_names)
+    return kin
+
+
 def make_blocks_t1_world():
     """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home."""
     from curobo.types import DeviceCfg

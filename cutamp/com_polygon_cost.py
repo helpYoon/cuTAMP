@@ -273,50 +273,20 @@ def particle_com_margin(world, particle: "dict[str, torch.Tensor]") -> float:
     )
 
 
-def _vee(m: torch.Tensor) -> torch.Tensor:
-    """The vector of a ``[..., 3, 3]`` matrix's skew-symmetric part."""
-    return 0.5 * torch.stack([m[..., 2, 1] - m[..., 1, 2], m[..., 0, 2] - m[..., 2, 0],
-                              m[..., 1, 0] - m[..., 0, 1]], dim=-1)
+def com_zmp_in_support(world, plan_js):
+    """``(com_xy [T, 2], zmp_xy [T, 2])`` of a plan's frames (position, velocity and acceleration, by joint name) in
+    the support frame, about its origin, the rectangle's centre and on the sole plane (test_real_legs_support.py).
 
+    The ZMP is the multibody one, exact: the floor's wrench on the robot is RNEA's first-pass base wrench
+    (``world.segment_torques.floor``), so with its moment about the origin, the ZMP is (-M_y, M_x) / F_z. That counts
+    every link's acceleration and spin; a trunk swinging above the hips moves it centimetres past the CoM alone's
+    cart-table ZMP.
 
-def com_zmp_in_support(world, q3: torch.Tensor, h: float, g: float = 9.81):
-    """``(com_xy [T, 2], zmp_xy [T, 2])`` in the support frame, about its origin, the rectangle's centre. ``q3``
-    ``[3, T, full_dof]`` holds each frame's configuration ``h`` s before, at and after it along the plan's own
-    velocity and acceleration (motion_solver._taylor_positions), so central differences give every link's
-    acceleration and angular acceleration as the plan moves, to O(h^2); one FK on ``world.bodies``, whose first
-    tool frame is the support frame.
-
-    The ZMP is the multibody one: over the links, ``sum m (g + z'') x - m z x''`` less the rate of each link's
-    spin about its own CoM (y: plus), over ``sum m (g + z'')``. A trunk swinging above the hips moves it
-    centimetres past the CoM alone's cart-table ZMP. z is the height above the support frame's origin, the sole
-    plane (test_real_legs_support.py). The support frame stays put during a segment (the stance hangs off the
-    world), so it is inertial.
-
-    The floor can only push. A frame whose ``sum m (g + z'')`` is not positive would need it to pull: the soles would
-    leave the floor and there is no ZMP, so that frame's is +inf, outside every support region."""
-    from curobo.types import Pose
-    kin, m, c, inertia = world.bodies
-    T = q3.shape[1]
-    poses = _fk_state(world, q3.reshape(3 * T, -1), kin).tool_poses
-    X = Pose(position=poses.position.reshape(-1, 3), quaternion=poses.quaternion.reshape(-1, 4)).get_matrix()
-    X = X.reshape(3, T, -1, 4, 4)
-    base_inv = X[1, :, :1, :3, :3].transpose(-1, -2)                  # [T, 1, 3, 3]: world -> base frame
-    R = base_inv @ X[..., :3, :3]                                      # [3, T, L, 3, 3]
-    x = (base_inv @ (X[..., :3, 3] - X[1, :, :1, :3, 3]).unsqueeze(-1) + R @ c.unsqueeze(-1)).squeeze(-1)
-    a = (x[2] - 2 * x[1] + x[0]) / h**2                                # link CoM accelerations
-    Rt = R[1].transpose(-1, -2)
-    w = _vee(Rt @ (R[2] - R[0])) / (2 * h)                             # body-frame angular velocity
-    dw = _vee(Rt @ (R[2] - 2 * R[1] + R[0])) / h**2                    # R^T R'' = [dw] + [w]^2, symmetric
-    Iw = (inertia @ w.unsqueeze(-1)).squeeze(-1)
-    spin = (inertia @ dw.unsqueeze(-1)).squeeze(-1) + torch.cross(w, Iw, dim=-1)
-    spin = (R[1] @ spin.unsqueeze(-1)).squeeze(-1).sum(-2)            # [T, 3]: sum of the links' L'
-    x = x[1]
-    f = m * (g + a[..., 2])
-    zmp = torch.stack([(f * x[..., 0] - m * x[..., 2] * a[..., 0]).sum(-1) - spin[:, 1],
-                       (f * x[..., 1] - m * x[..., 2] * a[..., 1]).sum(-1) + spin[:, 0]], dim=-1)
-    com = (m.unsqueeze(-1) * x[..., :2]).sum(-2) / m.sum()
-    load = f.sum(-1, keepdim=True)  # [T, 1]: the floor's vertical push
-    return com, torch.where(load > 0, zmp / load, math.inf)
+    The floor can only push. A frame whose F_z is not positive would need it to pull: the soles would leave the floor
+    and there is no ZMP, so that frame's is +inf, outside every support region."""
+    force, moment, com = world.segment_torques.floor(plan_js)
+    zmp = torch.stack([-moment[:, 1], moment[:, 0]], dim=-1) / force[:, 2:]
+    return com[:, :2], torch.where(force[:, 2:] > 0, zmp, math.inf)
 
 
 def compute_com_polygon_penalties(

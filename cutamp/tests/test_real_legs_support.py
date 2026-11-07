@@ -48,11 +48,14 @@ def test_mask_matches_a_brute_force_rectangle(real_world):
 def test_zmp_frame_is_the_stance(real_world):
     # At rest the multibody ZMP is the CoM, and both are measured from the stance: the home mid-sole, z = 0 on the
     # sole plane. The stance is massless, so it moves neither.
+    from curobo.types import JointState
     from cutamp.com_polygon_cost import _fk_state, com_zmp_in_support
     home = _home(real_world)
-    com, zmp = com_zmp_in_support(real_world, home.expand(3, 3, -1).contiguous(), 0.01)
+    rest = torch.zeros_like(home.expand(3, -1))
+    com, zmp = com_zmp_in_support(real_world, JointState(position=home.expand(3, -1), velocity=rest, acceleration=rest,
+                                                         joint_names=list(real_world.model.joint_names)))
     want = _fk_state(real_world, home).robot_com[..., :2].reshape(1, 2) - _mid_sole_xy(real_world)
     torch.testing.assert_close(com, want.expand(3, 2), rtol=0.0, atol=1e-6)
     torch.testing.assert_close(zmp, com, rtol=0.0, atol=1e-6)
-    bodies = real_world.bodies
-    assert bodies.kinematics.tool_frames[0] == "stance" and float(bodies.mass[0]) == 0.0
+    kp = real_world.kinematics.kinematics_config
+    assert float(kp.link_masses_com[kp.link_name_to_idx_map["stance"], 3]) == 0.0

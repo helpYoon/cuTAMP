@@ -1,14 +1,11 @@
 """The balance gate's resampling (motion_solver._retime): a segment keeps its ends, and at no slowdown it is the
-motion planner's own timing; and the bodies' config hygiene (get_t1_bodies). The gate itself has its tests on the real
-legs (test_real_legs_motion.py), which build their segments with ``_min_jerk``."""
+motion planner's own timing. The gate itself has its tests on the real legs (test_real_legs_motion.py), which build
+their segments with ``_min_jerk``."""
 import math
 
 import numpy as np
 import pytest
 import torch
-
-from cutamp.robots.t1 import REAL_LEGS
-from cutamp.tests.conftest import needs_cuda
 
 DT = 0.025
 
@@ -55,14 +52,3 @@ def test_retime_without_slowdown_is_the_motion_planners_timing():
     torch.testing.assert_close(slow.position[::2], fast.position, rtol=0, atol=1e-6)
     torch.testing.assert_close(slow.velocity[::2], fast.velocity / 2, rtol=0, atol=1e-5)
     torch.testing.assert_close(slow.acceleration[::2], fast.acceleration / 4, rtol=0, atol=1e-4)
-
-
-@needs_cuda
-def test_bodies_leave_the_robot_config_alone():
-    # The bodies' kinematics is built from the cached robot config, whose tool frames every later IK solver
-    # and motion planner reads: rewritten to the bodies' links, the next run in the process found no IK solution.
-    from cutamp.robots.t1 import get_t1_bodies, get_t1_kinematics, t1_curobo_cfg
-    config = get_t1_kinematics(REAL_LEGS).config
-    before = list(t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"]["tool_frames"])
-    get_t1_bodies(REAL_LEGS, config)
-    assert t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"]["tool_frames"] == before

@@ -134,7 +134,8 @@ graph LR
    the planner's and up to 4× (`RETIME_MAX`), at which every actuated joint's
    speed stays within cuRobo's limit, every joint's torque, cuRobo's RNEA with
    the floor's push on the soles (`SegmentTorques`), within its effort, and
-   the multibody ZMP (`com_zmp_in_support`) inside. The frames it returns are
+   the multibody ZMP (`com_zmp_in_support`, from the same RNEA's floor
+   wrench) inside. The frames it returns are
    checked again, and a segment no scale up to 4× passes fails the candidate,
    naming the check.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
@@ -234,9 +235,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
     limits bounded at `TRAJOPT_POSITION_BOUND_WEIGHT` (1e6, cuRobo's 1e4
     times 100, so paths that end on the ankle cap stay inside it), the soles held
     on the stance at every waypoint and the COM-over-polygon rollout soft
-    cost), and
-    `get_t1_bodies` (a `T1Bodies` of every massive link, with cuRobo's
-    masses, CoMs and inertias, for the balance gate's multibody ZMP).
+    cost).
   - The arm joint names (`LEFT_ARM_JOINT_NAMES`, `RIGHT_ARM_JOINT_NAMES`), the
     tool frames and the grippers' open and closed states.
   - `T1RerunRobot` for visualization: sets the URDF's joints by name from a
@@ -253,12 +252,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   with `compute_com=True`); it builds no IK solver (the IK is GN's, `gn_ik`)
   and no planner (`motion_solver.build_motion_planner` does). `q_init` is the
   model's home. It also holds the stance (`stance_soles`). Built lazily:
-  `kinematics_jac` (the Jacobian twin for GN), `bodies`
-  (`get_t1_bodies`: a second `Kinematics` whose tool frames are every massive
-  link, for the balance gate's multibody ZMP), `segment_torques` (the gate's
-  torque and speed checks), and one `site_kinematics(name)` per Adam-loop FK
-  site in `FK_SITES`; all but `bodies` run on the single `Kinematics`'s
-  config.
+  `kinematics_jac` (the Jacobian twin for GN), `segment_torques` (the gate's
+  torque, speed and ZMP checks), and one `site_kinematics(name)` per Adam-loop
+  FK site in `FK_SITES`; all run on the single `Kinematics`'s config.
 
 - [`_curobo_internals.py`](cutamp/_curobo_internals.py) — everything cuTAMP
   changes in cuRobo, in one file (with a `# TODO: file upstream issue` marker;
@@ -282,7 +278,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   `particle_com_margin` (a particle's static margin through
   `compute_com_margin`, for the run metrics' measure-only `best_com_margin`
   after Adam and `planned_com_margin` for the planned particle), and for the
-  trajectory gate `com_zmp_in_support` (each frame's CoM and multibody ZMP).
+  trajectory gate `com_zmp_in_support` (each frame's CoM and multibody ZMP,
+  the ZMP from the floor's wrench, RNEA's first-pass base wrench).
 
 - [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) —
   `joint_limit_margin_soft_cost` (the `joint_limit_margin` soft cost: a
@@ -293,17 +290,19 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 - [`floor_wrench.py`](cutamp/floor_wrench.py) — the floor's push on the
   planted soles: `install_floor_wrench` hooks it into trajopt's RNEA, and
-  `SegmentTorques` runs cuRobo's two RNEA passes with it on a plan's frames.
+  `SegmentTorques` runs cuRobo's two RNEA passes with it on a plan's frames;
+  its `floor` is the first pass's base wrench, the floor's wrench on the robot,
+  from which the gate takes the ZMP.
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
   through the single planner (`build_motion_planner`). Per operator: plan to
   the particle's conf with `plan_cspace`, then pass
   `_balance_gate`: every frame keeps both soles on the stance and its CoM
   inside `world.model.support.gate_half`, and the gate times each segment at
-  the smallest uniform scale its speed, torque and ZMP checks pass: the
-  speed's and the torque's exactly, the ZMP's by a batched search to within
-  `RETIME_TOL` = 2% above it, all on the planner's frames with the velocities
-  over s and the accelerations over s², up to `RETIME_MAX` = 4×. It resamples
+  the smallest uniform scale its speed, torque and ZMP checks pass, each
+  exactly (the torques and the floor's wrench are linear in 1/s²), on the
+  planner's frames with the velocities over s and the accelerations over s²,
+  up to `RETIME_MAX` = 4×. It resamples
   the segment at that scale (`_retime`, a C² cubic spline) and checks the
   frames it returns again (`_recheck`). Each segment is appended to
   `accum_plans` (with `held_objs`, `_held_obj_poses` for every arm holding

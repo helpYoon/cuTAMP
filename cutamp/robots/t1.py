@@ -235,35 +235,6 @@ def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None) -> Kinematic
     return kin
 
 
-class T1Bodies(NamedTuple):
-    """Every massive link of the planning model, for the multibody ZMP (com_polygon_cost.com_zmp_in_support)."""
-    kinematics: Kinematics  # tool frames: the support frame (massless), then the links
-    mass: torch.Tensor      # [L] kg
-    com: torch.Tensor       # [L, 3] in the link frame, m
-    inertia: torch.Tensor   # [L, 3, 3] about the CoM, in the link frame, kg m^2
-
-
-def get_t1_bodies(model: T1Model, config: KinematicsCfg) -> T1Bodies:
-    """:class:`T1Bodies` of ``model``: its support frame (``model.support.link``), then every massive link of
-    ``config`` (``model``'s, as :func:`get_t1_kinematics` builds it). Masses, CoMs and inertias are cuRobo's
-    (``link_masses_com``, ``link_inertias``): the masses and CoMs every ``robot_com`` sums. The support frame
-    (``stance``, which the URDF lacks) weighs nothing: no mass, and no inertia where cuRobo keeps LinkParams' 1e-4
-    default."""
-    kp = config.kinematics_config
-    support = model.support.link
-    names = [support] + [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0 and n != support]
-    cfg = copy.deepcopy(t1_curobo_cfg(model))  # from_robot_yaml_file writes tool_frames into the dict it is given
-    kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=names, device_cfg=config.device_cfg),
-                     compute_spheres=False)
-    _check_joint_order(model, kin.joint_names)
-    kp = kin.config.kinematics_config
-    idx = [kp.link_name_to_idx_map[n] for n in names]
-    mass_com = kp.link_masses_com[idx]
-    six = kp.link_inertias[idx, :6]  # ixx, iyy, izz, ixy, ixz, iyz
-    inertia = torch.where((mass_com[:, 3] > 0)[:, None, None], six[:, [[0, 3, 4], [3, 1, 5], [4, 5, 2]]], 0.0)
-    return T1Bodies(kin, mass_com[:, 3], mass_com[:, :3], inertia)
-
-
 TRAJOPT_POSITION_BOUND_WEIGHT = 1e6
 """Trajopt's joint-position bound cost weight, cuRobo's 1e4 times 100. The bound is a soft cost there (active within
 1% of a joint's range of it) and the success test a hard one; home's ankle pitch is the envelope's cap, so every

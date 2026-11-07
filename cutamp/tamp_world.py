@@ -27,11 +27,7 @@ from curobo.types import DeviceCfg, JointState, Pose
 from cutamp.envs import TAMPEnvironment
 from cutamp.floor_wrench import SegmentTorques
 from cutamp.robots import RobotContainer
-from cutamp.robots.t1 import (
-    TOOL_FRAME_FOR_ARM,
-    T1Model,
-    get_t1_bodies,
-)
+from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, T1Model
 from cutamp.t1_domain import get_initial_state
 from cutamp.task_planning import State
 from cutamp.utils.collision import WorldCollisionCost
@@ -80,7 +76,6 @@ class TAMPWorld:
         self._q_init = q_init
 
         self._kinematics_jac = None
-        self._bodies = None
         self._segment_torques = None
         self._site_kinematics: Dict[str, Kinematics] = {}
 
@@ -239,14 +234,6 @@ class TAMPWorld:
         if self._kinematics_jac is None:
             self._kinematics_jac = Kinematics(self.kinematics.config, compute_com=True, compute_jacobian=True)
         return self._kinematics_jac
-
-    @property
-    def bodies(self):
-        """Every massive link of the robot (:func:`cutamp.robots.t1.get_t1_bodies`, lazily built): the
-        balance gate's multibody ZMP."""
-        if self._bodies is None:
-            self._bodies = get_t1_bodies(self.model, self.kinematics.config)
-        return self._bodies
 
     @property
     def segment_torques(self) -> SegmentTorques:

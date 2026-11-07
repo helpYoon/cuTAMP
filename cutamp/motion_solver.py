@@ -476,14 +476,7 @@ def _full_positions(world: TAMPWorld, plan_js) -> torch.Tensor:
 
 # The slowest the balance gate will make a segment: 4x longer, 16x lower accelerations.
 RETIME_MAX = 4.0
-# The balance gate's central-difference step along each frame's motion, s.
-ZMP_STEP = 0.01
-# The gate times each segment at the smallest uniform time scale its checks pass, found to within this fraction
-# above it: a search setting, not a limit (_balance_gate) ...
-RETIME_TOL = 0.02
-# ... testing this many time scales per batched round of the ZMP's search ...
-RETIME_SEARCH_POINTS = 16
-# ... and slowing a resampled segment that fails its re-check by this factor until it passes, up to RETIME_MAX.
+# The gate slows a resampled segment that fails its re-check by this factor until it passes, up to RETIME_MAX.
 RETIME_RECHECK_STEP = 1.05
 
 
@@ -493,17 +486,6 @@ def _gate_error(check: str, message: str) -> RuntimeError:
     error = RuntimeError(message)
     error.check = check
     return error
-
-
-def _taylor_positions(world: TAMPWorld, plan_js, h: float = ZMP_STEP) -> torch.Tensor:
-    """``[3, T, full_dof]``: each frame's configuration ``h`` s before, at and after it along the plan's own
-    velocity and acceleration, ``q + tau q' + tau^2 / 2 q''`` (com_zmp_in_support's input)."""
-    q, v, a = plan_js.position, plan_js.velocity, plan_js.acceleration
-    return torch.stack([
-        _full_positions(world, JointState.from_position(q + tau * v + 0.5 * tau**2 * a,
-                                                        joint_names=plan_js.joint_names))
-        for tau in (-h, 0.0, h)
-    ])
 
 
 def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
@@ -644,35 +626,41 @@ def _torque_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tup
 
 def _zmp_margins(world: TAMPWorld, js: JointState, scales: torch.Tensor) -> torch.Tensor:
     """``[K]``: the multibody ZMP's smallest margin to the gate's support rectangle over the frames of ``js`` under each
-    uniform time scale in ``scales`` (negative outside, -inf where a frame would need the floor to pull; a NaN fails),
-    from the scaled frames' Taylor positions."""
+    uniform time scale in ``scales`` (negative outside, -inf where a frame would need the floor to pull; a NaN
+    fails)."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
-    _, zmp = com_zmp_in_support(world, _taylor_positions(world, _at_scales(js, scales)), ZMP_STEP)
+    _, zmp = com_zmp_in_support(world, _at_scales(js, scales))
     return com_margin_from_base(zmp, world.model.support.gate_half).reshape(len(scales), -1).amin(-1)
 
 
 def _zmp_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tuple[float, bool]:
-    """The smallest uniform time scale in [lo, hi] at which every frame's multibody ZMP stays inside the gate's support
-    rectangle, to within RETIME_TOL above it, and whether the ZMP sets it (False where ``lo`` passes): a geometric
-    bisection testing RETIME_SEARCH_POINTS scales per batched round, which assumes the ZMP's excursion falls as s
-    grows. Raises a RuntimeError when ``hi`` fails."""
-    def first_pass(grid: list) -> Optional[int]:
-        ok = (_zmp_margins(world, js, torch.tensor(grid, dtype=torch.float64)) >= 0).tolist()
-        return ok.index(True) if True in ok else None
-
-    grid = [lo * (hi / lo) ** (k / (RETIME_SEARCH_POINTS - 1)) for k in range(RETIME_SEARCH_POINTS - 1)] + [hi]
-    i = first_pass(grid)
-    if i == 0:
-        return lo, False
-    if i is None:
+    """The smallest uniform time scale s in [lo, hi] at which every frame of ``js`` (``[T, n]``, the model's order)
+    keeps its multibody ZMP inside the gate's support rectangle, and whether the ZMP sets it (False where ``lo``
+    passes). Exact, like ``_torque_scale``: the floor's wrench (``world.segment_torques.floor``) is linear in the first
+    pass's torques, so at scale s it is w_0 + (w_1 - w_0) u with u = 1 / s^2, and the ZMP inside, |M_y| <= h_x F_z and
+    |M_x| <= h_y F_z (which needs F_z >= 0: the floor pushes), keeps each frame's u inside an interval. With the CoM
+    inside, u = 0 passes, so every s above the smallest passes too. Raises a RuntimeError when no s in [lo, hi]
+    passes; a NaN fails."""
+    q, v, a = js.position, js.velocity, js.acceleration
+    T, rest = q.shape[0], torch.zeros_like(v)
+    force, moment, _ = world.segment_torques.floor(JointState(
+        position=torch.cat([q, q]), velocity=torch.cat([rest, v]), acceleration=torch.cat([rest, a]),
+        joint_names=js.joint_names))
+    hx, hy = map(float, world.model.support.gate_half)
+    fz, mx, my = force[:, 2], moment[:, 0], moment[:, 1]
+    g = torch.stack([hx * fz - my, hx * fz + my, hy * fz - mx, hy * fz + mx])  # [4, 2T]: each >= 0 inside
+    c0, c1 = g[:, :T], g[:, T:] - g[:, :T]  # c0 + c1 u >= 0
+    bound, still = -c0 / c1, c1 == 0
+    lower = torch.where(still, torch.where(c0 >= 0, -math.inf, math.inf), torch.where(c1 > 0, bound, -math.inf))
+    upper = torch.where(still, torch.where(c0 >= 0, math.inf, -math.inf), torch.where(c1 < 0, bound, math.inf))
+    lower = lower.masked_fill(c0.isnan() | c1.isnan(), math.inf)
+    u = min(float(upper.min()), lo**-2)
+    if not u >= max(float(lower.max()), hi**-2):
         raise _gate_error("zmp", f"trajectory ZMP stays outside the support region at the {hi}x slowdown cap")
-    a, b = grid[i - 1], grid[i]  # the ZMP fails at a and passes at b
-    while b > a * (1 + RETIME_TOL):
-        grid = [a * (b / a) ** (k / (RETIME_SEARCH_POINTS + 1)) for k in range(1, RETIME_SEARCH_POINTS + 1)]
-        i = first_pass(grid)
-        a, b = (grid[-1], b) if i is None else (grid[i - 1] if i else a, grid[i])
-    return b, True
+    if u == lo**-2:
+        return lo, False
+    return u**-0.5, True
 
 
 def _recheck(world: TAMPWorld, js: JointState, planted: bool = True) -> Tuple[float, float]:
@@ -687,7 +675,7 @@ def _recheck(world: TAMPWorld, js: JointState, planted: bool = True) -> Tuple[fl
     half = world.model.support.gate_half
     if planted:
         _check_planted(world, _full_positions(world, js))
-    com, zmp = com_zmp_in_support(world, _taylor_positions(world, js), ZMP_STEP)
+    com, zmp = com_zmp_in_support(world, js)
     com_m, zmp_m = com_margin_from_base(com, half).min().item(), com_margin_from_base(zmp, half).min().item()
     if not com_m >= 0:
         raise _gate_error("com", f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
@@ -710,18 +698,17 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
     it, so the planner moves to its next candidate or skeleton.
 
     Every frame must keep both soles on the stance (``_check_planted``) and its CoM inside the gate's support
-    rectangle; no time scale changes either. The gate then
-    finds the smallest uniform time scale s in [s_v, RETIME_MAX] (below 1 speeds the segment up, above 1 slows it down)
-    at which every actuated joint keeps its speed within cuRobo's limit (s_v, exact: ``_check_velocity``), every joint
-    its torque within its effort (exact: ``_torque_scale``) and the multibody ZMP stays inside (``_zmp_scale``, to
-    within RETIME_TOL above the smallest). Each is evaluated on the planner's own frames with the velocities over s and
-    the accelerations over s^2. Below one step of ``dt`` for the whole segment, the shortest ``_retime`` makes, no check
-    binds (``"none"``). The segment is resampled at s (``_retime``, whose whole steps give s_eff >= s; at s_eff 1 it is
-    the planner's own), its first and last frames kept the planner's bit for bit (the next segment starts from the
-    last), and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP fails is slowed
-    by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when no s passes, the
-    gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets it:
-    ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last. Their
+    rectangle; no time scale changes either. The gate then finds the smallest uniform time scale s in [s_v, RETIME_MAX]
+    (below 1 speeds the segment up, above 1 slows it down) at which every actuated joint keeps its speed within
+    cuRobo's limit (s_v: ``_check_velocity``), every joint its torque within its effort (``_torque_scale``) and the
+    multibody ZMP stays inside (``_zmp_scale``), each exactly, on the planner's own frames with the velocities over s
+    and the accelerations over s^2. Below one step of ``dt`` for the whole segment, the shortest ``_retime`` makes, no
+    check binds (``"none"``). The segment is resampled at s (``_retime``, whose whole steps give s_eff >= s; at s_eff
+    1 it is the planner's own), its first and last frames kept the planner's bit for bit (the next segment starts
+    from the last), and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP fails
+    is slowed by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when no s
+    passes, the gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets
+    it: ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last. Their
     ``"com_min_margin"`` and ``"zmp_min_margin"`` are the smaller of the returned frames' and the planner's frames' at
     s_eff (the returned spline at its knots): a sped-up segment returns fewer frames than the planner's, which the
     search ran on."""
@@ -730,7 +717,7 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
     with torch.no_grad():
         _check_planted(world, _full_positions(world, plan_js))
         js = _model_frames(world, plan_js)
-        com, _ = com_zmp_in_support(world, _taylor_positions(world, js), ZMP_STEP)
+        com, _ = com_zmp_in_support(world, js)
         com_planner = com_margin_from_base(com, world.model.support.gate_half).min().item()
         if not com_planner >= 0:
             raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_planner:.1f} cm")
