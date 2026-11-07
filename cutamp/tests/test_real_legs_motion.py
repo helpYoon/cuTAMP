@@ -250,9 +250,8 @@ def test_gate_rejects_sole_drift(real_world, monkeypatch):
     monkeypatch.setattr(cpc, "com_margin_from_base", spy)
     still = _ramp(real_world, {}, 1.0)
     out, stats, fast = _balance_gate(real_world, still, DT)
-    # Nothing moves, so no check binds: the gate keeps one step, the shortest segment _retime makes.
-    assert out.position.shape[0] == 2 and stats["retime"] == 1 / 40 and stats["binding"] == "none"
-    assert fast is not None and fast.position.shape == still.position.shape
+    # Nothing moves, so no check binds: the gate keeps the planner's timing.
+    assert out is still and stats["retime"] == 1.0 and stats["binding"] == "none" and fast is None
     assert halves and set(halves) == {REAL_LEGS.support.gate_half}
     # The whole robot slides 1 cm with the legs fixed: the soles leave the stance.
     with pytest.raises(RuntimeError, match="sole"):
@@ -274,9 +273,9 @@ def _peak_shares(world, js):
 
 
 def _elbow_sweep(world):
-    """The left elbow pitch from -1.87 to +1.87 rad, min-jerk over 2 s (81 frames): its torques allow 0.13x and its ZMP
-    0.17x, its peak speed only 0.1993x of cuRobo's 17.59 rad/s."""
-    return _ramp(world, {"Left_Elbow_Pitch": 3.74}, 2.0, start={"Left_Elbow_Pitch": -1.87})
+    """The left elbow pitch from -1.87 to +1.87 rad, min-jerk over 0.25 s (11 frames): its torques allow 1.02x and its
+    ZMP 1.36x, its peak speed 1.5947x of cuRobo's 17.59 rad/s."""
+    return _ramp(world, {"Left_Elbow_Pitch": 3.74}, 0.25, start={"Left_Elbow_Pitch": -1.87})
 
 
 @needs_cuda
@@ -314,15 +313,15 @@ def test_uniform_time_scaling_matches_the_resampled_frames(real_world, real_plan
 
 @needs_cuda
 def test_gate_paces_a_velocity_bound_segment_at_its_limit(real_world):
-    # Nothing but its speed limits the elbow sweep: the gate speeds it up 5x (16 steps of DT for its 0.1993 x 80 =
-    # 15.95), its fastest actuated joint ends at its limit, to that rounding and the spline's, and the binding check
-    # names it.
+    # Its speed limits the elbow sweep first: the gate slows it 1.6x (16 steps of DT for its 1.5947 x 10 = 15.95),
+    # its fastest actuated joint ends at its limit, to that rounding and the spline's, and the binding check names
+    # it.
     from cutamp.motion_solver import _balance_gate
     names = real_world.model.joint_names
     out, stats, fast = _balance_gate(real_world, _elbow_sweep(real_world), DT)
     assert stats["binding"] == "velocity Left_Elbow_Pitch"
-    assert stats["retime"] == 0.2 and out.position.shape[0] == 17
-    assert fast is not None and fast.position.shape[0] == 81  # the planner's timing, kept: s != 1
+    assert stats["retime"] == 1.6 and out.position.shape[0] == 17
+    assert fast is not None and fast.position.shape[0] == 11  # the planner's timing, kept: s != 1
     speed, effort = _peak_shares(real_world, out)
     assert names[_actuated(real_world)[int(speed.argmax())]] == "Left_Elbow_Pitch"
     assert 0.98 <= float(speed.max()) <= 1.0
@@ -336,7 +335,7 @@ def test_gate_keeps_a_segments_ends(real_world):
     # end value misses a joint that moves to 0 (here the left elbow, -1 -> 0 rad) by a rounding error, and the next
     # trajopt would start there.
     from cutamp.motion_solver import _balance_gate
-    plan = _ramp(real_world, {"Left_Elbow_Pitch": 1.0}, 2.0, start={"Left_Elbow_Pitch": -1.0})
+    plan = _ramp(real_world, {"Left_Elbow_Pitch": 1.0}, 0.1, start={"Left_Elbow_Pitch": -1.0})
     assert float(plan.position[-1, real_world.model.joint_names.index("Left_Elbow_Pitch")]) == 0.0
     out, stats, _ = _balance_gate(real_world, plan, DT)
     assert stats["retime"] != 1.0
@@ -345,22 +344,22 @@ def test_gate_keeps_a_segments_ends(real_world):
 
 @needs_cuda
 def test_gate_reports_the_torque_or_the_zmp_that_binds(real_world):
-    # Two min-jerk moves of both shoulder pitches over 2 s. Swinging opposite ways (0.7 -> -0.7 and -0.7 -> 0.7 rad),
-    # the arms cancel each other's ZMP shift, so a shoulder's torque binds first (0.112x, the ZMP 0.104x); both
-    # forward to -2.0 rad, the ZMP binds (0.64x, the torque 0.20x). Each ends at its bound: the joint near its
+    # Two min-jerk moves of both shoulder pitches. Swinging opposite ways in 0.2 s (0.7 -> -0.7 and -0.7 -> 0.7 rad),
+    # the arms cancel each other's ZMP shift, so a shoulder's torque binds first (1.11x, the ZMP 1.03x); both
+    # forward to -2.0 rad in 1 s, the ZMP binds (1.27x, the torque 0.40x). Each ends at its bound: the joint near its
     # effort, and the ZMP inside but within a centimetre of leaving.
     from cutamp.motion_solver import _balance_gate, _model_frames, _zmp_margins, _zmp_scale
     names = real_world.model.joint_names
-    opposite = _ramp(real_world, {"Left_Shoulder_Pitch": -1.4, "Right_Shoulder_Pitch": 1.4}, 2.0,
+    opposite = _ramp(real_world, {"Left_Shoulder_Pitch": -1.4, "Right_Shoulder_Pitch": 1.4}, 0.2,
                      start={"Left_Shoulder_Pitch": 0.7, "Right_Shoulder_Pitch": -0.7})
     out, stats, _ = _balance_gate(real_world, opposite, DT)
     check, joint = stats["binding"].split()
-    assert check == "torque" and joint in SHOULDERS and stats["retime"] < 0.2
+    assert check == "torque" and joint in SHOULDERS and stats["retime"] < 1.2
     _, effort = _peak_shares(real_world, out)
     assert 0.9 <= float(effort[_actuated(real_world).index(names.index(joint))]) <= 1.0
-    forward = _ramp(real_world, {j: -2.2 for j in SHOULDERS}, 2.0)
+    forward = _ramp(real_world, {j: -2.2 for j in SHOULDERS}, 1.0)
     out, stats, _ = _balance_gate(real_world, forward, DT)
-    assert stats["binding"] == "zmp" and 0.5 < stats["retime"] < 1.0 and 0.0 <= stats["zmp_min_margin"] < 0.01
+    assert stats["binding"] == "zmp" and 1.0 < stats["retime"] < 1.5 and 0.0 <= stats["zmp_min_margin"] < 0.01
     # The ZMP's scale is exact: the ZMP touches the rectangle there, passes 0.1% slower and fails 0.1% faster.
     js = _model_frames(real_world, forward)
     s, binds = _zmp_scale(real_world, js, 0.3, 4.0)
@@ -425,7 +424,7 @@ def test_gate_slows_a_resampled_segment_that_fails_its_recheck(real_world, monke
 
     monkeypatch.setattr(ms, "_recheck", failing_once("zmp"))
     out, stats, _ = ms._balance_gate(real_world, _elbow_sweep(real_world), DT)
-    assert calls == [17, 18] and stats["binding"] == "zmp" and stats["retime"] == 17 / 80
+    assert calls == [17, 18] and stats["binding"] == "zmp" and stats["retime"] == 17 / 10
     calls.clear()
     monkeypatch.setattr(ms, "_recheck", failing_once("soles"))
     with pytest.raises(RuntimeError, match="soles fails"):
@@ -466,7 +465,7 @@ def _on_the_stance(world, moves, T, eps=0.01):
     return JointState(position=q.float(), velocity=v.float(), acceleration=a.float(), joint_names=names)
 
 
-def _squat(world, theta=0.4, T=0.5, eps=0.01):
+def _squat(world, theta=0.4, T=0.125, eps=0.01):
     """Both legs bending alike from home, min-jerk over T s every DT s (each hip and ankle pitch by -theta, each knee
     by 2 theta), on the stance (``_on_the_stance``): the Trunk drops 7.5 cm."""
     bends = (("Hip_Pitch", -theta), ("Knee_Pitch", 2 * theta), ("Ankle_Pitch", -theta))
@@ -483,11 +482,11 @@ def _lean(world, pitch, T=2.0):
 
 @needs_cuda
 def test_gate_finds_no_zmp_where_the_floor_would_have_to_pull(real_world):
-    # The floor can only push. Sped up past about 0.38x, the squat's CoM starts falling faster than g: there
+    # The floor can only push. Faster than about 1.48x, the squat's CoM starts falling faster than g: there
     # sum m (g + z'') is negative, the soles would leave the floor, and there is no ZMP. com_zmp_in_support gives
-    # those frames +inf, so the margins are -inf at those scales. The torque bound (0.28x) lies below that crossing,
-    # and the gate still times the squat above it, where the ZMP binds (0.65x). Frames resampled at 0.3x fail their
-    # re-check on "zmp", which says why.
+    # those frames +inf, so the margins are -inf at those scales. The torque bound (1.12x), where the gate's ZMP solve
+    # starts, lies below that crossing, and the gate still times the squat above it, where the ZMP binds (2.8x).
+    # Frames resampled at 1.2x fail their re-check on "zmp", which says why.
     from cutamp.com_polygon_cost import _fk_com_and_base, com_zmp_in_support
     from cutamp.motion_solver import (RETIME_MAX, _at_scales, _balance_gate, _check_planted, _check_velocity, _recheck,
                                       _retime, _torque_scale, _zmp_margins)
@@ -502,39 +501,39 @@ def test_gate_finds_no_zmp_where_the_floor_would_have_to_pull(real_world):
         z = torch.stack([_fk_com_and_base(world, q)[0][:, 2].clone() for q in q3])  # cuRobo reuses its FK buffers
         return (1 + (z[2] - 2 * z[1] + z[0]) / h**2 / 9.81).reshape(len(scales), -1)
 
-    fast = torch.tensor([0.1, 0.2, 0.3])
+    fast = torch.tensor([0.4, 0.8, 1.2])
     load = loads(squat, fast)
     assert float(load.amin(-1).max()) < -0.5  # at each of these scales some frame would need the floor to pull
     _, zmp = com_zmp_in_support(world, _at_scales(squat, fast))
     zmp = zmp.reshape(len(fast), -1, 2)
     assert bool(torch.isposinf(zmp[load < -0.05]).all()) and bool(torch.isfinite(zmp[load > 0.05]).all())
     assert bool((_zmp_margins(world, squat, fast) == -math.inf).all())
-    grid = torch.linspace(0.3, 0.5, 201)
+    grid = torch.linspace(1.2, 2.0, 201)
     crossing = float(grid[(loads(squat, grid).amin(-1) > 0).cpu()][0])  # the fastest at which the floor always pushes
-    s_t, joint = _torque_scale(world, squat, _check_velocity(world, squat, RETIME_MAX)[0], RETIME_MAX)
+    s_t, joint = _torque_scale(world, squat, max(1.0, _check_velocity(world, squat, RETIME_MAX)[0]), RETIME_MAX)
     assert joint is not None and s_t < crossing  # where the ZMP's solve starts
     out, stats, _ = _balance_gate(world, squat, DT)
     assert stats["binding"] == "zmp" and stats["retime"] > crossing and stats["zmp_min_margin"] >= 0
     assert float(loads(squat, torch.tensor([stats["retime"]])).min()) > 0 and float(loads(out, torch.ones(1)).min()) > 0
     with pytest.raises(RuntimeError, match="floor would have to pull on the retimed trajectory's soles") as e:
-        _recheck(world, _retime(squat, 0.3, DT))
+        _recheck(world, _retime(squat, 1.2, DT))
     assert e.value.check == "zmp"
 
 
 @needs_cuda
 def test_gate_reports_the_smaller_margin_of_its_frames_and_the_planners(real_world):
-    # A sped-up segment returns fewer frames than the planner's, which the scale solve ran on, and they can miss its
-    # tightest instant: the opposite shoulder swings, sped up to 0.11x by a shoulder's torque, return 10 frames, whose
-    # ZMP margin is 2.00 cm, against 1.62 cm on the planner's 81 at the same scale. The stats report the smaller, and
-    # the CoM's margin likewise.
+    # The frames a segment returns can miss the tightest instant of the planner's, where the scale solve ran: the
+    # opposite shoulder swings, slowed to 1.125x by a shoulder's torque, return 10 frames, whose ZMP margin is
+    # 2.00 cm, against 1.62 cm on the planner's 9 at the same scale. The stats report the smaller, and the CoM's
+    # margin likewise.
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
     from cutamp.motion_solver import _balance_gate, _model_frames, _recheck, _zmp_margins
     world = real_world
-    opposite = _ramp(world, {"Left_Shoulder_Pitch": -1.4, "Right_Shoulder_Pitch": 1.4}, 2.0,
+    opposite = _ramp(world, {"Left_Shoulder_Pitch": -1.4, "Right_Shoulder_Pitch": 1.4}, 0.2,
                      start={"Left_Shoulder_Pitch": 0.7, "Right_Shoulder_Pitch": -0.7})
     out, stats, _ = _balance_gate(world, opposite, DT)
     s, n_out = stats["retime"], out.position.shape[0]
-    assert s < 0.2 and n_out == round(s * (opposite.position.shape[0] - 1)) + 1
+    assert s < 1.2 and n_out == round(s * (opposite.position.shape[0] - 1)) + 1
     com_out, zmp_out = _recheck(world, out)
     js = _model_frames(world, opposite)
     zmp_planner = float(_zmp_margins(world, js, torch.tensor([s]))[0])

@@ -130,8 +130,8 @@ graph LR
    (`world.model.support.gate_half`: the home stance's two soles, shrunk 2 cm
    and kept where each foot carries at least a tenth of the weight). A CoM
    outside fails the candidate and the next one is tried. The gate then sets
-   the segment's pace: the smallest uniform time scale, faster or slower than
-   the planner's and up to 4× (`RETIME_MAX`), at which every actuated joint's
+   the segment's pace: the smallest uniform time scale, never faster than the
+   planner's and up to 4× slower (`RETIME_MAX`), at which every actuated joint's
    speed stays within cuRobo's limit, every joint's torque, cuRobo's RNEA with
    the floor's push on the soles (`SegmentTorques`), within its effort, and
    the multibody ZMP (`com_zmp_in_support`, from the same RNEA's floor
@@ -143,7 +143,7 @@ graph LR
    (`stage3-raw`, `raw_motion_plan` in `utils/plan_processor.py`): per segment,
    positions, velocities and accelerations in the model's joint order at
    cuRobo's interpolation dt, until stage 6's schema-4 export. A segment the
-   gate retimed (slowed down or sped up) also carries `planner_timing`, the
+   gate slowed down also carries `planner_timing`, the
    same segment at the motion planner's own timing (`None` otherwise).
 
 `run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
@@ -296,24 +296,22 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
   through the single planner (`build_motion_planner`). Per operator: plan to
-  the particle's conf with `plan_cspace`, then pass
-  `_balance_gate`: every frame keeps both soles on the stance and its CoM
-  inside `world.model.support.gate_half`, and the gate times each segment at
-  the smallest uniform scale its speed, torque and ZMP checks pass, each
-  exactly (the torques and the floor's wrench are linear in 1/s²), on the
-  planner's frames with the velocities over s and the accelerations over s²,
-  up to `RETIME_MAX` = 4×. It resamples
-  the segment at that scale (`_retime`, a C² cubic spline) and checks the
-  frames it returns again (`_recheck`). Each segment is appended to
-  `accum_plans` (with `held_objs`, `_held_obj_poses` for every arm holding
-  an object; a retimed one also keeps
-  `planner_timing`, the same spline at the planner's own timing), then the
-  object is attached/detached via the AttachmentManager. Playback walks
-  `accum_plans` and hands each entry to the visualizer. The run metrics get
-  the gate's `retime_min` and `retime_max` (below 1 where it sped a segment
-  up), `retime_binding` (segments per binding check: `velocity <joint>`,
-  `torque <joint>`, `zmp`, or `none` where none binds),
-  `traj_com_min_margin` and `traj_zmp_min_margin`, plus
+  the particle's conf with `plan_cspace`, then pass `_balance_gate`: every
+  frame keeps both soles on the stance and its CoM inside
+  `world.model.support.gate_half`, and the gate times each segment at the
+  smallest uniform scale from 1 (the planner's own timing) up that its speed,
+  torque and ZMP checks pass, each exactly (the torques and the floor's wrench
+  are linear in 1/s²), on the planner's frames with the velocities over s and
+  the accelerations over s², up to `RETIME_MAX` = 4×. It resamples the segment
+  at that scale (`_retime`, a C² cubic spline) and checks the frames it
+  returns again (`_recheck`). Each segment is appended to `accum_plans` (with
+  `held_objs`, `_held_obj_poses` for every arm holding an object; a slowed one
+  also keeps `planner_timing`, the same spline at the planner's own timing),
+  then the object is attached/detached via the AttachmentManager. Playback
+  walks `accum_plans` and hands each entry to the visualizer. The run metrics
+  get the gate's `retime_min` and `retime_max`, `retime_binding` (segments per
+  binding check: `velocity <joint>`, `torque <joint>`, `zmp`, or `none` where
+  none binds), `traj_com_min_margin` and `traj_zmp_min_margin`, plus
   `plan_duration_s`.
 
 - [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
@@ -440,7 +438,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 Each test file's docstring says what it checks; shared fixtures and helpers
 live in [`conftest.py`](cutamp/tests/conftest.py). Run with:
-`python -m pytest -q cutamp/tests`
+`uv run python -m pytest -q cutamp/tests`
 (GPU required for the integration tests). `CUTAMP_SLOW=1` also runs the slow
 live `--cuda_graphs` runs in
 [`test_cuda_graphs_live.py`](cutamp/tests/test_cuda_graphs_live.py).
@@ -457,7 +455,7 @@ live `--cuda_graphs` runs in
   plans under a directory of `run_cutamp` experiment directories: per joint,
   the peak torque against its effort and the peak speed against the motor's
   knee speed and cuRobo's limit; per run, the largest Trunk tilt and sole
-  drift, the segments the gate slowed and sped up, its margins, time scales
+  drift, the segments the gate slowed, its margins, time scales
   and binding checks, and any planner-timed segment past an effort
   (`PREFIX.json`, `PREFIX.md`).
 - [`utils.py`](cutamp/scripts/utils.py) — the default cost multipliers and
@@ -477,39 +475,39 @@ placements stay near the base, the body stays near its home, and every
 arrival lands with its CoM inside the keyframe rectangle
 (`joint_limit_margin` has no band: the limits are already bfm_wm's soft
 limits). With `--motion_plan`, every trajectory frame also keeps both soles
-on the stance and its CoM and ZMP inside the soles shrunk 2 cm: the gate sets
-each segment's pace, up to 4×, and a candidate that still fails is dropped
+on the stance and its CoM and ZMP inside the soles shrunk 2 cm: the gate slows
+each segment as needed, up to 4×, and a candidate that still fails is dropped
 (`motion_solver._balance_gate`).
 
 ```bash
 # Smoke test (no motion plan)
-python -m cutamp.scripts.run_cutamp -n 16 --num_opt_steps 50
+uv run python -m cutamp.scripts.run_cutamp -n 16 --num_opt_steps 50
 
 # Full run with motion planning, no visualizer
-python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --disable_visualizer
+uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --disable_visualizer
 
 # With Rerun visualizer
-python -m cutamp.scripts.run_cutamp --motion_plan -n 64
+uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64
 
 # Save the raw plan (stage3-raw) next to the run's metrics
-python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto
+uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto
 
 # Different soft costs (replaces the default list)
-python -m cutamp.scripts.run_cutamp --motion_plan \
+uv run python -m cutamp.scripts.run_cutamp --motion_plan \
     --soft_cost retract_close_to_home minimize_body_movement
 
 # Eager Adam steps and refreshes (no CUDA graphs)
-python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
+uv run python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
 
 # Several runs, each saving its plan, then the real-leg report over them
 for s in 0 1 2; do
-    python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto \
+    uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto \
         --disable_visualizer --seed $s --experiment_root /tmp/study --experiment_id run_s$s
 done
-python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/real_legs
+uv run python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/real_legs
 ```
 
-`python -m cutamp.scripts.run_cutamp -h` lists every option.
+`uv run python -m cutamp.scripts.run_cutamp -h` lists every option.
 
 **Available soft costs** (see `SUPPORTED_SOFT_COSTS`):
 - `place_close_to_base` *(default)* — pull placed objects toward the base;
@@ -560,7 +558,7 @@ skips the robot's meshes; both cut bandwidth.
    Both arms are in GN's collision row, the optimizer's collision constraints
    and the planner's collision checks, with two gaps: a pick or place segment
    disables its block or support surface for the whole robot, and a segment
-   the balance gate retimes (slows down or speeds up) is resampled through
+   the balance gate slows down is resampled through
    the planner's frames (`_retime`) without new collision or joint-limit
    checks on the in-between frames.
 

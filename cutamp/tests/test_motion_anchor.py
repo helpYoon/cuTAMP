@@ -88,8 +88,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     # raw): setup_cutamp builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the
     # spies only record. The metrics the gate records hold for the exported segments, and the CoM and the multibody
     # ZMP re-measured on those frames stay inside the gate's rectangle (support.gate_half). On the real legs the
-    # gate sets each segment's pace, faster or slower than the planner's (measured 2026-11-05: 0.28x to 2.47x over 8
-    # segments), so retime_max may be under 1.
+    # gate sets each segment's pace, never faster than the planner's.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
     from curobo.types import JointState
@@ -177,7 +176,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
             # The planner-timing spline misses a joint that moves to 0 by a rounding error (measured 3e-27).
             np.testing.assert_allclose(timing["position"][[0, -1]], seg["position"][[0, -1]], rtol=0, atol=1e-6,
                                        err_msg=f"segment {k}")
-    assert metrics["retime_max"] == pytest.approx(max(scales))
+    assert metrics["retime_max"] == pytest.approx(max(scales)) and min(scales) >= 1  # never faster than the planner
     # Measured again on the frames actually exported, so a gated segment that never reaches the export fails here.
     for k, seg in enumerate(segments):
         js = JointState(position=torch.as_tensor(seg["position"], device=world.device),

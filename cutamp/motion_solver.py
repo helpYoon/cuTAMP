@@ -458,7 +458,7 @@ def solve_curobo(
     metrics = {"plan_duration_s": sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)}
     if gate_stats:
         metrics["retime_max"] = max(g["retime"] for g in gate_stats)
-        metrics["retime_min"] = min(g["retime"] for g in gate_stats)  # below 1 where the gate sped one up
+        metrics["retime_min"] = min(g["retime"] for g in gate_stats)
         metrics["retime_binding"] = dict(collections.Counter(g["binding"] for g in gate_stats))
         metrics["traj_com_min_margin"] = min(g["com_min_margin"] for g in gate_stats)
         metrics["traj_zmp_min_margin"] = min(g["zmp_min_margin"] for g in gate_stats)
@@ -698,20 +698,19 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
     it, so the planner moves to its next candidate or skeleton.
 
     Every frame must keep both soles on the stance (``_check_planted``) and its CoM inside the gate's support
-    rectangle; no time scale changes either. The gate then finds the smallest uniform time scale s in [s_v, RETIME_MAX]
-    (below 1 speeds the segment up, above 1 slows it down) at which every actuated joint keeps its speed within
-    cuRobo's limit (s_v: ``_check_velocity``), every joint its torque within its effort (``_torque_scale``) and the
-    multibody ZMP stays inside (``_zmp_scale``), each exactly, on the planner's own frames with the velocities over s
-    and the accelerations over s^2. Below one step of ``dt`` for the whole segment, the shortest ``_retime`` makes, no
-    check binds (``"none"``). The segment is resampled at s (``_retime``, whose whole steps give s_eff >= s; at s_eff
+    rectangle; no time scale changes either. The gate then finds the smallest uniform time scale s in [1, RETIME_MAX]
+    (never faster than the planner, whose timing keeps trajopt's acceleration and jerk caps) at which every actuated
+    joint keeps its speed within cuRobo's limit (s_v: ``_check_velocity``), every joint its torque within its effort
+    (``_torque_scale``) and the multibody ZMP stays inside (``_zmp_scale``), each exactly, on the planner's own frames
+    with the velocities over s and the accelerations over s^2. Where the planner's own timing passes, no check binds
+    (``"none"``). The segment is resampled at s (``_retime``, whose whole steps give s_eff >= s; at s_eff
     1 it is the planner's own), its first and last frames kept the planner's bit for bit (the next segment starts
     from the last), and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP fails
     is slowed by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when no s
     passes, the gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets
     it: ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last. Their
     ``"com_min_margin"`` and ``"zmp_min_margin"`` are the smaller of the returned frames' and the planner's frames' at
-    s_eff (the returned spline at its knots): a sped-up segment returns fewer frames than the planner's, which the
-    scale solve ran on."""
+    s_eff (the returned spline at its knots): the returned frames can miss the planner's, where the scale solve ran."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     with torch.no_grad():
@@ -722,9 +721,8 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
         if not com_planner >= 0:
             raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_planner:.1f} cm")
         n = js.position.shape[0]
-        step = 1.0 / (n - 1) if n > 1 else 1.0
         s_v, joint = _check_velocity(world, js, RETIME_MAX)
-        s, binding = (s_v, f"velocity {joint}") if s_v >= step else (step, "none")
+        s, binding = (s_v, f"velocity {joint}") if s_v >= 1 else (1.0, "none")  # never faster than the planner
         s_t, joint = _torque_scale(world, js, s, RETIME_MAX)
         if joint is not None:
             s, binding = s_t, f"torque {joint}"

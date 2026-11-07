@@ -61,10 +61,10 @@ def test_real_legs_report_on_a_still_home_plan(tmp_path):
 
 
 @needs_cuda
-def test_real_legs_report_counts_sped_up_and_slowed_segments(tmp_path):
-    # The balance gate can speed a segment up (s < 1) as well as slow it: each retimed segment keeps the
-    # planner's timing, so its s is its frames over the planner's. The report counts both, takes the gate's time
-    # scales and binding checks (by check) from overall_metrics, and writes them in its tables.
+def test_real_legs_report_counts_slowed_segments(tmp_path):
+    # Each segment the balance gate slowed keeps the planner's timing, so its s is its frames over the planner's.
+    # The report counts them, takes the gate's time scales and binding checks (by check) from overall_metrics, and
+    # writes them in its tables.
     import pickle
 
     import numpy as np
@@ -78,7 +78,7 @@ def test_real_legs_report_counts_sped_up_and_slowed_segments(tmp_path):
         position = np.tile(np.asarray(REAL_LEGS.home, dtype=np.float32), (n, 1))
         return {"position": position, "velocity": np.zeros_like(position), "acceleration": np.zeros_like(position)}
 
-    segments = [{"arm": "left", "dt": 0.025, **still(3), "planner_timing": still(5)},   # sped up, s = 0.5
+    segments = [{"arm": "left", "dt": 0.025, **still(4), "planner_timing": still(3)},   # slowed, s = 1.5
                 {"arm": "left", "dt": 0.025, **still(5), "planner_timing": still(3)},   # slowed, s = 2
                 {"arm": "right", "dt": 0.025, **still(3), "planner_timing": None}]       # s = 1
     run = tmp_path / "study" / "real_legs_h000_s0"
@@ -87,17 +87,17 @@ def test_real_legs_report_counts_sped_up_and_slowed_segments(tmp_path):
         pickle.dump({"schema_version": "stage3-raw", "model": "real_legs", "joint_names": names,
                      "segments": segments}, f)
     (run / "overall_metrics.json").write_text(json.dumps({
-        "traj_com_min_margin": 0.03, "traj_zmp_min_margin": 0.02, "retime_min": 0.5, "retime_max": 2.0,
+        "traj_com_min_margin": 0.03, "traj_zmp_min_margin": 0.02, "retime_min": 1.0, "retime_max": 2.0,
         "retime_binding": {"velocity Waist": 1, "zmp": 1, "torque Left_Knee_Pitch": 1}}))
 
     prefix = tmp_path / "out" / "report"
     real_legs_report.main(["--study", str(tmp_path / "study"), "--out", str(prefix)])
     report = json.loads(prefix.with_suffix(".json").read_text())
     (r,) = report["runs"]
-    assert (r["segments"], r["slowed"], r["sped_up"], r["retime_min"], r["retime_max"]) == (3, 1, 1, 0.5, 2.0)
+    assert (r["segments"], r["slowed"], r["retime_min"], r["retime_max"]) == (3, 2, 1.0, 2.0)
     assert r["binding"] == {"torque": 1, "velocity": 1, "zmp": 1}
-    assert (report["summary"]["retime_min"], report["summary"]["retime_max"]) == (0.5, 2.0)
+    assert (report["summary"]["retime_min"], report["summary"]["retime_max"]) == (1.0, 2.0)
     assert r["unslowed_over_effort"] == []  # only the segment at the planner's timing is read for it
     md = prefix.with_suffix(".md").read_text()
-    assert "| real_legs_h000_s0 | 3 | 1 | 1 | 0.50 | 2.00 | torque 1, velocity 1, zmp 1 |" in md
-    assert "time scales from 0.50x to 2.00x" in md
+    assert "| real_legs_h000_s0 | 3 | 2 | 1.00 | 2.00 | torque 1, velocity 1, zmp 1 |" in md
+    assert "time scales from 1.00x to 2.00x" in md

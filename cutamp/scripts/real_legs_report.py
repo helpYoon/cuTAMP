@@ -7,7 +7,7 @@ timing, FKs every frame, and writes ``PREFIX.json`` and ``PREFIX.md``:
 - per joint, the peak |torque| against its effort, and the peak |velocity| against its motor's knee speed (bfm_wm's
   ``t1_actuators.npz``, ``v_knee``: above it the motor's torque falls) and cuRobo's velocity limit;
 - per run, the largest Trunk tilt (from the base's pitch and roll) and sole drift from the stance (by FK); how many
-  segments the balance gate slowed and sped up (a retimed segment keeps the planner's timing), its smallest CoM and
+  segments the balance gate slowed (a slowed segment keeps the planner's timing), its smallest CoM and
   ZMP margins, its time scales and the checks that bound them (``overall_metrics.json``); and every segment the gate
   left at the planner's timing whose torque passes an effort. The gate checks those segments' torques too, so one
   here means a check missed it.
@@ -111,16 +111,13 @@ class _RealLegs:
                                    "effort": float(self.effort[j])} for j in np.flatnonzero(peak > self.effort)]
         metrics_path = run_dir / "overall_metrics.json"
         metrics = json.loads(metrics_path.read_text()) if metrics_path.exists() else {}
-        frames = [(len(seg["position"]), len(seg["planner_timing"]["position"]))
-                  for seg in plan["segments"] if seg["planner_timing"] is not None]  # both at the same dt
         binding = None if metrics.get("retime_binding") is None else {}  # segments per check, joints summed
         for label, count in (metrics.get("retime_binding") or {}).items():  # "velocity <joint>", "torque <joint>", ...
             check = label.split()[0]
             binding[check] = binding.get(check, 0) + count
         return {
             "run": run_dir.name, "path": str(run_dir), "segments": len(plan["segments"]),
-            "slowed": sum(n > n_planner for n, n_planner in frames),
-            "sped_up": sum(n < n_planner for n, n_planner in frames),
+            "slowed": sum(seg["planner_timing"] is not None for seg in plan["segments"]),
             "retime_min": metrics.get("retime_min"), "retime_max": metrics.get("retime_max"), "binding": binding,
             "com_min_margin": metrics.get("traj_com_min_margin"), "zmp_min_margin": metrics.get("traj_zmp_min_margin"),
             "max_tilt": tilt, "max_sole_drift_m": drift_m, "max_sole_drift_rad": drift_rad,
@@ -191,16 +188,16 @@ def _markdown(report: dict) -> str:
         f"Joints past their knee speed: {', '.join(past_knee) or 'none'}.",
         f"Segments at the planner's timing past an effort: {'; '.join(over) or 'none'}.",
         "", "## Runs", "",
-        "| run | segments | slowed | sped up | time scale min | time scale max | binding | CoM margin [cm] "
+        "| run | segments | slowed | time scale min | time scale max | binding | CoM margin [cm] "
         "| ZMP margin [cm] | max tilt [rad] | sole drift [mm] | sole drift [rad] | top torque / effort |",
-        "|" + "---|" * 13,
+        "|" + "---|" * 12,
     ]
     effort = {j["joint"]: j["effort"] for j in joints}
     for r in report["runs"]:
         top = max(effort, key=lambda j: r["peak_torque"][j] / effort[j])
         binding = "—" if r["binding"] is None else ", ".join(f"{k} {v}" for k, v in sorted(r["binding"].items()))
         lines.append(
-            f"| {r['run']} | {r['segments']} | {r['slowed']} | {r['sped_up']} | {num(r['retime_min'])} "
+            f"| {r['run']} | {r['segments']} | {r['slowed']} | {num(r['retime_min'])} "
             f"| {num(r['retime_max'])} | {binding} "
             f"| {num(r['com_min_margin'], scale=100)} | {num(r['zmp_min_margin'], 3, 100)} | {num(r['max_tilt'], 3)} "
             f"| {num(r['max_sole_drift_m'], 2, 1000)} | {num(r['max_sole_drift_rad'], 4)} "
