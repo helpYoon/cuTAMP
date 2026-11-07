@@ -46,8 +46,8 @@ def _shoulder_peak(world, js) -> float:
 
 def _swing(world):
     """Both shoulder pitches from home's 0.2 rad to -2.0 rad in 0.5 s, the soles fixed: fast enough that the gate
-    slows it for its ZMP (by 2.6x), and within every effort, slowed or not. In 0.3 s its ZMP would need 4.6x, past
-    the gate's 4x cap, and each ankle pitch would carry 117 N m against its 73.1."""
+    slows it for its ZMP (by 2.5x), and within every effort, slowed or not. In 0.3 s its ZMP would need 4.13x, past
+    the gate's 4x cap by 3%, and each ankle pitch would carry 117 N m against its 73.1."""
     return _ramp(world, {j: -2.2 for j in SHOULDERS}, 0.5)
 
 
@@ -370,7 +370,7 @@ def test_gate_reports_the_torque_or_the_zmp_that_binds(real_world):
 
 @needs_cuda
 def test_gate_still_slows_a_segment_that_needs_it(real_world):
-    # The 0.5 s shoulder swing's ZMP needs a 2.6x slowdown: the gate slows it, keeps the planner's timing, and every
+    # The 0.5 s shoulder swing's ZMP needs a 2.5x slowdown: the gate slows it, keeps the planner's timing, and every
     # frame it returns passes: the ZMP inside, every torque within its effort, every speed within its limit.
     from cutamp.motion_solver import _balance_gate
     swing = _swing(real_world)
@@ -386,7 +386,7 @@ def test_gate_still_slows_a_segment_that_needs_it(real_world):
 @needs_cuda
 def test_gate_raises_naming_the_check_no_scale_passes(real_world, monkeypatch):
     # With no time scale up to RETIME_MAX passing, the gate raises and names the check: in 0.3 s the shoulder swing's
-    # ZMP needs 4.6x; an elbow effort under the elbow's static load fails at every scale; a speed limit 1/100 of the
+    # ZMP needs 4.13x; an elbow effort under the elbow's static load fails at every scale; a speed limit 1/100 of the
     # elbow sweep's peak needs 100x.
     from cutamp.motion_solver import RETIME_MAX, _balance_gate
     with pytest.raises(RuntimeError, match=f"ZMP stays outside the support region at the {RETIME_MAX}x") as e:
@@ -523,7 +523,7 @@ def test_gate_finds_no_zmp_where_the_floor_would_have_to_pull(real_world):
 
 @needs_cuda
 def test_gate_reports_the_smaller_margin_of_its_frames_and_the_planners(real_world):
-    # A sped-up segment returns fewer frames than the planner's, which the search ran on, and they can miss its
+    # A sped-up segment returns fewer frames than the planner's, which the scale solve ran on, and they can miss its
     # tightest instant: the opposite shoulder swings, sped up to 0.11x by a shoulder's torque, return 10 frames, whose
     # ZMP margin is 2.00 cm, against 1.62 cm on the planner's 81 at the same scale. The stats report the smaller, and
     # the CoM's margin likewise.

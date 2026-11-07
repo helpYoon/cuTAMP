@@ -32,10 +32,13 @@ def link_kinematics(world):
     from cutamp.robots.t1 import _check_joint_order, t1_curobo_cfg
     kp, support = world.kinematics.kinematics_config, world.model.support.link
     tools = [support] + [n for n, i in kp.link_name_to_idx_map.items() if kp.link_masses_com[i, 3] > 0 and n != support]
-    cfg = copy.deepcopy(t1_curobo_cfg(world.model))
+    cached = t1_curobo_cfg(world.model)["robot_cfg"]["kinematics"]
+    before = list(cached["tool_frames"])
+    cfg = copy.deepcopy(t1_curobo_cfg(world.model))  # from_robot_yaml_file writes tool_frames into the dict it is given
     kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=tools, device_cfg=world.kinematics.device_cfg),
                      compute_spheres=False)
     _check_joint_order(world.model, kin.joint_names)
+    assert cached["tool_frames"] == before  # rewritten, later IK solvers and planners in the process find no solution
     return kin
 
 

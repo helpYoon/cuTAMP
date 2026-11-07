@@ -711,7 +711,7 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
     it: ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last. Their
     ``"com_min_margin"`` and ``"zmp_min_margin"`` are the smaller of the returned frames' and the planner's frames' at
     s_eff (the returned spline at its knots): a sped-up segment returns fewer frames than the planner's, which the
-    search ran on."""
+    scale solve ran on."""
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     with torch.no_grad():
