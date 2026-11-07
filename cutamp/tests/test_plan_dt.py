@@ -5,6 +5,8 @@
 import numpy as np
 import torch
 
+from curobo.types import JointState
+
 import cutamp.motion_solver as ms
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
@@ -22,8 +24,8 @@ def test_plan_dt_labels_interpolated_spacing():
     for joint, delta in (("Right_Shoulder_Pitch", -1.2), ("Left_Shoulder_Pitch", -0.6),
                          ("Left_Elbow_Yaw", 0.4), ("Right_Elbow_Yaw", -0.3)):
         goal[0, names.index(joint)] += delta
-    result = planner.plan_cspace(ms._planner_js_from_full(planner, goal, names),
-                                 ms._planner_js_from_full(planner, start, names))
+    result = planner.plan_cspace(JointState.from_position(goal, joint_names=names),
+                                 JointState.from_position(start, joint_names=names))
     assert bool(result.success.any())
     plan = result.get_interpolated_plan()
     dt = ms._plan_dt(planner)

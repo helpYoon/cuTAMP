@@ -135,17 +135,18 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
 
 def _plan_reach(world, real_plan, planner):
     """A planned home -> reach segment: plan_cspace's result for the first pick conf of ``real_plan`` that plans."""
-    from cutamp.motion_solver import _plan_arm_to_conf, _planner_js_from_full
+    from curobo.types import JointState
+    from cutamp.motion_solver import _plan_arm_to_conf
     from cutamp.tests.test_real_legs_gn import _accepted
     skeleton, particles = real_plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     obj, conf = op.values[0], op.values[-1]
     names = list(world.model.joint_names)
     home = torch.tensor(world.model.home, device=world.device)
-    start = _planner_js_from_full(planner, home, names)
+    start = JointState.from_position(home[None], joint_names=names)
     for q in particles[conf][_accepted(world, real_plan, conf)][:8]:  # GN IK's accepted reaches; a few may not plan
         try:
-            return _plan_arm_to_conf(planner, q, start, names, disable_obstacle=obj, ground_op=op)
+            return _plan_arm_to_conf(planner, q, start, disable_obstacle=obj, ground_op=op)
         except RuntimeError:
             continue
     raise AssertionError("no reach planned from home")
@@ -730,8 +731,8 @@ def test_plan_failed_names_torque_in_every_torque_form():
             check(*args)
         raised.append(str(e.value))
     result = SimpleNamespace(js_solution=object(), get_interpolated_plan=lambda: None)  # a trajopt result
-    messages = [str(_plan_failed(world(2.0), result, "Retract plan failed for op")), *raised,
-                str(_plan_failed(world(0.5), result, "Retract plan failed for op")),
+    messages = [str(_plan_failed(world(2.0), result, "cspace-anchored plan failed for op")), *raised,
+                str(_plan_failed(world(0.5), result, "cspace-anchored plan failed for op")),
                 f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
     assert messages[0].endswith(": torque") and messages[4].endswith(": other")
     assert f"at the {RETIME_MAX}x slowdown cap" in messages[2] and "velocity passes" in messages[3]

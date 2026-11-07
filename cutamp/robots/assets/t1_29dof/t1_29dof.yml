@@ -9,7 +9,6 @@
 # cuRobo never reads the cutamp: block.
 robot_cfg:
   kinematics:
-    format_version: 2.0
     asset_root_path: ''
     urdf_path: t1_planner.urdf
     base_link: world
@@ -115,8 +114,6 @@ robot_cfg:
         link_mass: 0.0
     lock_joints: {AAHead_yaw: 0.0, Head_pitch: 0.0, left_Link1: 0.0, left_Link11: 0.0, left_Link2: 0.0, left_Link22: 0.0,
       right_Link1: 0.0, right_Link11: 0.0, right_Link2: 0.0, right_Link22: 0.0}
-    use_global_cumul: true
-    mesh_link_names: null
     self_collision_buffer: {}
     self_collision_ignore:
       base_link_x: [base_link_y]
@@ -173,8 +170,6 @@ robot_cfg:
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-      acceleration_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
       velocity_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.761545969898298, 1.0, 0.761545969898298, 1.0]
       position_limit_clip: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2235999999999998, 0.16795000000000004, 0.22350000000000003, 0.18674999999999997,

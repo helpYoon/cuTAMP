@@ -31,7 +31,7 @@ import torch
 import trimesh
 from yourdfpy import URDF
 
-from curobo._src.util.config_io import load_yaml
+from curobo.config_io import load_yaml
 from curobo.kinematics import Kinematics, KinematicsCfg
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Scene
@@ -277,7 +277,7 @@ v0.9.0 planned worst (timeopt off), 50 planned 4 of 5 and 100 all 5, with 16 can
 
 def _trajopt_optimizer_dict() -> dict:
     """cuRobo's trajopt optimizer YAML with the position bound's weight at ``TRAJOPT_POSITION_BOUND_WEIGHT``."""
-    from curobo._src.util.config_io import resolve_config, join_path
+    from curobo.config_io import join_path, resolve_config
     from curobo.content import get_task_configs_path
 
     d = resolve_config(join_path(get_task_configs_path(), "trajopt/lbfgs_bspline_trajopt.yml"))
@@ -290,7 +290,6 @@ def get_t1_motion_planner(
     scene: Scene,
     *,
     use_cuda_graph: bool = True,
-    collision_activation_distance: float = 0.01,
     device_cfg: DeviceCfg = None,
 ) -> MotionPlanner:
     """Single MotionPlanner for the T1, with every joint free, the base included.
@@ -322,11 +321,11 @@ def get_t1_motion_planner(
         robot=cfg_dict,
         scene_model=scene,
         use_cuda_graph=use_cuda_graph,
-        num_ik_seeds=64,
-        num_trajopt_seeds=4,
-        optimizer_collision_activation_distance=collision_activation_distance,
-        max_batch_size=1,
-        max_goalset=1,
+        # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (MotionPlannerCfg.create's default, 0.01,
+        # is untested here). It only shapes the optimizers' collision cost: cuRobo still judges success at 0
+        # (metrics_base.yml). At 0 the optimum hugs obstacles, and retracts after a place grazed the block just
+        # released by up to 0.2 mm.
+        optimizer_collision_activation_distance=0.0025,
         device_cfg=device_cfg,
         trajopt_optimizer_configs=[_trajopt_optimizer_dict()],
         # cuRobo's timeopt retimes each plan to its torque limits on its own RNEA, without the floor's push

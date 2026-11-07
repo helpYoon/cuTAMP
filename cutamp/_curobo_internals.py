@@ -7,18 +7,25 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-"""Everything cuTAMP changes in, or reaches past the public surface of, NVlabs cuRobo v0.9.0 (``CUROBO_COMMIT``).
+"""Everything cuTAMP changes in NVlabs cuRobo v0.9.0 (``CUROBO_COMMIT``), and the helpers that reach past its public
+surface to do it.
 
 Every helper and patch here fixes a cuRobo bug or works around a missing API. They are gathered in one module so a
-cuRobo upgrade has exactly one place to audit. ``install_curobo_patches`` (run on ``import cutamp``) first checks that
+cuRobo upgrade has one place to audit for them. ``install_curobo_patches`` (run on ``import cutamp``) first checks that
 the cuRobo functions the patches wrap, and those whose behavior cuTAMP relies on (``_PINNED_SOURCES``), still have the
 v0.9.0 source they were written against, so an upgrade, or the old fork, fails loudly instead of running with
 half-applied fixes.
 
+Other modules import, unchanged, a few private names that v0.9.0 exports nowhere public: ``BaseCost`` and
+``BaseCostCfg`` (com_polygon_cost), ``SelfCollisionCost`` and ``SelfCollisionCostCfg`` (cost_function), ``Dynamics``,
+``DynamicsCfg`` and ``torch_quaternion_to_matrix`` (floor_wrench), and ``SceneCollision``, ``SceneCollisionCfg`` and
+``CollisionBuffer`` (utils/collision).
+
 Documented public-API constraints (no helper needed; noted here so the next
 upgrade audit catches them):
 
-* CUDA graphs can't be re-captured ("CUDA graph reset is not available."), so
+* CUDA graphs are not re-captured: cuRobo's graph reset is an opt-in runtime switch, off by default
+  (``curobo.runtime.cuda_graph_reset``; with it off a reset raises "CUDA graph reset is not available."), so
   a solver whose call structure changes after its first solve must run
   without them; the motion planner sees one fixed call shape and uses them.
   cuRobo captures in CUDA's global mode, where another thread's allocations

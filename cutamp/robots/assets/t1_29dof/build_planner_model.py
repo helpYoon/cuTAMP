@@ -12,7 +12,8 @@ lists below), and are written byte for byte the same each run:
   reach (``_base_limits``), and a ``cutamp:`` block (joint order, home, sole box, sole y, home mid-sole) that cuRobo
   never reads.
 
-Run with cuTAMP's python: ``python build_planner_model.py [--out DIR]``.
+Run with cuTAMP's python, on a machine with a CUDA device (``_curobo_joint_order``):
+``python build_planner_model.py [--out DIR]``.
 """
 
 import argparse
@@ -390,7 +391,6 @@ def _kinematics(mid_sole: list, base_limits: dict) -> dict:
     """The robot config's kinematics, except its cspace."""
     legs = [f"{key}_{Side}" for _, Side in SIDES for key in LEG_SPHERE_RADIUS]
     return {
-        "format_version": 2.0,
         "asset_root_path": "",  # cuRobo then takes the URDF's folder, this one, which holds meshes/
         "urdf_path": PLANNER_URDF,
         "base_link": "world",
@@ -402,8 +402,6 @@ def _kinematics(mid_sole: list, base_limits: dict) -> dict:
         "extra_collision_spheres": dict(EXTRA_COLLISION_SPHERES),
         "extra_links": _extra_links(mid_sole, base_limits),
         "lock_joints": {j: 0.0 for j in (*HEAD, *FINGERS)},
-        "use_global_cumul": True,
-        "mesh_link_names": None,
         "self_collision_buffer": {},
         "self_collision_ignore": _self_collision_ignore(),
     }
@@ -412,7 +410,8 @@ def _kinematics(mid_sole: list, base_limits: dict) -> dict:
 def _curobo_joint_order(kinematics: dict, out: Path) -> list:
     """cuRobo's joint order for ``kinematics``: KinematicsLoader._build_chain's walk from the first tool frame
     (``_build_kinematics_with_lock_joints`` locks joints on that same chain). The loader locks joints only
-    on CUDA, so this builds the model on the CPU without lock_joints or cspace, and drops the locked joints."""
+    on CUDA, so this builds the model with CPU tensors, without lock_joints or cspace, and drops the locked joints. It
+    still needs a CUDA device: cuRobo poses each extra link on the default device (``LinkParams.create``)."""
     import torch
     from curobo.kinematics import KinematicsCfg
     from curobo.types import DeviceCfg
@@ -471,7 +470,6 @@ def main(argv=None) -> None:
         "default_joint_position": [home[j] for j in order],
         "cspace_distance_weight": [1.0] * len(order),
         "null_space_weight": [1.0] * len(order),
-        "acceleration_scale": [1.0] * len(order),
         "velocity_scale": [velocity_scale[j] for j in order],
         "position_limit_clip": [clip[j] for j in order],
         "max_acceleration": TRAJOPT_MAX_ACCELERATION,

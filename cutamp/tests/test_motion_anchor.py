@@ -3,6 +3,7 @@ cutamp_demo: its retract values, planted soles, torques and speeds, saved raw pl
 exported frames."""
 import os
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,35 +13,39 @@ import cutamp.motion_solver as ms
 from cutamp.tests.conftest import needs_cuda
 
 
+_NAMES = [f"j{i}" for i in range(33)]
+
+
 def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
     # _plan_arm_to_conf must plan with plan_cspace to a target built FROM the
     # conf (not a Cartesian pose), and return the cuRobo result on success.
-    sentinel_target = object()
-    monkeypatch.setattr(ms, "_planner_js_from_full",
-                        lambda planner, conf, names: sentinel_target)
     monkeypatch.setattr(ms, "_cspace_plan_succeeded", lambda result: True)
     calls = {}
 
     class FakePlanner:
+        kinematics = SimpleNamespace(joint_names=_NAMES)
+
         def plan_cspace(self, target_js, last_js):
             calls["target_js"] = target_js
             calls["last_js"] = last_js
             return "FAKE_RESULT"
 
-    res = ms._plan_arm_to_conf(
-        FakePlanner(), torch.zeros(33), last_js="LAST", full_joint_names=["a"],
-        disable_obstacle=None, ground_op="OP",
-    )
+    conf = torch.arange(33.0)
+    res = ms._plan_arm_to_conf(FakePlanner(), conf, last_js="LAST", disable_obstacle=None, ground_op="OP")
     assert res == "FAKE_RESULT"
-    assert calls["target_js"] is sentinel_target  # planned to the conf, not a pose
+    # planned to the conf, at rest, in the planner's joint order, not to a pose
+    target = calls["target_js"]
+    assert torch.equal(target.position, conf[None]) and not target.velocity.any()
+    assert target.joint_names == _NAMES
     assert calls["last_js"] == "LAST"
 
 
 def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
-    monkeypatch.setattr(ms, "_planner_js_from_full", lambda *a: object())
     monkeypatch.setattr(ms, "_cspace_plan_succeeded", lambda *a: False)
 
     class FakePlanner:
+        kinematics = SimpleNamespace(joint_names=_NAMES)
+
         def __init__(self):
             self.n = 0
         def plan_cspace(self, *a, **k):
@@ -49,8 +54,7 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
 
     fp = FakePlanner()
     with pytest.raises(RuntimeError, match="cspace-anchored"):
-        ms._plan_arm_to_conf(fp, torch.zeros(33), "LAST", ["a"],
-                             disable_obstacle=None, ground_op="OP")
+        ms._plan_arm_to_conf(fp, torch.zeros(33), "LAST", disable_obstacle=None, ground_op="OP")
     assert fp.n == 1  # no repeat: the same start and goal plan the same way
 
 

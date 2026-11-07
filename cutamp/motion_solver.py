@@ -16,7 +16,10 @@ Per plan-skeleton operator (T1):
   - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
     we plan to the gate-approved particle conf with the grasp-object /
     placement-surface obstacle temporarily disabled.
-  - Retract is a cspace target pinning all joints toward the configured retract.
+  - Retract plans the same way to the particle's retract conf, with no obstacle disabled.
+
+Particles and the planner share one joint order, ``world.model.joint_names`` (``t1._check_joint_order``); every
+planner trajectory also carries the joints the planner locks (the head, the fingers).
 """
 
 import collections
@@ -50,43 +53,29 @@ def _cspace_plan_succeeded(result) -> bool:
     return result is not None and bool(result.success.any())
 
 
-def _planner_js_from_full(planner, full_pos, full_joint_names):
-    """Build a planner-native JointState from a full-cspace position vector.
-
-    cuRobo's ``get_active_js`` reorders + drops locked joints based on
-    ``joint_names``, which is why we must set ``joint_names`` on the
-    full-cspace JointState (the model's 33 joints).
-    """
-    if full_pos.dim() == 1:
-        full_pos = full_pos[None]
-    full_js = JointState.from_position(full_pos, joint_names=list(full_joint_names))
-    return planner.kinematics.get_active_js(full_js)
-
-
 def _plan_arm_to_conf(
     planner,
-    conf_full: torch.Tensor,
+    conf: torch.Tensor,
     last_js: JointState,
-    full_joint_names,
     *,
     disable_obstacle: Optional[str],
     ground_op,
     world: Optional[TAMPWorld] = None,
 ):
     """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
-    conf ``conf_full`` (the model's full cspace), via ``plan_cspace`` — so the executed
+    conf ``conf`` (``[n]``, in the planner's joint order), via ``plan_cspace`` — so the executed
     arrival equals the hard-COM-checked conf instead of a free Cartesian
-    redundancy solution. Mirrors the retract branch. ``disable_obstacle`` (if
-    given) is temporarily removed from the world during planning, so terminal
+    redundancy solution. Pick, place and retract all plan here. ``disable_obstacle`` (if
+    given, else None) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
     cuRobo result; raises ``RuntimeError`` if it fails (``_plan_failed``: given
     ``world`` it names the reason).
 
-    One call: plan_cspace already makes 5 attempts (4 graph-seeded), and
-    calling it again with the same start and goal returns the same trajectory
-    (blocks_t1: 54 of 54 repeats bit-identical, none succeeded).
+    One call: plan_cspace already makes up to 20 attempts (19 graph-seeded, each with one finetune pass). On the
+    fork, which made 5, calling it again with the same start and goal returned the same trajectory (blocks_t1: 54 of
+    54 repeats bit-identical, none succeeded).
     """
-    target_js = _planner_js_from_full(planner, conf_full, full_joint_names)
+    target_js = JointState.from_position(conf.reshape(1, -1), joint_names=list(planner.kinematics.joint_names))
     # _disabled_world_obstacle no-ops on name=None.
     with _disabled_world_obstacle(planner, disable_obstacle):
         result = planner.plan_cspace(target_js, last_js)
@@ -162,28 +151,12 @@ def _plan_dt(planner) -> float:
     return float(planner.trajopt_solver.config.interpolation_dt)
 
 
-def _last_timestep_js(plan, planner=None) -> JointState:
-    """Build a [1, active_dof] JointState from the last timestep of a trajectory.
-
-    cuRobo trajectories arrive in different shapes (``[time, dof]``,
-    ``[batch, time, dof]``, ``[1, 1, time, dof]``) and in either active-DOF
-    or full-DOF form (full includes the locked joints). We want a 2D
-    ``[1, active_dof]`` tensor for the next op's ``current_state``, since
-    plan_cspace / plan_pose target tensors live in active-DOF space.
-    """
-    pos = plan.position
-    while pos.dim() > 2:
-        if pos.shape[0] == 1:
-            pos = pos.squeeze(0)
-        else:
-            pos = pos[0]
-    # Preserve joint_names from the source plan so get_active_js can reorder.
-    js = JointState.from_position(pos[-1:], joint_names=getattr(plan, "joint_names", None))
-    if planner is not None:
-        active_dof = len(planner.kinematics.joint_names)
-        if js.position.shape[-1] != active_dof:
-            js = planner.trajopt_solver.get_active_js(js)
-    return js
+def _last_timestep_js(plan: JointState, planner) -> JointState:
+    """The next segment's ``current_state``: a ``[1, n]`` JointState at rest at ``plan``'s last frame, in the planner's
+    joint order (the locked joints every planner trajectory carries dropped)."""
+    pos = plan.position.reshape(-1, plan.position.shape[-1])  # one trajectory: any leading dims are 1
+    js = JointState.from_position(pos[-1:], joint_names=list(plan.joint_names))
+    return js.reorder(list(planner.kinematics.joint_names))
 
 
 def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
@@ -259,31 +232,24 @@ def _reset_attachment_state(planner, world) -> None:
         sc.update_obstacle_pose(name=obj.name, w_obj_pose=Pose.from_matrix(world.get_object_pose(obj)))
 
 
-def _held_obj_poses(planner, tool_from_ee, held: dict, plan: JointState) -> dict:
+def _held_obj_poses(world: TAMPWorld, planner, held: dict, plan: JointState) -> dict:
     """``{arm: (obj_name, world_from_obj per timestep)}`` along ``plan`` for every arm in ``held``.
 
-    ``held`` maps an arm to ``(obj_name, grasp_from_obj)``; ``tool_from_ee`` is ``{tool_frame: 4x4}``. The body
-    joints (the legs and the Waist) are free during single-arm planning, so an inactive arm's held block still moves
-    through the world with the body; visualization needs poses for both arms. ``plan`` is a planner-output JointState
-    in the planner's active cspace (the head and grippers locked); one that is not is reprojected with
-    ``get_active_js`` before FK through ``planner.kinematics``.
+    ``held`` maps an arm to ``(obj_name, grasp_from_obj)``. The body joints (the legs and the Waist) are free during
+    single-arm planning, so an inactive arm's held block still moves through the world with the body; visualization
+    needs poses for both arms. ``plan`` is a planner trajectory, put in the model's joint order (``_full_positions``)
+    for FK through ``planner.kinematics``.
     """
     out = {}
     for arm in ("left", "right"):
         if arm not in held:
             continue
         obj_name, grasp_tf = held[arm]
-        pos = plan.position
-        while pos.dim() > 2:
-            pos = pos.squeeze(0) if pos.shape[0] == 1 else pos[0]
-        if pos.shape[-1] != len(planner.kinematics.joint_names):
-            traj_js = JointState.from_position(pos, joint_names=plan.joint_names)
-            pos = planner.trajopt_solver.get_active_js(traj_js).position
-        js = JointState.from_position(pos.to(grasp_tf.device))
+        js = JointState.from_position(_full_positions(world, plan).to(grasp_tf.device))
         kin_state = planner.kinematics.compute_kinematics(js)
         tool_frame = TOOL_FRAME_FOR_ARM[arm]
         world_from_ee = kin_state.tool_poses.get_link_pose(tool_frame, make_contiguous=True).get_matrix()
-        out[arm] = (obj_name, world_from_ee @ torch.inverse(tool_from_ee[tool_frame]) @ grasp_tf)
+        out[arm] = (obj_name, world_from_ee @ torch.inverse(world.tool_from_ee[tool_frame]) @ grasp_tf)
     return out
 
 
@@ -302,12 +268,6 @@ def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> Motio
         world.model,
         get_world_cfg(world.env, include_movables=True),
         use_cuda_graph=use_cuda_graph,
-        # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (the
-        # planner's own default, 0.01, is untested here). It only shapes the
-        # optimizers' collision cost: cuRobo still judges success at 0
-        # (metrics_base.yml). At 0 the optimum hugs obstacles, and retracts after
-        # a place grazed the block just released by up to 0.2 mm.
-        collision_activation_distance=0.0025,
         device_cfg=world.device_cfg,
     )
 
@@ -323,10 +283,10 @@ def solve_curobo(
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
-    ``get_planner`` (optional) returns a pre-built, warmed planner — the
+    ``get_planner`` (optional) returns a pre-built planner — the
     overlap path: algorithm.py starts ``build_motion_planner`` on a thread
     when the optimization loop starts, and the timer below then measures
-    only the residual wait. ``None`` builds+warms inline.
+    only the residual wait. ``None`` builds it inline. Neither warms it up (``build_motion_planner``).
     """
     plan_skeleton = plan_info["plan_skeleton"]
 
@@ -341,12 +301,9 @@ def solve_curobo(
     # retry attempt.
     _reset_attachment_state(planner, world)
 
-    # Build initial state. Planner is in active-cspace (head and grippers
-    # locked); particles are in full-cspace — convert at every boundary.
-    full_joint_names = world.kinematics.joint_names
-    last_js = _planner_js_from_full(
-        planner, best_particle["left_q0"].clone(), full_joint_names,
-    )
+    # The initial state: particles are in the planner's joint order (the module docstring).
+    last_js = JointState.from_position(best_particle["left_q0"].clone().reshape(1, -1),
+                                       joint_names=list(planner.kinematics.joint_names))
     held = {}  # {arm: (obj_name, grasp_from_obj)}
     q_init = best_particle["left_q0"]
 
@@ -361,10 +318,8 @@ def solve_curobo(
         plan, stats, fast = _balance_gate(world, plan, dt)
         gate_stats.append(stats)
         if fast is not None:
-            entry["planner_timing"] = {
-                "plan": fast, "held_objs": _held_obj_poses(planner, world.tool_from_ee, held, fast),
-            }
-        entry.update(plan=plan, held_objs=_held_obj_poses(planner, world.tool_from_ee, held, plan))
+            entry["planner_timing"] = {"plan": fast, "held_objs": _held_obj_poses(world, planner, held, fast)}
+        entry.update(plan=plan, held_objs=_held_obj_poses(world, planner, held, plan))
         accum_plans.append(entry)
         return plan
 
@@ -390,15 +345,11 @@ def solve_curobo(
                 pass
 
             elif metadata.action_type == "retract":
-                q_retract_name = ground_op.values[-1]
-                target_q = best_particle[q_retract_name].clone()
                 with timer.time("curobo_planning"):
-                    target_js = _planner_js_from_full(planner, target_q, full_joint_names)
-                    result = planner.plan_cspace(
-                        target_js, last_js,
+                    result = _plan_arm_to_conf(
+                        planner, best_particle[ground_op.values[-1]].clone(), last_js,
+                        disable_obstacle=None, ground_op=ground_op, world=world,
                     )
-                if not _cspace_plan_succeeded(result):
-                    raise _plan_failed(world, result, f"Retract plan failed for {ground_op}")
                 plan = add_segment(_interp_plan(result), _plan_dt(planner), arm)
                 last_js = _last_timestep_js(plan, planner)
 
@@ -416,7 +367,6 @@ def solve_curobo(
                 with timer.time("curobo_planning"):
                     grasp_result = _plan_arm_to_conf(
                         planner, best_particle[q_name].clone(), last_js,
-                        full_joint_names,
                         disable_obstacle=obj_name, ground_op=ground_op, world=world,
                     )
 
@@ -445,7 +395,6 @@ def solve_curobo(
                 with timer.time("curobo_planning"):
                     place_result = _plan_arm_to_conf(
                         planner, best_particle[q_name].clone(), last_js,
-                        full_joint_names,
                         disable_obstacle=surface_name, ground_op=ground_op, world=world,
                     )
 
@@ -517,12 +466,9 @@ def solve_curobo(
 
 
 def _full_positions(world: TAMPWorld, plan_js) -> torch.Tensor:
-    """``[T, full_dof]`` positions of a planner trajectory in ``world.kinematics.joint_names`` order.
-
-    accum_plans entries carry trajectories in different DOF forms depending on which planner method
-    produced them: the planner's active cspace or the fully articulated form (a superset of
-    world.kinematics's 33 joints); a plain reorder by ``plan_js.joint_names``, which every planner trajectory
-    carries, handles both."""
+    """``[T, full_dof]`` positions of a planner trajectory in ``world.kinematics.joint_names`` order (the model's 33
+    joints), by ``plan_js.joint_names``: every planner trajectory also carries the joints the planner locks (the head,
+    the fingers), which this drops."""
     pos = plan_js.position.reshape(-1, plan_js.position.shape[-1])
     js = JointState.from_position(pos, joint_names=list(plan_js.joint_names))
     return js.reorder(list(world.kinematics.joint_names)).position
@@ -625,7 +571,7 @@ def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
 
 def _model_frames(world: TAMPWorld, plan_js: JointState) -> JointState:
     """``plan_js``'s frames: ``[T, n]`` positions, velocities and accelerations in ``world.model.joint_names`` order, by
-    its joint names. A plan may also carry the joints the planner locks (the head, the fingers)."""
+    its joint names. A planner trajectory also carries the joints the planner locks (the head, the fingers)."""
     names = list(world.model.joint_names)
     dof = plan_js.position.shape[-1]
     cols = [list(plan_js.joint_names).index(j) for j in names]

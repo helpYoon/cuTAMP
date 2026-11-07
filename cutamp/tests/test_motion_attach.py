@@ -1,7 +1,14 @@
 """Tests for _attach_object / _detach_object: where the held block's collision
 spheres go, and which blocks stay world obstacles."""
+from curobo.types import JointState
+
 import cutamp.motion_solver as ms
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
+
+
+def _home_js(world):
+    """``world.q_init`` as a ``[1, n]`` planner JointState."""
+    return JointState.from_position(world.q_init.reshape(1, -1), joint_names=list(world.model.joint_names))
 
 
 @needs_cuda
@@ -11,7 +18,7 @@ def test_attached_spheres_sit_on_the_block():
     world = make_blocks_t1_world()
     planner = ms.build_motion_planner(world)
     kp = planner.attachment_manager.kinematics_params
-    js = ms._planner_js_from_full(planner, world.q_init, world.kinematics.joint_names)
+    js = _home_js(world)
     for arm, block in (("left", "block3"), ("right", "block2")):
         ms._attach_object(planner, block, js, arm)
         idx = kp.get_sphere_index_from_link_name(ms._ATTACH_LINK_FOR_ARM[arm])
@@ -29,7 +36,7 @@ def test_place_reenables_only_the_placed_block():
     world = make_blocks_t1_world()
     planner = ms.build_motion_planner(world)
     cub = planner.scene_collision_checker.data.cuboids
-    js = ms._planner_js_from_full(planner, world.q_init, world.kinematics.joint_names)
+    js = _home_js(world)
     ms._attach_object(planner, "block3", js, "left")
     ms._attach_object(planner, "block2", js, "right")
 
