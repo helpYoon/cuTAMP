@@ -10,7 +10,7 @@
 from typing import Dict
 
 import torch
-from curobo.scene import Cuboid, Mesh, Obstacle, Scene
+from curobo.scene import Obstacle, Scene
 from roma import quat_wxyz_to_xyzw, unitquat_to_rotmat
 
 from cutamp.envs import TAMPEnvironment
@@ -88,23 +88,9 @@ def transform_points(
 
 
 def approximate_goal_aabb(goal: Obstacle) -> torch.Tensor:
-    """Approximate the goal AABB from the goal object."""
-    mat4x4 = pose_list_to_mat4x4(goal.pose)
-    if isinstance(goal, Mesh):
-        vertices = torch.tensor(goal.vertices, dtype=mat4x4.dtype)
-        vertices = transform_points(vertices, mat4x4)
-        lower = vertices.min(dim=0).values
-        upper = vertices.max(dim=0).values
-        aabb = torch.stack([lower, upper])
-    elif isinstance(goal, Cuboid):
-        # TODO: handle cases when the goal is not axis-aligned. i.e., has rotation
-        goal_xyz = torch.tensor(goal.dims)
-        aabb = torch.stack([-goal_xyz / 2, goal_xyz / 2])
-        aabb = transform_points(aabb, mat4x4)
-    else:
-        raise NotImplementedError(f"Goal type {type(goal)} not supported yet.")
-
-    return aabb
+    """World-frame AABB [[lower], [upper]] (float32, [2, 3]) of any obstacle: the bounds of cuRobo's posed trimesh,
+    so a rotated cuboid gets the box around all eight corners (a cylinder's or sphere's uses its tessellation)."""
+    return torch.tensor(goal.get_trimesh_mesh(transform_with_pose=True).bounds, dtype=torch.float32)
 
 
 def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> Scene:
