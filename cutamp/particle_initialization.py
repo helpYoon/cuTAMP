@@ -36,7 +36,8 @@ from cutamp.gn_refresh import (
 from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
 from cutamp.samplers import (
-    grasp_4dof_sampler,
+    _grasp_from_G,
+    top_down_grasps_7dof,
     place_4dof_sampler,
 )
 from cutamp.tamp_world import TAMPWorld
@@ -45,6 +46,7 @@ from cutamp.task_planning.constraints import KinematicConstraint
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
+    grasp_7dof_to_mat4x4,
     pose_list_to_mat4x4,
     transform_spheres,
 )
@@ -283,10 +285,13 @@ class ParticleInitializer:
                 obj_spheres = world.get_collision_spheres(obj)
                 num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
 
-                sampled_grasps = grasp_4dof_sampler(num_particles * 4, obj_curobo, obj_spheres, num_faces=num_faces)
-                obj_from_grasp = action_4dof_to_mat4x4(sampled_grasps)
+                sampled_grasps = top_down_grasps_7dof(num_particles * 4, obj_curobo, obj_spheres, num_faces=num_faces)
+                obj_from_grasp = grasp_7dof_to_mat4x4(sampled_grasps)
 
-                grasp_spheres = transform_spheres(gripper_spheres, obj_from_grasp)
+                # Today's filter: the gripper spheres placed at the old top-down grasp frame (Task 6 removes it).
+                grasp_spheres = transform_spheres(
+                    gripper_spheres, obj_from_grasp @ torch.inverse(_grasp_from_G().to(device))
+                )
                 grasp_coll = sphere_to_sphere_overlap(obj_spheres, grasp_spheres)
                 good_idxs = grasp_coll.topk(num_particles, largest=False).indices
                 particles[grasp] = sampled_grasps[good_idxs]
@@ -332,7 +337,7 @@ class ParticleInitializer:
                 world_from_obj = world_from_obj[best_idxs]
 
                 particles[placement] = sampled_placements
-                obj_from_grasp = action_4dof_to_mat4x4(particles[grasp])
+                obj_from_grasp = grasp_7dof_to_mat4x4(particles[grasp])
                 world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
                 # The placed object at its new placement (particles[placement], set above), as the rollout has it.
                 movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)

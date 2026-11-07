@@ -21,6 +21,7 @@ from cutamp.conf_locking import apply_grad_masks, build_grad_masks
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
+    grasp_7dof_to_mat4x4,
 )
 from cutamp.com_polygon_cost import particle_com_margin
 from cutamp.config import TAMPConfiguration
@@ -68,7 +69,7 @@ def _build_ik_deps(
     (Retract, MoveFree, MoveHolding) are skipped.
     """
     deps: List[IKDep] = []
-    grasp_to_mat = action_4dof_to_mat4x4
+    grasp_to_mat = grasp_7dof_to_mat4x4
     for idx, ground_op in enumerate(plan_skeleton):
         meta = ground_op.operator.metadata
         if not getattr(meta, "is_actionable", False):

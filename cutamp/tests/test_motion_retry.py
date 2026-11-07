@@ -20,7 +20,7 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
     )]
 
     def cand(q1, q3):
-        return {"left_q0": torch.zeros(2), "grasp1": torch.zeros(4), "pose1": torch.zeros(4),
+        return {"left_q0": torch.zeros(2), "grasp1": torch.zeros(7), "pose1": torch.zeros(4),
                 "left_q1": torch.tensor([q1, 0.0]), "left_q3": torch.tensor([q3, 0.0])}
 
     planned = []

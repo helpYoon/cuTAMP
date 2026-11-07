@@ -39,7 +39,7 @@ from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM, get_t1_motion_planner
 from cutamp.tamp_world import TAMPWorld
-from cutamp.utils.common import Particles, action_4dof_to_mat4x4, get_world_cfg
+from cutamp.utils.common import Particles, action_4dof_to_mat4x4, get_world_cfg, grasp_7dof_to_mat4x4
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -355,7 +355,7 @@ def solve_curobo(
 
             elif metadata.action_type == "pick":
                 obj_name, grasp_name, q_name = ground_op.values
-                obj_from_grasp = action_4dof_to_mat4x4(best_particle[grasp_name].clone())
+                obj_from_grasp = grasp_7dof_to_mat4x4(best_particle[grasp_name].clone())
 
                 # Anchor the grasp TERMINAL to the COM-safe particle conf
                 # (best_particle[q_name]) via plan_cspace instead of a free

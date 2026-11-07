@@ -11,7 +11,7 @@ from typing import Dict
 
 import torch
 from curobo.scene import Cuboid, Cylinder, Mesh, Obstacle, Scene
-from roma import quat_wxyz_to_xyzw, unitquat_to_rotmat
+from roma import quat_wxyz_to_xyzw, quat_xyzw_to_wxyz, rotmat_to_unitquat, unitquat_to_rotmat
 
 from cutamp.envs import TAMPEnvironment
 
@@ -51,6 +51,25 @@ def action_4dof_to_mat4x4(action_4dof: torch.Tensor) -> torch.Tensor:
     # Set the translation component
     mat4x4[..., :3, 3] = action_4dof[..., :3]
     return mat4x4
+
+
+def grasp_7dof_to_mat4x4(grasp: torch.Tensor) -> torch.Tensor:
+    """Convert a grasp ``[..., 7]`` = ``[x, y, z, qw, qx, qy, qz]`` (cuRobo's wxyz order) to ``[..., 4, 4]``.
+
+    The pose is the gripper frame G in the object frame. The quaternion is not normalized: the loader stores unit ones.
+    """
+    if grasp.shape[-1] != 7:
+        raise ValueError(f"Expected last dimension to be 7, got shape {grasp.shape}")
+    mat4x4 = torch.eye(4, device=grasp.device, dtype=grasp.dtype).repeat(*grasp.shape[:-1], 1, 1)
+    mat4x4[..., :3, :3] = unitquat_to_rotmat(quat_wxyz_to_xyzw(grasp[..., 3:]))
+    mat4x4[..., :3, 3] = grasp[..., :3]
+    return mat4x4
+
+
+def mat4x4_to_grasp_7dof(mat: torch.Tensor) -> torch.Tensor:
+    """Convert ``[..., 4, 4]`` transforms to grasps ``[..., 7]`` = ``[x, y, z, qw, qx, qy, qz]``."""
+    quat_wxyz = quat_xyzw_to_wxyz(rotmat_to_unitquat(mat[..., :3, :3]))
+    return torch.cat([mat[..., :3, 3], quat_wxyz], dim=-1)
 
 
 def transform_spheres(

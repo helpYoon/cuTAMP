@@ -26,6 +26,7 @@ from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
+    grasp_7dof_to_mat4x4,
     transform_spheres,
 )
 
@@ -181,7 +182,7 @@ class RolloutFunction:
 
         def get_grasp_mat4x4(grasp_name_: str) -> torch.Tensor:
             if grasp_name_ not in grasp_to_mat4x4:
-                grasp_to_mat4x4[grasp_name_] = action_4dof_to_mat4x4(particles[grasp_name_])
+                grasp_to_mat4x4[grasp_name_] = grasp_7dof_to_mat4x4(particles[grasp_name_])
             return grasp_to_mat4x4[grasp_name_]
 
         obj_to_pose = {

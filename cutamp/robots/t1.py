@@ -348,22 +348,19 @@ def get_t1_motion_planner(
 def get_t1_tool_from_ee(
     device_cfg: DeviceCfg = None,
 ) -> Dict[str, torch.Tensor]:
-    """``world_from_ee = world_from_grasp @ tool_from_ee``.
+    """``world_from_ee = world_from_obj @ obj_from_G @ tool_from_ee``, with ``tool_from_ee = G_from_base``.
 
-    The T1 EE frames are ``left_base_link`` / ``right_base_link``. In each EE
-    frame, +X points toward the fingertips. Ry(+90°) maps EE +X → grasp -Z, so
-    a top-down grasp has the gripper pointing DOWN. Both arms share the same
-    tool transform.
+    A grasp is the pose of GraspGenX's gripper frame G in the object frame. The EE frames are ``left_base_link`` /
+    ``right_base_link``, and ``load_sweep_volume()["base_from_G"]`` places G in that base frame, so the rigid inverse
+    of it is the tool transform. Both arms share it.
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    device = device_cfg.device
-    rotvec_y_pos90 = torch.tensor([[0.0, torch.pi / 2, 0.0]], device=device, dtype=torch.float32)
-    grasp_from_ee = roma.rotvec_to_rotmat(rotvec_y_pos90)[0]
-    tool_from_ee = torch.eye(4, device=device, dtype=torch.float32)
-    tool_from_ee[:3, :3] = grasp_from_ee
-    tool_from_ee[:3, 3] = torch.tensor([0.01, 0.0, 0.09], device=device, dtype=torch.float32)
-    return {LEFT_TOOL_FRAME: tool_from_ee, RIGHT_TOOL_FRAME: tool_from_ee.clone()}
+    base_from_G = torch.tensor(load_sweep_volume()["base_from_G"], device=device_cfg.device, dtype=torch.float32)
+    G_from_base = torch.eye(4, device=device_cfg.device, dtype=torch.float32)
+    G_from_base[:3, :3] = base_from_G[:3, :3].T
+    G_from_base[:3, 3] = -base_from_G[:3, :3].T @ base_from_G[:3, 3]
+    return {LEFT_TOOL_FRAME: G_from_base, RIGHT_TOOL_FRAME: G_from_base.clone()}
 
 
 SWEEP_VOLUME_PATH = Path(__file__).parent / "assets" / "t1_description" / "graspgenx" / "sweep_volume.json"
