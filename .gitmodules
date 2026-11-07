@@ -2,3 +2,7 @@
 	path = curobo
 	url = https://github.com/NVlabs/curobo.git
 	shallow = true
+[submodule "GraspGenX"]
+	path = GraspGenX
+	url = https://github.com/NVlabs/GraspGenX.git
+	shallow = true

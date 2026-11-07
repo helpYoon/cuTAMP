@@ -51,7 +51,8 @@ with the headers from its `cu12` extra's NVIDIA wheels), so its install builds
 nothing.
 
 ```bash
-git clone --recursive https://github.com/helpYoon/cuTAMP.git  # cuRobo v0.9.0 comes as curobo/
+# cuRobo v0.9.0 comes as curobo/ and GraspGenX as GraspGenX/; the variable skips GraspGenX's git-LFS files
+GIT_LFS_SKIP_SMUDGE=1 git clone --recursive https://github.com/helpYoon/cuTAMP.git
 cd cuTAMP
 uv sync  # --extra editor adds the sphere editor's open3d
 ```
@@ -60,9 +61,32 @@ Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
 `uv run pytest`) or after `source .venv/bin/activate`. Both put `.venv/bin`,
 which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
-A clone made without `--recursive` gets cuRobo with `git submodule update --init`.
-The submodule is shallow (`shallow = true` in `.gitmodules`): it fetches the
-pinned commit only, about 136 MB, not cuRobo's whole history.
+A clone made without `--recursive` gets both submodules with
+`GIT_LFS_SKIP_SMUDGE=1 git submodule update --init`. Both are shallow
+(`shallow = true` in `.gitmodules`): each fetches its pinned commit only, about
+136 MB for cuRobo, not its whole history.
+
+[GraspGenX](https://github.com/NVlabs/GraspGenX) (6-DoF grasps) is pinned at
+`b9429097`. On x86_64, `uv sync` installs it editable into the same env with its
+`serve` extra. On aarch64 it is left out, because its scene tools need
+`usd-core`. Its pins on torch, torchvision, numpy, trimesh and yourdfpy are
+overridden to cuTAMP's (`override-dependencies` in `pyproject.toml`). Its
+179 MB of LFS gripper meshes and sample data are not needed, because
+cuTAMP passes the hand as a sweep volume. Before anything imports `graspgenx`,
+point two variables at existing folders: `GRASPGENX_CHECKPOINT_DIR` at the
+model and `GRASPGENX_GRIPPER_CFG_DIR` at any folder, which may be empty.
+Otherwise its first import clones the newest heads of two Hugging Face repos,
+about 2 GB, into `GraspGenX/ext/`. The model is
+`adithyamurali/GraspGenXModel` at `7c834043` (1.69 GB):
+
+```bash
+M=~/graspgenx-model/7c834043; SHA=7c834043c11a11417e31d6d5ea9355801e40a2c1
+for f in release/gen/config.yaml release/gen/epoch_736.pth release/dis/config.yaml release/dis/epoch_1056.pth; do
+  curl -fL --create-dirs -o $M/$f https://huggingface.co/adithyamurali/GraspGenXModel/resolve/$SHA/$f
+done
+mkdir -p ~/graspgenx-model/no-gripper-descriptions
+export GRASPGENX_CHECKPOINT_DIR=$M GRASPGENX_GRIPPER_CFG_DIR=~/graspgenx-model/no-gripper-descriptions
+```
 
 cuRobo's own [install guide](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
 has the details.

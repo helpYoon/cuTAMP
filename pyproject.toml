@@ -25,10 +25,15 @@ classifiers = [
 
 # The pinned versions are the ones cuTAMP 7238816's plans were accepted on: bump them together and re-check plans.
 dependencies = [
+    # GraspGenX (the GraspGenX/ submodule) shares this env. Its serve extra is needed in-process: from_sweep_volume imports
+    # graspgenx.serving, which loads zmq and msgpack. x86_64 only: its scene-synthesizer[recommend] needs usd-core, and uv
+    # finds no usd-core wheel for aarch64 Linux on Python 3.10.
+    "graspgenx[serve]; platform_machine == 'x86_64'",
     "nvidia-curobo[cu12]",
     "rerun-sdk==0.27.3",
     "roma==1.5.4",
     "torch==2.9.1",
+    "torchvision==0.24.1; platform_machine == 'x86_64'",  # only GraspGenX needs it; listed so it comes from the cu128 index
     "tqdm",
     "trimesh==4.10.1",
     "warp-lang==1.16.0",
@@ -49,15 +54,34 @@ dev = [
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
 constraint-dependencies = ["cuda-bindings==12.9.6", "cuda-core==0.7.0", "cuda-pathfinder==1.5.4"]  # cuRobo's kernel compile and launch
+# GraspGenX caps torch < 2.7 only for its authors' older driver (its pyproject says the code runs on 2.7) and pins numpy,
+# trimesh and yourdfpy older than cuTAMP's; rerun-sdk needs numpy >= 2. Everything runs on cuTAMP's accepted versions.
+# An override replaces every requirement on that name, markers and extras included: torchvision keeps its x86_64 marker
+# and trimesh keeps the [easy] extras yourdfpy asks for.
+override-dependencies = [
+    "torch==2.9.1",
+    "torchvision==0.24.1; platform_machine == 'x86_64'",
+    "numpy==2.2.6",
+    "trimesh[easy]==4.10.1",
+    "yourdfpy==0.0.58",
+]
+extra-build-dependencies = { sharedarray = ["setuptools>=45,<78"] }  # GraspGenX's own build fix for this sdist
 
 [tool.uv.sources]
+graspgenx = { path = "GraspGenX", editable = true }
 nvidia-curobo = { path = "curobo", editable = true }
 torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[tool.pytest.ini_options]
+# A bare `pytest` must not collect the submodules' own tests: GraspGenX's import graspgenx, whose first import clones
+# about 2 GB of unpinned Hugging Face repos unless GRASPGENX_CHECKPOINT_DIR and GRASPGENX_GRIPPER_CFG_DIR are set.
+testpaths = ["cutamp/tests"]
 
 [tool.ruff]
 line-length = 120
