@@ -16,6 +16,7 @@ The head (2 DOF) and grippers (4+4 DOF) are construction-time lock_joints in
 
 import copy
 import hashlib
+import json
 import os
 import tempfile
 import xml.etree.ElementTree as ET
@@ -363,6 +364,15 @@ def get_t1_tool_from_ee(
     tool_from_ee[:3, :3] = grasp_from_ee
     tool_from_ee[:3, 3] = torch.tensor([0.01, 0.0, 0.09], device=device, dtype=torch.float32)
     return {LEFT_TOOL_FRAME: tool_from_ee, RIGHT_TOOL_FRAME: tool_from_ee.clone()}
+
+
+SWEEP_VOLUME_PATH = Path(__file__).parent / "assets" / "t1_description" / "graspgenx" / "sweep_volume.json"
+
+
+def load_sweep_volume() -> dict:
+    """The gripper's GraspGenX swept-volume numbers (``cutamp.scripts.graspgenx_sweep_volume`` writes the file)."""
+    with open(SWEEP_VOLUME_PATH) as f:
+        return json.load(f)
 
 
 def get_t1_gripper_spheres(
