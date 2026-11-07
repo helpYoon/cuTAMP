@@ -1,8 +1,8 @@
 """Write mujoco_fixture.npz: MuJoCo's FK, masses, inertias and soft limits on bfm_wm's T1 (design call 18).
 
-Neither of cuTAMP's Python environments has MuJoCo, so this runs once in bfm_wm's venv, and the tests compare the
-planner model with the fixture. It reads bfm_wm's ``mjcf/t1.xml`` (its sha1 must be PROVENANCE.yml's, and the
-fixture is stamped with it) and the pinned ``t1_actuators.npz``; it writes nothing into bfm_wm. Run it from cuTAMP:
+cuTAMP's .venv has no MuJoCo, so this runs once in bfm_wm's venv, and the tests compare the planner model with the
+fixture. It reads bfm_wm's ``mjcf/t1.xml`` (its sha1 must be PROVENANCE.yml's, and the fixture is stamped with it) and
+the pinned ``t1_actuators.npz``; it writes nothing into bfm_wm. Run it from cuTAMP:
 
     env -C <cuTAMP> PYTHONDONTWRITEBYTECODE=1 /home/yoonwoo/bfm_wm/.venv/bin/python \\
         cutamp/robots/assets/t1_29dof/write_mujoco_fixture.py [--bfm_wm DIR]

@@ -301,8 +301,8 @@ def _centring_step(ja, jac, jac_com, com_lin, active, half):
     """Level 3, below :func:`_prioritized_step`'s two: the CoM axes level 1 leaves free (``~active``) toward the
     support's centre from ``com_lin``, the CoM (about the centre) after levels 1-2's step, linear on every
     column, in the null space of level 1's rows ``ja`` ``[B, k, dof]`` and of the hand rows ``jac``
-    ``[B, 6, dof]`` (:func:`_null_space_step`), every Jacobian on level 3's columns. Each axis is over ``half``, as
-    in the old seed IK's pull-to-center term ``sum((com / half)^2)``.
+    ``[B, 6, dof]`` (:func:`_null_space_step`), every Jacobian on level 3's columns. Each axis is over ``half``: the
+    step lowers ``sum((com / half)^2)``, the CoM's squared distance from the centre in half-widths.
 
     Without the level, GN's minimum-norm steps leave the CoM wherever level 1 stops it, at the rectangle's edge:
     GN IK's blocks_t1 first picks sat at a median 0.95 (x) and 0.96 (|y|) of ``half``, with the base slid

@@ -3,7 +3,9 @@
 cuTAMP plans on one model, the real-legs T1: bfm_wm's T1 on its home stance.
 The simplified 21-DOF model and the paper's ablation reproduce from branch
 `ablation-baseline` (cuTAMP f29516b with fork f4e4ff2), and the G1-era code
-from tag `paper-g1-comfix`.
+from tag `paper-g1-comfix`. Both need the cuRobo fork helpYoon/curobo (with
+`SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0`), installed from a checkout of its own:
+`curobo/` here is the v0.9.0 submodule.
 
 > **cuRobo dependency:** cuTAMP runs on unmodified NVlabs cuRobo v0.9.0 (tag
 > `v0.9.0`, commit 42498cf), pinned as the git submodule `curobo/`, with
@@ -11,14 +13,13 @@ from tag `paper-g1-comfix`.
 > Everything cuTAMP changes in cuRobo lives in
 > [`cutamp/_curobo_internals.py`](cutamp/_curobo_internals.py), applied on
 > `import cutamp`, which first checks the source of each cuRobo function it
-> patches or relies on and refuses to run on any cuRobo but v0.9.0, the old
-> fork included:
+> patches or relies on and refuses to run on any cuRobo but v0.9.0:
 > - a URDF link with no inertial weighs 0, not cuRobo's 0.01 kg (the T1 has
 >   11: `world` and the 10 gripper links);
-> - one warp stream wrapper per CUDA stream, kept from the fork: warp 1.16.0
->   registers every new wrapper in a native stream map with no lock, so the
->   background motion-planner build thread, launching beside the main thread,
->   would corrupt the heap (`malloc(): unaligned tcache chunk detected`);
+> - one warp stream wrapper per CUDA stream: warp 1.16.0 registers every new
+>   wrapper in a native stream map with no lock, so the background
+>   motion-planner build thread, launching beside the main thread, would
+>   corrupt the heap (`malloc(): unaligned tcache chunk detected`);
 > - trajopt's transitions compute the CoM and run RNEA a second time with the
 >   floor's push on the soles (`set_external_wrench_fn`, installed by
 >   `floor_wrench.install_floor_wrench`);
@@ -29,13 +30,11 @@ from tag `paper-g1-comfix`.
 > the planner reads joint limits back from cuRobo. Its timeopt (on by default)
 > retimes each plan to torque limits on its own RNEA, without the floor's push,
 > so `get_t1_motion_planner` turns it off and the balance gate paces each
-> segment; trajopt's first solve keeps v0.8's 100 L-BFGS iterations (v0.9.0's
-> default is 50). Its FK backward sums sphere gradients with float atomics,
-> which can differ in the last bits between calls; same-seed plans still came
-> out bit-identical.
-> Branch `ablation-baseline` and tag `paper-g1-comfix` need the old fork
-> (helpYoon/curobo, with `SETUPTOOLS_SCM_PRETEND_VERSION=0.8.0`), installed
-> from a checkout of its own: `curobo/` here is the v0.9.0 submodule.
+> segment. Trajopt's first solve runs 100 L-BFGS iterations, not v0.9.0's 50:
+> on the five blocks_t1 cases v0.9.0 planned worst, 50 planned 4 and 100 all 5
+> (`TRAJOPT_INITIAL_ITERS`). cuRobo's FK backward sums sphere gradients with
+> float atomics, which can differ in the last bits between calls; same-seed
+> plans still came out bit-identical.
 
 ## Installation
 
@@ -243,8 +242,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   - `T1RerunRobot` for visualization: sets the URDF's joints by name from a
     conf in the model's cspace (the six base joints give the Trunk's world
     pose, `trunk_pose_from_q`, logged as the root transform), the fingers from
-    `set_grippers` and the head at its locked values. Playback reprojects the
-    planner's trajectories to the model's full cspace first.
+    `set_grippers` and the head at its locked values. Playback reorders the
+    planner's trajectories to the model's cspace first, dropping the head and
+    finger joints they also carry (`motion_solver._full_positions`).
 
 ### 📁 [`cutamp/`](cutamp/) — core
 
@@ -433,7 +433,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   retimed (else `None`).
 
 - Other [`utils/`](cutamp/utils/): `collision.py` (`WorldCollisionCost`,
-  sphere-vs-scene distance), `common.py` (pose / transform helpers,
+  the sphere-vs-scene collision cost), `common.py` (pose / transform helpers,
   `get_world_cfg`), `shapes.py` (`sample_greedy_surface_spheres`),
   `rerun_utils.py`, and `timer.py` (`TorchTimer`, GPU-synchronized timing).
 
@@ -538,9 +538,8 @@ optimization and the plan. On a machine without a display, either pass
 `--disable_visualizer` or stream to a viewer on your local machine through a
 reverse SSH tunnel:
 
-1. Locally, `pip install rerun-sdk` (ideally the version `pip show rerun-sdk`
-   reports on the server) and run `rerun`; note the TCP port at the viewer's
-   top right (usually `9876`).
+1. Locally, `pip install rerun-sdk==0.27.3` (`pyproject.toml`'s pin) and run
+   `rerun`; note the TCP port at the viewer's top right (usually `9876`).
 2. Connect with `ssh -R 9876:127.0.0.1:9876 username@server`.
 3. Run cuTAMP on the server as usual; it streams to the local viewer.
 
@@ -552,11 +551,6 @@ skips the robot's meshes; both cut bandwidth.
 
 - **`torch.OutOfMemoryError: CUDA out of memory`** — use fewer particles
   (default 256), e.g. `-n 64`.
-- **`rerun-sdk` fails to install** — older Linux distros may lack a PyPI
-  wheel; install it from `conda-forge`
-  ([instructions](https://rerun.io/docs/getting-started/installing-viewer#python)).
-- **`ImportError ... GLIBCXX ... not found`** — try
-  `conda install -c conda-forge libstdcxx-ng -y`.
 
 ## Key Design Decisions
 
@@ -586,8 +580,8 @@ skips the robot's meshes; both cut bandwidth.
    one-off workarounds beside their callers (`_attach_object` /
    `_detach_object`) and plain `curobo._src` imports
    (the cost base classes and `SelfCollisionCost`, `utils/collision.py`'s
-   scene collision, `floor_wrench.py`'s `Dynamics` and quaternion helper,
-   `config_io`). cuRobo itself is unmodified: the patches check its source
+   scene collision, `floor_wrench.py`'s `Dynamics` and quaternion helper).
+   cuRobo itself is unmodified: the patches check its source
    on import, so an upgrade fails loudly until they are re-audited.
 
 ## Acknowledgements and citation

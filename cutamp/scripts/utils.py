@@ -46,7 +46,8 @@ default_constraint_to_mult = {
 
 default_constraint_to_tol = {
     Collision.type: {"default": 1e-3},
-    # Based on cuRobo thresholds: https://github.com/NVlabs/curobo/blob/2fbffc35225398cf9d5f382804faa9de2608753b/src/curobo/wrap/reacher/ik_solver.py#L127-L128
+    # cuRobo v0.9.0's defaults (MotionPlannerCfg.create's position_tolerance and orientation_tolerance):
+    # https://github.com/NVlabs/curobo/blob/v0.9.0/curobo/_src/motion/motion_planner_cfg.py#L137-L138
     # Can lower position for high precision, but should be fine for now.
     # sole_*: the soles against the stance (design 7.4), on the hand's tolerances; the balance gate holds
     # every trajectory frame to the same two.

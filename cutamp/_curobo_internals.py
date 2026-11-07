@@ -13,8 +13,7 @@ surface to do it.
 Every helper and patch here fixes a cuRobo bug or works around a missing API. They are gathered in one module so a
 cuRobo upgrade has one place to audit for them. ``install_curobo_patches`` (run on ``import cutamp``) first checks that
 the cuRobo functions the patches wrap, and those whose behavior cuTAMP relies on (``_PINNED_SOURCES``), still have the
-v0.9.0 source they were written against, so an upgrade, or the old fork, fails loudly instead of running with
-half-applied fixes.
+v0.9.0 source they were written against, so an upgrade fails loudly instead of running with half-applied fixes.
 
 Other modules import, unchanged, a few private names that v0.9.0 exports nowhere public: ``BaseCost`` and
 ``BaseCostCfg`` (com_polygon_cost), ``SelfCollisionCost`` and ``SelfCollisionCostCfg`` (cost_function), ``Dynamics``,

@@ -14,7 +14,7 @@ from typing import Callable, List, Union, Optional, Tuple
 
 import numpy as np
 import torch
-from curobo.types import DeviceCfg as TensorDeviceType
+from curobo.types import DeviceCfg
 
 from cutamp.com_polygon_cost import particle_com_margin
 from cutamp.config import TAMPConfiguration, validate_tamp_config
@@ -266,21 +266,21 @@ def setup_cutamp(
     exp_logger.save_env(env)
 
     # Loading robot can be done offline, so doesn't count towards timing
-    tensor_args = TensorDeviceType()
+    device_cfg = DeviceCfg()
     model = REAL_LEGS
-    robot_container = load_t1_container(model, device_cfg=tensor_args)
+    robot_container = load_t1_container(model, device_cfg=device_cfg)
 
     # Single-MotionPlanner: q_init is a single full-DOF vector of the model's cspace.
     if q_init is None:
         q_init = model.home
-    q_init = tensor_args.to_device(q_init)
+    q_init = device_cfg.to_device(q_init)
 
     # Load TAMP world
     timer = TorchTimer()
     with timer.time("load_tamp_world", log_callback=_log.info):
         world = TAMPWorld(
             env=env,
-            device_cfg=tensor_args,
+            device_cfg=device_cfg,
             robot=robot_container,
             q_init=q_init,
         )
