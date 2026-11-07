@@ -4,8 +4,7 @@ Interactive YAML Collision Sphere Editor for Robot URDFs.
 This tool allows you to:
 1. Load existing collision spheres from cuRobo YAML configuration
 2. Manually add/edit/delete collision spheres for specific links
-3. Optionally auto-fit spheres from link collision geometry (F key)
-4. Export back to YAML for cuRobo motion planning
+3. Export back to YAML for cuRobo motion planning
 
 Usage (the defaults edit the real legs' upper-body spheres against t1_planner.urdf):
     python -m cutamp.scripts.robot_sphere_editor --links Trunk AL3
@@ -25,7 +24,6 @@ Key Controls:
     +/-         - Adjust radius
     A           - Add sphere at link origin (manual placement)
     D           - Delete selected sphere
-    F           - Auto-fit spheres from link collision geometry
     S           - Save to YAML
     R           - Reset view
     Q           - Quit
@@ -35,67 +33,15 @@ import argparse
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import yaml
 import open3d as o3d
-import trimesh
 from yourdfpy import URDF
-
-# cuRobo imports for mesh sphere fitting
-from curobo.sphere_fit import SphereFitType, fit_spheres_to_mesh
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
-
-
-def fit_spheres_to_mesh_file(
-    mesh_path: Path,
-    origin: np.ndarray,
-    n_spheres: int = 10,
-    surface_sphere_radius: float = 0.01,
-) -> np.ndarray:
-    """Fit spheres to a mesh file using cuRobo's sphere fitting."""
-    if not mesh_path.exists():
-        _log.warning(f"Mesh file not found: {mesh_path}")
-        return np.zeros((0, 4), dtype=np.float32)
-
-    try:
-        mesh = trimesh.load(mesh_path, force='mesh')
-        if isinstance(mesh, trimesh.Scene):
-            mesh = mesh.dump(concatenate=True)
-
-        pts, radii = fit_spheres_to_mesh(
-            mesh,
-            n_spheres=n_spheres,
-            surface_sphere_radius=surface_sphere_radius,
-            fit_type=SphereFitType.VOXEL,
-            voxelize_method="subdivide",
-        )
-
-        if pts is None or len(pts) == 0:
-            _log.warning(f"No spheres fit for mesh: {mesh_path}")
-            return np.zeros((0, 4), dtype=np.float32)
-
-        pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
-        pts_transformed = (origin @ pts_hom.T).T[:, :3]
-
-        radii = np.array(radii).reshape(-1, 1)
-        spheres = np.hstack([pts_transformed, radii])
-
-        return spheres.astype(np.float32)
-
-    except Exception as e:
-        _log.error(f"Error fitting spheres to mesh {mesh_path}: {e}")
-        return np.zeros((0, 4), dtype=np.float32)
-
-
-def get_collision_origin(collision) -> np.ndarray:
-    """Get 4x4 transform from collision origin, defaulting to identity."""
-    if collision.origin is not None:
-        return collision.origin
-    return np.eye(4)
 
 
 @dataclass
@@ -433,32 +379,6 @@ class SphereEditor:
             print(f"\rLink: {link} ({self.state.current_link_idx + 1}/{len(self.state.link_names)}) | "
                   f"No spheres (press A to add)   ", end="", flush=True)
 
-    def _on_key_f(self, vis):
-        """Re-fit spheres for current link."""
-        link = self._get_current_link()
-        if link is None:
-            return False
-
-        urdf_link = self.urdf.link_map.get(link)
-        if urdf_link is None:
-            print(f"\nLink {link} not found in URDF")
-            return False
-
-        print(f"\nRe-fitting spheres for {link}...")
-        new_spheres = fit_spheres_to_link(urdf_link, self.urdf_dir, n_spheres=5)
-
-        if len(new_spheres) > 0:
-            self.state.link_spheres[link] = new_spheres
-            self.state.current_sphere_idx = 0
-            self.state.modified = True
-            self._rebuild_sphere_meshes()
-            self._update_info()
-            print(f"Fitted {len(new_spheres)} spheres")
-        else:
-            print("No spheres generated - link may not have collision geometry")
-
-        return False
-
     def _on_key_s(self, vis):
         """Save to YAML file."""
         print("\n\nSaving to YAML...")
@@ -482,7 +402,6 @@ class SphereEditor:
         print("  +/-          - Adjust radius")
         print("  A            - Add sphere")
         print("  D            - Delete sphere")
-        print("  F            - Re-fit current link")
         print("  S            - Save to YAML")
         print("  R            - Reset view")
         print("  Q            - Quit")
@@ -511,7 +430,6 @@ class SphereEditor:
         self.vis.register_key_callback(ord('-'), self._on_key_minus)
         self.vis.register_key_callback(ord('A'), self._on_key_a)
         self.vis.register_key_callback(ord('D'), self._on_key_d)
-        self.vis.register_key_callback(ord('F'), self._on_key_f)
         self.vis.register_key_callback(ord('S'), self._on_key_s)
         self.vis.register_key_callback(ord('Q'), self._on_key_q)
         self.vis.register_key_callback(ord('R'), self._on_key_r)
@@ -537,96 +455,6 @@ class SphereEditor:
         # Run
         self.vis.run()
         self.vis.destroy_window()
-
-
-# =============================================================================
-# Analytical sphere fitting for URDF links (primitives + meshes)
-# =============================================================================
-
-
-def fit_spheres_to_box(
-    size: Tuple[float, float, float],
-    origin: np.ndarray,
-    n_spheres: int = 8,
-) -> np.ndarray:
-    """Fit spheres to a box primitive."""
-    sx, sy, sz = size
-    half = np.array([sx / 2, sy / 2, sz / 2])
-    radius = min(size) / 4
-
-    corners = []
-    for dx in [-1, 1]:
-        for dy in [-1, 1]:
-            for dz in [-1, 1]:
-                corners.append([dx * half[0], dy * half[1], dz * half[2]])
-    corners = np.array(corners)
-
-    faces = np.array([
-        [half[0], 0, 0], [-half[0], 0, 0],
-        [0, half[1], 0], [0, -half[1], 0],
-        [0, 0, half[2]], [0, 0, -half[2]],
-    ])
-
-    all_pts = np.vstack([corners, faces])
-    n_pts = min(n_spheres, len(all_pts))
-    pts = all_pts[:n_pts]
-
-    pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
-    pts_transformed = (origin @ pts_hom.T).T[:, :3]
-
-    radii = np.full((len(pts_transformed), 1), radius)
-    return np.hstack([pts_transformed, radii]).astype(np.float32)
-
-
-def fit_spheres_to_cylinder(
-    radius: float,
-    length: float,
-    origin: np.ndarray,
-    n_spheres: int = 5,
-) -> np.ndarray:
-    """Fit spheres to a cylinder primitive."""
-    half_len = length / 2
-    if n_spheres == 1:
-        z_positions = [0.0]
-    else:
-        z_positions = np.linspace(-half_len + radius, half_len - radius, n_spheres)
-    pts = np.array([[0, 0, z] for z in z_positions])
-    pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
-    pts_transformed = (origin @ pts_hom.T).T[:, :3]
-    radii = np.full((len(pts_transformed), 1), radius)
-    return np.hstack([pts_transformed, radii]).astype(np.float32)
-
-
-def fit_spheres_to_link(
-    link,
-    urdf_dir: Path,
-    n_spheres: int = 10,
-) -> np.ndarray:
-    """Fit spheres to a URDF link based on its collision geometry type."""
-    if not link.collisions:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    collision = link.collisions[0]
-    geom = collision.geometry
-    origin = get_collision_origin(collision)
-
-    if geom.box is not None:
-        _log.info(f"  {link.name}: box {geom.box.size}")
-        return fit_spheres_to_box(geom.box.size, origin, n_spheres)
-    elif geom.cylinder is not None:
-        _log.info(f"  {link.name}: cylinder r={geom.cylinder.radius}, L={geom.cylinder.length}")
-        return fit_spheres_to_cylinder(geom.cylinder.radius, geom.cylinder.length, origin, n_spheres)
-    elif geom.sphere is not None:
-        _log.info(f"  {link.name}: sphere r={geom.sphere.radius}")
-        center = origin[:3, 3]
-        return np.array([[center[0], center[1], center[2], geom.sphere.radius]], dtype=np.float32)
-    elif geom.mesh is not None:
-        mesh_path = urdf_dir / geom.mesh.filename
-        _log.info(f"  {link.name}: mesh {mesh_path.name}")
-        return fit_spheres_to_mesh_file(mesh_path, origin, n_spheres)
-    else:
-        _log.warning(f"  {link.name}: unknown geometry type")
-        return np.zeros((0, 4), dtype=np.float32)
 
 
 # =============================================================================
@@ -806,7 +634,7 @@ def main():
         for link_name in links_empty:
             print(f"  {link_name}: 0 spheres")
 
-    print("\nPress 'A' to add spheres, 'F' to auto-fit from geometry")
+    print("\nPress 'A' to add spheres")
 
     # Run editor (all valid links are now editable)
     editor = SphereEditor(
