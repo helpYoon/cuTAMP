@@ -1,6 +1,6 @@
 """COM-anchored pick/place terminals (plan_cspace to the conf), and blocks_t1 end to end on the real legs through
-cutamp_demo: its retract values, planted soles, torques and speeds, saved raw plan, and balance metrics against its
-exported frames."""
+cutamp_demo: its retract values, segments and their phase tags, planted soles, torques and speeds, straight lines,
+saved raw plan, and balance metrics against its exported frames."""
 import os
 import pickle
 from types import SimpleNamespace
@@ -88,7 +88,9 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     # raw): setup_cutamp builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the
     # spies only record. The metrics the gate records hold for the exported segments, and the CoM and the multibody
     # ZMP re-measured on those frames stay inside the gate's rectangle (support.gate_half). On the real legs the
-    # gate sets each segment's pace, never faster than the planner's.
+    # gate sets each segment's pace, never faster than the planner's. Each pick and place plans an approach, a straight
+    # insert and a leave, and each retract one segment: 16 in skeleton order, each tagged with its op, phase and
+    # gripper event, and every straight segment saved still on its line.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
     from curobo.types import JointState
@@ -134,6 +136,13 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     assert metrics["found_solution"] and metrics["motion_plan_success"], metrics.get("motion_plan_failures")
     assert metrics["traj_com_min_margin"] >= 0 and metrics["traj_zmp_min_margin"] >= 0
     assert seen["retract"] and all(not bool(v.any()) for d in seen["retract"] for v in d.values())
+    # Each op's segments in skeleton order (blocks_t1 picks both blocks before placing either): a pick's approach,
+    # insert (the hand closes at its end) and lift, a place's approach, insert (it opens) and back-out, a retract's one.
+    kinds = {"Pick": [("approach", None), ("insert", "close"), ("lift", None)],
+             "Place": [("approach", None), ("insert", "open"), ("back_out", None)], "Retract": [("retract", None)]}
+    want = [(idx, *tags) for idx, op in enumerate(metrics["final_plan_skeleton"])  # (op_idx, phase, gripper)
+            for kind, phases in kinds.items() if kind in op.split("(")[0] for tags in phases]
+    assert len(want) == 16 and [(e["op_idx"], e["phase"], e["gripper"]) for e in curobo_plan] == want
     world = seen["world"]
     torques = world.segment_torques
     for k, entry in enumerate(curobo_plan):
@@ -144,8 +153,9 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         speed = (ms._model_frames(world, entry["plan"]).velocity.abs() / torques.velocity)[:, _actuated(world)]
         assert float(speed.max()) <= 1.0, (k, float(speed.max()))  # the pace the gate set keeps every speed limit
 
-    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned, in the model's 33 joints, and
-    # each segment starting where the one before it ends.
+    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned with its entry's tags, in the
+    # model's 33 joints, each segment starting where the one before it ends, and each insert, lift and back-out still on
+    # its line from its first frame to its conf (the gate keeps the last frame).
     with open(tmp_path / "audit" / "motion_plan.pkl", "rb") as f:
         raw = pickle.load(f)
     names = list(REAL_LEGS.joint_names)
@@ -164,6 +174,9 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
             for key in ("position", "velocity", "acceleration"):
                 assert timing[key].dtype == np.float32 and timing[key].shape == (n, 33), (k, key)
         np.testing.assert_array_equal(seg["position"], ms._full_positions(world, entry["plan"]).cpu().numpy())
+        if seg["phase"] in ("insert", "lift", "back_out"):
+            palm = ms._palm(world, torch.as_tensor(seg["position"], device=world.device), seg["arm"])
+            ms.check_line(palm, palm[0], palm[-1])
         if k:
             np.testing.assert_allclose(seg["position"][0], segments[k - 1]["position"][-1], rtol=0, atol=1e-5,
                                        err_msg=f"segment {k} starts away from segment {k - 1}'s end")

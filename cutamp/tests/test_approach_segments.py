@@ -1,16 +1,14 @@
 """Each pick and place as an approach, a straight insert and a leave along the grasp's axis (design 7.8): the pre and
 post hand targets, the FK line check, the active hand's criteria row, the held block's gap to the floor the lift starts
-from, the retry on a line miss, and blocks_t1 end to end with its phase tags."""
+from, and the retry on a line miss. blocks_t1's segments end to end are test_motion_anchor's plan audit."""
 
 import math
-import os
 
 import pytest
 import torch
 
 from cutamp.tests.conftest import needs_cuda
 
-needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
 def _hand(x_axis, y_axis, position) -> torch.Tensor:
     """``[4, 4]``: a hand pose whose +x (the approach) is ``x_axis`` and +y is ``y_axis``, at ``position``."""
@@ -26,62 +24,6 @@ def _moved(pose: torch.Tensor, offset) -> torch.Tensor:
     out = pose.clone()
     out[:3, 3] += torch.tensor(offset, dtype=torch.float32)
     return out
-
-
-# The slow test runs first, before this module's fixtures build their world: two blocks_t1 worlds in one process OOM
-# a 24 GiB card, and cutamp_demo builds its own.
-@needs_cuda
-@needs_slow
-def test_blocks_t1_segments(tmp_path, monkeypatch):
-    # blocks_t1, seed 0, the surface at 0.5 m, 64 particles: each pick and place plans three segments and each retract
-    # one, 16 in all, in skeleton order (blocks_t1 picks both blocks before placing either); the hand closes at the end
-    # of each pick's insert and opens at the end of each place's; every straight segment saved still follows its line;
-    # and the saved raw plan carries the tags.
-    import pickle
-
-    import cutamp.algorithm as alg
-    import cutamp.motion_solver as ms
-    import cutamp.scripts.run_cutamp as rc
-    from cutamp.config import TAMPConfiguration
-    from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
-
-    seen = {}
-    run, solve = rc.run_cutamp, alg.solve_curobo
-
-    def run_spy(*args, **kwargs):
-        seen["run"] = run(*args, **kwargs)
-        return seen["run"]
-
-    def solve_spy(plan_info, particle, world, *args, **kwargs):
-        seen["world"] = world
-        return solve(plan_info, particle, world, *args, **kwargs)
-
-    monkeypatch.setattr(rc, "run_cutamp", run_spy)
-    monkeypatch.setattr(alg, "solve_curobo", solve_spy)
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
-    raise_surface_height(env, 0.5)
-    torch.manual_seed(0)  # run_cutamp's --seed 0
-    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
-                               experiment_root=str(tmp_path))
-    rc.cutamp_demo(env, config, experiment_id="segments", save_plan="auto")
-
-    curobo_plan, _, metrics = seen["run"]
-    assert metrics["motion_plan_success"], metrics.get("motion_plan_failures")
-    ops = {"Pick": [("approach", None), ("insert", "close"), ("lift", None)],
-           "Place": [("approach", None), ("insert", "open"), ("back_out", None)], "Retract": [("retract", None)]}
-    want = [(idx, *tags) for idx, op in enumerate(metrics["final_plan_skeleton"])
-            for kind, phases in ops.items() if kind in op.split("(")[0] for tags in phases]  # (op_idx, phase, gripper)
-    assert len(want) == 16 and [(e["op_idx"], e["phase"], e["gripper"]) for e in curobo_plan] == want
-
-    with open(tmp_path / "segments" / "motion_plan.pkl", "rb") as f:
-        raw = pickle.load(f)
-    assert raw["schema_version"] == "stage4-raw"
-    assert [(s["op_idx"], s["phase"], s["gripper"]) for s in raw["segments"]] == want
-    world = seen["world"]
-    for seg in raw["segments"]:
-        if seg["phase"] in ("insert", "lift", "back_out"):
-            palm = ms._palm(world, torch.as_tensor(seg["position"], device=world.device), seg["arm"])
-            ms.check_line(palm, palm[0], palm[-1])  # the last frame is the segment's conf (the gate keeps it)
 
 
 def test_approach_targets():

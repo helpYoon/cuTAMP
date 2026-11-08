@@ -23,9 +23,10 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
         return {"left_q0": torch.zeros(2), "grasp1": torch.zeros(7), "pose1": torch.zeros(4),
                 "left_q1": torch.tensor([q1, 0.0]), "left_q3": torch.tensor([q3, 0.0])}
 
-    planned = []
+    planned, tol = [], object()  # tol: the run's IK tolerances, which the retry passes through
 
-    def fake_solve_curobo(plan_info, particle, *a, **k):
+    def fake_solve_curobo(plan_info, particle, *a, ik_tol, **k):
+        assert ik_tol is tol
         q1, q3 = float(particle["left_q1"][0]), float(particle["left_q3"][0])
         planned.append((q1, q3))
         if q1 == 0 or q3 == 0:  # pick fails on q1 == 0, else place fails on q3 == 0
@@ -37,7 +38,7 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
     monkeypatch.setattr(alg, "solve_curobo", fake_solve_curobo)
     candidates = [cand(0, 0), cand(0, 1), cand(1, 0), cand(1, 0), cand(1, 1)]
     plan, _, attempts, rank, failures = alg._motion_plan_with_retries(
-        {"plan_skeleton": skeleton}, candidates, None, None, None, None,
+        {"plan_skeleton": skeleton}, candidates, None, None, None, None, ik_tol=tol,
     )
     # (0, 1) repeats (0, 0) through the failing pick; the second (1, 0) repeats
     # the first through the failing place; (1, 1) differs at the place, so it runs.

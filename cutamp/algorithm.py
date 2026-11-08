@@ -25,7 +25,7 @@ from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
-from cutamp.particle_initialization import ParticleInitializer
+from cutamp.particle_initialization import IKTol, ParticleInitializer
 from cutamp.robots import REAL_LEGS, load_t1_container
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
@@ -187,7 +187,8 @@ def _motion_plan_with_retries(
     timer: TorchTimer,
     visualizer,
     get_planner=None,
-    ik_tol=None,
+    *,
+    ik_tol: IKTol,
 ) -> Tuple[Optional[dict], Optional[dict], int, Optional[int], List[str]]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success. ``get_planner`` and
     ``ik_tol`` (the run's IK tolerances, ``ParticleInitializer.ik_tol``) go to ``solve_curobo``.
