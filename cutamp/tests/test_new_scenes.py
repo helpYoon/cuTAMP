@@ -48,33 +48,27 @@ def test_scenes_load(name):
             assert (lo <= box[0] + 1e-9).all() and (box[1] <= hi + 1e-9).all(), obj.name
 
 
-_THIN_WALL = ("cuRobo's VOXEL fit keeps spheres inscribed in the mesh, and the cup's 4 mm wall holds none above 2 mm: at "
-              "6 slots it falls back to 4 surface spheres of 2 mm, and no count from 6 to 128 passes (2026-11-08)")
-
-
 @needs_cuda
-@pytest.mark.parametrize("name, obj_name", [
-    ("shelf_t1", "box"),
-    ("cylinder_t1", "cylinder"),
-    pytest.param("cup_t1", "cup", marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=_THIN_WALL)),
-])
+@pytest.mark.parametrize("name, obj_name", [("shelf_t1", "box"), ("cylinder_t1", "cylinder"), ("cup_t1", "cup")])
 def test_held_fit(name, obj_name):
-    """The spheres ``motion_solver._attach_object`` fits to the held object at its pick: cuRobo's VOXEL fit of its
-    trimesh posed at its start (``AttachmentManager``'s), with the 2 mm surface radius of ``attach_from_scene``'s
-    default and as many spheres as the attach link has slots (build_planner_model.py's ``HELD_OBJECT_SPHERES``, in
-    t1_29dof.yml). None may be a 2 mm surface fallback, and they reach within 2 cm of the object's bottom and top."""
+    """The spheres ``motion_solver._attach_object`` fits to the held object at its pick: cuRobo's VOXEL fit of the
+    posed trimesh of ``held_fit_obstacle`` (the cup's convex hull) at the object's start (``AttachmentManager``'s),
+    with the 2 mm surface radius of ``attach``'s default and as many spheres as the attach link has slots
+    (build_planner_model.py's ``HELD_OBJECT_SPHERES``, in t1_29dof.yml). None may be a 2 mm surface fallback, and they
+    reach within 2 cm of the bottom and top of the object's own posed mesh, so a hull in the wrong frame fails."""
     from curobo.sphere_fit import SphereFitType, fit_spheres_to_mesh
 
+    from cutamp.motion_solver import held_fit_obstacle
     from cutamp.robots.t1 import REAL_LEGS
 
     slots = yaml.safe_load(REAL_LEGS.cfg_path.read_text())["robot_cfg"]["kinematics"]["extra_collision_spheres"]
     assert slots["attached_object_left"] == slots["attached_object_right"]
     obj = next(o for o in _scene(name).movables if o.name == obj_name)
-    mesh = obj.get_trimesh_mesh(transform_with_pose=True)
-    fit = fit_spheres_to_mesh(mesh, num_spheres=slots["attached_object_left"], surface_radius=0.002,
+    fit = fit_spheres_to_mesh(held_fit_obstacle(obj).get_trimesh_mesh(transform_with_pose=True),
+                              num_spheres=slots["attached_object_left"], surface_radius=0.002,
                               fit_type=SphereFitType.VOXEL)
     z, r = fit.centers[:, 2].cpu().numpy(), fit.radii.cpu().numpy()
     assert len(r) and (r > 0.002 + 1e-6).all(), f"radii {np.round(r * 1000, 2)} mm"  # a fallback's is 2 mm
-    bottom, top = mesh.bounds[:, 2]
+    bottom, top = obj.get_trimesh_mesh(transform_with_pose=True).bounds[:, 2]
     assert (z - r).min() - bottom <= 0.02 and top - (z + r).max() <= 0.02, \
         f"{(z - r).min() - bottom:.4f} m from the bottom, {top - (z + r).max():.4f} m from the top"

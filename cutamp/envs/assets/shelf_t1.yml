@@ -1,6 +1,7 @@
 # T1 shelf environment (design 7.7): a box on the lower of two boards, to be placed on a pad on the same board.
-# The upper board's underside (0.93 m) is 5.4 cm above the box's top (0.876 m), too little room for the hand: the
-# pick needs a side or angled grasp.
+# The upper board's underside (0.98 m) is 10.4 cm above the box's top (0.876 m), still too little room for a top-down
+# hand, whose highest sphere reaches at least 1.034 m: the pick needs a side or angled grasp. It is 5 cm above the
+# plan's (top 0.95 m), where an angled place's 5 cm drop-in (grasps.LIFT_HEIGHT) put the box 11-20 mm into it.
 # Run at height 0 (no --surface_height): raise_surface_height would lift the box and the pad, not the boards.
 
 name: shelf_t1
@@ -19,7 +20,7 @@ geometries:
       dims: [4.0, 4.0, 0.1]
       pose: [0, 0, -0.05, 1, 0, 0, 0]
 
-    # The boards: 2 cm thick, 0.3 m deep (x) and 0.6 m wide (y), their front edge at x = 0.38.
+    # The boards: 2 cm thick, 0.3 m deep (x) and 0.6 m wide (y), their front edge at x = 0.38; tops at 0.75 and 1.00.
     lower_board:
       color: [141, 110, 99]
       dims: [0.3, 0.6, 0.02]
@@ -27,7 +28,7 @@ geometries:
     upper_board:
       color: [141, 110, 99]
       dims: [0.3, 0.6, 0.02]
-      pose: [0.53, 0.0, 0.94, 1.0, 0.0, 0.0, 0.0]
+      pose: [0.53, 0.0, 0.99, 1.0, 0.0, 0.0, 0.0]
 
     # Goal pad on the lower board, 1 cm thick (top at 0.76), its front edge on the board's.
     goal:

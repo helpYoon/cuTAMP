@@ -38,6 +38,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import torch
 
 from curobo.motion_planner import MotionPlanner
+from curobo.scene import Mesh, Obstacle
 from curobo.sphere_fit import SphereFitType
 from curobo.types import JointState, Pose
 
@@ -284,6 +285,16 @@ def _last_timestep_js(plan: JointState, planner) -> JointState:
     return js.reorder(list(planner.kinematics.joint_names))
 
 
+def held_fit_obstacle(obstacle: Obstacle) -> Obstacle:
+    """The obstacle whose posed trimesh ``_attach_object`` fits a held object's spheres to: a Mesh's convex hull, as a
+    Mesh with the world-frame vertices of its posed trimesh and the identity pose, so the fit's centres stay in the
+    world frame; any other obstacle as it is (``attach_from_scene``'s)."""
+    if not isinstance(obstacle, Mesh):
+        return obstacle
+    hull = obstacle.get_trimesh_mesh(transform_with_pose=True).convex_hull
+    return Mesh(name=obstacle.name, vertices=hull.vertices, faces=hull.faces, pose=[0, 0, 0, 1, 0, 0, 0])
+
+
 def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     """Attach a scene obstacle to ``arm``'s attach link via cuRobo's attach.
 
@@ -305,18 +316,31 @@ def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     to over-extending into the wrist links than ``MORPHIT``'s optimization
     output. It fits as many spheres as the link has slots: build_planner_model.py's
     ``HELD_OBJECT_SPHERES``, 6, enough coverage for a 5 cm cube.
+
+    A held Mesh is fit on its convex hull (``held_fit_obstacle``), through ``attach`` as ``attach_from_scene`` does
+    with the obstacle swapped. VOXEL's spheres are inscribed in the mesh, and a thin wall holds none of use: cup_t1's
+    4 mm wall holds none over 2 mm, so its fit fell back to 2 mm surface spheres. cuRobo takes the hull itself only
+    when the mesh fills under 0.1 of its bbox (the cup: 0.257). A hull is the conservative shape for a held object.
     """
     am = planner.attachment_manager
     link_name = _ATTACH_LINK_FOR_ARM[arm]
     kp = am.kinematics_params
     idx = kp.get_sphere_index_from_link_name(link_name)
-    am.attach_from_scene(
-        joint_states=last_js,
-        obstacle_names=[obj_name],
-        link_name=link_name,
-        num_spheres=len(idx),
-        sphere_fit_type=SphereFitType.VOXEL,
-    )
+    scene = planner.scene_collision_checker.scene_model  # attach_from_scene's lookup
+    obstacle = (scene[0] if isinstance(scene, list) else scene).get_obstacle(obj_name)
+    if isinstance(obstacle, Mesh):
+        am.attach(last_js, [held_fit_obstacle(obstacle)], link_name=link_name, num_spheres=len(idx),
+                  sphere_fit_type=SphereFitType.VOXEL, disable_obstacle_names=[obj_name])
+        _log.debug(f"Attached {obj_name}'s convex hull to {link_name}: radii (mm) "
+                   f"{[round(1000 * r, 1) for r in kp.link_spheres[0, idx, 3].tolist() if r > 0]}")
+    else:
+        am.attach_from_scene(
+            joint_states=last_js,
+            obstacle_names=[obj_name],
+            link_name=link_name,
+            num_spheres=len(idx),
+            sphere_fit_type=SphereFitType.VOXEL,
+        )
     # The attach link is a FIXED identity child of the arm's tool frame
     # (t1_29dof.yml), so the tool-frame pose is the link pose.
     world_from_link = planner.kinematics.compute_kinematics(last_js).tool_poses.get_link_pose(TOOL_FRAME_FOR_ARM[arm])
