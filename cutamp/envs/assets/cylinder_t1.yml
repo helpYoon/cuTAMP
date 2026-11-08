@@ -1,0 +1,38 @@
+# T1 standing-cylinder environment (design 7.7): a cylinder 5 cm across and 12 cm tall and the goal pad, laid out
+# like blocks_t1 with one object, the cylinder at block2's place within |y| <= 0.3. Run at --surface_height 0.5: the
+# cylinder and the pad go up onto a table top (raise_surface_height).
+
+name: cylinder_t1
+geometries:
+  cylinder:
+    # Centre at z = 0.06, lifted 6 mm so the lowest of its 5 mm surface spheres sits 1 mm above its support.
+    cylinder:
+      color: [66, 165, 245]
+      radius: 0.025
+      height: 0.12
+      pose: [0.35, -0.30, 0.066, 1.0, 0.0, 0.0, 0.0]
+
+  cuboid:
+    # The floor: its top is at z = 0.
+    floor:
+      color: [200, 200, 200]
+      dims: [4.0, 4.0, 0.1]
+      pose: [0, 0, -0.05, 1, 0, 0, 0]
+
+    # Goal pad: blocks_t1's, 1 cm thick (top at 0.01).
+    goal:
+      color: [186, 255, 201]
+      dims: [0.45, 0.45, 0.01]
+      pose: [0.55, 0.0, 0.005, 1.0, 0.0, 0.0, 0.0]
+
+types:
+  Movable: [cylinder]
+  Surface: [goal]
+
+goal:
+  # "On" needs to be in quotes because it's a YAML keyword
+  - "On": [cylinder, goal]
+  - LeftHandEmpty: []
+  - RightHandEmpty: []
+  - LeftCanMove: []
+  - RightCanMove: []

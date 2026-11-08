@@ -1,0 +1,48 @@
+# T1 shelf environment (design 7.7): a box on the lower of two boards, to be placed on a pad on the same board.
+# The upper board's underside (0.93 m) is 5.4 cm above the box's top (0.876 m), too little room for the hand: the
+# pick needs a side or angled grasp.
+# Run at height 0 (no --surface_height): raise_surface_height would lift the box and the pad, not the boards.
+
+name: shelf_t1
+geometries:
+  cuboid:
+    # 5 x 5 x 12 cm on the lower board (top at 0.75): centre at z = 0.75 + 0.06, lifted 6 mm so the lowest of its
+    # 5 mm surface spheres sits 1 mm above the board, inside the place sampler's 1-10 mm band.
+    box:
+      color: [251, 140, 0]
+      dims: [0.05, 0.05, 0.12]
+      pose: [0.43, -0.15, 0.816, 1.0, 0.0, 0.0, 0.0]
+
+    # The floor: its top is at z = 0.
+    floor:
+      color: [200, 200, 200]
+      dims: [4.0, 4.0, 0.1]
+      pose: [0, 0, -0.05, 1, 0, 0, 0]
+
+    # The boards: 2 cm thick, 0.3 m deep (x) and 0.6 m wide (y), their front edge at x = 0.38.
+    lower_board:
+      color: [141, 110, 99]
+      dims: [0.3, 0.6, 0.02]
+      pose: [0.53, 0.0, 0.74, 1.0, 0.0, 0.0, 0.0]
+    upper_board:
+      color: [141, 110, 99]
+      dims: [0.3, 0.6, 0.02]
+      pose: [0.53, 0.0, 0.94, 1.0, 0.0, 0.0, 0.0]
+
+    # Goal pad on the lower board, 1 cm thick (top at 0.76), its front edge on the board's.
+    goal:
+      color: [186, 255, 201]
+      dims: [0.1, 0.2, 0.01]
+      pose: [0.43, 0.15, 0.755, 1.0, 0.0, 0.0, 0.0]
+
+types:
+  Movable: [box]
+  Surface: [goal]
+
+goal:
+  # "On" needs to be in quotes because it's a YAML keyword
+  - "On": [box, goal]
+  - LeftHandEmpty: []
+  - RightHandEmpty: []
+  - LeftCanMove: []
+  - RightCanMove: []

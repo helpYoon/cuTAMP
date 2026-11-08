@@ -1,0 +1,38 @@
+# T1 cup environment (design 7.7): the procedural cup (cutamp/scripts/make_cup_mesh.py: 5 cm across, 10 cm tall,
+# 4 mm wall, 5 mm base) and the goal pad, laid out like cylinder_t1. Run at --surface_height 0.5: the cup and the pad
+# go up onto a table top (raise_surface_height).
+
+name: cup_t1
+geometries:
+  mesh:
+    # The mesh's frame is at its centre: z = 0.05, lifted 6 mm so the lowest of its 5 mm surface spheres sits 1 mm
+    # above its support. The path resolves against this file's folder.
+    cup:
+      color: [239, 83, 80]
+      file_path: meshes/cup.obj
+      pose: [0.35, -0.30, 0.056, 1.0, 0.0, 0.0, 0.0]
+
+  cuboid:
+    # The floor: its top is at z = 0.
+    floor:
+      color: [200, 200, 200]
+      dims: [4.0, 4.0, 0.1]
+      pose: [0, 0, -0.05, 1, 0, 0, 0]
+
+    # Goal pad: blocks_t1's, 1 cm thick (top at 0.01).
+    goal:
+      color: [186, 255, 201]
+      dims: [0.45, 0.45, 0.01]
+      pose: [0.55, 0.0, 0.005, 1.0, 0.0, 0.0, 0.0]
+
+types:
+  Movable: [cup]
+  Surface: [goal]
+
+goal:
+  # "On" needs to be in quotes because it's a YAML keyword
+  - "On": [cup, goal]
+  - LeftHandEmpty: []
+  - RightHandEmpty: []
+  - LeftCanMove: []
+  - RightCanMove: []

@@ -171,6 +171,9 @@ def _xy_half_extents(obj: Obstacle) -> Tuple[float, float]:
         return (c * obj.dims[0] + s * obj.dims[1]) / 2, (s * obj.dims[0] + c * obj.dims[1]) / 2
     if isinstance(obj, Cylinder):
         return obj.radius, obj.radius
+    if isinstance(obj, Mesh):  # e.g. cup_t1's cup: its posed vertices' farthest reach from its xy position
+        x, y = np.abs(obj.get_trimesh_mesh(transform_with_pose=True).vertices[:, :2] - obj.pose[:2]).max(axis=0)
+        return float(x), float(y)
     raise NotImplementedError(f"No table footprint for {type(obj)} {obj.name}")
 
 
