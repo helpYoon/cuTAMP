@@ -2,6 +2,7 @@
 import os
 
 import numpy as np
+import pytest
 import yaml
 
 from cutamp.constraint_checker import ConstraintChecker
@@ -87,6 +88,15 @@ def test_resolve_env_path(tmp_path):
     assert resolve_env_path(str(other)) == str(other)
 
 
+def test_resolve_env_path_takes_a_file_or_a_shipped_name(tmp_path):
+    # A shipped name may carry ".yml"; a path must be an existing file, not a folder; anything else raises.
+    assert resolve_env_path("shelf_t1.yml") == resolve_env_path("shelf_t1") == os.path.join(get_env_dir(),
+                                                                                           "shelf_t1.yml")
+    for arg in (str(tmp_path), "shelf_t2", "shelf_t2.yml", str(tmp_path / "shelf_t1.yml")):
+        with pytest.raises(FileNotFoundError, match="neither an existing file nor a shipped scene"):
+            resolve_env_path(arg)
+
+
 def test_floor_is_in_the_env_file():
     env = load_env(BLOCKS)
     floor = next(o for o in env.statics if o.name == "floor")
@@ -121,3 +131,29 @@ def test_no_table_at_height_zero():
     env = load_env(BLOCKS)
     raise_surface_height(env, 0.0)
     assert "table" not in [o.name for o in env.statics]
+
+
+def _poses(env) -> dict:
+    return {o.name: list(o.pose) for o in env.movables + env.statics}
+
+
+def test_raise_refuses_statics_it_would_leave_behind():
+    # At a nonzero height only the floor and the Surfaces may be static: shelf_t1's boards would stay below the box.
+    for name, heights in (("blocks_t1", (0.0, 0.5, 0.85)), ("cylinder_t1", (0.5,)), ("cup_t1", (0.5,)),
+                          ("shelf_t1", (0.0,))):
+        for height in heights:
+            raise_surface_height(load_env(resolve_env_path(name)), height)
+    env = load_env(resolve_env_path("shelf_t1"))
+    before = _poses(env)
+    with pytest.raises(ValueError, match="shelf_t1's statics lower_board, upper_board would stay put"):
+        raise_surface_height(env, 0.5)
+    assert _poses(env) == before  # nothing moved, and no table top
+
+
+def test_raise_refuses_an_object_named_table():
+    env = load_env(BLOCKS)
+    next(o for o in env.statics if o.name == "goal").name = "table"  # a Surface: the height check passes it
+    before = _poses(env)
+    with pytest.raises(ValueError, match="blocks_t1 already has an object named 'table'"):
+        raise_surface_height(env, 0.5)
+    assert _poses(env) == before

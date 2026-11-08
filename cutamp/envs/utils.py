@@ -147,11 +147,22 @@ def raise_surface_height(env: TAMPEnvironment, height: float) -> TAMPEnvironment
     kinematic planner, so the objects simply sit at the new z — no support
     geometry is added except a static ``table`` top (``TABLE_THICKNESS`` thick, top at
     ``height``) covering every raised object's xy box, grown by ``TABLE_MARGIN`` (0) on each side; the
-    floor and every other static stay put. Used by run_cutamp's ``--surface_height``.
+    floor stays put. Used by run_cutamp's ``--surface_height``.
+
+    A nonzero ``height`` raises ``ValueError``, before anything moves, where the env has any other static, which
+    would stay behind (shelf_t1's boards), or already has an object named ``table``.
     """
     if height == 0.0:
         return env
     targets = list(env.movables) + list(env.type_to_objects.get("Surface", []))
+    if any(obj.name == "table" for obj in env.movables + env.statics):
+        raise ValueError(f"{env.name} already has an object named 'table', the name of the table top that "
+                         "raise_surface_height adds")
+    lifted = {obj.name for obj in targets}
+    left = [obj.name for obj in env.statics if obj.name != "floor" and obj.name not in lifted]
+    if left:
+        raise ValueError(f"{env.name}'s statics {', '.join(left)} would stay put while its movables and Surfaces rise "
+                         f"{height} m: at a nonzero surface height only the floor and the Surfaces may be static")
     seen: Set[int] = set()
     for obj in targets:
         if id(obj) in seen:  # an object could be both movable and a surface
@@ -240,7 +251,15 @@ def get_env_dir() -> str:
 
 
 def resolve_env_path(arg: str) -> str:
-    """``--env``: an existing path as given, else the shipped ``<arg>.yml``."""
-    return arg if os.path.exists(arg) else os.path.join(get_env_dir(), f"{arg}.yml")
+    """``--env``: an existing file as given, else the shipped scene ``arg`` names, with or without ``.yml``
+    (``shelf_t1`` and ``shelf_t1.yml`` are both ``assets/shelf_t1.yml``). Anything else, a folder included, raises
+    ``FileNotFoundError``."""
+    if os.path.isfile(arg):
+        return arg
+    name = arg.removesuffix(".yml")
+    shipped = sorted(f.removesuffix(".yml") for f in os.listdir(get_env_dir()) if f.endswith(".yml"))
+    if name in shipped:
+        return os.path.join(get_env_dir(), f"{name}.yml")
+    raise FileNotFoundError(f"--env {arg!r} is neither an existing file nor a shipped scene ({', '.join(shipped)})")
 
 
