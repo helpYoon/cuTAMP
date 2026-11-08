@@ -1,4 +1,4 @@
-"""The stage3-raw plan's ``dt`` label (``motion_solver._plan_dt``): it must be the spacing of the positions
+"""The stage4-raw plan's ``dt`` label (``motion_solver._plan_dt``): it must be the spacing of the positions
 ``get_interpolated_plan()`` returns, cuRobo's ``interpolation_dt``. The optimizer's
 ``js_solution.dt`` (0.0145-0.0246 s) played plans 1.02-1.54x too fast."""
 

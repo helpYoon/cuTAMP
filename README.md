@@ -32,9 +32,13 @@ from tag `paper-g1-comfix`. Both need the cuRobo fork helpYoon/curobo (with
 > so `get_t1_motion_planner` turns it off and the balance gate paces each
 > segment. Trajopt's first solve runs 100 L-BFGS iterations, not v0.9.0's 50:
 > on the five blocks_t1 cases v0.9.0 planned worst, 50 planned 4 and 100 all 5
-> (`TRAJOPT_INITIAL_ITERS`). cuRobo's FK backward sums sphere gradients with
-> float atomics, which can differ in the last bits between calls; same-seed
-> plans still came out bit-identical.
+> (`TRAJOPT_INITIAL_ITERS`). cuRobo's FK backward adds each link's sphere and
+> tool-frame gradients with float atomics, whose order varies between warps.
+> Since stage 4's line segments (each pick's and place's straight insert and
+> leave), a right-hand line segment can differ by about 1e-6 rad between
+> same-seed runs. Particle init also sometimes accepts different IK confs in
+> same-seed runs, while the motion planner is being built. So same-seed plans
+> are usually, not always, bit-identical.
 
 ## Installation
 
@@ -96,6 +100,16 @@ mkdir -p ~/graspgenx-model/no-gripper-descriptions
 export GRASPGENX_CHECKPOINT_DIR=$M GRASPGENX_GRIPPER_CFG_DIR=~/graspgenx-model/no-gripper-descriptions
 ```
 
+The planner runs GraspGenX in its own process: when the world loads,
+`grasp_sets` ([`cutamp/grasps.py`](cutamp/grasps.py)) makes each object
+shape's 6-DoF grasps once, in about 3.6 s per process (`generate_grasps`, timed
+apart from the planning time), and there is no grasp server or grasp file. It
+sets either variable that is unset or empty to its folder above
+(`~/graspgenx-model/7c834043`, `~/graspgenx-model/no-gripper-descriptions`)
+and stops with an error naming this paragraph if a folder is missing, before
+anything imports `graspgenx`. Any other script that imports `graspgenx` must
+set both variables itself.
+
 cuRobo's own [install guide](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
 has the details.
 
@@ -120,7 +134,7 @@ graph LR
    the closer arm for each object first (`make_arm_affinity_priority_fn`).
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
-   / configs (`samplers.py`) and solves each pick / place conf with GN IK
+   / configs and solves each pick / place conf with GN IK
    (`gn_ik`): balance-first Gauss-Newton from home and from three noisy starts
    on the stance in one batch, first reaching and then clearing any collision
    with the scene, the robot itself and the movable objects, the clearing
@@ -130,7 +144,14 @@ graph LR
    tolerances (`ik_check`): the hand, both soles on the stance, the CoM in the
    model's keyframe rectangle (`world.model.support.keyframe_half`) and no
    collision. Retract confs start at the model's home
-   (`REAL_LEGS.home`).
+   (`REAL_LEGS.home`). Each pick row draws a 6-DoF grasp, weighted by
+   GraspGenX's score, from its object's grasps that the hand can take
+   (`world.grasp_candidates`: none with a hand sphere below the object's
+   bottom face or touching the object, `grasps.drop_grasps`) and that, unless
+   near vertical, approach from the robot's side (`grasps.approach_in_cone`).
+   Each place row draws its placement (`place_4dof_sampler`), its yaw turned so
+   the held grasp approaches from the robot's side. The rows whose IK fails
+   draw again, up to `GRASP_REDRAW_ROUNDS` times. Grasps are never optimized.
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic — the hand's pose and both soles on the stance — motion,
@@ -153,7 +174,16 @@ graph LR
    model's cspace, built on a background thread while the optimizer runs,
    and planned to each particle conf with `plan_cspace`, so a pick or place
    ends exactly at the conf the optimizer approved and cuRobo can't
-   re-resolve the redundancy at the endpoint. Trajopt holds both soles on the
+   re-resolve the redundancy at the endpoint. Each pick and place is three
+   segments: an approach to a pre conf, a straight insert to the particle conf
+   and a straight leave to a post conf (`grasps.approach_targets`). A pick
+   comes in along the hand's approach from `APPROACH_DISTANCE` back and leaves
+   the same way, or lifts `LIFT_HEIGHT` straight up if its approach is more
+   than `VERTICAL_CONE` from vertical; a place comes in the same way, or,
+   past that cone, from `LIFT_HEIGHT` above, and always backs out along its
+   approach. GN solves the
+   pre and post confs (`_approach_confs`), trajopt holds the hand on each line
+   (`_line_motion`) and FK checks it (`check_line`). Trajopt holds both soles on the
    stance at every waypoint and bounds every joint's torque at its effort with
    cuRobo's RNEA, the floor's push on the soles included
    (`install_floor_wrench`). Each
@@ -172,14 +202,16 @@ graph LR
    naming the check.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the plan raw
-   (`stage3-raw`, `raw_motion_plan` in `utils/plan_processor.py`): per segment,
-   positions, velocities and accelerations in the model's joint order at
+   (`stage4-raw`, `raw_motion_plan` in `utils/plan_processor.py`): per segment,
+   its arm, its op's index, its phase (`approach`, `insert`, `lift`,
+   `back_out` or `retract`) and the gripper event at its end, and positions,
+   velocities and accelerations in the model's joint order at
    cuRobo's interpolation dt, until stage 6's schema-4 export. A segment the
    gate slowed down also carries `planner_timing`, the
    same segment at the motion planner's own timing (`None` otherwise).
 
-`run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` builds
-the shared `TAMPWorld`.
+`run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` makes
+the grasps (`grasp_sets`) and builds the shared `TAMPWorld`.
 
 ## T1 Single-Planner Architecture (cuRobo v0.9.0)
 
@@ -237,7 +269,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   cuTAMP's gripper: `gripper.urdf` (the links and joints the builder appends
   to each hand, weightless) and its 10 STL `meshes/`. Its collision spheres
   sit on each hand's base link in `t1_29dof_spheres.yml`, which both cuRobo
-  and grasp sampling (`get_t1_gripper_spheres`) read.
+  and the grasp drops (`get_t1_gripper_spheres`, `TAMPWorld.hand_spheres`)
+  read. `graspgenx/sweep_volume.json` is the hand as GraspGenX takes it, its
+  swept volume (`scripts/graspgenx_sweep_volume.py`).
 - **[`assets/envelopes/`](cutamp/robots/assets/envelopes/)** —
   `route_a_start.yml`, route A's envelope: the joint ranges the planner
   enforces (the Waist's, and the ankle pitches' up to home, so no plan pitches
@@ -283,7 +317,11 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   TAMPEnvironment with the collision Scene and the single `Kinematics` (built
   with `compute_com=True`); it builds no IK solver (the IK is GN's, `gn_ik`)
   and no planner (`motion_solver.build_motion_planner` does). `q_init` is the
-  model's home. It also holds the stance (`stance_soles`). Built lazily:
+  model's home. It also holds the stance (`stance_soles`), the movables'
+  GraspGenX grasps (`grasps`, same-shaped movables share one set), each hand's
+  spheres for the grasp drops (`hand_spheres`) and each object and arm's grasps
+  that pass them (`grasp_candidates`, with each rule's count in
+  `grasp_drops`). Built lazily:
   `kinematics_jac` (the Jacobian twin for GN), `segment_torques` (the gate's
   torque, speed and ZMP checks), and one `site_kinematics(name)` per Adam-loop
   FK site in `FK_SITES`; all run on the single `Kinematics`'s config.
@@ -327,8 +365,10 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   from which the gate takes the ZMP.
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
-  through the single planner (`build_motion_planner`). Per operator: plan to
-  the particle's conf with `plan_cspace`, then pass `_balance_gate`: every
+  through the single planner (`build_motion_planner`). Per operator, each
+  segment plans to a conf with `plan_cspace` (a pick or place three, each
+  tagged with its phase: approach, insert, then lift or back-out; a retract
+  one), then passes `_balance_gate`: every
   frame keeps both soles on the stance and its CoM inside
   `world.model.support.gate_half`, and the gate times each segment at the
   smallest uniform scale from 1 (the planner's own timing) up that its speed,
@@ -339,7 +379,10 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   returns again (`_recheck`). Each segment is appended to `accum_plans` (with
   `held_objs`, `_held_obj_poses` for every arm holding an object; a slowed one
   also keeps `planner_timing`, the same spline at the planner's own timing),
-  then the object is attached/detached via the AttachmentManager. Playback
+  then the object is attached/detached via the AttachmentManager. A held
+  mesh is fit on its convex hull (`held_fit_obstacle`): cuRobo's VOXEL fit
+  inscribes its spheres, and a thin wall such as cup_t1's holds none of use.
+  Playback
   walks `accum_plans` and hands each entry to the visualizer. The run metrics
   get the gate's `retime_min` and `retime_max`, `retime_binding` (segments per
   binding check: `velocity <joint>`, `torque <joint>`, `zmp`, or `none` where
@@ -357,11 +400,25 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   safe one (every check but the hand's) with the smallest hand error, else
   the one with the smallest hand error. The movable objects' spheres at each
   conf come from `rollout.movable_spheres_fn`, placed as the rollout places
-  them.
+  them. A pick row draws its grasp and a place row its placement, and the
+  rows whose IK fails draw again (`_draw_and_solve`; a placement keeps the
+  least-colliding of its candidates, `_draw_placements`).
 
-- [`samplers.py`](cutamp/samplers.py) — grasp / placement / yaw samplers
-  (`grasp_4dof_sampler`, `place_4dof_sampler`,
-  `sample_yaw`) that seed the continuous particles.
+- [`grasps.py`](cutamp/grasps.py) — the grasps: `grasp_sets` runs
+  GraspGenX's graspmoe planner on each object shape's surface points when the
+  world loads (its diffusion grasps and the box grasps on the top and the
+  sides, all kept with their scores), seeded, so every process gets the same
+  grasps. A grasp is a 6-DoF pose of GraspGenX's gripper frame in the object
+  frame, `[x, y, z, qw, qx, qy, qz]`. Here too: init's rules
+  (`drop_grasps`, `approach_in_cone`), each pick's and place's targets
+  (`approach_targets`, `is_vertical`) and their knobs, search settings rather
+  than robot limits (`APPROACH_DISTANCE`, `LIFT_HEIGHT`, `VERTICAL_CONE`,
+  `AZIMUTH_CONE`, `GRASP_REDRAW_ROUNDS`, and the line check's `LINE_TOL`,
+  `LINE_BACKTRACK` and `LINE_END_TOL`).
+
+- [`samplers.py`](cutamp/samplers.py) — the placement and yaw samplers
+  (`place_4dof_sampler`, `sample_yaw`); grasps come from GraspGenX
+  (`grasps.py`).
 
 - [`task_planning/`](cutamp/task_planning/) — the symbolic layer:
   `task_plan_generator` runs breadth-first search (`search.py`) over the domain
@@ -446,18 +503,32 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   (`build_grad_masks` / `apply_grad_masks`) that zero the inactive arm's
   DOFs, and for a retract conf the base and body too, so Adam can't move them.
 
-- [`envs/`](cutamp/envs/) — `TAMPEnvironment`, `load_env`, and
-  `raise_surface_height` (`--surface_height`);
-  `assets/blocks_t1.yml` is the only env (two blocks and a goal pad on the
-  ground).
+- [`envs/`](cutamp/envs/) — `TAMPEnvironment`, `load_env` (it normalizes
+  each pose's quaternion and resolves a mesh's `file_path` against the env
+  file's folder), `resolve_env_path` (`--env`: a shipped name or a path) and
+  `raise_surface_height` (`--surface_height`: the movables and surfaces go up
+  onto a static `table` top, `TABLE_THICKNESS` thick with its top at the
+  height, that covers their xy box; the floor and the other statics stay
+  put). Each scene in `assets/` has a `floor`, a static cuboid whose top is at
+  z = 0 (`FLOOR`):
+  - `blocks_t1`: two blocks and a goal pad on the floor;
+  - `shelf_t1`: a box on the lower of two boards, to be placed on a pad on
+    the same board. The upper board leaves no room for a top-down hand, so
+    the box needs a side or angled grasp. It runs at height 0, and the box
+    stands on the robot's left, since a one-object scene plans the left arm
+    first;
+  - `cylinder_t1` and `cup_t1`: a standing cylinder, and a cup mesh
+    (`meshes/cup.obj`, from `scripts/make_cup_mesh.py`), each with
+    blocks_t1's pad, run at `--surface_height 0.5`.
 
 - [`utils/visualizer.py`](cutamp/utils/visualizer.py) — Rerun visualizer.
   `log_joint_trajectory_with_mat4x4s(traj, mat4x4s, …)` accepts any number
   of held-object transforms per trajectory.
 
 - [`utils/plan_processor.py`](cutamp/utils/plan_processor.py) —
-  `raw_motion_plan` builds the plan `--save_plan` writes, schema `stage3-raw`:
-  per segment, the model's joints' positions, velocities and accelerations at
+  `raw_motion_plan` builds the plan `--save_plan` writes, schema `stage4-raw`:
+  per segment, its arm, op index, phase and gripper event, and the model's
+  joints' positions, velocities and accelerations at
   cuRobo's interpolation dt, and `planner_timing` for a segment the gate
   retimed (else `None`).
 
@@ -478,11 +549,18 @@ live `--cuda_graphs` runs in
 ### 📁 [`cutamp/scripts/`](cutamp/scripts/)
 
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
-  (installed as `cutamp-demo`). T1 / `blocks_t1` only (no `--env` flag, no
-  other envs); `--surface_height` raises the blocks and goal pad, `--seed`
-  seeds the sampling, and `--save_plan PATH` (or `auto`, or no value:
-  `motion_plan.pkl` next to the run's metrics) saves the raw plan
-  (`stage3-raw`, the model's joints).
+  (installed as `cutamp-demo`), T1 only. `--env` picks the scene, a shipped
+  name (`blocks_t1`, the default, `shelf_t1`, `cylinder_t1`, `cup_t1`) or an
+  env file's path; `--surface_height` raises its movables and surfaces onto a
+  table top, `--seed` seeds the sampling, and `--save_plan PATH` (or `auto`,
+  or no value: `motion_plan.pkl` next to the run's metrics) saves the raw
+  plan (`stage4-raw`, the model's joints).
+- [`graspgenx_sweep_volume.py`](cutamp/scripts/graspgenx_sweep_volume.py) —
+  the hand's swept volume as GraspGenX takes it (two boxes in its gripper
+  frame and a fingertip depth), from the gripper's meshes, into
+  `t1_description/graspgenx/sweep_volume.json`.
+- [`make_cup_mesh.py`](cutamp/scripts/make_cup_mesh.py) — writes cup_t1's
+  `meshes/cup.obj`, a revolved, watertight cup.
 - [`real_legs_report.py`](cutamp/scripts/real_legs_report.py) — the saved
   plans under a directory of `run_cutamp` experiment directories: per joint,
   the peak torque against its effort and the peak speed against the motor's
@@ -521,8 +599,12 @@ uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --disable_visuali
 # With Rerun visualizer
 uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64
 
-# Save the raw plan (stage3-raw) next to the run's metrics
+# Save the raw plan (stage4-raw) next to the run's metrics
 uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto
+
+# Another scene: the shelf (at height 0), or the cylinder or the cup on a 0.5 m table top
+uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --env shelf_t1
+uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --env cylinder_t1 --surface_height 0.5
 
 # Different soft costs (replaces the default list)
 uv run python -m cutamp.scripts.run_cutamp --motion_plan \
@@ -588,8 +670,9 @@ skips the robot's meshes; both cut bandwidth.
    joints fixed, so that hand rides with the trunk when they move the body,
    and `plan_cspace` holds nothing between confs.
    Both arms are in GN's collision row, the optimizer's collision constraints
-   and the planner's collision checks, with two gaps: a pick or place segment
-   disables its block or support surface for the whole robot, and a segment
+   and the planner's collision checks, with two gaps: a pick's insert disables
+   its object, and a place's insert its support surface and its back-out the
+   released object, each for the whole robot; and a segment
    the balance gate slows down is resampled through
    the planner's frames (`_retime`) without new collision or joint-limit
    checks on the in-between frames.
