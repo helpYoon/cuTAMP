@@ -28,6 +28,12 @@ class CostReducer:
         direct = self.cost_to_multiplier.get((cost_type, name))
         if direct is not None:
             return direct
+        # The longest "*suffix" key the name ends with, as in ConstraintChecker._get_tol
+        suffixes = [
+            n for (t, n) in self.cost_to_multiplier if t == cost_type and n.startswith("*") and name.endswith(n[1:])
+        ]
+        if suffixes:
+            return self.cost_to_multiplier[(cost_type, max(suffixes, key=len))]
         # Mirror ConstraintChecker._get_tol's "default" fallback so
         # constraints with plan-skeleton-dependent inner names (e.g.
         # ComPolygon's per-conf entries left_q0, right_q3, ...) can

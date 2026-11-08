@@ -10,7 +10,6 @@
 """Run cuTAMP on blocks_t1, e.g. ``python -m cutamp.scripts.run_cutamp -n 64 --motion_plan --save_plan``."""
 
 import logging
-import os
 import pickle
 from pathlib import Path
 from typing import Optional
@@ -20,7 +19,7 @@ from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
-from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
+from cutamp.envs.utils import load_env, raise_surface_height, resolve_env_path
 
 from cutamp.scripts.utils import (
     default_constraint_to_mult,
@@ -153,6 +152,10 @@ def entrypoint():
         help="Whether to plan for full motions after using cuTAMP.",
     )
     parser.add_argument(
+        "--env", type=str, default="blocks_t1",
+        help="Environment: a shipped name (blocks_t1, ...) or the path of an env YAML file.",
+    )
+    parser.add_argument(
         "--seed", type=int, default=None,
         help="torch.manual_seed for reproducible sampling.",
     )
@@ -207,7 +210,7 @@ def entrypoint():
     validate_tamp_config(config)
 
     # Load env and run demo
-    env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
+    env = load_env(resolve_env_path(args.env))
     raise_surface_height(env, args.surface_height)  # no-op at 0.0
     cutamp_demo(env, config, experiment_id=args.experiment_id, save_plan=args.save_plan)
 

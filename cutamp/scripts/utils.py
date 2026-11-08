@@ -24,7 +24,7 @@ from cutamp.com_polygon_cost import COM_TOL, SOLE_POS_TOL, SOLE_ROT_TOL
 default_constraint_to_mult = {
     # sole_*: the soles against the stance at every conf (design 7.4), weighted as the hand is.
     KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0},
-    StablePlacement.type: {"goal_support": 2.0},
+    StablePlacement.type: {"*_support": 2.0},
     TrajectoryLength.type: {"traj_length": 1e-3},
     # ComPolygon penalty values are O(1e-4 to 1e-3) in m²; multiplier 10
     # puts the COM gradient contribution to Adam's loss on par with KinematicConstraint
@@ -62,9 +62,9 @@ default_constraint_to_tol = {
         "retract_self_collision": 0.0,
     },
     StablePlacement.type: {
-        # You might need to add additional tolerances if your support surfaces have different names
-        "goal_in_xy": 1e-3,
-        "goal_support": 1e-2,
+        # Matched by suffix, so every support surface shares them
+        "*_in_xy": 1e-3,
+        "*_support": 1e-2,
     },
     # ComPolygon per-conf values are continuous penalty in m² from
     # compute_com_polygon_penalties. With the max-over-axes barrier, the

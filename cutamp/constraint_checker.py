@@ -33,6 +33,13 @@ class ConstraintChecker:
         if key in self.constraint_to_tol:
             return self.constraint_to_tol[key]
 
+        # The longest "*suffix" key the name ends with
+        suffixes = [
+            n for (t, n) in self.constraint_to_tol if t == constraint_type and n.startswith("*") and name.endswith(n[1:])
+        ]
+        if suffixes:
+            return self.constraint_to_tol[(constraint_type, max(suffixes, key=len))]
+
         default_key = (constraint_type, "default")
         if default_key in self.constraint_to_tol:
             return self.constraint_to_tol[default_key]

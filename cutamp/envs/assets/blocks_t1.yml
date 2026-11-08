@@ -1,19 +1,26 @@
 # T1 dual-arm robot blocks environment
 # Uses LeftHandEmpty and RightHandEmpty fluents for goal state
-# Ground variant — no table; blocks and goal pad sit directly on the floor.
+# Ground variant: blocks and goal pad sit on the floor (top at z = 0).
 
 name: blocks_t1
 geometries:
   cuboid:
-    # Movables on the ground. Block dim = 0.05 → center at z = 0.025.
+    # Movables on the ground. Block dim = 0.05 → center at z = 0.025; lifted 6 mm so the lowest of each block's
+    # 5 mm surface spheres sits 1 mm above its support, inside the place sampler's 1-10 mm band.
     block2:
       color: [251, 140, 0]
       dims: [0.05, 0.05, 0.05]
-      pose: [0.35, -0.325, 0.025, 0.03, 0.0, 0.0, 0.99]
+      pose: [0.35, -0.325, 0.031, 0.03, 0.0, 0.0, 0.99]
     block3:
       color: [102, 187, 106]
       dims: [0.05, 0.05, 0.05]
-      pose: [0.36, 0.32, 0.025, -0.43, 0.0, 0.0, 0.90]
+      pose: [0.36, 0.32, 0.031, -0.43, 0.0, 0.0, 0.90]
+
+    # The floor: its top is at z = 0.
+    floor:
+      color: [200, 200, 200]
+      dims: [4.0, 4.0, 0.1]
+      pose: [0, 0, -0.05, 1, 0, 0, 0]
 
     # Goal pad on the ground. 1 cm thick slab → center z = 0.005, top at 0.01.
     # Blocks placed on it land at center z = 0.035.

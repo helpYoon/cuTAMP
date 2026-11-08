@@ -8,9 +8,9 @@
 # its affiliates is strictly prohibited.
 
 import os
-import warnings
 from typing import Dict, List, ClassVar, Set, Tuple
 
+import numpy as np
 import yaml
 from curobo.scene import Cuboid, Obstacle, Cylinder, Mesh
 
@@ -48,6 +48,14 @@ class TAMPEnvironment:
                 raise ValueError(f"Unknown object type: {obj_type}")
 
 
+# The floor every scene's env file holds as a static cuboid named "floor" (top at z = 0).
+FLOOR = {"dims": [4.0, 4.0, 0.1], "pose": [0, 0, -0.05, 1, 0, 0, 0]}
+# raise_surface_height's table top: its overhang past the raised objects and its thickness.
+# 0: a 5 cm overhang left no plannable candidate on blocks_t1 s0/s2 at h 0.5 (trajopt could not take the hands over
+# the edge without sliding a sole or exceeding ankle torque), so the table is flush with the objects' xy box.
+TABLE_MARGIN = 0.0
+TABLE_THICKNESS = 0.03
+
 _key_to_factory = {
     "cuboid": Cuboid,
     "cylinder": Cylinder,
@@ -77,6 +85,13 @@ def load_env(env_path: str) -> TAMPEnvironment:
         for name, obj_dict in obj_dicts.items():
             if name in name_to_obj:
                 raise ValueError(f"Cannot have duplicate object names: {name}")
+            obj_dict = dict(obj_dict)
+            if "pose" in obj_dict:  # wxyz; keep the direction, fix the length
+                pose = [float(v) for v in obj_dict["pose"]]
+                pose[3:7] = (np.array(pose[3:7]) / np.linalg.norm(pose[3:7])).tolist()
+                obj_dict["pose"] = pose
+            if cls is Mesh and not os.path.isabs(obj_dict["file_path"]):
+                obj_dict["file_path"] = os.path.join(os.path.dirname(os.path.abspath(env_path)), obj_dict["file_path"])
             obj = cls(name=name, **obj_dict)
             name_to_obj[name] = obj
 
@@ -130,7 +145,9 @@ def raise_surface_height(env: TAMPEnvironment, height: float) -> TAMPEnvironment
     the boxes and goal pad sit at the given height instead of on the ground.
     ``height == 0`` leaves the env unchanged (the ground variant). cuTAMP is a
     kinematic planner, so the objects simply sit at the new z — no support
-    geometry is added. Used by run_cutamp's ``--surface_height``.
+    geometry is added except a static ``table`` top (``TABLE_THICKNESS`` thick, top at
+    ``height``) covering every raised object's xy box, grown by ``TABLE_MARGIN`` (0) on each side; the
+    floor and every other static stay put. Used by run_cutamp's ``--surface_height``.
     """
     if height == 0.0:
         return env
@@ -141,7 +158,33 @@ def raise_surface_height(env: TAMPEnvironment, height: float) -> TAMPEnvironment
             continue
         seen.add(id(obj))
         obj.pose[2] += height
+    env.statics.append(_table_top(list({id(o): o for o in targets}.values()), height))
     return env
+
+
+def _xy_half_extents(obj: Obstacle) -> Tuple[float, float]:
+    """Half extents of the object's axis-aligned xy box, from its (unit, wxyz) pose."""
+    w, z = obj.pose[3], obj.pose[6]
+    if isinstance(obj, Cuboid):
+        yaw = 2 * np.arctan2(z, w)  # the scenes only yaw their objects
+        c, s = abs(np.cos(yaw)), abs(np.sin(yaw))
+        return (c * obj.dims[0] + s * obj.dims[1]) / 2, (s * obj.dims[0] + c * obj.dims[1]) / 2
+    if isinstance(obj, Cylinder):
+        return obj.radius, obj.radius
+    raise NotImplementedError(f"No table footprint for {type(obj)} {obj.name}")
+
+
+def _table_top(objs: List[Obstacle], height: float) -> Cuboid:
+    lo = np.min([[o.pose[0] - _xy_half_extents(o)[0], o.pose[1] - _xy_half_extents(o)[1]] for o in objs], axis=0)
+    hi = np.max([[o.pose[0] + _xy_half_extents(o)[0], o.pose[1] + _xy_half_extents(o)[1]] for o in objs], axis=0)
+    lo, hi = lo - TABLE_MARGIN, hi + TABLE_MARGIN
+    cx, cy = (lo + hi) / 2
+    return Cuboid(
+        name="table",
+        dims=[float(hi[0] - lo[0]), float(hi[1] - lo[1]), TABLE_THICKNESS],
+        pose=[float(cx), float(cy), height - TABLE_THICKNESS / 2, 1, 0, 0, 0],
+        color=[160, 160, 160],
+    )
 
 
 def _get_object_dict(obj: Obstacle) -> Tuple[str, dict]:
@@ -164,8 +207,9 @@ def _get_object_dict(obj: Obstacle) -> Tuple[str, dict]:
             "color": obj.color,
         }
     elif isinstance(obj, Mesh):
-        warnings.warn(f"Serialization of mesh objects are not supported yet. Mesh name: {obj.name}")
-        return "mesh", {}
+        if obj.file_path is None:  # meshes come from files and are pre-scaled
+            raise NotImplementedError(f"{obj.name} is a mesh without a file_path")
+        return "mesh", {"file_path": obj.file_path, "pose": obj.pose, "color": obj.color}
     raise NotImplementedError(f"Unsupported object type: {type(obj)}")
 
 
@@ -190,5 +234,10 @@ def get_env_dict(env: TAMPEnvironment) -> dict:
 def get_env_dir() -> str:
     """Get the directory containing the environment files."""
     return os.path.join(os.path.dirname(__file__), "assets")
+
+
+def resolve_env_path(arg: str) -> str:
+    """``--env``: an existing path as given, else the shipped ``<arg>.yml``."""
+    return arg if os.path.exists(arg) else os.path.join(get_env_dir(), f"{arg}.yml")
 
 
