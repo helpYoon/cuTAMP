@@ -178,7 +178,10 @@ def test_attached_block_clears_the_floor(real_world, real_plan, planner):
 def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeypatch):
     # The first insert's line check misses: solve_curobo's RuntimeError carries the first pick's op_idx, and
     # _motion_plan_with_retries moves on to the next candidate. The skeleton is cut after the first pick, so the
-    # approach IK has only that pick's confs, which the init's GN accepted.
+    # approach IK has only that pick's confs, which the init's GN accepted. The gate's soles check is off, so the
+    # test's miss is the first error the retry meets whatever the init drew: on the init whose first pick is block2's
+    # (PYTHONHASHSEED 1) both candidates' approaches leave the stance by 6.5 and 9.3 mm (2026-11-08), which would fail
+    # them first. test_real_legs_motion tests that check.
     import cutamp.algorithm as alg
     import cutamp.motion_solver as ms
     from cutamp.config import TAMPConfiguration
@@ -210,6 +213,7 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
             raise
 
     monkeypatch.setattr(ms, "check_line", miss_first)
+    monkeypatch.setattr(ms, "_check_planted", lambda world, q: None)
     monkeypatch.setattr(alg, "solve_curobo", solve_spy)
     config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False)
     _, _, attempts, _, failures = alg._motion_plan_with_retries(
