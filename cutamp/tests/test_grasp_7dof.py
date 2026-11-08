@@ -3,21 +3,14 @@
 import pytest
 import roma
 import torch
-from curobo.scene import Cuboid
 
 from cutamp.robots.t1 import LEFT_TOOL_FRAME, get_t1_tool_from_ee, load_sweep_volume
-from cutamp.samplers import grasp_4dof_sampler, top_down_grasps_7dof
 from cutamp.utils.common import (
     action_4dof_to_mat4x4,
     grasp_7dof_to_mat4x4,
     mat4x4_to_grasp_7dof,
     pose_list_to_mat4x4,
 )
-
-# Today's tool transform, written out: Ry(+90 deg), offset (0.01, 0, 0.09).
-OLD_TOOL_FROM_EE = torch.eye(4)
-OLD_TOOL_FROM_EE[:3, :3] = torch.tensor([[0.0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-OLD_TOOL_FROM_EE[:3, 3] = torch.tensor([0.01, 0.0, 0.09])
 
 
 def test_quaternion_order_is_curobos():
@@ -59,17 +52,3 @@ def test_frame_pins_the_top_down_grasp():  # design 7.8's frame test, 5 cm block
     assert torch.allclose(obj_from_ee[:3, :3], torch.tensor([[0.0, 0, 1], [0, 1, 0], [-1, 0, 0]]), atol=1e-6)
     old_point = obj_from_ee @ torch.tensor([0.090, 0, -0.010, 1])  # today's grasp point, in the hand frame
     assert (old_point[:3] - torch.tensor([0, 0, 0.005])).norm() < 3e-3  # the probes put it 2.2 mm from the TCP
-
-
-def test_top_down_7dof_gives_todays_hand_targets():
-    block = Cuboid(name="block", pose=[0.0, 0.0, 0.025, 1.0, 0.0, 0.0, 0.0], dims=[0.05, 0.05, 0.05])
-    spheres = torch.tensor([[0.0, 0.0, 0.0, 0.025]])
-    torch.manual_seed(0)
-    g4 = grasp_4dof_sampler(64, block, spheres, num_faces=4)
-    torch.manual_seed(0)
-    g7 = top_down_grasps_7dof(64, block, spheres, num_faces=4)
-    assert g7.shape == (64, 7)
-    # On the CPU: CUDA matmuls may run in TF32.
-    old = action_4dof_to_mat4x4(g4.cpu()) @ OLD_TOOL_FROM_EE
-    new = grasp_7dof_to_mat4x4(g7.cpu()) @ get_t1_tool_from_ee()[LEFT_TOOL_FRAME].cpu()
-    assert torch.allclose(old, new, atol=1e-6)

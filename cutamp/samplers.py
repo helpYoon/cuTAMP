@@ -12,16 +12,9 @@ from typing import Optional
 import torch
 from curobo.scene import Cuboid, Mesh, Obstacle
 
-from cutamp.utils.common import (
-    action_4dof_to_mat4x4,
-    approximate_goal_aabb,
-    mat4x4_to_grasp_7dof,
-    pose_list_to_mat4x4,
-    transform_points,
-)
+from cutamp.utils.common import approximate_goal_aabb, pose_list_to_mat4x4, transform_points
 
-Grasp4DOF = Place4DOF = torch.Tensor  # [n, 4]
-Grasp7DOF = torch.Tensor  # [n, 7]: G's pose in the object frame, [x, y, z, qw, qx, qy, qz]
+Place4DOF = torch.Tensor  # [n, 4]
 
 
 def sample_yaw(num_samples: int, num_faces: Optional[int], device: torch.device):
@@ -36,52 +29,6 @@ def sample_yaw(num_samples: int, num_faces: Optional[int], device: torch.device)
         yaw_idxs = torch.randint(0, num_faces, (num_samples,), device=device)
         yaw = yaw_choices[yaw_idxs]
     return yaw
-
-
-def grasp_4dof_sampler(
-    num_samples: int, obj: Obstacle, obj_spheres: torch.Tensor, num_faces: Optional[int] = None
-) -> Grasp4DOF:
-    """
-    Sample 4-DOF grasps for the given object in the object's coordinate frame.
-    This could be made a lot more sophisticated.
-    """
-    # Determine point to grasp from the top of the object
-    if isinstance(obj, Cuboid):
-        obj_half_z = max(0.0, obj.dims[2] / 2 - 0.02)  # grasp 2cm from top of object
-    else:
-        max_z = obj_spheres[:, 2].max()
-        obj_half_z = max_z - 0.02  # 2cm from top of obejct
-
-    # Assume zero translation for now in x and y-axes
-    translation = torch.zeros(num_samples, 3, device=obj.device_cfg.device)
-    translation[:, 2] = obj_half_z
-
-    # Sample yaw
-    yaw = sample_yaw(num_samples, num_faces, obj.device_cfg.device)
-
-    # Form full 4-DOF grasp
-    grasp_4dof = torch.cat([translation, yaw.unsqueeze(-1)], dim=1)
-    return grasp_4dof
-
-
-def _grasp_from_G() -> torch.Tensor:
-    """Today's top-down grasp frame to G: ``old_tool_from_ee @ base_from_G``, the old tool transform (Ry(+90 deg),
-    offset (0.01, 0, 0.09)) written inline. Task 6 deletes this with ``top_down_grasps_7dof``."""
-    from cutamp.robots.t1 import load_sweep_volume
-
-    old_tool_from_ee = torch.eye(4)
-    old_tool_from_ee[:3, :3] = torch.tensor([[0.0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-    old_tool_from_ee[:3, 3] = torch.tensor([0.01, 0.0, 0.09])
-    return old_tool_from_ee @ torch.tensor(load_sweep_volume()["base_from_G"], dtype=torch.float32)
-
-
-def top_down_grasps_7dof(
-    num_samples: int, obj: Obstacle, obj_spheres: torch.Tensor, num_faces: Optional[int] = None
-) -> Grasp7DOF:
-    """``grasp_4dof_sampler``'s top-down draws as G's pose in the object frame, so the hand targets are today's."""
-    g4 = grasp_4dof_sampler(num_samples, obj, obj_spheres, num_faces=num_faces)
-    # The product runs on the CPU: CUDA matmuls may use TF32, which would move the targets by 4e-5.
-    return mat4x4_to_grasp_7dof(action_4dof_to_mat4x4(g4.cpu()) @ _grasp_from_G()).to(g4.device)
 
 
 def place_4dof_sampler(

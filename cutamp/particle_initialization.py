@@ -11,21 +11,23 @@
 
 Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single vector in
 the model's full cspace order (its 33 joints). A pick's and a place's conf come from :func:`gn_ik`, the
-planner's only IK: balance first, clear of collision.
+planner's only IK: balance first, clear of collision. Each pick row draws its grasp from the object's GraspGenX
+grasps that the hand can take from the robot's side, and each place row its placement, with the yaw following the
+held grasp; the rows whose IK fails draw again (design 7.8).
 """
 
 import logging
-from typing import NamedTuple, Optional, Sequence, Union
+import math
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import roma
 import torch
 
-from curobo.scene import Cuboid
+from curobo.scene import Obstacle
 from curobo.types import JointState, Pose
 
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
-from cutamp.costs import sphere_to_sphere_overlap
 from cutamp.gn_refresh import (
     _row_layout,
     _row_tool_pose,
@@ -33,13 +35,10 @@ from cutamp.gn_refresh import (
     gn_project_balanced,
     soles_on_stance,
 )
+from cutamp.grasps import AZIMUTH_CONE, GRASP_REDRAW_ROUNDS, approach_in_cone, near_vertical
 from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
-from cutamp.samplers import (
-    _grasp_from_G,
-    top_down_grasps_7dof,
-    place_4dof_sampler,
-)
+from cutamp.samplers import place_4dof_sampler
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import KinematicConstraint
@@ -47,7 +46,6 @@ from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
     grasp_7dof_to_mat4x4,
-    pose_list_to_mat4x4,
     transform_spheres,
 )
 
@@ -218,6 +216,60 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     return q[best], ok[best]
 
 
+def _draw_and_solve(
+    world: TAMPWorld, particles: Particles, name: str, num_particles: int,
+    draw: Callable[[torch.Tensor], torch.Tensor],
+    ik_inputs: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]], arm: str, tol: IKTol,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Draws ``particles[name]`` (``draw(rows)`` gives the rows' values) and solves the rows' confs with
+    :func:`gn_ik` from ``ik_inputs(rows)``: their hand targets ``[r, 4, 4]`` and movables ``[r, M, 4]`` under the
+    particles as they then stand. For up to ``GRASP_REDRAW_ROUNDS`` rounds, the rows that ``gn_ik`` failed draw again
+    and only those rows are solved again. Returns the confs ``[num_particles, dof]`` and the accepted count after the
+    first solve and after each round."""
+    rows = torch.arange(num_particles, device=world.device)
+    particles[name] = draw(rows)
+    targets, movables = ik_inputs(rows)
+    q, ok = gn_ik(world, targets, arm, movables, tol)
+    accepted = [int(ok.sum())]
+    for _ in range(GRASP_REDRAW_ROUNDS):
+        rows = (~ok).nonzero().squeeze(-1)
+        if rows.numel() == 0:
+            break
+        particles[name][rows] = draw(rows)
+        targets, movables = ik_inputs(rows)
+        q[rows], ok[rows] = gn_ik(world, targets, arm, movables, tol)
+        accepted.append(int(ok.sum()))
+    return q, accepted
+
+
+#: Placement candidates per row at a place: the row keeps the one that collides least with the scene.
+_PLACE_DRAWS = 4
+
+
+def _draw_placements(
+    world: TAMPWorld, obj: Obstacle, obj_spheres: torch.Tensor, surface: Obstacle, held: torch.Tensor,
+) -> torch.Tensor:
+    """``[n, 4]``: a placement of ``obj`` on ``surface`` for each row of ``held`` ``[n, 4, 4]``, the row's grasp of
+    ``obj`` (G in the object frame). Of ``_PLACE_DRAWS`` candidates whose xyz come from ``place_4dof_sampler``, the row
+    keeps the one whose spheres ``obj_spheres`` collide least with the scene (``world.collision_fn``).
+
+    Each candidate's yaw follows the grasp: ψ = φ_u - φ_g + U(-AZIMUTH_CONE, AZIMUTH_CONE), with φ_g the azimuth of
+    the grasp's approach Z_G in the object frame and φ_u that of the candidate's xy minus the stance's (the mean of
+    ``world.stance_soles``). The world approach, ψ + φ_g, then comes from the robot's side, within ``AZIMUTH_CONE`` of
+    the direction from the stance to the placement. A near-vertical grasp keeps the sampler's uniform yaw."""
+    n = held.shape[0]
+    candidates = place_4dof_sampler(n * _PLACE_DRAWS, obj, obj_spheres, surface).view(n, _PLACE_DRAWS, 4)
+    approach = held[:, :3, 2]
+    away = candidates[..., :2] - world.stance_soles[:, :2, 3].mean(0)
+    phi_u, phi_g = torch.atan2(away[..., 1], away[..., 0]), torch.atan2(approach[:, 1:2], approach[:, :1])
+    psi = phi_u - phi_g + (2 * torch.rand_like(phi_u) - 1) * AZIMUTH_CONE
+    candidates[..., 3] = torch.where(near_vertical(approach)[:, None], candidates[..., 3],
+                                     torch.remainder(psi, 2 * math.pi))
+    world_from_obj = action_4dof_to_mat4x4(candidates)  # [n, k, 4, 4]
+    collision = world.collision_fn(transform_spheres(obj_spheres, world_from_obj).contiguous())  # [n, k]
+    return candidates[torch.arange(n, device=candidates.device), collision.argmin(-1)]
+
+
 class ParticleInitializer:
     def __init__(self, world: TAMPWorld, config: TAMPConfiguration, constraint_checker: ConstraintChecker):
         self.world = world
@@ -277,31 +329,31 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                tool_frame = world.tool_frame_for_arm(arm)
-                gripper_spheres = world.gripper_spheres[tool_frame]
-                tool_from_ee = world.tool_from_ee[tool_frame]
-
-                obj_curobo = world.get_object(obj)
-                obj_spheres = world.get_collision_spheres(obj)
-                num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
-
-                sampled_grasps = top_down_grasps_7dof(num_particles * 4, obj_curobo, obj_spheres, num_faces=num_faces)
-                obj_from_grasp = grasp_7dof_to_mat4x4(sampled_grasps)
-
-                # Today's filter: the gripper spheres placed at the old top-down grasp frame (Task 6 removes it).
-                grasp_spheres = transform_spheres(
-                    gripper_spheres, obj_from_grasp @ torch.inverse(_grasp_from_G().to(device))
+                # The grasps this hand can take from the robot's side, at the object's start pose: init picks only
+                # from start poses.
+                world_from_obj = world.get_object_pose(obj)
+                candidates = world.grasp_candidates(obj, arm)
+                in_cone = approach_in_cone(world_from_obj @ grasp_7dof_to_mat4x4(candidates.grasps),
+                                           world.stance_soles[:, :2, 3].mean(0), world_from_obj[:2, 3])
+                if not in_cone.any():
+                    below, touching = world.grasp_drops(obj, arm)
+                    raise ValueError(
+                        f"{header}: no grasp of {obj} is left for the {arm} hand. Of its "
+                        f"{len(world.grasps[obj].grasps)} grasps, {below} reach below its bottom face and {touching} "
+                        f"touch it (a grasp may do both), and the approach cone drops the {len(candidates.grasps)} "
+                        f"others")
+                grasps, scores = candidates.grasps[in_cone], candidates.scores[in_cone]
+                tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
+                movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)  # the grasp moves none of them
+                particles[q], accepted = _draw_and_solve(
+                    world, particles, grasp, num_particles,
+                    lambda rows: grasps[torch.multinomial(scores, len(rows), replacement=True)],
+                    lambda rows: (world_from_obj @ grasp_7dof_to_mat4x4(particles[grasp][rows]) @ tool_from_ee,
+                                  movables[rows]),
+                    arm, self.ik_tol,
                 )
-                grasp_coll = sphere_to_sphere_overlap(obj_spheres, grasp_spheres)
-                good_idxs = grasp_coll.topk(num_particles, largest=False).indices
-                particles[grasp] = sampled_grasps[good_idxs]
-
-                obj_from_grasp = obj_from_grasp[good_idxs]
-                world_from_obj = pose_list_to_mat4x4(obj_curobo.pose).to(device)
-                world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)
-                particles[q], ok = gn_ik(world, world_from_ee, arm, movables, self.ik_tol)
-                log_debug(f"{header}. IK accepted: {int(ok.sum())}/{num_particles}")
+                log_debug(f"{header}. {len(grasps)} grasps pass the drops and the cone; IK accepted: "
+                          f"{accepted[0]}/{num_particles}, after redraws {accepted[1:]}")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
@@ -318,31 +370,20 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                tool_frame = world.tool_frame_for_arm(arm)
-                tool_from_ee = world.tool_from_ee[tool_frame]
-
-                obj_curobo = world.get_object(obj)
-                obj_spheres = world.get_collision_spheres(obj)
+                obj_curobo, obj_spheres = world.get_object(obj), world.get_collision_spheres(obj)
                 surface_curobo = world.get_object(surface)
-                sampled_placements = place_4dof_sampler(
-                    num_particles * 4, obj_curobo, obj_spheres, surface_curobo,
+                obj_from_G = grasp_7dof_to_mat4x4(particles[grasp])
+                tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
+                # The placed object at its placement (particles[placement], redrawn per round), as the rollout has it.
+                movables = movable_spheres_fn(world, plan_skeleton, idx)
+                particles[q], accepted = _draw_and_solve(
+                    world, particles, placement, num_particles,
+                    lambda rows: _draw_placements(world, obj_curobo, obj_spheres, surface_curobo, obj_from_G[rows]),
+                    lambda rows: (action_4dof_to_mat4x4(particles[placement][rows]) @ obj_from_G[rows] @ tool_from_ee,
+                                  movables(particles)[rows]),
+                    arm, self.ik_tol,
                 )
-
-                world_from_obj = action_4dof_to_mat4x4(sampled_placements)
-                obj_place_spheres = transform_spheres(obj_spheres, world_from_obj)
-                # WorldCollisionCost returns [B, H] summed across spheres.
-                place_coll = world.collision_fn(obj_place_spheres[:, None].contiguous())[:, 0]
-                best_idxs = place_coll.topk(num_particles, largest=False).indices
-                sampled_placements = sampled_placements[best_idxs]
-                world_from_obj = world_from_obj[best_idxs]
-
-                particles[placement] = sampled_placements
-                obj_from_grasp = grasp_7dof_to_mat4x4(particles[grasp])
-                world_from_ee = world_from_obj @ obj_from_grasp @ tool_from_ee
-                # The placed object at its new placement (particles[placement], set above), as the rollout has it.
-                movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)
-                particles[q], ok = gn_ik(world, world_from_ee, arm, movables, self.ik_tol)
-                log_debug(f"{header}. IK accepted: {int(ok.sum())}/{num_particles}")
+                log_debug(f"{header}. IK accepted: {accepted[0]}/{num_particles}, after redraws {accepted[1:]}")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 

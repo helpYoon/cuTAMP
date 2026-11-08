@@ -16,7 +16,8 @@ The world wraps a TAMPEnvironment with: collision Scene and T1 Kinematics, on th
 """
 
 import logging
-from typing import Dict, List, Union
+import math
+from typing import Dict, List, Tuple, Union
 
 import torch
 
@@ -26,7 +27,7 @@ from curobo.types import DeviceCfg, JointState, Pose
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.floor_wrench import SegmentTorques
-from cutamp.grasps import GraspSet
+from cutamp.grasps import GraspSet, drop_grasps
 from cutamp.robots import RobotContainer
 from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, T1Model
 from cutamp.t1_domain import get_initial_state
@@ -35,6 +36,7 @@ from cutamp.utils.collision import WorldCollisionCost
 from cutamp.utils.common import (
     approximate_goal_aabb,
     get_world_cfg,
+    grasp_7dof_to_mat4x4,
     pose_list_to_mat4x4,
     transform_spheres,
 )
@@ -124,6 +126,22 @@ class TAMPWorld:
             pose.get_matrix().reshape(4, 4) for pose in stance_sole_poses.values()
         ])
 
+        # Each hand's spheres in its tool frame for the grasp drops: the gripper's 12, then the hand link's and the
+        # wrist's (AL6 / AR6), moved into that frame by this FK at home.
+        kp = self.kinematics.kinematics_config
+        self._hand_spheres: Dict[str, torch.Tensor] = {}
+        for arm in ("left", "right"):
+            tool = self.tool_frame_for_arm(arm)
+            links = (f"{arm}_hand_link", f"A{arm[0].upper()}6")
+            idx = torch.cat([kp.get_sphere_index_from_link_name(link) for link in links])
+            world_from_tool = stance_ks.tool_poses.get_link_pose(tool, make_contiguous=True).get_matrix().reshape(4, 4)
+            # In float64: a float32 CUDA matmul runs in TF32 here, 0.2 mm off at these world coordinates.
+            wrist = transform_spheres(stance_ks.robot_spheres.reshape(-1, 4)[idx].double(),
+                                      torch.linalg.inv(world_from_tool.double()))
+            self._hand_spheres[arm] = torch.cat([self.gripper_spheres[tool], wrist.float()])
+        # Each (object, arm)'s grasp candidates and the drop rules' counts, made at first use (grasp_candidates).
+        self._grasp_candidates: Dict[Tuple[str, str], Tuple[GraspSet, Tuple[int, int]]] = {}
+
     # ---- Container delegates ------------------------------------------------
 
     @property
@@ -205,6 +223,37 @@ class TAMPWorld:
     def grasps(self) -> Dict[str, GraspSet]:
         """Each movable's GraspGenX grasps by name (``grasps.grasp_sets``); same-shaped movables share one set."""
         return self._grasps
+
+    def hand_spheres(self, arm: str) -> torch.Tensor:
+        """``[14, 4]``: ``arm``'s hand spheres in its tool frame (``*_base_link``), for the grasp drops: the gripper's 12
+        (``gripper_spheres``), then the ``*_hand_link`` and the wrist (AL6 / AR6) spheres, placed by FK at
+        ``model.home``. Hand_Roll moves the wrist sphere less than 2 mm in that frame across its range, so the set is
+        taken as rigid."""
+        return self._hand_spheres[arm]
+
+    def grasp_candidates(self, obj_name: str, arm: str) -> GraspSet:
+        """``obj_name``'s grasps (``grasps``) that ``arm``'s hand can take: those ``grasps.drop_grasps`` keeps with
+        ``hand_spheres(arm)``, the object's spheres and its bottom face. Made at first use, with each rule's count
+        (``grasp_drops``), and kept. Same-shaped objects get equal sets."""
+        key = (obj_name, arm)
+        if key not in self._grasp_candidates:
+            grasps, hand, spheres = self.grasps[obj_name], self.hand_spheres(arm), self.get_collision_spheres(obj_name)
+            bottom = float(self.get_object(obj_name).get_trimesh_mesh().bounds[0, 2])  # unit pose: the object frame
+            obj_from_G = grasp_7dof_to_mat4x4(grasps.grasps)
+            keep = drop_grasps(obj_from_G, hand, spheres, bottom)
+            # Each rule alone: no object spheres to touch, then no bottom face to reach below.
+            below = int((~drop_grasps(obj_from_G, hand, spheres[:0], bottom)).sum())
+            touching = int((~drop_grasps(obj_from_G, hand, spheres, -math.inf)).sum())
+            self._grasp_candidates[key] = GraspSet(grasps.grasps[keep], grasps.scores[keep]), (below, touching)
+            _log.debug(f"{obj_name}, {arm} hand: {int(keep.sum())} of {len(keep)} grasps kept; {below} reach below "
+                       f"its bottom face, {touching} touch it")
+        return self._grasp_candidates[key][0]
+
+    def grasp_drops(self, obj_name: str, arm: str) -> Tuple[int, int]:
+        """``(below, touching)``: how many of ``obj_name``'s grasps the two drop rules of ``grasp_candidates`` remove
+        for ``arm``'s hand, each rule counted alone (a grasp can break both)."""
+        self.grasp_candidates(obj_name, arm)
+        return self._grasp_candidates[(obj_name, arm)][1]
 
     def get_aabb(self, obj: Union[Obstacle, str]) -> torch.Tensor:
         obj_name = obj.name if isinstance(obj, Obstacle) else obj
