@@ -2,10 +2,11 @@
 the coupled-reIK feature TypeErrors on first refresh."""
 import pytest
 
-from cutamp.tests.conftest import needs_cuda
+from cutamp.tests.conftest import needs_cuda, needs_graspgenx
 
 
 @needs_cuda
+@needs_graspgenx
 @pytest.mark.parametrize("cuda_graphs", [False, True])
 def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     """Run cutamp_demo with coupled re-IK for a few Adam steps: no exception, and the balance-first

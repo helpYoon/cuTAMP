@@ -2,6 +2,7 @@
 
 import dataclasses
 import gc
+import importlib.util
 import os
 import struct
 import sys
@@ -20,6 +21,12 @@ needs_cuda = pytest.mark.skipif(
     _cvd in ("", "-1") or (_cvd is None and not os.path.exists("/dev/nvidia0")),
     reason="Requires a CUDA device.",
 )
+#: Whether GraspGenX is installed: it installs on x86_64 only (pyproject.toml), and every world loads its grasps from
+#: it (``grasps.grasp_sets``). find_spec only finds the package, so its first-import hook never runs here.
+HAS_GRASPGENX = importlib.util.find_spec("graspgenx") is not None
+_NO_GRASPGENX = "Requires GraspGenX, which installs on x86_64 only: every world loads its grasps from it."
+#: Skips unless GraspGenX is installed. ``make_blocks_t1_world`` skips by itself: a mark can't skip a fixture.
+needs_graspgenx = pytest.mark.skipif(not HAS_GRASPGENX, reason=_NO_GRASPGENX)
 
 
 def link_kinematics(world):
@@ -44,7 +51,10 @@ def link_kinematics(world):
 
 def make_blocks_t1_world():
     """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home,
-    with its GraspGenX grasps (the first build in a process loads the model, which then stays)."""
+    with its GraspGenX grasps (the first build in a process loads the model, which then stays). Without GraspGenX it
+    skips the calling test, or every test of the calling fixture."""
+    if not HAS_GRASPGENX:
+        pytest.skip(_NO_GRASPGENX)
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.grasps import grasp_sets

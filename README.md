@@ -42,8 +42,8 @@ from tag `paper-g1-comfix`. Both need the cuRobo fork helpYoon/curobo (with
 
 ## Installation
 
-cuTAMP needs Linux, an NVIDIA GPU that
-[cuRobo supports](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
+cuTAMP needs Linux on x86_64 (planning needs GraspGenX, below), an NVIDIA GPU
+that [cuRobo supports](https://github.com/NVlabs/curobo/blob/v0.9.0/docs/getting-started/installation.rst)
 (newer than Turing, with a driver >= 580.65.06) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/). `uv sync`
 builds `.venv` from `uv.lock`: Python 3.10, PyTorch 2.9.1 for CUDA 12.8
@@ -75,9 +75,12 @@ folder is empty, and `uv sync` and `uv run` fail. Both are shallow
 [GraspGenX](https://github.com/NVlabs/GraspGenX) (6-DoF grasps) is pinned at
 `b9429097`. On x86_64, `uv sync` installs it editable into the same env with its
 `serve` extra. One of its dependencies, sharedarray, builds from source, so that
-needs a C compiler. On aarch64 GraspGenX is left out, because its scene tools
-need `usd-core`. Its pins on torch, torchvision, numpy, trimesh and yourdfpy are
-overridden to cuTAMP's (`override-dependencies` in `pyproject.toml`). Its
+needs a C compiler. Planning needs GraspGenX, since every world loads its
+grasps from it, so cuTAMP plans on x86_64 only: on aarch64 `uv sync` leaves
+GraspGenX out, because its scene tools need `usd-core`, and setup stops with a
+`RuntimeError` that names the platform and this paragraph. Its pins on torch,
+torchvision, numpy, trimesh and yourdfpy are overridden to cuTAMP's
+(`override-dependencies` in `pyproject.toml`). Its
 179 MB of LFS gripper meshes and sample data are not needed: GraspGenX can take
 the hand as a sweep volume (`GraspGenXSampler.from_sweep_volume`). Before
 anything imports `graspgenx`, point two variables at existing folders:

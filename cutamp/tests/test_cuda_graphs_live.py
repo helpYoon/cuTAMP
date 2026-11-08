@@ -8,7 +8,7 @@ import os
 import pytest
 
 from cutamp.config import TAMPConfiguration
-from cutamp.tests.conftest import SpyVis, install_refresh_spy, install_step_replay_spy, needs_cuda
+from cutamp.tests.conftest import SpyVis, install_refresh_spy, install_step_replay_spy, needs_cuda, needs_graspgenx
 
 needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
@@ -28,6 +28,7 @@ def _run_demo(tmp_path, monkeypatch, n) -> list:
 
 
 @needs_cuda
+@needs_graspgenx
 @needs_slow
 @pytest.mark.parametrize("n", [64, 512])
 def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
@@ -52,6 +53,7 @@ def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
 
 
 @needs_cuda
+@needs_graspgenx
 @needs_slow
 def test_live_capture_waits_for_the_planner_thread(tmp_path, monkeypatch):
     # The build waits until call 1 has run a step, so the real build thread is alive at call 1's

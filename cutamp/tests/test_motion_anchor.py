@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import cutamp.motion_solver as ms
-from cutamp.tests.conftest import needs_cuda
+from cutamp.tests.conftest import needs_cuda, needs_graspgenx
 
 
 _NAMES = [f"j{i}" for i in range(33)]
@@ -83,6 +83,7 @@ def _sole_errors(world, q: torch.Tensor):
 
 
 @needs_cuda
+@needs_graspgenx
 def test_real_legs_plan_audit(tmp_path, monkeypatch):
     # One real-legs plan end to end (blocks_t1, seed 0, 64 particles, the surface at 0.5 m, the motion plan saved
     # raw): setup_cutamp builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the

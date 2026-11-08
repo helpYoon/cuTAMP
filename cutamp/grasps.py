@@ -9,9 +9,11 @@ axis and leaves the same way, or lifts and comes in from above.
 
 import functools
 import hashlib
+import importlib.util
 import logging
 import math
 import os
+import platform
 import random
 from typing import Dict, Literal, NamedTuple, Sequence, Tuple, Union
 
@@ -148,12 +150,14 @@ class GraspSet(NamedTuple):
     """``[K]`` float32 in [0, 1]: GraspGenX's discriminator scores."""
 
 
-_SETS: Dict[str, GraspSet] = {}
-"""Each shape's grasps by ``mesh_sha256``, kept for the life of the process."""
+_SETS: Dict[Tuple[str, torch.device], GraspSet] = {}
+"""Each shape's grasps by ``(mesh_sha256, device)``, kept for the life of the process: a world on another device gets
+tensors of its own."""
 
 _SAMPLER = None
 """GraspGenX's ``GraspGenXSampler`` for the T1 gripper, its model on the GPU (538 MB), kept for the life of the
-process."""
+process. One serves every device: GraspGenX runs on ``.cuda()`` and returns numpy arrays, which ``grasp_sets`` places
+on each call's device."""
 
 
 def mesh_sha256(obj: Obstacle) -> str:
@@ -237,7 +241,7 @@ def _z_offsets_cm(mesh: trimesh.Trimesh) -> Tuple[int, ...]:
 def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Dict[str, GraspSet]:
     """Each object's GraspGenX grasps, keyed by name, made in this process.
 
-    Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process
+    Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process and device
     (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame, and runs GraspGenX's
     graspmoe planner on them: 500 diffusion grasps and the box grasps on the top and the four sides, all kept.
     GraspGenX always runs on ``.cuda()``; ``device`` only places the returned tensors.
@@ -249,13 +253,21 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
     Call it only inside ``setup_cutamp``, before the motion planner's warmup thread starts, and in tests: deterministic
     mode and the TF32 pin are process-wide, which is safe only while no other CUDA work runs.
 
-    Every call first checks GraspGenX's model folders (``_checked_model_dir``), before anything imports ``graspgenx``
-    or touches CUDA, and raises ``RuntimeError`` naming the README if they are missing.
+    Every call first checks that GraspGenX is installed, which it is on x86_64 only (``pyproject.toml``), and then its
+    model folders (``_checked_model_dir``), before anything imports ``graspgenx`` or touches CUDA. Either check raises
+    ``RuntimeError`` naming the README.
     """
     global _SAMPLER
+    if importlib.util.find_spec("graspgenx") is None:  # finds the package only: its first-import hook doesn't run
+        raise RuntimeError(
+            "GraspGenX is not installed, and planning needs it: every world loads its movables' grasps from it "
+            f"(cutamp/grasps.py). uv sync installs it on x86_64 only, and this machine is {platform.machine()}. "
+            "See README.md, Installation, the GraspGenX paragraph."
+        )
     ckpt = _checked_model_dir()
+    device = torch.device(device)  # a str and a torch.device of one device share a key
     shape_of = {obj.name: mesh_sha256(obj) for obj in objs}
-    new = {shape_of[obj.name]: obj for obj in objs if shape_of[obj.name] not in _SETS}
+    new = {shape_of[obj.name]: obj for obj in objs if (shape_of[obj.name], device) not in _SETS}
     if new:
         rng = random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all()
         tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
@@ -278,7 +290,7 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
                     moe_obb_mode="advanced", moe_skip_obb_rule="auto", moe_obb_position_spacing_cm=1.0,
                     moe_outlier_threshold=0.014, moe_outlier_k=20,
                 )
-                _SETS[shape] = GraspSet(
+                _SETS[shape, device] = GraspSet(
                     mat4x4_to_grasp_7dof(torch.from_numpy(grasps).to(device)), torch.from_numpy(scores).to(device)
                 )
                 n_box, names = tags.count("obb"), ", ".join(n for n, s in shape_of.items() if s == shape)
@@ -289,4 +301,4 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
             torch.set_rng_state(rng[2])
             torch.cuda.set_rng_state_all(rng[3])
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
-    return {name: _SETS[shape] for name, shape in shape_of.items()}
+    return {name: _SETS[shape, device] for name, shape in shape_of.items()}
