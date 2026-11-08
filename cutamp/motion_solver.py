@@ -89,7 +89,7 @@ def _plan_arm_to_conf(
     given, else None) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
     cuRobo result; raises ``RuntimeError`` if it fails (``_plan_failed``: given
-    ``world`` it names the reason).
+    ``world`` it names the reason), with ``out_of_attempts`` set.
 
     One call: plan_cspace makes up to ``max_attempts`` attempts (cuRobo's default 20; all but the first graph-seeded,
     each with one finetune pass). On the fork, which made 5, calling it again with the same start and goal returned
@@ -100,7 +100,9 @@ def _plan_arm_to_conf(
     with _disabled_world_obstacle(planner, disable_obstacle):
         result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
     if not _cspace_plan_succeeded(result):
-        raise _plan_failed(world, result, f"cspace-anchored plan failed for {ground_op}")
+        error = _plan_failed(world, result, f"cspace-anchored plan failed for {ground_op}")
+        error.out_of_attempts = True  # more attempts may plan it (_motion_plan_with_retries' second pass)
+        raise error
     return result
 
 

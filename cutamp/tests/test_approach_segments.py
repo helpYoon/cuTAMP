@@ -215,6 +215,7 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
     monkeypatch.setattr(ms, "check_line", miss_first)
     monkeypatch.setattr(ms, "_check_planted", lambda world, q: None)
     monkeypatch.setattr(alg, "solve_curobo", solve_spy)
+    monkeypatch.setattr(alg, "_PLAN_ATTEMPTS", (20,))  # one pass: the next candidate plans, or the test fails here
     config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False)
     _, _, attempts, _, failures = alg._motion_plan_with_retries(
         {"plan_skeleton": list(skeleton[: k + 1])}, candidates, real_world, config, TorchTimer(),

@@ -70,9 +70,10 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
             return "R"
 
     fp = FakePlanner()
-    with pytest.raises(RuntimeError, match="cspace-anchored"):
+    with pytest.raises(RuntimeError, match="cspace-anchored") as e:
         ms._plan_arm_to_conf(fp, torch.zeros(33), "LAST", disable_obstacle=None, ground_op="OP")
     assert fp.n == 1  # no repeat: the same start and goal plan the same way
+    assert e.value.out_of_attempts  # the retry's second pass gives it more
 
 
 def _sole_errors(world, q: torch.Tensor):

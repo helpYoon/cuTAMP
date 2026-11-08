@@ -114,7 +114,8 @@ def test_motion_plan_attempts_add_up_over_skeletons(monkeypatch, results, attemp
 
 def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_attempts(monkeypatch):
     # The balance gate rejects candidate 0's plan, which no budget changes; candidate 1's pick needs more than 2
-    # plan_cspace attempts. The cheap pass fails both; the full pass skips 0 and plans 1.
+    # plan_cspace attempts (out_of_attempts, as _plan_arm_to_conf sets it). The cheap pass fails both; the full pass
+    # skips 0 and plans 1.
     skeleton = [SimpleNamespace(values=("left_q0", "traj1", "left_q1"))]
     calls = []
 
@@ -126,6 +127,8 @@ def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_atte
             e.op_idx = 0
             if q1 == 0:
                 e.check = "zmp"
+            else:
+                e.out_of_attempts = True
             raise e
         return "PLAN", {}
 

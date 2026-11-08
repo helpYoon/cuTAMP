@@ -216,9 +216,10 @@ def _motion_plan_with_retries(
 
     The candidates get two passes (``_PLAN_ATTEMPTS``): each segment first with
     2 plan_cspace attempts, then, only if no candidate planned, with cuRobo's
-    20 for the candidates that ran out of attempts. A balance-gate rejection
-    (``e.check``) is not planned again: plan_cspace returns its first success,
-    so a bigger budget replans the same trajectory.
+    20 for the candidates whose plan_cspace ran out of attempts
+    (``e.out_of_attempts``). Any other failure (a balance-gate rejection, an
+    approach-IK or line miss) is not planned again: plan_cspace returns its
+    first success, so a bigger budget replans the same trajectory.
 
     Returns ``(curobo_plan, traj_metrics, attempts, rank, failures)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
@@ -266,7 +267,9 @@ def _motion_plan_with_retries(
                 ops = skeleton[: getattr(e, "op_idx", len(skeleton)) + 1]
                 used = {"left_q0"} | {v for op in ops for v in op.values if v in particle}
                 failed.append({k: particle[k] for k in used})
-                if hasattr(e, "check"):  # the balance gate's: no budget changes it
+                # No budget changes the rest (a gate rejection, an approach-IK or line miss): plan_cspace returns
+                # its first success, so more attempts replan the same trajectory.
+                if not getattr(e, "out_of_attempts", False):
                     rejected.append(failed[-1])
         if max_attempts != _PLAN_ATTEMPTS[-1]:
             _log.warning(f"No candidate planned with {max_attempts} plan_cspace attempts per segment; "
@@ -292,9 +295,9 @@ def setup_cutamp(
     experiment_id: str,
 ):
     # cuRobo runs a full gc.collect() before every CUDA graph capture (cuda_graph_util.py:197), 11-27 per problem, and
-    # each walks the whole heap: 2.2-2.6 s per problem. Frozen here, before the world is built, the heap is skipped (0.1-0.5
-    # s). Frozen objects are still freed by refcount, but frozen garbage, and what it holds, waits for the next problem's
-    # unfreeze below or for the one at exit (atexit, above).
+    # each walks the whole heap: 2.2-2.6 s per problem. Frozen here and again once the world is built (GraspGenX's import
+    # and grasps are most of the heap), those collections skip it. Frozen objects are still freed by refcount, but frozen
+    # garbage, and what it holds, waits for the next problem's unfreeze below or for the one at exit (atexit, above).
     gc.unfreeze()
     gc.collect()
     gc.freeze()
@@ -329,6 +332,8 @@ def setup_cutamp(
             grasps=grasps,
         )
         check_tamp_world_not_in_collision(world)
+    gc.collect()
+    gc.freeze()  # the grasps and the world too, before run_cutamp's planner thread starts capturing graphs
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
