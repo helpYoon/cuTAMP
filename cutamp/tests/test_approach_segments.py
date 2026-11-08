@@ -222,4 +222,5 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
         Visualizer(config, None), get_planner=lambda: planner, ik_tol=IKTol.from_checker(default_checker()))
     assert errors and errors[0].op_idx == k and "the test's miss" in str(errors[0]), errors
     assert "insert" in str(errors[0]) and failures[0] == str(errors[0])
+    assert not hasattr(errors[0], "out_of_attempts")  # a line miss: the retry's second pass skips it
     assert attempts == 2 and len(lines) >= 2  # the next candidate planned its own insert

@@ -36,9 +36,9 @@ from tag `paper-g1-comfix`. Both need the cuRobo fork helpYoon/curobo (with
 > tool-frame gradients with float atomics, whose order varies between warps.
 > Since stage 4's line segments (each pick's and place's straight insert and
 > leave), a line segment, most often a right-hand one, can differ by 1.55e-6
-> to 8.52e-4 rad between same-seed runs. Particle init also sometimes accepts different IK
-> confs in same-seed runs, while the motion planner is being built. So
-> same-seed plans are usually, not always, bit-identical.
+> to 8.52e-4 rad between same-seed runs. Particle init also sometimes accepts
+> different IK confs in same-seed runs, while the motion planner is being
+> built. So same-seed plans are usually, not always, bit-identical.
 
 ## Installation
 
