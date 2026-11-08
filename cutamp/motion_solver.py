@@ -9,14 +9,20 @@
 
 """Motion-plan solver for cuTAMP under cuRobo's single MotionPlanner.
 
-Per plan-skeleton operator (T1):
+Per plan-skeleton operator (T1), every segment a ``plan_cspace`` call to a conf (``_plan_arm_to_conf``) that the
+balance gate then checks and paces:
   - Arm ops (Pick/Place/Retract): every joint is free, the base included, and
     trajopt holds the soles on the stance (``get_t1_motion_planner``); nothing
     holds the inactive hand between confs.
-  - Pick / Place terminals are cspace-anchored via ``_plan_arm_to_conf``:
-    we plan to the gate-approved particle conf with the grasp-object /
-    placement-surface obstacle temporarily disabled.
-  - Retract plans the same way to the particle's retract conf, with no obstacle disabled.
+  - Pick and place: three segments along the grasp's axis (design 7.8). An approach, everything enabled, to the
+    pre conf; a straight insert to the gate-approved particle conf with the grasp object or the placement surface
+    disabled; and a straight leave, a pick's lift or a place's back-out (the released object disabled), to the post
+    conf. The pre and post confs come from cuTAMP's balance-aware GN (``_approach_confs``), the straight segments
+    hold the hand on their line (``_line_motion``) and FK checks it (``check_line``). A non-vertical approach
+    (``grasps.is_vertical``) lifts straight up after a pick and comes in from above to a place.
+  - Retract plans to the particle's retract conf, with no obstacle disabled.
+
+Each plan entry carries its op index, its phase and its gripper event (``add_segment``).
 
 Particles and the planner share one joint order, ``world.model.joint_names`` (``t1._check_joint_order``); every
 planner trajectory also carries the joints the planner locks (the head, the fingers).
@@ -27,7 +33,7 @@ import contextlib
 import logging
 import math
 import random
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -37,10 +43,21 @@ from curobo.types import JointState, Pose
 
 from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
+from cutamp.gn_refresh import gn_project_balanced
+from cutamp.grasps import LINE_BACKTRACK, LINE_END_TOL, LINE_TOL, approach_targets, is_vertical
 from cutamp.optimize_plan import PlanContainer
+from cutamp.particle_initialization import GN_IK_CLEAR_ITERS, IKTol, ik_check
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM, get_t1_motion_planner
+from cutamp.rollout import movable_spheres_fn
 from cutamp.tamp_world import TAMPWorld
-from cutamp.utils.common import Particles, action_4dof_to_mat4x4, get_world_cfg, grasp_7dof_to_mat4x4
+from cutamp.task_planning import PlanSkeleton
+from cutamp.utils.common import (
+    Particles,
+    action_4dof_to_mat4x4,
+    get_world_cfg,
+    grasp_7dof_to_mat4x4,
+    transform_spheres,
+)
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
@@ -125,6 +142,113 @@ def _disabled_world_obstacle(planner, name):
         yield
     finally:
         sc.enable_obstacle(name=name, enable=True)
+
+
+def _hand_poses(world: TAMPWorld, q: torch.Tensor, arms: Union[str, Sequence[str]]) -> torch.Tensor:
+    """``[N, 4, 4]``: the hand's tool-frame pose (``*_base_link``, whose +x is the approach) at each conf of ``q``
+    ``[N, dof]`` (the model's joint order), row i on ``arms[i]`` (a bare ``str``: every row's), by one FK on
+    ``world.kinematics``."""
+    from cutamp.com_polygon_cost import _fk_state
+
+    state = _fk_state(world, q)
+
+    def pose(arm):  # get_matrix builds a new tensor, so the next FK call cannot overwrite it
+        frame = world.tool_frame_for_arm(arm)
+        return state.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(-1, 4, 4)
+
+    if isinstance(arms, str):
+        return pose(arms)
+    is_left = torch.tensor([arm == "left" for arm in arms], device=q.device).view(-1, 1, 1)
+    return torch.where(is_left, pose("left"), pose("right"))
+
+
+def _palm(world: TAMPWorld, q: torch.Tensor, arm: str) -> torch.Tensor:
+    """``[T, 3]``: ``arm``'s palm (its tool frame's origin) at each conf of ``q`` ``[T, dof]`` (the model's order)."""
+    return _hand_poses(world, q, arm)[:, :3, 3]
+
+
+def _approach_confs(
+    world: TAMPWorld, best_particle: Particles, plan_skeleton: PlanSkeleton, ik_tol: IKTol,
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    """``{op index: (q_pre, q_post)}`` for each pick and place of ``plan_skeleton``: the confs where its straight
+    insert starts and its leave ends, from one batched balance-aware GN call (design 7.8).
+
+    Each op's targets are ``grasps.approach_targets`` of the hand's pose at its particle conf (FK, so the insert's
+    line through the conf's palm starts on the pre target). Each row is seeded at that conf and runs
+    ``GN_IK_CLEAR_ITERS`` iterations of ``gn_project_balanced`` with the collision row on, against the objects where
+    the rollout puts them at that op (``movable_spheres_fn`` on ``best_particle``); ``ik_check`` judges every row on
+    ``ik_tol``. A failed row raises a RuntimeError whose ``op_idx`` is that op's index, the first such op's, so the
+    retry skips candidates that repeat ops up to it."""
+    ops = [(idx, op) for idx, op in enumerate(plan_skeleton) if op.operator.metadata.action_type in ("pick", "place")]
+    if not ops:
+        return {}
+    arms = tuple(op.operator.metadata.arm for _, op in ops)
+    confs = torch.stack([best_particle[op.values[-1]] for _, op in ops])
+    hands = _hand_poses(world, confs, arms)
+    targets = torch.stack([t for (_, op), hand in zip(ops, hands)
+                           for t in approach_targets(hand, op.operator.metadata.action_type)])  # [2K, 4, 4]
+    one = {name: v.unsqueeze(0) for name, v in best_particle.items()}  # a batch of one particle
+    movables = torch.cat([movable_spheres_fn(world, plan_skeleton, idx)(one).expand(2, -1, -1) for idx, _ in ops])
+    seeds = confs.repeat_interleave(2, dim=0)  # rows (pre, post) per op: len(arms) dep-major blocks of 2
+    q = gn_project_balanced(world, seeds, targets, arms, iters=GN_IK_CLEAR_ITERS, movables=movables)
+    ok, safe, err = ik_check(world, q, targets, arms, movables, ik_tol)
+    ok, safe, err = ok.tolist(), safe.tolist(), err.tolist()
+    for row, accepted in enumerate(ok):
+        if not accepted:
+            idx, op = ops[row // 2]
+            why = (f"misses its target by {err[row]:.4f} (m + rad)" if safe[row]
+                   else "is off balance, off the stance or in collision")
+            error = RuntimeError(f"approach IK failed for {op}: its {('pre', 'post')[row % 2]} conf {why}")
+            error.op_idx = idx
+            raise error
+    return {idx: (q[2 * k], q[2 * k + 1]) for k, (idx, _) in enumerate(ops)}
+
+
+@contextlib.contextmanager
+def _line_motion(planner, arm: str, world_direction: Optional[torch.Tensor] = None):
+    """Hold ``arm``'s hand on a straight line in the ``plan_cspace`` calls inside the block (design 7.8).
+
+    The hand's ``ToolPoseCriteria`` row becomes ``linear_motion(axis="x")``: at every waypoint, the palm's offset
+    from the line through the goal conf's palm along the goal palm's +x (the approach; cuRobo's GOAL error frame),
+    and the hand's rotation from the goal's. Given ``world_direction`` ``[3]``, the line runs along that world
+    direction instead (``linear_motion(direction=...)``, the WORLD error frame), and only its axis matters. The line
+    is a soft cost; the soles keep their rows. On exit, even if the block raises, the row is
+    ``get_t1_motion_planner``'s terminal-only hand tracking again, ``track_position_and_orientation`` at non-terminal
+    scale 0. cuRobo copies the rows in place, so the captured CUDA graphs see both changes."""
+    from curobo.types import ToolPoseCriteria
+
+    device_cfg, frame = planner.device_cfg, TOOL_FRAME_FOR_ARM[arm]
+    line = (ToolPoseCriteria.linear_motion(axis="x", device_cfg=device_cfg) if world_direction is None
+            else ToolPoseCriteria.linear_motion(direction=world_direction, device_cfg=device_cfg))
+    planner.update_tool_pose_criteria({frame: line})
+    try:
+        yield
+    finally:
+        planner.update_tool_pose_criteria({
+            frame: ToolPoseCriteria.track_position_and_orientation(non_terminal_scale=0.0, device_cfg=device_cfg)})
+
+
+def check_line(palm: torch.Tensor, start: torch.Tensor, end: torch.Tensor) -> None:
+    """Raise a RuntimeError naming the worst frame unless the palm positions ``palm`` ``[T, 3]`` of a straight
+    segment follow the line from ``start`` to ``end`` (``[3]`` each): every frame within ``LINE_TOL`` of the line,
+    its progress along the line never dropping by more than ``LINE_BACKTRACK`` (so the palm neither backs up nor
+    overshoots the end and comes back), and the last frame within ``LINE_END_TOL`` of ``end``. A NaN fails."""
+    n = palm.shape[0]
+    axis = end - start
+    u = axis / axis.norm().clamp_min(1e-9)
+    rel = palm - start
+    along = rel @ u
+    lateral = (rel - along.unsqueeze(-1) * u).norm(dim=-1)
+    k = int(lateral.nan_to_num(nan=math.inf).argmax())
+    if not float(lateral[k]) <= LINE_TOL:
+        raise RuntimeError(f"palm strays {1000 * float(lateral[k]):.1f} mm from its line at frame {k} of {n}")
+    drop = along.cummax(0).values - along
+    k = int(drop.nan_to_num(nan=math.inf).argmax())
+    if not float(drop[k]) <= LINE_BACKTRACK:
+        raise RuntimeError(f"palm backs up {1000 * float(drop[k]):.1f} mm along its line at frame {k} of {n}")
+    miss = float((palm[-1] - end).norm())
+    if not miss <= LINE_END_TOL:
+        raise RuntimeError(f"palm ends {1000 * miss:.1f} mm from its line's end at frame {n - 1} of {n}")
 
 
 def _interp_plan(result):
@@ -285,6 +409,8 @@ def solve_curobo(
     timer: TorchTimer,
     visualizer: Visualizer,
     get_planner=None,
+    *,
+    ik_tol: IKTol,
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
@@ -292,6 +418,8 @@ def solve_curobo(
     overlap path: algorithm.py starts ``build_motion_planner`` on a thread
     when the optimization loop starts, and the timer below then measures
     only the residual wait. ``None`` builds it inline. Neither warms it up (``build_motion_planner``).
+    ``ik_tol``: the tolerances the run's checker holds every IK conf to, which the pre and post confs of the picks and
+    places meet too (``_approach_confs``).
     """
     plan_skeleton = plan_info["plan_skeleton"]
 
@@ -306,6 +434,10 @@ def solve_curobo(
     # retry attempt.
     _reset_attachment_state(planner, world)
 
+    # Every pick's and place's pre and post confs, in one GN call before the first segment.
+    with timer.time("approach_ik"):
+        approach = _approach_confs(world, best_particle, plan_skeleton, ik_tol)
+
     # The initial state: particles are in the planner's joint order (the module docstring).
     last_js = JointState.from_position(best_particle["left_q0"].clone().reshape(1, -1),
                                        joint_names=list(planner.kinematics.joint_names))
@@ -315,11 +447,13 @@ def solve_curobo(
     accum_plans: List[dict] = []
     gate_stats: List[dict] = []
 
-    def add_segment(plan, dt, arm):
+    def add_segment(plan, dt, arm, *, op_idx: int, phase: str, gripper: Optional[str] = None):
         # The real robot's balance check: every frame's CoM and ZMP inside the support rectangle, and the
         # segment's pace from its speeds, torques and ZMP; a RuntimeError fails the candidate. A retimed segment
-        # also keeps its motion planner's timing, with the held objects along it.
-        entry = {"dt": dt, "arm": arm}
+        # also keeps its motion planner's timing, with the held objects along it. The entry names its op, its phase
+        # ("approach", "insert", "lift", "back_out" or "retract") and the gripper event at its end ("close" after a
+        # pick's insert, "open" after a place's, else None).
+        entry = {"dt": dt, "arm": arm, "op_idx": op_idx, "phase": phase, "gripper": gripper}
         plan, stats, fast = _balance_gate(world, plan, dt)
         gate_stats.append(stats)
         if fast is not None:
@@ -327,6 +461,30 @@ def solve_curobo(
         entry.update(plan=plan, held_objs=_held_obj_poses(world, planner, held, plan))
         accum_plans.append(entry)
         return plan
+
+    up, down = torch.tensor([0.0, 0.0, 1.0]), torch.tensor([0.0, 0.0, -1.0])  # a straight lift's, a drop-in's line
+
+    def segment(ground_op, idx, arm, conf, phase, *, disable=None, gripper=None, line=False, direction=None):
+        # One segment of ground_op (index idx) from last_js to conf (_plan_arm_to_conf, disabling the obstacle
+        # `disable`), through the gate (add_segment). A straight one (`line`) plans under _line_motion, along the
+        # goal palm's +x or the world `direction`, and FK of its frames checks the palm's line (check_line) from where
+        # it starts to the conf's palm. A failure names the op and the phase.
+        nonlocal last_js
+        what = f"{ground_op} {phase}"
+        with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
+            with timer.time("curobo_planning"):
+                result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
+                                           world=world)
+        try:
+            plan = add_segment(_interp_plan(result), _plan_dt(planner), arm, op_idx=idx, phase=phase,
+                               gripper=gripper)
+            if line:
+                palm = _palm(world, _full_positions(world, plan), arm)
+                check_line(palm, palm[0], _palm(world, conf.reshape(1, -1), arm)[0])
+        except RuntimeError as e:
+            e.args = (f"{what}: {e}",)  # the same error object, so a gate error keeps its `check`
+            raise
+        last_js = _last_timestep_js(plan, planner)
 
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
 
@@ -350,72 +508,57 @@ def solve_curobo(
                 pass
 
             elif metadata.action_type == "retract":
-                with timer.time("curobo_planning"):
-                    result = _plan_arm_to_conf(
-                        planner, best_particle[ground_op.values[-1]].clone(), last_js,
-                        disable_obstacle=None, ground_op=ground_op, world=world,
-                    )
-                plan = add_segment(_interp_plan(result), _plan_dt(planner), arm)
-                last_js = _last_timestep_js(plan, planner)
+                segment(ground_op, idx, arm, best_particle[ground_op.values[-1]].clone(), "retract")
 
             elif metadata.action_type == "pick":
                 obj_name, grasp_name, q_name = ground_op.values
                 obj_from_grasp = grasp_7dof_to_mat4x4(best_particle[grasp_name].clone())
+                q_grasp = best_particle[q_name].clone()
+                q_pre, q_post = approach[idx]
+                vertical = is_vertical(_hand_poses(world, q_grasp.reshape(1, -1), arm)[0])
 
-                # Anchor the grasp TERMINAL to the COM-safe particle conf
-                # (best_particle[q_name]) via plan_cspace instead of a free
-                # Cartesian-pose redundancy solve. The conf is an exact IK
-                # solution for the grasp pose, so the gripper still arrives at
-                # the grasp, with a COM-safe posture. Disable the target block
-                # obstacle so gripper-block contact at the grasp isn't rejected;
-                # gripper-table / gripper-other-block collision stays enforced.
-                with timer.time("curobo_planning"):
-                    grasp_result = _plan_arm_to_conf(
-                        planner, best_particle[q_name].clone(), last_js,
-                        disable_obstacle=obj_name, ground_op=ground_op, world=world,
-                    )
-
-                # Attach AT the grasp conf. Block tracking from this point uses
-                # inverse(obj_from_grasp) since the gripper is at the intended
-                # grasp pose.
-                grasp_plan = add_segment(_interp_plan(grasp_result), _plan_dt(planner), arm)
-                last_js = _last_timestep_js(grasp_plan, planner)
-
+                # The insert ends at the COM-safe particle conf, an exact IK solution for the grasp pose, with the
+                # target block disabled so gripper-block contact at the grasp isn't rejected; gripper-table and
+                # gripper-other-block collision stay enforced. The block attaches AT the grasp conf, tracked from
+                # there by inverse(obj_from_grasp).
+                segment(ground_op, idx, arm, q_pre, "approach")
+                segment(ground_op, idx, arm, q_grasp, "insert", disable=obj_name, gripper="close", line=True)
                 _attach_object(planner, obj_name, last_js, arm)
                 held[arm] = (obj_name, torch.inverse(obj_from_grasp).clone())
+                segment(ground_op, idx, arm, q_post, "lift", line=True, direction=None if vertical else up)
 
             elif metadata.action_type == "place":
                 obj_name, grasp_name, place_name, surface_name, q_name = ground_op.values
                 world_from_obj_target = action_4dof_to_mat4x4(best_particle[place_name].clone())
+                q_place = best_particle[q_name].clone()
+                q_pre, q_post = approach[idx]
+                vertical = is_vertical(_hand_poses(world, q_place.reshape(1, -1), arm)[0])
 
-                # Anchor the place TERMINAL to the COM-safe particle conf
-                # (best_particle[q_name]) via plan_cspace, instead of a free
-                # Cartesian-pose redundancy solve. The conf is an exact IK
-                # solution for the same place hand pose but sits inside the COM
-                # support hull (hard-checked), so the executed arrival is
-                # COM-feasible. The held block sits ON the placement surface at
-                # the terminal, so the surface obstacle is disabled during
-                # planning (gripper stays collision-checked against everything
-                # else).
-                with timer.time("curobo_planning"):
-                    place_result = _plan_arm_to_conf(
-                        planner, best_particle[q_name].clone(), last_js,
-                        disable_obstacle=surface_name, ground_op=ground_op, world=world,
-                    )
+                # GN cannot see a held object (gn_refresh.collision_penetration), so the held block's spheres at the
+                # pre conf are checked against the statics here.
+                frame = world.tool_frame_for_arm(arm)
+                world_from_obj = (_hand_poses(world, q_pre.reshape(1, -1), arm)[0]
+                                  @ torch.inverse(world.tool_from_ee[frame]) @ held[arm][1])
+                spheres = transform_spheres(world.get_collision_spheres(obj_name), world_from_obj)
+                penetration = float(world.collision_fn(spheres[None, None].contiguous()).sum())
+                if not penetration <= 0:
+                    raise RuntimeError(f"{ground_op} approach: the held {obj_name} collides with the statics at the "
+                                       f"pre conf ({penetration:.4g})")
 
-                plan = add_segment(_interp_plan(place_result), _plan_dt(planner), arm)
-                last_js = _last_timestep_js(plan, planner)
+                # The insert ends at the COM-safe particle conf with the placement surface disabled, since the held
+                # block sits ON it there; the gripper stays checked against everything else. Then the block is
+                # detached, which re-enables it as a world obstacle at its original pickup pose, so it moves to its
+                # placement before the back-out, which disables it.
+                segment(ground_op, idx, arm, q_pre, "approach")
+                segment(ground_op, idx, arm, q_place, "insert", disable=surface_name, gripper="open", line=True,
+                        direction=None if vertical else down)
                 obj_to_current_pose[obj_name] = world_from_obj_target
-
                 held.pop(arm, None)
-                # Detach: resets the gripper link's spheres and re-enables
-                # the world obstacle. But the obstacle's stored pose is
-                # still the original pickup pose, so update it to the
-                # placement target before continuing.
                 _detach_object(planner, obj_name, arm)
                 planner.scene_collision_checker.update_obstacle_pose(
                     name=obj_name, w_obj_pose=Pose.from_matrix(world_from_obj_target),
                 )
+                segment(ground_op, idx, arm, q_post, "back_out", disable=obj_name, line=True)
 
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")

@@ -42,7 +42,7 @@ def cutamp_demo(
         ``None`` — don't save the motion plan (default).
         ``"auto"`` — save to ``<experiment_root>/<experiment_id>/motion_plan.pkl``.
         Any other string — save to that path (parent directory auto-created).
-    The plan is saved raw (``"stage3-raw"``); see cutamp/utils/plan_processor.py.
+    The plan is saved raw (``"stage4-raw"``); see cutamp/utils/plan_processor.py.
     """
     setup_logging()
 
@@ -184,7 +184,7 @@ def entrypoint():
         help=(
             "Save the motion plan as a pickle (no arg: "
             "<experiment_root>/<experiment_id>/motion_plan.pkl; or pass a path): the raw "
-            "'stage3-raw' plan. See cutamp/utils/plan_processor.py."
+            "'stage4-raw' plan. See cutamp/utils/plan_processor.py."
         ),
     )
 

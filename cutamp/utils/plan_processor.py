@@ -1,5 +1,5 @@
 """The plan ``--save_plan`` writes: :func:`raw_motion_plan` saves a ``solve_curobo`` plan as planned, schema
-``"stage3-raw"``, until stage 6's schema-4 export (design 7.6). See its docstring for the layout."""
+``"stage4-raw"``, until stage 6's schema-4 export (design 7.6). See its docstring for the layout."""
 
 from __future__ import annotations
 
@@ -15,19 +15,22 @@ if TYPE_CHECKING:
 
 
 # raw_motion_plan's schema_version: a plan as planned, until stage 6's schema 4.
-RAW_SCHEMA_VERSION = "stage3-raw"
+RAW_SCHEMA_VERSION = "stage4-raw"
 
 
 def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict[str, Any]:
     """A ``solve_curobo`` plan as planned (decision 9), until stage 6's schema-4 export (design 7.6)::
 
         {
-            "schema_version": "stage3-raw",
+            "schema_version": "stage4-raw",
             "model": model.name,                     # "real_legs"
             "joint_names": list(model.joint_names),  # the base's six joints included
             "segments": [{
                 "arm": "left" | "right" | None,
                 "dt": float,                         # s between frames: cuRobo's interpolation_dt
+                "op_idx": int,                       # the segment's op in the plan skeleton
+                "phase": "approach" | "insert" | "lift" | "back_out" | "retract",
+                "gripper": "close" | "open" | None,  # the gripper event at the segment's end
                 "position": [T, n],                  # float32, in joint_names order
                 "velocity": [T, n],
                 "acceleration": [T, n],
@@ -58,6 +61,7 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
     segments = []
     for entry in curobo_plan:
         fast = entry.get("planner_timing")
-        segments.append({"arm": entry.get("arm"), "dt": float(entry["dt"]), **frames(entry["plan"]),
+        segments.append({"arm": entry.get("arm"), "dt": float(entry["dt"]), "op_idx": entry["op_idx"],
+                         "phase": entry["phase"], "gripper": entry["gripper"], **frames(entry["plan"]),
                          "planner_timing": None if fast is None else frames(fast["plan"])})
     return {"schema_version": RAW_SCHEMA_VERSION, "model": model.name, "joint_names": names, "segments": segments}

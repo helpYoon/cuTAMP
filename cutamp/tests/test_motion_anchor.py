@@ -150,12 +150,14 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         raw = pickle.load(f)
     names = list(REAL_LEGS.joint_names)
     assert len(names) == 33
-    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage3-raw", "real_legs", names)
+    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage4-raw", "real_legs", names)
     segments = raw["segments"]
     assert len(segments) == len(curobo_plan)
     for k, (seg, entry) in enumerate(zip(segments, curobo_plan)):
-        assert set(seg) == {"arm", "dt", "position", "velocity", "acceleration", "planner_timing"}, k
-        assert (seg["arm"], seg["dt"]) == (entry["arm"], entry["dt"]), k
+        assert set(seg) == {"arm", "dt", "op_idx", "phase", "gripper", "position", "velocity", "acceleration",
+                            "planner_timing"}, k
+        assert ([seg[key] for key in ("arm", "dt", "op_idx", "phase", "gripper")]
+                == [entry[key] for key in ("arm", "dt", "op_idx", "phase", "gripper")]), k
         assert (seg["planner_timing"] is None) == (entry.get("planner_timing") is None), k
         for timing in [seg] + ([seg["planner_timing"]] if seg["planner_timing"] is not None else []):
             n = len(timing["position"])

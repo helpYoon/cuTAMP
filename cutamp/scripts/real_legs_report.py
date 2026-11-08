@@ -1,6 +1,6 @@
 """The real-leg plans' torque, speed and balance report (design 7.4a and section 8).
 
-For every real-leg raw plan (``run_cutamp --save_plan``, schema ``stage3-raw``) under a study
+For every real-leg raw plan (``run_cutamp --save_plan``, schema ``stage3-raw`` or ``stage4-raw``) under a study
 directory, it runs cuRobo's two RNEA passes with the floor's push (``SegmentTorques``) on every segment at its saved
 timing, FKs every frame, and writes ``PREFIX.json`` and ``PREFIX.md``:
 
@@ -35,7 +35,7 @@ def find_plans(study: Path) -> list:
     for path in sorted(Path(study).rglob(PLAN_FILE)):
         with open(path, "rb") as f:
             plan = pickle.load(f)
-        if plan.get("schema_version") == RAW_SCHEMA_VERSION and plan.get("model") == "real_legs":
+        if plan.get("schema_version") in ("stage3-raw", RAW_SCHEMA_VERSION) and plan.get("model") == "real_legs":
             plans.append((path.parent, plan))
     return plans
 
@@ -137,7 +137,7 @@ class _RealLegs:
 def build_report(study: Path) -> dict:
     plans = find_plans(study)
     if not plans:
-        raise SystemExit(f"no real-leg raw plans ({PLAN_FILE}, schema stage3-raw) under {study}")
+        raise SystemExit(f"no real-leg raw plans ({PLAN_FILE}, schema stage3-raw or stage4-raw) under {study}")
     legs = _RealLegs()
     runs = [legs.run(run_dir, plan) for run_dir, plan in plans]
 

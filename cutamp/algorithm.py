@@ -187,8 +187,10 @@ def _motion_plan_with_retries(
     timer: TorchTimer,
     visualizer,
     get_planner=None,
+    ik_tol=None,
 ) -> Tuple[Optional[dict], Optional[dict], int, Optional[int], List[str]]:
-    """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success.
+    """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success. ``get_planner`` and
+    ``ik_tol`` (the run's IK tolerances, ``ParticleInitializer.ik_tol``) go to ``solve_curobo``.
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
     its internal retries; a different particle gives a different pair and
@@ -222,7 +224,7 @@ def _motion_plan_with_retries(
         try:
             curobo_plan, traj_metrics = solve_curobo(
                 plan_info, particle, world, config, timer, visualizer,
-                get_planner=get_planner,
+                get_planner=get_planner, ik_tol=ik_tol,
             )
             if rank > 0:
                 _log.warning(
@@ -437,7 +439,7 @@ def run_cutamp(
                 )
                 curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
-                    get_planner=get_planner,
+                    get_planner=get_planner, ik_tol=particle_initializer.ik_tol,
                 )
                 overall_metrics["motion_plan_success"] = bool(curobo_plan)
                 overall_metrics["motion_plan_attempts"] = attempts

@@ -44,24 +44,27 @@ def _raw_plan_input():
         x = start + torch.arange(n * len(names), dtype=torch.float32).reshape(1, n, len(names))
         return JointState(position=x, velocity=x + 1000, acceleration=x + 2000, joint_names=names)
 
-    return [{"dt": 0.025, "arm": "left", "plan": frames(4, 0.0), "held_objs": {}},
-            {"dt": 0.025, "arm": None, "plan": frames(6, 1e4), "held_objs": {},
-             "planner_timing": {"plan": frames(3, 2e4), "held_objs": {}}}]
+    return [{"dt": 0.025, "arm": "left", "op_idx": 1, "phase": "insert", "gripper": "close", "plan": frames(4, 0.0),
+             "held_objs": {}},
+            {"dt": 0.025, "arm": None, "op_idx": 2, "phase": "retract", "gripper": None, "plan": frames(6, 1e4),
+             "held_objs": {}, "planner_timing": {"plan": frames(3, 2e4), "held_objs": {}}}]
 
 
 def test_raw_motion_plan_in_model_order():
     # A real-leg plan is saved raw (decision 9): float32 [T, 33] in the model's joint order, whatever order cuRobo's
-    # JointStates carry, and a slowed segment keeps its motion planner's timing.
+    # JointStates carry, each segment with its op, phase and gripper event, and a slowed segment keeps its motion
+    # planner's timing.
     from cutamp.robots.t1 import REAL_LEGS
     from cutamp.utils.plan_processor import raw_motion_plan
     plan = _raw_plan_input()
     raw = raw_motion_plan(plan, REAL_LEGS)
     names = list(REAL_LEGS.joint_names)
-    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage3-raw", "real_legs", names)
+    assert (raw["schema_version"], raw["model"], raw["joint_names"]) == ("stage4-raw", "real_legs", names)
     assert len(raw["segments"]) == len(plan)
+    tags = ("arm", "dt", "op_idx", "phase", "gripper")
     for seg, entry in zip(raw["segments"], plan):
-        assert set(seg) == {"arm", "dt", "position", "velocity", "acceleration", "planner_timing"}
-        assert (seg["arm"], seg["dt"]) == (entry["arm"], entry["dt"])
+        assert set(seg) == {*tags, "position", "velocity", "acceleration", "planner_timing"}
+        assert [seg[key] for key in tags] == [entry[key] for key in tags]
         pairs = [(seg, entry["plan"])]
         if "planner_timing" in entry:
             pairs.append((seg["planner_timing"], entry["planner_timing"]["plan"]))
