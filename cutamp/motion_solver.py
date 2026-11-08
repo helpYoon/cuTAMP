@@ -26,6 +26,7 @@ import collections
 import contextlib
 import logging
 import math
+import random
 from typing import List, Optional, Tuple
 
 import torch
@@ -264,12 +265,16 @@ def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> Motio
     instead (~1 s), on the main thread after the join; every later segment has
     the same shape and replays.
     """
-    return get_t1_motion_planner(
+    planner = get_t1_motion_planner(
         world.model,
         get_world_cfg(world.env, include_movables=True),
         use_cuda_graph=use_cuda_graph,
         device_cfg=world.device_cfg,
     )
+    # cuRobo's PRM picks with Python's unseeded global random.choice (graph_planner_prm.py:506): seed it so
+    # same-seed runs stay identical.
+    random.seed(0)
+    return planner
 
 
 def solve_curobo(

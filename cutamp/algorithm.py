@@ -192,8 +192,9 @@ def _motion_plan_with_retries(
 
     cuRobo's plan_cspace can fail on a specific (start, goal) pair even after
     its internal retries; a different particle gives a different pair and
-    usually succeeds. The same pair fails the same way (plan_cspace is
-    deterministic), so a candidate whose values for the failing op and every
+    usually succeeds. The same pair fails the same way (plan_cspace is only given
+    the same PRM random state, which build_motion_planner's
+    random.seed(0) fixes per process), so a candidate whose values for the failing op and every
     op before it equal a failed candidate's is skipped: particles often share
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
