@@ -9,6 +9,8 @@
 
 """Core cuTAMP algorithm implementation."""
 
+import atexit
+import gc
 import logging
 from typing import Callable, List, Union, Optional, Tuple
 
@@ -36,6 +38,9 @@ from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import RerunVisualizer, Visualizer
 
 _log = logging.getLogger(__name__)
+# setup_cutamp freezes the heap. Unfrozen at exit, the interpreter's collection before module teardown frees what frozen
+# garbage still holds: a MotionPlanner, whose __del__ raises ImportError ("Exception ignored") once teardown has begun.
+atexit.register(gc.unfreeze)
 
 
 def heuristic_fn(
@@ -180,6 +185,12 @@ def sample_plan_skeleton(
     return plan_info, num_satisfying > 0
 
 
+# plan_cspace attempts per segment, one pass over the candidates each. On blocks_t1 (2026-11-07, 13 problems) every
+# segment that planned did so on its first attempt (223 of 223), while each failing one spent all of cuRobo's 20 at
+# 1.1-4.0 s, against 0.06 s for a success. The 20 run only when no candidate plans on 2 (one of them graph-seeded).
+_PLAN_ATTEMPTS = (2, 20)
+
+
 def _motion_plan_with_retries(
     plan_info: dict,
     candidates: list,
@@ -203,48 +214,63 @@ def _motion_plan_with_retries(
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
 
+    The candidates get two passes (``_PLAN_ATTEMPTS``): each segment first with
+    2 plan_cspace attempts, then, only if no candidate planned, with cuRobo's
+    20 for the candidates that ran out of attempts. A balance-gate rejection
+    (``e.check``) is not planned again: plan_cspace returns its first success,
+    so a bigger budget replans the same trajectory.
+
     Returns ``(curobo_plan, traj_metrics, attempts, rank, failures)``:
       - ``curobo_plan``: the successful plan, or ``None`` if all candidates
         failed.
       - ``traj_metrics``: the plan's metrics dict from ``solve_curobo`` (its
         duration and the balance gate's retimes and margins), or ``None`` if
         all candidates failed.
-      - ``attempts``: number of candidates actually planned (skips excluded).
+      - ``attempts``: number of candidates actually planned (skips excluded),
+        over both passes.
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
-      - ``failures``: each planned candidate's failure message, in order. A
-        failed trajopt's message names its reason (design 7.4a). The caller
-        records them in ``overall_metrics["motion_plan_failures"]``.
+      - ``failures``: each planned candidate's failure message, in order, over
+        both passes. A failed trajopt's message names its reason (design
+        7.4a). The caller records them in
+        ``overall_metrics["motion_plan_failures"]``.
     """
     skeleton = plan_info["plan_skeleton"]
-    last_err, tried, failed, failures = None, 0, [], []
-    for rank, particle in enumerate(candidates):
-        if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed):
-            _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
-            continue
-        tried += 1
-        try:
-            curobo_plan, traj_metrics = solve_curobo(
-                plan_info, particle, world, config, timer, visualizer,
-                get_planner=get_planner, ik_tol=ik_tol,
-            )
-            if rank > 0:
-                _log.warning(
-                    f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
+    last_err, tried, failures, rejected = None, 0, [], []
+    for max_attempts in _PLAN_ATTEMPTS:
+        failed = list(rejected)
+        for rank, particle in enumerate(candidates):
+            if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed):
+                _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
+                continue
+            tried += 1
+            try:
+                curobo_plan, traj_metrics = solve_curobo(
+                    plan_info, particle, world, config, timer, visualizer,
+                    get_planner=get_planner, ik_tol=ik_tol, max_attempts=max_attempts,
                 )
-            return curobo_plan, traj_metrics, tried, rank, failures
-        except RuntimeError as e:
-            _log.warning(
-                f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
-            )
-            last_err = e
-            failures.append(str(e))
-            # ponytail: keys on every value read up to the failing op (all ops if untagged), so
-            # a candidate differing only in values that op never sees (a pick conf before a
-            # shared retract) still replans; key on the op's own start/goal/world if that matters.
-            ops = skeleton[: getattr(e, "op_idx", len(skeleton)) + 1]
-            used = {"left_q0"} | {v for op in ops for v in op.values if v in particle}
-            failed.append({k: particle[k] for k in used})
+                if rank > 0:
+                    _log.warning(
+                        f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
+                    )
+                return curobo_plan, traj_metrics, tried, rank, failures
+            except RuntimeError as e:
+                _log.warning(
+                    f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
+                )
+                last_err = e
+                failures.append(str(e))
+                # ponytail: keys on every value read up to the failing op (all ops if untagged), so
+                # a candidate differing only in values that op never sees (a pick conf before a
+                # shared retract) still replans; key on the op's own start/goal/world if that matters.
+                ops = skeleton[: getattr(e, "op_idx", len(skeleton)) + 1]
+                used = {"left_q0"} | {v for op in ops for v in op.values if v in particle}
+                failed.append({k: particle[k] for k in used})
+                if hasattr(e, "check"):  # the balance gate's: no budget changes it
+                    rejected.append(failed[-1])
+        if max_attempts != _PLAN_ATTEMPTS[-1]:
+            _log.warning(f"No candidate planned with {max_attempts} plan_cspace attempts per segment; "
+                         f"retrying those that ran out with {_PLAN_ATTEMPTS[-1]}")
     _log.error(
         f"Exhausted {len(candidates)} particle retries ({tried} planned); giving up on this plan. "
         f"Last error: {last_err}"
@@ -265,6 +291,14 @@ def setup_cutamp(
     *,
     experiment_id: str,
 ):
+    # cuRobo runs a full gc.collect() before every CUDA graph capture (cuda_graph_util.py:197), 11-27 per problem, and
+    # each walks the whole heap: 2.2-2.6 s per problem. Frozen here, before the world is built, the heap is skipped (0.1-0.5
+    # s). Frozen objects are still freed by refcount, but frozen garbage, and what it holds, waits for the next problem's
+    # unfreeze below or for the one at exit (atexit, above).
+    gc.unfreeze()
+    gc.collect()
+    gc.freeze()
+
     # Validate args and setup experiment logger
     validate_tamp_config(config)
     exp_logger = ExperimentLogger(name=experiment_id, config=config)

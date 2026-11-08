@@ -112,6 +112,33 @@ def test_motion_plan_attempts_add_up_over_skeletons(monkeypatch, results, attemp
     assert (attempts or 0) == len(metrics["motion_plan_failures"]) + metrics["motion_plan_success"]
 
 
+def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_attempts(monkeypatch):
+    # The balance gate rejects candidate 0's plan, which no budget changes; candidate 1's pick needs more than 2
+    # plan_cspace attempts. The cheap pass fails both; the full pass skips 0 and plans 1.
+    skeleton = [SimpleNamespace(values=("left_q0", "traj1", "left_q1"))]
+    calls = []
+
+    def fake_solve_curobo(plan_info, particle, *a, max_attempts, **k):
+        q1 = float(particle["left_q1"][0])
+        calls.append((q1, max_attempts))
+        if q1 == 0 or max_attempts < 20:
+            e = RuntimeError("trajectory ZMP leaves the support region" if q1 == 0 else "pick failed: other")
+            e.op_idx = 0
+            if q1 == 0:
+                e.check = "zmp"
+            raise e
+        return "PLAN", {}
+
+    monkeypatch.setattr(alg, "solve_curobo", fake_solve_curobo)
+    candidates = [{"left_q0": torch.zeros(2), "left_q1": torch.tensor([q1, 0.0])} for q1 in (0.0, 1.0)]
+    plan, _, attempts, rank, failures = alg._motion_plan_with_retries(
+        {"plan_skeleton": skeleton}, candidates, None, None, None, None, ik_tol=None,
+    )
+    assert calls == [(0.0, 2), (1.0, 2), (1.0, 20)]
+    assert (plan, attempts, rank) == ("PLAN", 3, 1)
+    assert failures == ["trajectory ZMP leaves the support region", "pick failed: other"]
+
+
 def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
     # planned_com_margin: the planned particle's margin, computed as optimize_plan computes best_com_margin
     # for rank 0, which a retry didn't plan (known-bugs N3). Grasps and placements aren't confs.

@@ -52,7 +52,9 @@ builds `.venv` from `uv.lock`: Python 3.10, PyTorch 2.9.1 for CUDA 12.8
 The exact pins in `pyproject.toml` are the versions the v0.9.0 plans were
 accepted on. cuRobo v0.9.0 compiles its kernels when they first run (NVRTC,
 with the headers from its `cu12` extra's NVIDIA wheels), so its install builds
-nothing.
+nothing; cuTAMP keeps the compiled kernels in
+`${XDG_CACHE_HOME:-~/.cache}/cutamp/nvrtc`, so a run compiles (3-4 s in all)
+only the kernels this checkout and toolchain have not compiled before.
 
 ```bash
 # cuRobo v0.9.0 comes as curobo/ and GraspGenX as GraspGenX/; the variable skips GraspGenX's git-LFS files
@@ -175,7 +177,9 @@ graph LR
    the best satisfying particles (up to `motion_plan_max_retries`, first
    success wins) through `motion_solver.py`: one `MotionPlanner` over the
    model's cspace, built on a background thread while the optimizer runs,
-   and planned to each particle conf with `plan_cspace`, so a pick or place
+   and planned to each particle conf with `plan_cspace` (2 attempts per
+   segment; if no particle plans, those that ran out of attempts get cuRobo's
+   20), so a pick or place
    ends exactly at the conf the optimizer approved and cuRobo can't
    re-resolve the redundancy at the endpoint. Each pick and place is three
    segments: an approach to a pre conf, a straight insert to the particle conf
@@ -440,13 +444,14 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   `soft_cost=["place_close_to_base", "joint_limit_margin",
   "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
   balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
-  `early_stop_patience=150`; `motion_plan_max_retries=10`.
+  `early_stop_patience=50`; `motion_plan_max_retries=10`.
 
 - [`algorithm.py`](cutamp/algorithm.py) — `setup_cutamp` + `run_cutamp`
   outer loop. The motion-plan retry sweep lives in `_motion_plan_with_retries`:
   a cuRobo failure or a balance-gate rejection moves on to the next
   candidate, skipping candidates that repeat a failed plan, and every failed
-  candidate's message goes into the run metrics (`motion_plan_failures`).
+  plan's message, over both attempt passes, goes into the run metrics
+  (`motion_plan_failures`).
 
 - [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
   particles; respects `left_q0` / `right_q0` as fixed initial-state. Holds the

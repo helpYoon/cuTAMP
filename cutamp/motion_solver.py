@@ -80,6 +80,7 @@ def _plan_arm_to_conf(
     disable_obstacle: Optional[str],
     ground_op,
     world: Optional[TAMPWorld] = None,
+    max_attempts: int = 20,
 ):
     """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
     conf ``conf`` (``[n]``, in the planner's joint order), via ``plan_cspace`` — so the executed
@@ -90,14 +91,14 @@ def _plan_arm_to_conf(
     cuRobo result; raises ``RuntimeError`` if it fails (``_plan_failed``: given
     ``world`` it names the reason).
 
-    One call: plan_cspace already makes up to 20 attempts (19 graph-seeded, each with one finetune pass). On the
-    fork, which made 5, calling it again with the same start and goal returned the same trajectory (blocks_t1: 54 of
-    54 repeats bit-identical, none succeeded).
+    One call: plan_cspace makes up to ``max_attempts`` attempts (cuRobo's default 20; all but the first graph-seeded,
+    each with one finetune pass). On the fork, which made 5, calling it again with the same start and goal returned
+    the same trajectory (blocks_t1: 54 of 54 repeats bit-identical, none succeeded).
     """
     target_js = JointState.from_position(conf.reshape(1, -1), joint_names=list(planner.kinematics.joint_names))
     # _disabled_world_obstacle no-ops on name=None.
     with _disabled_world_obstacle(planner, disable_obstacle):
-        result = planner.plan_cspace(target_js, last_js)
+        result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
     if not _cspace_plan_succeeded(result):
         raise _plan_failed(world, result, f"cspace-anchored plan failed for {ground_op}")
     return result
@@ -437,6 +438,7 @@ def solve_curobo(
     get_planner=None,
     *,
     ik_tol: IKTol,
+    max_attempts: int = 20,
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
@@ -446,6 +448,7 @@ def solve_curobo(
     only the residual wait. ``None`` builds it inline. Neither warms it up (``build_motion_planner``).
     ``ik_tol``: the tolerances the run's checker holds every IK conf to, which the pre and post confs of the picks and
     places meet too (``_approach_confs``).
+    ``max_attempts`` is each segment's plan_cspace budget (``_plan_arm_to_conf``).
     """
     plan_skeleton = plan_info["plan_skeleton"]
 
@@ -500,7 +503,7 @@ def solve_curobo(
         with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
             with timer.time("curobo_planning"):
                 result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
-                                           world=world)
+                                           world=world, max_attempts=max_attempts)
         try:
             plan = add_segment(_interp_plan(result), _plan_dt(planner), arm, op_idx=idx, phase=phase,
                                gripper=gripper)

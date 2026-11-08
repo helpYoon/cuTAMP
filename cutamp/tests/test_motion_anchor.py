@@ -39,19 +39,22 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
     class FakePlanner:
         kinematics = SimpleNamespace(joint_names=_NAMES)
 
-        def plan_cspace(self, target_js, last_js):
+        def plan_cspace(self, target_js, last_js, max_attempts):
             calls["target_js"] = target_js
             calls["last_js"] = last_js
+            calls["max_attempts"] = max_attempts
             return "FAKE_RESULT"
 
     conf = torch.arange(33.0)
-    res = ms._plan_arm_to_conf(FakePlanner(), conf, last_js="LAST", disable_obstacle=None, ground_op="OP")
+    res = ms._plan_arm_to_conf(FakePlanner(), conf, last_js="LAST", disable_obstacle=None, ground_op="OP",
+                               max_attempts=2)
     assert res == "FAKE_RESULT"
     # planned to the conf, at rest, in the planner's joint order, not to a pose
     target = calls["target_js"]
     assert torch.equal(target.position, conf[None]) and not target.velocity.any()
     assert target.joint_names == _NAMES
     assert calls["last_js"] == "LAST"
+    assert calls["max_attempts"] == 2  # the caller's budget reaches plan_cspace
 
 
 def test_plan_arm_to_conf_raises_on_failure(monkeypatch):

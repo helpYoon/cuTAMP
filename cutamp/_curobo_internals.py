@@ -37,9 +37,12 @@ upgrade audit catches them):
   off and the balance gate paces each segment.
 """
 
+import functools
 import hashlib
 import importlib
 import inspect
+import os
+import pickle
 import threading
 from typing import Callable
 
@@ -56,7 +59,8 @@ _PINNED_SOURCES = {
     # call (install_floor_wrench flips it); RNEA's f_ext layout and reused torque buffer (set_external_wrench_fn); the
     # solver's rollout list (install_floor_wrench); the cost manager's six hardcoded costs (add_extra_cost); the
     # attachment by name, which auto-disables the obstacle, and its fit, whose world-frame centres it writes as
-    # link-local (motion_solver._attach_object).
+    # link-local (motion_solver._attach_object); the kernel compile, which imports cuda.core.Program on each call and
+    # compiles to a cubin (_patch_kernel_disk_cache).
     "curobo._src.robot.parser.parser_urdf:UrdfRobotParser.get_link_parameters": "7da2bd10430b",
     "curobo._src.transition.robot_state_transition:RobotStateTransition.compute_augmented_state": "b850477475b9",
     "curobo._src.util.warp:get_warp_device_stream": "ba0736c58155",
@@ -69,7 +73,10 @@ _PINNED_SOURCES = {
     "curobo._src.collision.attachment_manager:AttachmentManager.attach": "decf92a8d1f3",
     "curobo._src.collision.attachment_manager:AttachmentManager._obstacles_to_trimesh": "db3f10e800cf",
     "curobo._src.collision.attachment_manager:AttachmentManager.update": "70e3f1f9c584",
+    "curobo._src.curobolib.backends.cuda_core_backend.kernel_cache:CudaCoreKernelCache._compile_kernel": "b7e2fc3d8b5f",
 }
+
+_KERNEL_CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "cutamp", "nvrtc")
 
 
 # TODO: file upstream issue against cuRobo. RobotCostManager.compute_costs (cost_manager_robot.py) evaluates only its
@@ -156,6 +163,78 @@ def _patch_warp_streams() -> None:
     wp.stream_from_torch = cached
 
 
+@functools.lru_cache(maxsize=None)
+def _tree_digest(path: str) -> str:
+    """sha256 of the names and contents of every file under ``path``."""
+    h = hashlib.sha256()
+    for root, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            file = os.path.join(root, name)
+            h.update(file.encode())
+            with open(file, "rb") as f:
+                h.update(f.read())
+    return h.hexdigest()
+
+
+def _patch_kernel_disk_cache() -> None:
+    """Keep the cubins cuRobo compiles on disk, in ``_KERNEL_CACHE_DIR``. cuRobo keeps its NVRTC kernels in memory only
+    (``CudaCoreKernelCache.compiled_kernels``), so every process recompiled its ~29 on the first plan, 3.35-3.9 s.
+    ``_compile_kernel`` imports ``cuda.core.Program`` on each call, so a subclass takes its place there. A cubin is
+    keyed on all that goes into it: the source, every ProgramOptions field (its repr shows only name and arch), the
+    kernel names, every file under the include paths, and the cuda.core and NVRTC versions, so an edited header or a
+    new toolchain compiles afresh. The cache never fails a compile: a key it can't build compiles uncached, and an entry
+    whose kernels don't load is compiled again and replaced. Deleting the directory clears it."""
+    import cuda.core
+
+    def include_digests(options, digest):
+        includes = options.include_path or ()
+        return [digest(str(inc)) for inc in ([includes] if isinstance(includes, (str, os.PathLike)) else includes)]
+
+    class CachedProgram(cuda.core.Program):
+        def __init__(self, code, code_type, options=None):
+            super().__init__(code, code_type, options=options)
+            self._args = (code, code_type, options)
+
+        def compile(self, target_type, name_expressions=(), logs=None):
+            code, code_type, options = self._args
+            if target_type != "cubin" or not name_expressions:  # a hit is checked by loading its named kernels
+                return super().compile(target_type, name_expressions, logs)
+            try:
+                from cuda.bindings import nvrtc
+
+                digests = include_digests(options, _tree_digest)
+                key = (code, code_type, sorted(vars(options).items()), tuple(name_expressions), digests,
+                       cuda.core.__version__, nvrtc.nvrtcVersion()[1:])
+                path = os.path.join(_KERNEL_CACHE_DIR, hashlib.sha256(repr(key).encode()).hexdigest() + ".pkl")
+            except Exception:  # an unreadable file under an include path, say
+                return super().compile(target_type, name_expressions, logs)
+            try:
+                with open(path, "rb") as f:
+                    cubin, symbols = pickle.load(f)
+                mod = cuda.core.ObjectCode.from_cubin(cubin, symbol_mapping=symbols)
+                for name in name_expressions:
+                    mod.get_kernel(name)  # from_cubin loads lazily: a bad entry fails here, not in cuRobo
+                return mod
+            except Exception:  # not cached yet, or unusable
+                pass
+            mod = super().compile(target_type, name_expressions, logs)
+            try:
+                # _tree_digest keeps the first digest a process takes; a header edited since then went into this cubin,
+                # which the key would misdescribe, so it isn't stored.
+                if include_digests(options, _tree_digest.__wrapped__) == digests:
+                    os.makedirs(_KERNEL_CACHE_DIR, exist_ok=True)
+                    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+                    with open(tmp, "wb") as f:
+                        pickle.dump((bytes(mod.code), dict(mod.symbol_mapping)), f)
+                    os.replace(tmp, path)  # atomic: a process compiling the same kernel never reads half a file
+            except Exception:  # an unwritable cache costs the next process this compile, nothing more
+                pass
+            return mod
+
+    cuda.core.Program = CachedProgram
+
+
 def _check_curobo_sources() -> None:
     for path, digest in _PINNED_SOURCES.items():
         module, qualname = path.split(":")
@@ -171,7 +250,9 @@ def _check_curobo_sources() -> None:
 
 
 def install_curobo_patches() -> None:
-    """Check the cuRobo sources, then apply the warp-stream and parser patches (``import cutamp`` runs it once)."""
+    """Check the cuRobo sources, then apply the warp-stream, parser and kernel-cache patches (``import cutamp`` runs it
+    once)."""
     _check_curobo_sources()
     _patch_warp_streams()
     _patch_mass_floor()
+    _patch_kernel_disk_cache()

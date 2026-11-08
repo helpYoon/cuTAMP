@@ -29,11 +29,12 @@ class TAMPConfiguration:
     # Stop Adam after this many steps without meaningful progress
     # (new-best satisfying count or best-particle loss drop). 0 disables.
     # The best-seen particle snapshot is kept regardless of this setting.
-    # Default 150: calibrated on blocks_t1 traces (max record gap 35) and
-    # verified on the raised-surface variant (2026-08-05): a full 1000-step
-    # run produced zero new records after step 50 — patience 150 matched its
-    # quality (435 vs 433 satisfying, soft 0.80 vs 0.81) at 1/3 the loop time.
-    early_stop_patience: int = 150
+    # Default 50, still above the max record gap of 35 on the blocks_t1 traces
+    # it was calibrated on. On a full 1000-step raised-surface run (2026-08-05)
+    # no record came after step 50, and on 15 blocks_t1 problems (2026-11-07)
+    # patience 150 ran 177-687 steps only to restore the same snapshot: the
+    # same plans as 50, at 2-3.5x the loop time.
+    early_stop_patience: int = 50
     lr: float = 7e-3  # default LR for optimizer
     conf_lr: float = 2.226e-2  # LR for robot configurations
 
