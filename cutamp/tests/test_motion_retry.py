@@ -1,5 +1,6 @@
 """Tests for the next-best-particle motion-plan retry
 (algorithm._motion_plan_with_retries, motion_solver._reset_attachment_state)."""
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 import cutamp.algorithm as alg
 import cutamp.com_polygon_cost as cpc
 import cutamp.motion_solver as ms
+from cutamp.config import TAMPConfiguration
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
@@ -47,6 +49,67 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
     assert (plan, attempts, rank) == ("PLAN", 3, 4)
     # Each planned candidate that failed keeps its message, so a report can count those lost to torque (7.4a).
     assert failures == ["pick failed: torque", "place failed: other"]
+
+
+def _run_skeletons(monkeypatch, results) -> dict:
+    """run_cutamp's overall_metrics, on the CPU, over one skeleton per entry of ``results``, in order: ``None`` where
+    no particle satisfies, else ``(planned, attempts)``: its motion plan tries ``attempts`` candidates, each failing
+    but the last if ``planned``. Everything else run_cutamp calls is a stand-in."""
+
+    class Timer:  # TorchTimer syncs CUDA
+        def time(self, *args, **kwargs):
+            return contextlib.nullcontext()
+
+        def start(self, metric):
+            pass
+
+        def stop(self, metric):
+            return 0.0
+
+        def get_summaries(self):
+            return {}
+
+    def sample(plan_gen, world, config, timer, idx, *args):
+        if idx == len(results):
+            raise StopIteration
+        return {"idx": idx, "plan_skeleton": [], "heuristic": float(idx)}, False
+
+    def optimize(plan_info, timer, visualizer):
+        satisfying = results[plan_info["idx"]] is not None
+        return satisfying, {"best_cost": 0.0, "best_soft_cost": 0.0, "num_satisfying_final": int(satisfying)}, False
+
+    def plan(plan_info, *args, **kwargs):
+        planned, attempts = results[plan_info["idx"]]
+        failures = [f"skeleton {plan_info['idx']}, candidate {i}" for i in range(attempts - planned)]
+        return ("PLAN", {}, attempts, attempts - 1, failures) if planned else (None, None, attempts, None, failures)
+
+    logger, world = SimpleNamespace(log_dict=lambda name, d: None), SimpleNamespace(initial_state=None, goal_state=None)
+    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, Timer(), world))
+    monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: SimpleNamespace(ik_tol=None))
+    monkeypatch.setattr(alg, "build_motion_planner", lambda world: None)
+    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda world: None)
+    monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: None)
+    monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
+    monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: optimize)
+    monkeypatch.setattr(alg, "get_top_satisfying_particles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(alg, "_motion_plan_with_retries", plan)
+    monkeypatch.setattr(alg, "_planned_metrics", lambda *args: {})
+    config = TAMPConfiguration(curobo_plan=True, enable_visualizer=False)
+    return alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
+                          experiment_id="fake")[2]
+
+
+@pytest.mark.parametrize("results, attempts", [
+    ([(True, 2)], 2),  # one skeleton: its own count
+    ([(False, 3), (True, 2)], 5),  # the first skeleton's candidates all fail: both skeletons' count
+    ([None, (False, 1), (True, 1)], 2),  # a skeleton with no satisfying particle plans nothing
+    ([None], None),  # nothing planned: no count
+])
+def test_motion_plan_attempts_add_up_over_skeletons(monkeypatch, results, attempts):
+    # As the failures do: every planned candidate either fails or gives the plan.
+    metrics = _run_skeletons(monkeypatch, results)
+    assert metrics.get("motion_plan_attempts") == attempts
+    assert (attempts or 0) == len(metrics["motion_plan_failures"]) + metrics["motion_plan_success"]
 
 
 def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):

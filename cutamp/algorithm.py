@@ -449,7 +449,8 @@ def run_cutamp(
                     get_planner=get_planner, ik_tol=particle_initializer.ik_tol,
                 )
                 overall_metrics["motion_plan_success"] = bool(curobo_plan)
-                overall_metrics["motion_plan_attempts"] = attempts
+                # Over the skeletons planned, like the failures; absent until a skeleton is motion-planned.
+                overall_metrics["motion_plan_attempts"] = overall_metrics.get("motion_plan_attempts", 0) + attempts
                 overall_metrics["motion_plan_failures"] += failures
                 if curobo_plan is None:
                     continue
