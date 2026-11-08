@@ -26,6 +26,7 @@ from curobo.types import DeviceCfg, JointState, Pose
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.floor_wrench import SegmentTorques
+from cutamp.grasps import GraspSet
 from cutamp.robots import RobotContainer
 from cutamp.robots.t1 import TOOL_FRAME_FOR_ARM, T1Model
 from cutamp.t1_domain import get_initial_state
@@ -60,9 +61,11 @@ class TAMPWorld:
         device_cfg: DeviceCfg,
         robot: RobotContainer,
         q_init: torch.Tensor,
+        grasps: Dict[str, GraspSet],
     ):
         self.env = env
         self.device_cfg = device_cfg
+        self._grasps = grasps
 
         self._name_to_obj = {obj.name: obj for obj in env.movables + env.statics}
 
@@ -197,6 +200,11 @@ class TAMPWorld:
     def get_collision_spheres(self, obj: Union[Obstacle, str]) -> torch.Tensor:
         obj_name = obj.name if isinstance(obj, Obstacle) else obj
         return self._obj_to_spheres[obj_name]
+
+    @property
+    def grasps(self) -> Dict[str, GraspSet]:
+        """Each movable's GraspGenX grasps by name (``grasps.grasp_sets``); same-shaped movables share one set."""
+        return self._grasps
 
     def get_aabb(self, obj: Union[Obstacle, str]) -> torch.Tensor:
         obj_name = obj.name if isinstance(obj, Obstacle) else obj

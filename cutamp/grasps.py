@@ -1,14 +1,28 @@
-"""Grasp geometry for the motion solver: each pick and place approaches along the grasp's axis and leaves the same way,
-or lifts and comes in from above (design 7.8).
+"""Grasps (design 7.8). ``grasp_sets`` makes each object shape's grasps with GraspGenX, in this process, when the world
+loads. The motion solver's grasp geometry: each pick and place approaches along the grasp's axis and leaves the same
+way, or lifts and comes in from above.
 
 ``world_from_ee`` is the hand's tool frame (``*_base_link``, ``robots/t1.py``), whose +x is GraspGenX's approach axis
 (G's +z). The knobs are search settings, not robot limits (design section 12).
 """
 
+import functools
+import hashlib
+import logging
 import math
-from typing import Literal, Tuple
+import os
+import random
+from typing import Dict, Literal, NamedTuple, Sequence, Tuple, Union
 
+import numpy as np
 import torch
+import trimesh
+from curobo.scene import Obstacle
+
+from cutamp.robots.t1 import load_sweep_volume
+from cutamp.utils.common import mat4x4_to_grasp_7dof
+
+_log = logging.getLogger(__name__)
 
 APPROACH_DISTANCE = 0.05
 """m: how far back along the hand's +x a pick's or a place's straight insert starts, and a back-out ends: upstream
@@ -58,3 +72,170 @@ def approach_targets(world_from_ee: torch.Tensor, kind: Literal["pick", "place"]
     else:
         raise ValueError(f"kind must be 'pick' or 'place', got {kind!r}")
     return pre.clone(), post.clone()
+
+
+# ---- GraspGenX's grasps, made in-process when the world loads ----------------------------------------------------
+
+GRASP_SEED = 0
+"""Seeds each shape's surface sample, and every generator right before GraspGenX runs: every process, and a cold
+sampler as well as a warm one, then gives the same grasps."""
+
+_README_FOLDERS = {
+    "GRASPGENX_CHECKPOINT_DIR": "~/graspgenx-model/7c834043",
+    "GRASPGENX_GRIPPER_CFG_DIR": "~/graspgenx-model/no-gripper-descriptions",
+}
+"""Each variable's folder in README.md, Installation, the GraspGenX paragraph."""
+
+
+class GraspSet(NamedTuple):
+    """One object shape's GraspGenX grasps, every one kept with no threshold: init weights its draws by score."""
+
+    grasps: torch.Tensor
+    """``[K, 7]`` float32 on the device: GraspGenX's gripper frame G in the object frame, ``[x, y, z, qw, qx, qy, qz]``
+    (``utils.common.grasp_7dof_to_mat4x4``), with a unit quaternion."""
+    scores: torch.Tensor
+    """``[K]`` float32 in [0, 1]: GraspGenX's discriminator scores."""
+
+
+_SETS: Dict[str, GraspSet] = {}
+"""Each shape's grasps by ``mesh_sha256``, kept for the life of the process."""
+
+_SAMPLER = None
+"""GraspGenX's ``GraspGenXSampler`` for the T1 gripper, its model on the GPU (538 MB), kept for the life of the
+process."""
+
+
+def mesh_sha256(obj: Obstacle) -> str:
+    """The sha256 of the mesh the sphere fitting uses, ``obj.get_trimesh_mesh()`` at the unit pose: its float64
+    vertices, then its int64 faces, both C-ordered. Same-shaped objects share it, whatever their poses."""
+    mesh = obj.get_trimesh_mesh()
+    digest = hashlib.sha256(np.ascontiguousarray(mesh.vertices, dtype=np.float64).tobytes())
+    digest.update(np.ascontiguousarray(mesh.faces, dtype=np.int64).tobytes())
+    return digest.hexdigest()
+
+
+def _checked_model_dir() -> str:
+    """The checked ``GRASPGENX_CHECKPOINT_DIR``. An unset or empty variable is set to its README folder
+    (``_README_FOLDERS``), and every value is made absolute in ``os.environ`` (``load_model_cfg`` doesn't expand ``~``),
+    so GraspGenX's first-import hook finds both folders and never clones."""
+    for var, folder in _README_FOLDERS.items():
+        os.environ[var] = os.path.abspath(os.path.expanduser(os.environ.get(var) or folder))
+    ckpt, grippers = os.environ["GRASPGENX_CHECKPOINT_DIR"], os.environ["GRASPGENX_GRIPPER_CFG_DIR"]
+    has_model = all(os.path.isfile(os.path.join(ckpt, "release", side, "config.yaml")) for side in ("gen", "dis"))
+    if not (has_model and os.path.isdir(grippers)):
+        raise RuntimeError(
+            f"GraspGenX's model folders are missing: GRASPGENX_CHECKPOINT_DIR ({ckpt}) must hold "
+            f"release/gen/config.yaml and release/dis/config.yaml, and GRASPGENX_GRIPPER_CFG_DIR ({grippers}) must be "
+            "an existing folder. See README.md, Installation, the GraspGenX paragraph."
+        )
+    return ckpt
+
+
+def _deterministic(fn):
+    """``fn`` with torch's deterministic algorithms on for each call; the caller's mode and warn-only flag come back
+    after it."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        mode = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            torch.use_deterministic_algorithms(mode, warn_only=warn_only)
+
+    wrapper.cutamp_deterministic = True
+    return wrapper
+
+
+def _load_sampler(ckpt: str):
+    """Import GraspGenX, keeping its logging out of cuTAMP's; make PTv3's segment reduction deterministic; and build
+    the sampler on the T1 gripper's sweep volume (``load_sweep_volume``), which loads the model's weights."""
+    root = logging.getLogger()
+    level, handlers = root.level, root.handlers[:]
+    try:  # graspgenx's import sets the root logger to INFO and adds a stdout handler (utils/logging_config.py)
+        import graspgenx  # noqa: F401
+        from graspgenx.grasp_server import GraspGenXSampler
+        from graspgenx.models.ptv3 import ptv3_vanilla
+        from graspgenx.serving.types import FLAT_FIELD_ORDER, SweepVolumeParams
+        from graspgenx.utils.checkpoint_io import load_model_cfg
+    finally:
+        root.setLevel(level)
+        root.handlers[:] = handlers
+    for name in ("graspgenx", "graspgenx.dataset.dataset"):  # dataset.py gives its logger its own INFO level
+        logging.getLogger(name).setLevel(logging.WARNING)
+    # PTv3's scatter_reduce_ (ptv3_vanilla.py:257-279) is nondeterministic on CUDA: seeded runs differ by up to 1.8 um.
+    # Its callers look the name up at each call, so the wrapper reaches all of them.
+    if not getattr(ptv3_vanilla.segment_csr_vanilla, "cutamp_deterministic", False):
+        ptv3_vanilla.segment_csr_vanilla = _deterministic(ptv3_vanilla.segment_csr_vanilla)
+    sv = load_sweep_volume()
+    flat = [x for field in FLAT_FIELD_ORDER for x in sv[field]]
+    cfg = load_model_cfg(f"{ckpt}/release/gen", f"{ckpt}/release/dis")  # the latest epoch_*.pth: gen 736, dis 1056
+    params = SweepVolumeParams.from_flat(flat, fingertip_depth=sv["fingertip_depth"])
+    return GraspGenXSampler.from_sweep_volume(cfg, params)
+
+
+def _z_offsets_cm(mesh: trimesh.Trimesh) -> Tuple[int, ...]:
+    """The box grasps' depths into each face: 0, -1, ..., -m cm, with m = min(8, floor(the smallest extent in cm) - 1),
+    so the fingertips stop at least 1 cm short of the far side. Upstream's -8 cm would put them below a 5 cm block."""
+    m = min(8, math.floor(100 * min(mesh.extents) + 1e-9) - 1)  # 1e-9: 0.29 m is 28.999999999999996 cm in floats
+    return tuple(range(0, -m - 1, -1))
+
+
+def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Dict[str, GraspSet]:
+    """Each object's GraspGenX grasps, keyed by name, made in this process.
+
+    Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process
+    (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame, and runs GraspGenX's
+    graspmoe planner on them: 500 diffusion grasps and the box grasps on the top and the four sides, all kept.
+    GraspGenX always runs on ``.cuda()``; ``device`` only places the returned tensors.
+
+    The grasps repeat bit for bit across calls and processes: each run is seeded with ``GRASP_SEED`` and runs in FP32,
+    with PTv3's segment reduction deterministic. The caller's random state (Python's, numpy's, torch's CPU and every
+    CUDA generator) and both TF32 flags are restored afterwards.
+
+    Call it only inside ``setup_cutamp``, before the motion planner's warmup thread starts, and in tests: deterministic
+    mode and the TF32 pin are process-wide, which is safe only while no other CUDA work runs.
+
+    Every call first checks GraspGenX's model folders (``_checked_model_dir``), before anything imports ``graspgenx``
+    or touches CUDA, and raises ``RuntimeError`` naming the README if they are missing.
+    """
+    global _SAMPLER
+    ckpt = _checked_model_dir()
+    shape_of = {obj.name: mesh_sha256(obj) for obj in objs}
+    new = {shape_of[obj.name]: obj for obj in objs if shape_of[obj.name] not in _SETS}
+    if new:
+        rng = random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all()
+        tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+        try:
+            if _SAMPLER is None:
+                _SAMPLER = _load_sampler(ckpt)
+            from graspgenx.samplers.planner import run_planner_on_object
+
+            for shape, obj in new.items():
+                mesh = obj.get_trimesh_mesh()
+                points = trimesh.sample.sample_surface(mesh, 3000, seed=GRASP_SEED)[0]  # not centred
+                # The model build draws from torch's CPU generator: seeding here makes a cold sampler match a warm one.
+                random.seed(GRASP_SEED)
+                np.random.seed(GRASP_SEED)
+                torch.manual_seed(GRASP_SEED)  # and every CUDA generator
+                grasps, scores, tags, _ = run_planner_on_object(
+                    points, _SAMPLER, planner="graspmoe", num_grasps=500, grasp_threshold=-1.0, topk_num_grasps=-1,
+                    moe_obb_density="dense-topandside", moe_z_offsets_cm=_z_offsets_cm(mesh), moe_num_yaws=36,
+                    moe_obb_mode="advanced", moe_skip_obb_rule="auto", moe_obb_position_spacing_cm=1.0,
+                    moe_outlier_threshold=0.014, moe_outlier_k=20,
+                )
+                _SETS[shape] = GraspSet(
+                    mat4x4_to_grasp_7dof(torch.from_numpy(grasps).to(device)), torch.from_numpy(scores).to(device)
+                )
+                n_box, names = tags.count("obb"), ", ".join(n for n, s in shape_of.items() if s == shape)
+                _log.debug(f"GraspGenX: {len(tags)} grasps for {names}, {len(tags) - n_box} diffusion and {n_box} box")
+        finally:
+            random.setstate(rng[0])
+            np.random.set_state(rng[1])
+            torch.set_rng_state(rng[2])
+            torch.cuda.set_rng_state_all(rng[3])
+            torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
+    return {name: _SETS[shape] for name, shape in shape_of.items()}

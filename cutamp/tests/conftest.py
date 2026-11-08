@@ -43,16 +43,18 @@ def link_kinematics(world):
 
 
 def make_blocks_t1_world():
-    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home."""
+    """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home,
+    with its GraspGenX grasps (the first build in a process loads the model, which then stays)."""
     from curobo.types import DeviceCfg
     from cutamp.envs.utils import get_env_dir, load_env
+    from cutamp.grasps import grasp_sets
     from cutamp.robots import load_t1_container
     from cutamp.tamp_world import TAMPWorld
     dc = DeviceCfg()
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     robot = load_t1_container(REAL_LEGS, dc)
     q_init = torch.as_tensor(REAL_LEGS.home, dtype=torch.float32, device=dc.device)
-    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init)
+    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, grasps=grasp_sets(env.movables, dc.device))
 
 
 @pytest.fixture(autouse=True)

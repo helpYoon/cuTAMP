@@ -23,6 +23,7 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
+from cutamp.grasps import grasp_sets
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import IKTol, ParticleInitializer
@@ -281,12 +282,17 @@ def setup_cutamp(
 
     # Load TAMP world
     timer = TorchTimer()
+    # GraspGenX's grasps, once per object shape and process, timed apart from planning. grasp_sets turns process-wide
+    # settings on while it runs, so it comes before the motion planner's warmup thread starts (run_cutamp).
+    with timer.time("generate_grasps", log_callback=_log.info):
+        grasps = grasp_sets(env.movables, device_cfg.device)
     with timer.time("load_tamp_world", log_callback=_log.info):
         world = TAMPWorld(
             env=env,
             device_cfg=device_cfg,
             robot=robot_container,
             q_init=q_init,
+            grasps=grasps,
         )
         check_tamp_world_not_in_collision(world)
 
