@@ -30,7 +30,10 @@ from tag `paper-g1-comfix`. Both need the cuRobo fork helpYoon/curobo (with
 > the planner reads joint limits back from cuRobo. Its timeopt (on by default)
 > retimes each plan to torque limits on its own RNEA, without the floor's push,
 > so `get_t1_motion_planner` turns it off and the balance gate paces each
-> segment. Trajopt's first solve runs 100 L-BFGS iterations, not v0.9.0's 50:
+> segment. With timeopt off, trajopt times a segment at the fastest pace its
+> speed, acceleration and jerk caps allow, and its success test would drop a
+> segment over an effort there that fits slower, so that test leaves torque to
+> the gate (`_trajopt_metrics_dict`). Trajopt's first solve runs 100 L-BFGS iterations, not v0.9.0's 50:
 > on the five blocks_t1 cases v0.9.0 planned worst, 50 planned 4 and 100 all 5
 > (`TRAJOPT_INITIAL_ITERS`). cuRobo's FK backward adds each link's sphere and
 > tool-frame gradients with float atomics, whose order varies between warps.
@@ -203,9 +206,9 @@ graph LR
    approach. GN solves the
    pre and post confs (`_approach_confs`), trajopt holds the hand on each line
    (`_line_motion`) and FK checks it (`check_line`). Trajopt holds both soles on the
-   stance at every waypoint and bounds every joint's torque at its effort with
-   cuRobo's RNEA, the floor's push on the soles included
-   (`install_floor_wrench`). Each
+   stance at every waypoint and penalizes every joint's torque past its effort
+   with cuRobo's RNEA, the floor's push on the soles included
+   (`install_floor_wrench`); its success test leaves torque to the gate. Each
    segment then passes `_balance_gate`: every frame must keep both soles on
    the stance and its CoM inside the model's support rectangle
    (`world.model.support.gate_half`: the home stance's two soles, shrunk 2 cm
@@ -316,7 +319,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
     world builds its other `Kinematics` on its config),
     `get_t1_motion_planner` (the
     single planner: cuRobo's RNEA in trajopt with the floor's push on the
-    planted soles and each joint's torque bounded at its effort, the joint
+    planted soles and each joint's torque penalized past its effort, which its
+    success test leaves to the balance gate (`_trajopt_metrics_dict`), the joint
     limits bounded at `TRAJOPT_POSITION_BOUND_WEIGHT` (1e6, cuRobo's 1e4
     times 100, so paths that end on the ankle cap stay inside it), the soles held
     on the stance at every waypoint and the COM-over-polygon rollout soft

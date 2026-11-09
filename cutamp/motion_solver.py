@@ -66,8 +66,9 @@ _log = logging.getLogger(__name__)
 
 def _cspace_plan_succeeded(result) -> bool:
     """True iff ``plan_cspace`` returned a plan cuRobo calls converged and feasible over the optimized and the
-    interpolated trajectory (timeopt off, as get_t1_motion_planner sets it). Trust it: ``cspace_error`` is never set,
-    and the last waypoint is pinned to the goal, so neither shows a mid-path violation."""
+    interpolated trajectory (timeopt off, as get_t1_motion_planner sets it). Feasible leaves torque out: the balance
+    gate slows the segment until every effort holds. Trust it: ``cspace_error`` is never set, and the last waypoint is
+    pinned to the goal, so neither shows a mid-path violation."""
     return result is not None and bool(result.success.any())
 
 
@@ -78,7 +79,6 @@ def _plan_arm_to_conf(
     *,
     disable_obstacle: Optional[str],
     ground_op,
-    world: Optional[TAMPWorld] = None,
     max_attempts: int = 20,
 ):
     """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
@@ -87,8 +87,7 @@ def _plan_arm_to_conf(
     redundancy solution. Pick, place and retract all plan here. ``disable_obstacle`` (if
     given, else None) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
-    cuRobo result; raises ``RuntimeError`` if it fails (``_plan_failed``: given
-    ``world`` it names the reason), with ``out_of_attempts`` set.
+    cuRobo result; raises ``RuntimeError`` if it fails, with ``out_of_attempts`` set.
 
     One call: plan_cspace makes up to ``max_attempts`` attempts (cuRobo's default 20; all but the first graph-seeded,
     each with one finetune pass). On the fork, which made 5, calling it again with the same start and goal returned
@@ -99,32 +98,10 @@ def _plan_arm_to_conf(
     with _disabled_world_obstacle(planner, disable_obstacle):
         result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
     if not _cspace_plan_succeeded(result):
-        error = _plan_failed(world, result, f"cspace-anchored plan failed for {ground_op}")
+        error = RuntimeError(f"cspace-anchored plan failed for {ground_op}")
         error.out_of_attempts = True  # more attempts may plan it (_motion_plan_with_retries' second pass)
         raise error
     return result
-
-
-def _failure_reason(world: TAMPWorld, result) -> str:
-    """Why a trajopt failed (design 7.4a): ``"torque"`` when either trajectory ``result`` carries passes a
-    joint's effort by cuRobo's two RNEA passes with the floor's push (``world.segment_torques``), else ``"other"``.
-    The two are the trajopt horizon (``js_solution``) and the interpolated trajectory between its frames, which
-    trajopt's success test re-checks (``get_interpolated_plan``). IK and Adam never see torque, so a conf can need
-    more than a motor gives."""
-    torques = world.segment_torques
-
-    def over(js) -> bool:
-        return js is not None and bool((torques(js).abs() > torques.effort).any())
-
-    return "torque" if over(getattr(result, "js_solution", None)) or over(_interp_plan(result)) else "other"
-
-
-def _plan_failed(world: Optional[TAMPWorld], result, message: str) -> RuntimeError:
-    """The RuntimeError for a failed trajopt; given ``world`` its message ends with the reason
-    (``_failure_reason``), which ``_motion_plan_with_retries`` keeps per candidate."""
-    if world is not None:
-        message = f"{message}: {_failure_reason(world, result)}"
-    return RuntimeError(message)
 
 
 @contextlib.contextmanager
@@ -477,7 +454,7 @@ def solve_curobo(
         with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
             with timer.time("curobo_planning"):
                 result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
-                                           world=world, max_attempts=max_attempts)
+                                           max_attempts=max_attempts)
         try:
             plan, dt = _interp_plan(result), _plan_dt(planner)
             entry = {"dt": dt, "arm": arm, "op_idx": idx, "phase": phase, "gripper": gripper}

@@ -88,13 +88,14 @@ ROLL_MARGIN = 0.1  # rad
 
 SOFT_LIMIT_FACTOR = 0.9  # bfm_wm robot/t1.py:118, T1_CFG.soft_joint_pos_limit_factor (call 17)
 ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's top speed, npz v_max (7.4a)
-# Trajopt's internal timing. Trajopt times each segment against these and its success test checks the torques at that
-# timing, so they shape each path, its time profile and its fastest pace. The balance gate keeps that profile and only
+# Trajopt's internal timing. Trajopt times each segment against these, so they shape each path, its time profile and
+# its fastest pace. The balance gate keeps that profile and only
 # slows a segment, by a uniform time scale, for the robot's speed limits, efforts and the ZMP
 # (motion_solver._balance_gate), so their shape and pace reach every exported motion. They are not robot facts: the
 # acceleration and jerk caps are trajopt's pace limits for the real legs, and the base's velocity limit is cuRobo's
 # default for extra links (link_params.py:32), written out. With non-binding caps in their place (1e4, 1e6, 1e3) both
-# seed-0 runs of P2's check set failed every candidate's first trajopt on its torque check, so trajopt keeps these.
+# seed-0 runs of P2's check set failed every candidate's first trajopt on torque, when its success test still judged
+# torque at its own pace (before 2026-11-09). Trajopt keeps these: they set the pace the gate slows from, by at most 4x.
 TRAJOPT_MAX_ACCELERATION = 15.0  # rad/s^2 (m/s^2 on the base's x, y, z)
 TRAJOPT_MAX_JERK = 100.0  # rad/s^3
 BASE_VELOCITY_LIMIT = 2.0  # rad/s, m/s: each of the six virtual base joints

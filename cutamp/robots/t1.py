@@ -257,6 +257,19 @@ def _trajopt_optimizer_dict() -> dict:
     return d
 
 
+def _trajopt_metrics_dict() -> dict:
+    """cuRobo's metrics YAML for trajopt's success test, without its torque bound. With timeopt off, trajopt judges a
+    segment at the fastest pace its speed, acceleration and jerk caps allow, so a torque bound there drops segments
+    that fit slower: at h 0.2 (2026-11-09), every segment dropped on torque fit at half speed. The balance gate slows
+    each segment until every effort holds (``motion_solver._torque_scale``); trajopt's cost still penalizes torque."""
+    from curobo.config_io import join_path, resolve_config
+    from curobo.content import get_task_configs_path
+
+    d = resolve_config(join_path(get_task_configs_path(), "metrics_base.yml"))
+    d["rollout"]["constraint_cfg"]["cspace_cfg"]["weight"][4] = 0.0  # position, vel, acc, jerk, tau; 0 skips the bound
+    return d
+
+
 def get_t1_motion_planner(
     model: T1Model,
     scene: Scene,
@@ -268,10 +281,11 @@ def get_t1_motion_planner(
 
     The planner also (design 7.4a and 7.5):
 
-    - runs cuRobo's RNEA in trajopt (``load_dynamics``), whose cspace cost and success test bound every joint's torque
-      at the URDF's effort, with the floor's push on the planted soles (``install_floor_wrench``, hooked before any
-      plan or warm-up: cuRobo's CUDA graphs keep the hook they were captured with). cuRobo's energy term keeps its
-      default weight;
+    - runs cuRobo's RNEA in trajopt (``load_dynamics``), whose cspace cost penalizes every joint's torque past the
+      URDF's effort, with the floor's push on the planted soles (``install_floor_wrench``, hooked before any plan or
+      warm-up: cuRobo's CUDA graphs keep the hook they were captured with). Its success test bounds no torque
+      (``_trajopt_metrics_dict``): the balance gate slows each segment until every effort holds. cuRobo's energy term
+      keeps its default weight;
     - holds both soles on the stance at every waypoint (pose tracking at non-terminal scale 1.0, stage 2's verified
       weight), tracks the hands at the terminal only, and leaves the ``stance`` frame untracked (it is world-fixed,
       and the CoM cost's support frame);
@@ -301,6 +315,7 @@ def get_t1_motion_planner(
         optimizer_collision_activation_distance=0.0025,
         device_cfg=device_cfg,
         trajopt_optimizer_configs=[_trajopt_optimizer_dict()],
+        trajopt_metrics_rollout=_trajopt_metrics_dict(),
         # cuRobo's timeopt retimes each plan to its torque limits on its own RNEA, without the floor's push
         # (motion_trajectory_timeopt.py), so the soles' load never reaches the legs and the floor-push check rejects
         # its timing; the balance gate paces each segment instead.

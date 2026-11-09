@@ -1,7 +1,7 @@
-"""Motion planning on the real legs with planted feet and cuRobo's torque check (design 7.4a, 7.5): the floor's push on
-every trajopt transition, SegmentTorques against trajopt's own torques, the balance gate's multibody ZMP against a
-float64 reference, its sole, CoM and torque checks, and the failed-trajopt reason. blocks_t1 end to end on the
-real legs is test_motion_anchor's."""
+"""Motion planning on the real legs with planted feet and the torque checks (design 7.4a, 7.5): the floor's push on
+every trajopt transition, SegmentTorques against trajopt's own torques, trajopt's success test leaving torque to the
+balance gate, the gate's multibody ZMP against a float64 reference, and its sole, CoM and torque checks. blocks_t1 end
+to end on the real legs is test_motion_anchor's."""
 
 import functools
 import math
@@ -133,6 +133,22 @@ def test_planner_hooks_every_trajopt_transition(real_world, planner):
     assert max(loads) <= 0.05, loads
 
 
+@needs_cuda
+def test_trajopt_success_test_leaves_torque_to_the_gate(planner):
+    # With timeopt off, trajopt times each segment at the fastest pace its speed, acceleration and jerk caps allow.
+    # A success test bounding torque there dropped segments that fit slower: at h 0.2 (2026-11-09), every segment
+    # dropped on torque fit at half speed. The gate slows a segment until every effort holds (_torque_scale), so
+    # the success test (the metrics rollouts: trajopt's horizon and the interpolated re-check) bounds every
+    # joint's position, speed, acceleration and jerk but no torque, and trajopt's cost still penalizes torque.
+    ts = planner.trajopt_solver
+    tests = [ts.metrics_rollout, ts.additional_metrics_rollouts["interpolated_rollout"]]
+    for r in tests:
+        weight = r.metrics_constraint_manager.get_cost("cspace").config.weight  # position, vel, acc, jerk, torque
+        assert float(weight[4]) == 0.0 and float(weight[:4].min()) > 0.0, r.rollout_instance_name
+    for r in ts.optimizer_rollouts:
+        assert float(r.cost_manager.get_cost("cspace").config.weight[4]) > 0.0
+
+
 def _plan_reach(world, real_plan, planner):
     """A planned home -> reach segment: plan_cspace's result for the first pick conf of ``real_plan`` that plans."""
     from curobo.types import JointState
@@ -155,7 +171,7 @@ def _plan_reach(world, real_plan, planner):
 @needs_cuda
 def test_segment_torques_equal_trajopt_s(real_world, real_plan, planner):
     # The gate re-runs cuRobo's own two passes: on a planned home -> reach segment, SegmentTorques equals the torque
-    # every trajopt transition computes, the cost's and the success test's.
+    # every trajopt transition computes, the cost's and the metrics'.
     from cutamp.motion_solver import _interp_plan
     names = list(real_world.model.joint_names)
     plan = planner.kinematics.get_active_js(_interp_plan(_plan_reach(real_world, real_plan, planner)))
@@ -170,7 +186,7 @@ def test_segment_torques_equal_trajopt_s(real_world, real_plan, planner):
 def test_planned_torques_equal_segment_torques(real_world, real_plan, planner):
     # The torques trajopt computed while it planned, read where the plan left them, equal SegmentTorques on the same
     # frames: the metrics rollout's (the trajopt horizon, computed inside its replayed CUDA graph) and the
-    # interpolated rollout's last ones (its success test). A graph captured before the floor's push was hooked would
+    # interpolated rollout's last ones (its re-check). A graph captured before the floor's push was hooked would
     # replay without the push, while the eager calls above would still see it.
     from curobo.types import JointState
     _plan_reach(real_world, real_plan, planner)
@@ -194,8 +210,8 @@ def test_planned_torques_equal_segment_torques(real_world, real_plan, planner):
 
 @needs_cuda
 def test_gate_fails_a_slowed_segment_past_a_torque_limit(real_world, monkeypatch):
-    # Trajopt bounds the torque at its own timing only; the gate runs the two passes (design 7.4a) at every time scale
-    # it tries and on the frames it returns, and fails past an effort. The slowed swing's shoulders carry less than
+    # Trajopt's success test leaves torque to the gate, which runs the two passes (design 7.4a) at every time scale it
+    # tries and on the frames it returns, and fails past an effort. The slowed swing's shoulders carry less than
     # the planned one's: an effort between the two peaks passes only if the gate checks the torque at the scale it
     # picks, not at the planner's; one under the shoulders' static load fails at every scale.
     from cutamp.motion_solver import _balance_gate
@@ -675,40 +691,12 @@ def test_real_legs_gate_rejects_com_outside_support(real_world, site):
     assert gate(_lean(world, 0.12)) >= 0.0
 
 
-def _result(js_solution, interpolated=None):
-    """A trajopt result's two trajectories: the horizon's (``js_solution``) and the interpolated one."""
-    return SimpleNamespace(js_solution=js_solution, get_interpolated_plan=lambda: interpolated)
-
-
-@needs_cuda
-def test_failure_reason_names_torque(real_world, monkeypatch):
-    # "torque" when either trajectory of a failed trajopt passes an effort: the horizon's, or the interpolated one
-    # between its frames that trajopt's success test re-checks.
-    from cutamp.motion_solver import _failure_reason
-    swing, still = _swing(real_world), _ramp(real_world, {}, 2 * DT)
-    assert _failure_reason(real_world, None) == "other"
-    assert _failure_reason(real_world, _result(None)) == "other"
-    assert _failure_reason(real_world, _result(still, still)) == "other"
-    assert _failure_reason(real_world, _result(swing, swing)) == "other"  # within the real efforts
-    torques = real_world.segment_torques
-    columns = [real_world.model.joint_names.index(j) for j in SHOULDERS]
-    still_peak, swing_peak = _shoulder_peak(real_world, still), _shoulder_peak(real_world, swing)
-    assert still_peak < swing_peak
-    effort = torques.effort.clone()
-    effort[columns] = 0.5 * (still_peak + swing_peak)
-    monkeypatch.setattr(torques, "effort", effort)
-    assert _failure_reason(real_world, _result(swing, still)) == "torque"
-    assert _failure_reason(real_world, _result(still, swing)) == "torque"
-    assert _failure_reason(real_world, _result(None, swing)) == "torque"
-    assert _failure_reason(real_world, _result(still, still)) == "other"
-
-
-def test_plan_failed_names_torque_in_every_torque_form():
-    # A failed candidate's message names torque in trajopt's reason (": torque") and in each of the balance gate's
-    # torque raises: no time scale up to the cap keeps every effort (_torque_scale), or the frames it returns pass one
-    # (_check_torques). Trajopt's ": other" and the gate's velocity and ZMP raises don't. The last assert pins which of
-    # the six messages name torque.
-    from cutamp.motion_solver import RETIME_MAX, _check_torques, _check_velocity, _plan_failed, _torque_scale
+def test_gate_names_torque_in_every_torque_form():
+    # Only the balance gate fails a segment on torque (trajopt's success test leaves it to the gate), and a failed
+    # candidate's message names torque in each of its torque raises: no time scale up to the cap keeps every effort
+    # (_torque_scale), or the frames it returns pass one (_check_torques). Its velocity and ZMP raises don't. The last
+    # assert pins which of the four messages name torque.
+    from cutamp.motion_solver import RETIME_MAX, _check_torques, _check_velocity, _torque_scale
 
     n = len(REAL_LEGS.joint_names)
 
@@ -731,13 +719,9 @@ def test_plan_failed_names_torque_in_every_torque_form():
         with pytest.raises(RuntimeError) as e:
             check(*args)
         raised.append(str(e.value))
-    result = SimpleNamespace(js_solution=object(), get_interpolated_plan=lambda: None)  # a trajopt result
-    messages = [str(_plan_failed(world(2.0), result, "cspace-anchored plan failed for op")), *raised,
-                str(_plan_failed(world(0.5), result, "cspace-anchored plan failed for op")),
-                f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
-    assert messages[0].endswith(": torque") and messages[4].endswith(": other")
-    assert f"at the {RETIME_MAX}x slowdown cap" in messages[2] and "velocity passes" in messages[3]
-    assert [("torque" in m) for m in messages] == [True, True, True, False, False, False]
+    messages = [*raised, f"trajectory ZMP stays outside the support region at the {RETIME_MAX}x slowdown cap"]
+    assert f"at the {RETIME_MAX}x slowdown cap" in messages[1] and "velocity passes" in messages[2]
+    assert [("torque" in m) for m in messages] == [True, True, False, False]
 
 
 def test_torque_check_fails_a_nan_torque():
