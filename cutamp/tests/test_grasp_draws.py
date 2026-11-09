@@ -158,13 +158,14 @@ def test_no_grasp_left_names_the_rules(real_world, monkeypatch):
 
 def _fake_ik(monkeypatch, accept):
     """gn_ik and ik_check stand-ins. A row's targets hold its drawn value v; gn_ik answers q = (v, v), accepts
-    accept(v) and records each call's values; ik_check accepts a conf whose first entry is >= 0."""
+    accept(v) and records each call's values and arms; ik_check accepts a conf whose first entry is >= 0."""
     import cutamp.particle_initialization as pi
-    calls = []
+    calls, arms_seen = [], []
 
     def gn_ik(world, world_from_ee, arms, movables, tol):
         v = world_from_ee[:, 0, 0]
         calls.append(v.tolist())
+        arms_seen.append(tuple(arms))
         return torch.stack([v, v], -1), accept(v)
 
     def ik_check(world, q, world_from_ee, arms, movables, tol):
@@ -172,39 +173,83 @@ def _fake_ik(monkeypatch, accept):
 
     monkeypatch.setattr(pi, "gn_ik", gn_ik)
     monkeypatch.setattr(pi, "ik_check", ik_check)
-    return calls
+    return calls, arms_seen
 
 
-def _solve(particles, draw, **kw):  # four rows on the CPU
+def _step(particles, name, values, redraw, arm="left", **kw):
+    """A walk step ``name`` on four CPU rows, drawn as ``values``; its targets hold its value, the fake IK's input."""
     import cutamp.particle_initialization as pi
-    inputs = lambda rows: (particles["x"][rows, None, None].expand(-1, 4, 4), torch.zeros(len(rows), 1, 4))
-    return pi._draw_and_solve(SimpleNamespace(device="cpu"), particles, "x", 4, draw, inputs, "left", None, **kw)
+    particles[name] = torch.tensor(values, dtype=torch.float)
+    inputs = lambda rows: (particles[name][rows, None, None].expand(-1, 4, 4), torch.zeros(len(rows), 1, 4))
+    return pi._Step(name, f"q_{name}", arm, inputs, lambda rows: redraw + rows.float(), **kw)
+
+
+def _solve(particles, steps, rounds=2):
+    import cutamp.particle_initialization as pi
+    return pi._solve_steps(SimpleNamespace(device="cpu", q_init=torch.zeros(2)), particles, steps, 4, rounds, None)
 
 
 def test_redraw_only_failed_rows(monkeypatch):
-    calls = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 10))
+    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 10))
     particles = {}
-    q, ok, accepted = _solve(particles, lambda rows: rows.float() + 10 * (len(rows) < 4))
+    q, ok, accepted = _solve(particles, [_step(particles, "x", [0, 1, 2, 3], redraw=10)])["q_x"]
     assert calls == [[0, 1, 2, 3], [10, 12]]  # only the failed rows drew again and were solved again
     assert particles["x"].tolist() == [10, 1, 12, 3] and q[:, 0].tolist() == [10, 1, 12, 3]
     assert ok.all() and accepted == [2, 4]
     calls.clear()
-    q, ok, accepted = _solve({}, lambda rows: rows.float(), rounds=0)
+    q, ok, accepted = _solve(particles, [_step(particles, "x", [0, 1, 2, 3], redraw=10)], rounds=0)["q_x"]
     assert calls == [[0, 1, 2, 3]] and ok.tolist() == [False, True, False, True] and accepted == [2]
 
 
 def test_check_the_start_before_solving(monkeypatch):
     # Rows 0 and 2 pass the check and keep their start conf; gn_ik solves rows 1 and 3, accepts 3; row 1 redraws
-    # with `redraw`, not `draw` (G4).
-    calls = _fake_ik(monkeypatch, lambda v: (v == 3) | (v >= 100))
+    # (G4).
+    calls, _ = _fake_ik(monkeypatch, lambda v: (v == 3) | (v >= 100))
     start = torch.tensor([[1.0, 7.0], [-1.0, 7.0], [1.0, 8.0], [-1.0, 8.0]])
     particles = {}
-    q, ok, accepted = _solve(particles, lambda rows: rows.float(), redraw=lambda rows: 100 + rows.float(),
-                             q_start=start)
+    q, ok, accepted = _solve(particles, [_step(particles, "x", [0, 1, 2, 3], redraw=100, q_start=start)])["q_x"]
     assert calls == [[1, 3], [101]]
     assert torch.equal(q[[0, 2]], start[[0, 2]])
     assert q[1].tolist() == [101, 101] and q[3].tolist() == [3, 3]
     assert particles["x"].tolist() == [0, 101, 2, 3] and ok.all() and accepted == [3, 4]
+
+
+def test_steps_solve_in_one_call_per_round(monkeypatch):
+    # Two steps, one per hand: one call solves both, then one call per round their failed rows, each step's rows a
+    # block of the call's arms, the smaller block repeating its rows up to the larger's (y's row 1 twice).
+    calls, arms = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
+    particles = {}
+    steps = [_step(particles, "x", [0, 1, 2, 3], redraw=100), _step(particles, "y", [5, 4, 7, 9], redraw=200,
+                                                                    arm="right")]
+    solved = _solve(particles, steps)
+    assert calls == [[0, 1, 2, 3, 5, 4, 7, 9], [100, 102, 201, 201]]
+    assert arms == [("left", "right")] * 2
+    assert solved["q_x"][0][:, 0].tolist() == [100, 1, 102, 3] and solved["q_y"][0][:, 0].tolist() == [5, 201, 7, 9]
+    assert solved["q_x"][2] == [2, 4] and solved["q_y"][2] == [3, 4]
+
+
+def test_a_redrawn_grasp_redraws_its_place(monkeypatch):
+    # The place reads the pick's grasp (drawn_from): the pick's row 0 draws again, so the place's row 0 draws again
+    # and is solved again, though its IK had passed; its other rows stay.
+    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
+    particles = {}
+    steps = [_step(particles, "g", [0, 1, 3, 5], redraw=100),
+             _step(particles, "p", [7, 9, 11, 13], redraw=300, drawn_from=("g",))]
+    _solve(particles, steps)
+    assert calls == [[0, 1, 3, 5, 7, 9, 11, 13], [100, 300]]
+    assert particles["p"].tolist() == [300, 9, 11, 13]
+
+
+def test_a_moved_placement_rechecks_the_later_steps(monkeypatch):
+    # b's movables read a's placement (checked_against): a's rows 0 and 1 draw again, so b's rows 0 and 1 are checked
+    # again where they stand; row 0 fails the check (q < 0) and is solved again, as drawn; row 1 passes and stays.
+    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
+    particles = {}
+    steps = [_step(particles, "a", [0, 2, 5, 7], redraw=100),
+             _step(particles, "b", [-1, 3, 5, 7], redraw=300, checked_against=("a",))]
+    solved = _solve(particles, steps)
+    assert calls == [[0, 2, 5, 7, -1, 3, 5, 7], [100, 101, -1, -1]]
+    assert particles["b"].tolist() == [-1, 3, 5, 7] and solved["q_b"][1].all()
 
 
 @needs_cuda
@@ -232,10 +277,33 @@ def test_floor_picks_choose_upright_grasps(real_world):
 
 
 @needs_cuda
+def test_each_walk_solves_its_steps_together(real_world, monkeypatch):
+    # blocks_t1's first plan: the pool walk's two picks and two places solve in one gn_ik call, a block per step; the
+    # particle walk's in one call, then one per redraw round.
+    import cutamp.particle_initialization as pi
+    from cutamp.config import TAMPConfiguration
+    from cutamp.grasps import GRASP_REDRAW_ROUNDS
+
+    real_gn_ik, arms_seen = pi.gn_ik, []
+
+    def counted(world, world_from_ee, arms, movables, tol):
+        arms_seen.append(tuple(arms))
+        return real_gn_ik(world, world_from_ee, arms, movables, tol)
+
+    monkeypatch.setattr(pi, "gn_ik", counted)
+    skeleton, _, _ = _first_plan(real_world)
+    torch.manual_seed(0)
+    pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=16), default_checker())(skeleton)
+    steps = tuple(op.operator.metadata.arm for op in skeleton if op.operator.metadata.action_type in ("pick", "place"))
+    assert len(steps) == 4 and arms_seen[0] == steps
+    assert 1 <= len(arms_seen) - 1 <= 1 + GRASP_REDRAW_ROUNDS, arms_seen
+
+
+@needs_cuda
 def test_no_balanced_grasp_falls_back_to_the_score_draw(real_world, monkeypatch, caplog):
-    # Every pool-walk IK fails (its calls are the ones wider than n), so no grasp is balanced: each pick warns and
-    # draws by score from its pool, as before (G6): torch.multinomial on the pick's own scores, not the pool walk's
-    # draw in turn.
+    # Every pool-walk IK fails (its one call is wider than any of the particle walk's, at most its 4 steps' n rows), so
+    # no grasp is balanced: each pick warns and draws by score from its pool, as before (G6): torch.multinomial on the
+    # pick's own scores, not the pool walk's draw in turn.
     import logging
     import cutamp.particle_initialization as pi
     from cutamp.config import TAMPConfiguration
@@ -244,7 +312,7 @@ def test_no_balanced_grasp_falls_back_to_the_score_draw(real_world, monkeypatch,
 
     def pool_fails(world, world_from_ee, arms, movables, tol):
         q, ok = real_gn_ik(world, world_from_ee, arms, movables, tol)
-        return q, ok & (len(ok) <= n)
+        return q, ok & (len(ok) <= 4 * n)
 
     def multinomial(input, *args, **kwargs):
         draws.append(input.clone())

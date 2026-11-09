@@ -420,8 +420,10 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   conf come from `rollout.movable_spheres_fn`, placed as the rollout places
   them. A pick row takes one of its pick's chosen grasps (a pool walk solves
   every eligible grasp once, then `choose_grasps`) and a place row draws its
-  placement, and the rows whose IK fails draw again (`_draw_and_solve`; a
-  placement keeps the least-colliding of its candidates, `_draw_placements`).
+  placement, and the rows whose IK fails draw again (a placement keeps the
+  least-colliding of its candidates, `_draw_placements`). Each walk draws
+  every pick and place first, then solves them all in one `gn_ik` call, and
+  each redraw round in one more (`_solve_steps`).
 
 - [`grasps.py`](cutamp/grasps.py) — the grasps: `grasp_sets` runs
   GraspGenX's graspmoe planner on each object shape's surface points when the

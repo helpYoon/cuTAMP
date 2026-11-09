@@ -292,41 +292,94 @@ def choice_stats(c: PickChoice) -> dict:
     }
 
 
-def _draw_and_solve(
-    world: TAMPWorld, particles: Particles, name: str, num_particles: int,
-    draw: Callable[[torch.Tensor], torch.Tensor],
-    ik_inputs: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]], arm: str, tol: IKTol,
-    *, redraw: Optional[Callable[[torch.Tensor], torch.Tensor]] = None, rounds: Optional[int] = None,
-    q_start: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-    """Draws ``particles[name]`` (``draw(rows)`` gives the rows' values) and solves the rows' confs from
-    ``ik_inputs(rows)``: their hand targets ``[r, 4, 4]`` and movables ``[r, M, 4]`` under the particles as they then
-    stand. :func:`gn_ik` solves every row, or, given start confs ``q_start`` ``[num_particles, dof]``, only the rows
-    whose start :func:`ik_check` rejects. For up to ``rounds`` rounds (``None``: ``GRASP_REDRAW_ROUNDS``), the rows
-    still failed draw again with ``redraw`` (``None``: ``draw``) and only those rows are solved again, by
-    :func:`gn_ik`. Returns the confs ``[num_particles, dof]``, the accepted rows ``[num_particles]`` and the accepted
-    count after the first solve and after each round."""
-    redraw = draw if redraw is None else redraw
-    rows = torch.arange(num_particles, device=world.device)
-    particles[name] = draw(rows)
-    targets, movables = ik_inputs(rows)
-    if q_start is None:
-        q, ok = gn_ik(world, targets, arm, movables, tol)
-    else:
-        q, ok = q_start.clone(), ik_check(world, q_start, targets, arm, movables, tol)[0]
-        rejected = (~ok).nonzero().squeeze(-1)
-        if rejected.numel():
-            q[rejected], ok[rejected] = gn_ik(world, targets[rejected], arm, movables[rejected], tol)
-    accepted = [int(ok.sum())]
-    for _ in range(GRASP_REDRAW_ROUNDS if rounds is None else rounds):
-        rows = (~ok).nonzero().squeeze(-1)
-        if rows.numel() == 0:
+class _Step(NamedTuple):
+    """One pick or place of a walk, which :func:`_solve_steps` solves with the walk's others. ``name``: its drawn
+    parameter (the grasp or the placement), ``q``: its conf, ``ik_inputs(rows)``: the rows' hand targets ``[r, 4, 4]``
+    and movables ``[r, M, 4]`` under the particles as they then stand, ``redraw(rows)``: the rows' values when they
+    draw again, ``q_start``: start confs ``[n, dof]`` (the rows that :func:`ik_check` accepts keep theirs).
+    ``drawn_from``: the earlier steps' parameters its draw reads (a place's grasp); ``checked_against``: those its
+    movables read (the earlier placements)."""
+
+    name: str
+    q: str
+    arm: str
+    ik_inputs: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+    redraw: Callable[[torch.Tensor], torch.Tensor]
+    drawn_from: Tuple[str, ...] = ()
+    checked_against: Tuple[str, ...] = ()
+    q_start: Optional[torch.Tensor] = None
+
+
+def _gn_ik_blocks(world: TAMPWorld, blocks: Sequence[Tuple[torch.Tensor, str, torch.Tensor]], tol: IKTol):
+    """:func:`gn_ik` of ``blocks`` (each ``(targets [r, 4, 4], arm, movables [r, M, 4])``, ``r >= 1``) in one call:
+    ``[(q [r, dof], ok [r])]``. gn_ik's dep blocks are equal, so each block repeats its rows up to the largest's, and
+    the repeats are dropped."""
+    sizes = [len(t) for t, _, _ in blocks]
+    r = max(sizes)
+    pad = [torch.arange(r, device=world.device) % size for size in sizes]
+    q, ok = gn_ik(world, torch.cat([t[i] for (t, _, _), i in zip(blocks, pad)]), tuple(a for _, a, _ in blocks),
+                  torch.cat([m[i] for (_, _, m), i in zip(blocks, pad)]), tol)
+    return [(q[i * r:i * r + size], ok[i * r:i * r + size]) for i, size in enumerate(sizes)]
+
+
+def _solve_steps(world: TAMPWorld, particles: Particles, steps: Sequence[_Step], n: int, rounds: int,
+                 tol: IKTol) -> Dict[str, Tuple[torch.Tensor, torch.Tensor, List[int]]]:
+    """Solves every step's ``n`` rows, drawn in ``particles``, in one :func:`_gn_ik_blocks` call (a step with
+    ``q_start`` solves only the rows whose start :func:`ik_check` rejects), then for up to ``rounds`` rounds, one call
+    each, the rows to solve again. A round walks the steps in order: a row draws again (``redraw``) where its IK
+    failed or a parameter in its ``drawn_from`` drew again, and is checked again, as it stands, where one in its
+    ``checked_against`` drew again; it is solved again if it drew or the check rejects it. So every row ends solved under
+    the values the particles end with, as when each step finished its rounds before the next drew.
+
+    Writes ``particles[step.q]``; returns, per conf, ``(q [n, dof], ok [n], accepted counts after the first solve and
+    each round)``."""
+    q, ok, todo = {}, {}, {}  # todo: per conf, the rows to solve
+    every = torch.arange(n, device=world.device)
+    for step in steps:
+        if step.q_start is None:
+            q[step.q], ok[step.q], todo[step.q] = world.q_init.repeat(n, 1), torch.zeros(n, dtype=torch.bool,
+                                                                                         device=world.device), every
+        else:
+            targets, movables = step.ik_inputs(every)
+            q[step.q], ok[step.q] = step.q_start.clone(), ik_check(world, step.q_start, targets, step.arm, movables,
+                                                                   tol)[0]
+            todo[step.q] = (~ok[step.q]).nonzero().squeeze(-1)
+    accepted = {step.q: [] for step in steps}
+    for round_ in range(rounds + 1):
+        blocks = [(step, todo[step.q]) for step in steps if todo[step.q].numel()]
+        if round_ and not blocks:
             break
-        particles[name][rows] = redraw(rows)
-        targets, movables = ik_inputs(rows)
-        q[rows], ok[rows] = gn_ik(world, targets, arm, movables, tol)
-        accepted.append(int(ok.sum()))
-    return q, ok, accepted
+        if blocks:
+            inputs = [step.ik_inputs(rows) for step, rows in blocks]
+            solved = _gn_ik_blocks(world, [(t, step.arm, m) for (step, _), (t, m) in zip(blocks, inputs)], tol)
+            for (step, rows), (q_rows, ok_rows) in zip(blocks, solved):
+                q[step.q][rows], ok[step.q][rows] = q_rows, ok_rows
+        for step in steps:
+            accepted[step.q].append(int(ok[step.q].sum()))
+        if round_ == rounds:
+            break
+        drew = {}  # per drawn parameter, the rows that drew again this round
+        for step in steps:
+            draw = ~ok[step.q]
+            for name in step.drawn_from:
+                draw = draw | drew[name]
+            rows = draw.nonzero().squeeze(-1)
+            if rows.numel():
+                particles[step.name][rows] = step.redraw(rows)
+            drew[step.name] = draw
+            moved = torch.zeros_like(draw)
+            for name in step.checked_against:
+                moved = moved | drew[name]
+            check = (moved & ~draw).nonzero().squeeze(-1)
+            if check.numel():
+                targets, movables = step.ik_inputs(check)
+                passed = ik_check(world, q[step.q][check], targets, step.arm, movables, tol)[0]
+                ok[step.q][check] = passed
+                rows = torch.cat([rows, check[~passed]])
+            todo[step.q] = rows
+    for step in steps:
+        particles[step.q] = q[step.q]
+    return {step.q: (q[step.q], ok[step.q], accepted[step.q]) for step in steps}
 
 
 #: Placement candidates per row at a place: the row keeps the one that collides least with the scene.
@@ -424,6 +477,59 @@ class ParticleInitializer:
             pools[grasp] = candidates.grasps, candidates.scores
         return pools
 
+    def _pick_step(
+        self, plan_skeleton: PlanSkeleton, idx: int, particles: Particles, n: int,
+        pools: Dict[str, Tuple[torch.Tensor, torch.Tensor]], chosen: Optional[Dict[str, Optional[torch.Tensor]]],
+        pool_q: Optional[Dict[str, torch.Tensor]], placements: Sequence[str],
+    ) -> _Step:
+        """The pick ``plan_skeleton[idx]``'s step, its grasps drawn into ``particles`` as :meth:`_walk` describes."""
+        world, device = self.world, self.world.device
+        obj, grasp, q = plan_skeleton[idx].values
+        arm = plan_skeleton[idx].operator.metadata.arm
+        grasps, scores = pools[grasp]
+        redraw = q_start = None
+        if chosen is None:  # the pool walk
+            draw = lambda rows: grasps[rows % len(grasps)]
+        elif chosen[grasp] is None:  # no grasp is balanced (G6): by score, as before the choice
+            draw = lambda rows: grasps[torch.multinomial(scores, len(rows), replacement=True)]
+        else:  # the chosen grasps in turn, each from its pool conf (G4, G5)
+            c = chosen[grasp]
+            draw = lambda rows: grasps[c[rows % len(c)]]
+            redraw = lambda rows: grasps[c[torch.randint(len(c), (len(rows),), device=device)]]
+            q_start = pool_q[q][c[torch.arange(n, device=device) % len(c)]]
+        world_from_obj = world.get_object_pose(obj)
+        tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
+        movables = movable_spheres_fn(world, plan_skeleton, idx)  # the earlier placements; the grasp moves none
+        particles[grasp] = draw(torch.arange(n, device=device))
+        return _Step(
+            grasp, q, arm,
+            lambda rows: (world_from_obj @ grasp_7dof_to_mat4x4(particles[grasp][rows]) @ tool_from_ee,
+                          movables(particles)[rows]),
+            draw if redraw is None else redraw, checked_against=tuple(placements), q_start=q_start,
+        )
+
+    def _place_step(self, plan_skeleton: PlanSkeleton, idx: int, particles: Particles, n: int,
+                    placements: Sequence[str]) -> _Step:
+        """The place ``plan_skeleton[idx]``'s step, its placements drawn into ``particles``: each row's follows the
+        grasp the row holds as it then stands (``particles[grasp]``), so it draws again when the grasp does."""
+        world = self.world
+        obj, grasp, placement, surface, q = plan_skeleton[idx].values
+        arm = plan_skeleton[idx].operator.metadata.arm
+        obj_curobo, obj_spheres = world.get_object(obj), world.get_collision_spheres(obj)
+        surface_curobo = world.get_object(surface)
+        obj_from_G = lambda rows: grasp_7dof_to_mat4x4(particles[grasp][rows])
+        tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
+        # The placed object at its placement (particles[placement]), as the rollout has it, and the earlier ones.
+        movables = movable_spheres_fn(world, plan_skeleton, idx)
+        draw = lambda rows: _draw_placements(world, obj_curobo, obj_spheres, surface_curobo, obj_from_G(rows))
+        particles[placement] = draw(torch.arange(n, device=world.device))
+        return _Step(
+            placement, q, arm,
+            lambda rows: (action_4dof_to_mat4x4(particles[placement][rows]) @ obj_from_G(rows) @ tool_from_ee,
+                          movables(particles)[rows]),
+            draw, drawn_from=(grasp,), checked_against=tuple(placements),
+        )
+
     def _walk(
         self, plan_skeleton: PlanSkeleton, n: int, pools: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
         chosen: Optional[Dict[str, Optional[torch.Tensor]]] = None, pool_q: Optional[Dict[str, torch.Tensor]] = None,
@@ -434,12 +540,13 @@ class ParticleInitializer:
         its pool ``pools[grasp]``, and every pick and place solves once. With it, the particle walk (G4): at a pick
         whose chosen grasps ``chosen[grasp]`` are ``c``, row i takes grasp ``c[i % len(c)]`` and starts from that
         grasp's row of the pool walk's confs ``pool_q[q]``, and a failed row draws again from ``c``, uniformly; a pick
-        with none (G6) draws by score. Places draw their placements and redraw as before."""
+        with none (G6) draws by score. Places draw their placements and redraw as before. The walk draws every step
+        in skeleton order, then solves them all together (:func:`_solve_steps`)."""
         world = self.world
         device = world.device
         particles = self._initial_particles(n)
-        confs: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        rounds = 0 if chosen is None else None
+        steps: List[_Step] = []
+        placements: List[str] = []  # the placements drawn so far, which later steps' movables read
         deferred_params: set[str] = set()
         move_free_deferred: dict[str, str] = {}
 
@@ -475,29 +582,9 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                grasps, scores = pools[grasp]
-                redraw = pool_start = None
-                if chosen is None:  # the pool walk
-                    draw = lambda rows: grasps[rows % len(grasps)]
-                elif chosen[grasp] is None:  # no grasp is balanced (G6): by score, as before the choice
-                    draw = lambda rows: grasps[torch.multinomial(scores, len(rows), replacement=True)]
-                else:  # the chosen grasps in turn, each from its pool conf (G4, G5)
-                    c = chosen[grasp]
-                    draw = lambda rows: grasps[c[rows % len(c)]]
-                    redraw = lambda rows: grasps[c[torch.randint(len(c), (len(rows),), device=device)]]
-                    pool_start = pool_q[q][c[torch.arange(n, device=device) % len(c)]]
-                world_from_obj = world.get_object_pose(obj)
-                tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
-                movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)  # the grasp moves none of them
-                particles[q], ok, accepted = _draw_and_solve(
-                    world, particles, grasp, n, draw,
-                    lambda rows: (world_from_obj @ grasp_7dof_to_mat4x4(particles[grasp][rows]) @ tool_from_ee,
-                                  movables[rows]),
-                    arm, self.ik_tol, redraw=redraw, rounds=rounds, q_start=pool_start,
-                )
-                confs[q] = particles[q], ok
-                log_debug(f"{header}. {len(grasps)} grasps pass the drops; IK accepted: "
-                          f"{accepted[0]}/{n}, after redraws {accepted[1:]}")
+                steps.append(self._pick_step(plan_skeleton, idx, particles, n, pools, chosen, pool_q, placements))
+                particles[q] = None  # ponytail: a placeholder, so later ops see q bound; _solve_steps writes it
+                log_debug(f"{header}. {len(pools[grasp][1])} grasps pass the drops")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
@@ -514,21 +601,10 @@ class ParticleInitializer:
                 if q in particles:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
-                obj_curobo, obj_spheres = world.get_object(obj), world.get_collision_spheres(obj)
-                surface_curobo = world.get_object(surface)
-                obj_from_G = grasp_7dof_to_mat4x4(particles[grasp])
-                tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
-                # The placed object at its placement (particles[placement], redrawn per round), as the rollout has it.
-                movables = movable_spheres_fn(world, plan_skeleton, idx)
-                particles[q], ok, accepted = _draw_and_solve(
-                    world, particles, placement, n,
-                    lambda rows: _draw_placements(world, obj_curobo, obj_spheres, surface_curobo, obj_from_G[rows]),
-                    lambda rows: (action_4dof_to_mat4x4(particles[placement][rows]) @ obj_from_G[rows] @ tool_from_ee,
-                                  movables(particles)[rows]),
-                    arm, self.ik_tol, rounds=rounds,
-                )
-                confs[q] = particles[q], ok
-                log_debug(f"{header}. IK accepted: {accepted[0]}/{n}, after redraws {accepted[1:]}")
+                steps.append(self._place_step(plan_skeleton, idx, particles, n, placements))
+                placements.append(placement)
+                particles[q] = None  # as at a pick
+                log_debug(f"{header}. Drew {placement}")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)
 
@@ -547,6 +623,12 @@ class ParticleInitializer:
 
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
+
+        # Every pick and place solves together, one gn_ik call per round (_solve_steps).
+        solved = _solve_steps(world, particles, steps, n, 0 if chosen is None else GRASP_REDRAW_ROUNDS, self.ik_tol)
+        confs = {q: (q_rows, ok) for q, (q_rows, ok, _) in solved.items()}
+        for q, (_, _, accepted) in solved.items():
+            log_debug(f"{q}: IK accepted {accepted[0]}/{n}, after redraws {accepted[1:]}")
 
         # Resolve trailing MoveFree configs by copying the source.
         unresolved = deferred_params & set(move_free_deferred.keys())
