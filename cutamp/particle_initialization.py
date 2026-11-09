@@ -325,11 +325,13 @@ def _gn_ik_blocks(world: TAMPWorld, blocks: Sequence[Tuple[torch.Tensor, str, to
 def _solve_steps(world: TAMPWorld, particles: Particles, steps: Sequence[_Step], n: int, rounds: int,
                  tol: IKTol) -> Dict[str, Tuple[torch.Tensor, torch.Tensor, List[int]]]:
     """Solves every step's ``n`` rows, drawn in ``particles``, in one :func:`_gn_ik_blocks` call (a step with
-    ``q_start`` solves only the rows whose start :func:`ik_check` rejects), then for up to ``rounds`` rounds, one call
-    each, the rows to solve again. A round walks the steps in order: a row draws again (``redraw``) where its IK
-    failed or a parameter in its ``drawn_from`` drew again, and is checked again, as it stands, where one in its
-    ``checked_against`` drew again; it is solved again if it drew or the check rejects it. So every row ends solved under
-    the values the particles end with, as when each step finished its rounds before the next drew.
+    ``q_start`` solves only the rows whose start :func:`ik_check` rejects), then in rounds, one call each, the rows to
+    solve again. A round walks the steps in order: a row draws again (``redraw``) where a parameter in its
+    ``drawn_from`` drew again, or where its IK failed and it has redraws left, and is checked again, as it stands,
+    where one in its ``checked_against`` drew again; it is solved again if it drew or the check rejects it. A row has
+    ``rounds`` redraws after the last change to the values it reads (a redraw or a rejected check restarts them). So
+    every row ends solved under the values the particles end with, with the redraws it had when each step finished
+    its rounds before the next drew.
 
     Writes ``particles[step.q]``; returns, per conf, ``(q [n, dof], ok [n], accepted counts after the first solve and
     each round)``."""
@@ -345,7 +347,10 @@ def _solve_steps(world: TAMPWorld, particles: Particles, steps: Sequence[_Step],
                                                                    tol)[0]
             todo[step.q] = (~ok[step.q]).nonzero().squeeze(-1)
     accepted = {step.q: [] for step in steps}
-    for round_ in range(rounds + 1):
+    left = {step.q: torch.full((n,), rounds, device=world.device) for step in steps}  # each row's redraws left
+    # A row's redraws restart when a value it reads changes, so a step at depth d is done by round d * rounds.
+    last = len(steps) * rounds
+    for round_ in range(last + 1):
         blocks = [(step, todo[step.q]) for step in steps if todo[step.q].numel()]
         if round_ and not blocks:
             break
@@ -356,13 +361,16 @@ def _solve_steps(world: TAMPWorld, particles: Particles, steps: Sequence[_Step],
                 q[step.q][rows], ok[step.q][rows] = q_rows, ok_rows
         for step in steps:
             accepted[step.q].append(int(ok[step.q].sum()))
-        if round_ == rounds:
+        if round_ == last:  # no draw may follow the last solve
             break
         drew = {}  # per drawn parameter, the rows that drew again this round
         for step in steps:
-            draw = ~ok[step.q]
+            fresh = torch.zeros(n, dtype=torch.bool, device=world.device)
             for name in step.drawn_from:
-                draw = draw | drew[name]
+                fresh = fresh | drew[name]
+            own = ~ok[step.q] & (left[step.q] > 0) & ~fresh
+            draw = own | fresh
+            left[step.q] = torch.where(fresh, rounds, left[step.q] - own.long())
             rows = draw.nonzero().squeeze(-1)
             if rows.numel():
                 particles[step.name][rows] = step.redraw(rows)
@@ -375,6 +383,7 @@ def _solve_steps(world: TAMPWorld, particles: Particles, steps: Sequence[_Step],
                 targets, movables = step.ik_inputs(check)
                 passed = ik_check(world, q[step.q][check], targets, step.arm, movables, tol)[0]
                 ok[step.q][check] = passed
+                left[step.q][check[~passed]] = rounds
                 rows = torch.cat([rows, check[~passed]])
             todo[step.q] = rows
     for step in steps:

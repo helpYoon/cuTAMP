@@ -177,11 +177,13 @@ def _fake_ik(monkeypatch, accept):
 
 
 def _step(particles, name, values, redraw, arm="left", **kw):
-    """A walk step ``name`` on four CPU rows, drawn as ``values``; its targets hold its value, the fake IK's input."""
+    """A walk step ``name`` on four CPU rows, drawn as ``values``; its targets hold its value, the fake IK's input.
+    ``redraw``: a number (row i redraws to it plus i) or the step's redraw."""
     import cutamp.particle_initialization as pi
     particles[name] = torch.tensor(values, dtype=torch.float)
     inputs = lambda rows: (particles[name][rows, None, None].expand(-1, 4, 4), torch.zeros(len(rows), 1, 4))
-    return pi._Step(name, f"q_{name}", arm, inputs, lambda rows: redraw + rows.float(), **kw)
+    redraws = redraw if callable(redraw) else lambda rows: redraw + rows.float()
+    return pi._Step(name, f"q_{name}", arm, inputs, redraws, **kw)
 
 
 def _solve(particles, steps, rounds=2):
@@ -240,6 +242,20 @@ def test_a_redrawn_grasp_redraws_its_place(monkeypatch):
     assert particles["p"].tolist() == [300, 9, 11, 13]
 
 
+def test_a_redrawn_grasp_restores_its_places_redraws(monkeypatch):
+    # The pick's row 0 fails twice and draws again in both rounds, so its place's row 0 draws twice for the grasp;
+    # under the final grasp it still has its own two redraws, as when the pick finished before the place drew.
+    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
+    sequence = lambda *values: (lambda it: lambda rows: torch.tensor([next(it) for _ in rows], dtype=torch.float))(
+        iter(values))
+    particles = {}
+    steps = [_step(particles, "g", [0, 1, 3, 5], redraw=sequence(2, 101)),
+             _step(particles, "p", [7, 9, 11, 13], redraw=sequence(10, 12, 14, 301), drawn_from=("g",))]
+    q, ok, accepted = _solve(particles, steps)["q_p"]
+    assert calls == [[0, 1, 3, 5, 7, 9, 11, 13], [2, 10], [101, 12], [14], [301]]
+    assert particles["p"].tolist() == [301, 9, 11, 13] and ok.all() and accepted == [4, 3, 3, 3, 4]
+
+
 def test_a_moved_placement_rechecks_the_later_steps(monkeypatch):
     # b's movables read a's placement (checked_against): a's rows 0 and 1 draw again, so b's rows 0 and 1 are checked
     # again where they stand; row 0 fails the check (q < 0) and is solved again, as drawn; row 1 passes and stays.
@@ -279,7 +295,8 @@ def test_floor_picks_choose_upright_grasps(real_world):
 @needs_cuda
 def test_each_walk_solves_its_steps_together(real_world, monkeypatch):
     # blocks_t1's first plan: the pool walk's two picks and two places solve in one gn_ik call, a block per step; the
-    # particle walk's in one call, then one per redraw round.
+    # particle walk's in one call, then one per redraw round, a step's rounds restarting where a value it reads drew
+    # again (at most 1 + steps * GRASP_REDRAW_ROUNDS calls).
     import cutamp.particle_initialization as pi
     from cutamp.config import TAMPConfiguration
     from cutamp.grasps import GRASP_REDRAW_ROUNDS
@@ -296,7 +313,7 @@ def test_each_walk_solves_its_steps_together(real_world, monkeypatch):
     pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=16), default_checker())(skeleton)
     steps = tuple(op.operator.metadata.arm for op in skeleton if op.operator.metadata.action_type in ("pick", "place"))
     assert len(steps) == 4 and arms_seen[0] == steps
-    assert 1 <= len(arms_seen) - 1 <= 1 + GRASP_REDRAW_ROUNDS, arms_seen
+    assert 1 <= len(arms_seen) - 1 <= 1 + len(steps) * GRASP_REDRAW_ROUNDS, arms_seen
 
 
 @needs_cuda
