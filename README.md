@@ -185,8 +185,10 @@ graph LR
    Adam stops after `early_stop_patience` steps without progress and keeps the
    best-seen particles. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
-   the best satisfying particles (up to `motion_plan_max_retries`, first
-   success wins) through `motion_solver.py`: one `MotionPlanner` over the
+   up to `motion_plan_max_retries` satisfying particles, first success wins,
+   taken round their grasp groups (`get_top_satisfying_particles`: groups
+   whose grasps all score 0.7 or more first, then upright first on each
+   group's best particle by soft cost), through `motion_solver.py`: one `MotionPlanner` over the
    model's cspace, built on a background thread while the optimizer runs,
    and planned to each particle conf with `plan_cspace` (2 attempts per
    segment; if no particle plans, those that ran out of attempts get cuRobo's

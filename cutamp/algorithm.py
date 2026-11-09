@@ -25,10 +25,12 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
-from cutamp.grasps import grasp_sets
+from cutamp.grasps import GRASP_SCORE_CUTOFF, grasp_sets
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
-from cutamp.particle_initialization import IKTol, ParticleInitializer
+from cutamp.particle_initialization import (
+    IKTol, ParticleInitializer, choice_stats, pick_place_confs, worst_posture,
+)
 from cutamp.robots import REAL_LEGS, load_t1_container
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
@@ -107,6 +109,26 @@ def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
     return priority
 
 
+def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int) -> List[int]:
+    """Try order, as positions into the ``s`` satisfying particles, of ``pool_idx`` ``[s, P]`` (each particle's pool
+    row per pick); ``soft``, ``all_hi``, ``tilt``, ``travel`` and ``margin`` are ``[s]``. A group is the particles with
+    equal ``pool_idx`` rows, ordered inside by ``(soft, position)``. Groups go by their first particle's
+    ``(not all_hi, tilt, travel, -margin)``, then by ``tuple(pool_idx)``. The tries are every group's first particle in
+    that order, then every group's second, and so on, cut to ``n`` (G7, G8)."""
+    soft, hi, tilt, travel, margin = (t.tolist() for t in (soft, all_hi, tilt, travel, margin))
+    groups = {}
+    for i, row in enumerate(pool_idx.tolist()):
+        groups.setdefault(tuple(row), []).append(i)
+    ranked = []
+    for row, members in groups.items():
+        members.sort(key=lambda i: (soft[i], i))
+        f = members[0]
+        ranked.append(((not hi[f], tilt[f], travel[f], -margin[f]), row, members))
+    ranked.sort(key=lambda g: g[:2])
+    rounds = max(len(g[2]) for g in ranked)
+    return [g[2][r] for r in range(rounds) for g in ranked if r < len(g[2])][:n]
+
+
 def get_top_satisfying_particles(
     plan_info: dict,
     config: TAMPConfiguration,
@@ -114,22 +136,40 @@ def get_top_satisfying_particles(
     cost_reducer: CostReducer,
     n: int,
 ) -> List[dict]:
-    """Top-N satisfying particles ranked by ascending soft cost. May return < n
-    if fewer particles satisfy constraints. Used by the motion-plan retry loop:
-    if solve_curobo fails on the best particle, retry on the next-best.
+    """Up to ``n`` satisfying particles in motion-plan try order: grouped by grasp and taken round the groups, each
+    group's particles by ascending soft cost (``grasp_group_order``). The posture measures are the particle's after
+    the optimizer. May return < n if fewer particles satisfy constraints. Used by the motion-plan retry loop: if
+    solve_curobo fails on a try, retry on the next.
     """
     particles = plan_info["particles"]
     with torch.no_grad():
         rollout = plan_info["rollout_fn"](particles)
         cost_dict = plan_info["cost_fn"](rollout, particles)
-    satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
-    if not satisfying_mask.any():
-        raise RuntimeError("No satisfying particles found")
-    soft_costs = cost_reducer.soft_costs(cost_dict)
-    sat_indices = torch.arange(config.num_particles, device=soft_costs.device)[satisfying_mask]
-    order = torch.argsort(soft_costs[satisfying_mask])
-    top = sat_indices[order[: min(n, order.numel())]]
-    return [{k: v[i].detach().clone() for k, v in particles.items()} for i in top]
+        satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
+        if not satisfying_mask.any():
+            raise RuntimeError("No satisfying particles found")
+        soft_costs = cost_reducer.soft_costs(cost_dict)
+        sat_indices = torch.arange(config.num_particles, device=soft_costs.device)[satisfying_mask]
+        sat = {k: v[satisfying_mask] for k, v in particles.items()}
+        s = sat_indices.numel()
+        rows, all_hi = [], torch.ones(s, dtype=torch.bool, device=soft_costs.device)
+        for c in plan_info["grasp_choice"]:
+            pool = c.grasps.to(sat[c.grasp])
+            match = (sat[c.grasp][:, None, :] == pool[None]).all(-1)  # [s, m]
+            if not match.any(-1).all():
+                raise RuntimeError(f"A satisfying particle's {c.grasp} matches no row of its grasp pool")
+            row = match.long().argmax(-1)  # the first matching row
+            rows.append(row)
+            all_hi &= (c.scores.to(row.device)[row] >= GRASP_SCORE_CUTOFF).to(all_hi.device)
+        pool_idx = torch.stack(rows, -1) if rows else torch.zeros(s, 0, dtype=torch.long)
+        confs = pick_place_confs(plan_info["plan_skeleton"])
+        if confs:
+            tilt, travel, margin = worst_posture(plan_info["rollout_fn"].world, [sat[name] for name in confs])
+        else:
+            tilt = travel = margin = torch.zeros(s)
+        order = grasp_group_order(pool_idx.cpu(), soft_costs[satisfying_mask].cpu(), all_hi.cpu(), tilt.cpu(),
+                                  travel.cpu(), margin.cpu(), n)
+    return [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
 
 
 def sample_plan_skeleton(
@@ -176,6 +216,7 @@ def sample_plan_skeleton(
         "cost_fn": cost_fn,
         "heuristic": heuristic,
         "num_satisfying": num_satisfying,
+        "grasp_choice": particle_initializer.grasp_choice,
     }
 
     _log.debug(
@@ -281,10 +322,14 @@ def _motion_plan_with_retries(
     return None, None, tried, None, failures
 
 
-def _planned_metrics(world: TAMPWorld, candidates: List[dict], rank: int) -> dict:
-    """The planned particle's rank and CoM margin. ``best_com_margin`` is rank 0's; after a retry the plan comes
-    from another particle (known-bugs N3)."""
-    return {"motion_plan_rank": rank, "planned_com_margin": particle_com_margin(world, candidates[rank])}
+def _planned_metrics(world: TAMPWorld, plan_skeleton: PlanSkeleton, candidates: List[dict], rank: int) -> dict:
+    """The planned particle's rank, CoM margin (over all its confs) and the Trunk's tilt (radians to degrees) and travel
+    (metres), the worst over its pick and place confs (G7). ``best_com_margin`` is rank 0's; after a retry the plan
+    comes from another particle (known-bugs N3)."""
+    particle = candidates[rank]
+    tilt, travel, _ = worst_posture(world, [particle[name][None] for name in pick_place_confs(plan_skeleton)])
+    return {"motion_plan_rank": rank, "planned_com_margin": particle_com_margin(world, particle),
+            "planned_trunk_tilt_deg": float(torch.rad2deg(tilt[0])), "planned_trunk_travel": float(travel[0])}
 
 
 def setup_cutamp(
@@ -477,6 +522,7 @@ def run_cutamp(
         exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
 
         overall_metrics["num_optimized_plans"] += 1
+        overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
         if has_satisfying:
             if config.curobo_plan:
                 candidates = get_top_satisfying_particles(
@@ -494,7 +540,7 @@ def run_cutamp(
                 if curobo_plan is None:
                     continue
                 overall_metrics.update(traj_metrics)
-                overall_metrics.update(_planned_metrics(world, candidates, rank))
+                overall_metrics.update(_planned_metrics(world, plan_skeleton, candidates, rank))
             found_solution = True
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]

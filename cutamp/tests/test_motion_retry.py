@@ -1,6 +1,7 @@
 """Tests for the next-best-particle motion-plan retry
 (algorithm._motion_plan_with_retries, motion_solver._reset_attachment_state)."""
 import contextlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import cutamp.algorithm as alg
 import cutamp.com_polygon_cost as cpc
 import cutamp.motion_solver as ms
 from cutamp.config import TAMPConfiguration
+from cutamp.particle_initialization import PickChoice
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
@@ -72,7 +74,9 @@ def _run_skeletons(monkeypatch, results) -> dict:
     def sample(plan_gen, world, config, timer, idx, *args):
         if idx == len(results):
             raise StopIteration
-        return {"idx": idx, "plan_skeleton": [], "heuristic": float(idx)}, False
+        choice = PickChoice(f"block{idx}", "grasp1", torch.zeros(1, 7), torch.ones(1), torch.ones(1, dtype=torch.bool),
+                            torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1, dtype=torch.long))
+        return {"idx": idx, "plan_skeleton": [], "heuristic": float(idx), "grasp_choice": [choice]}, False
 
     def optimize(plan_info, timer, visualizer):
         satisfying = results[plan_info["idx"]] is not None
@@ -152,11 +156,28 @@ def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
 
 
 def test_planned_metrics_describe_the_planned_particle(monkeypatch):
-    # After a retry the plan comes from candidates[rank], not rank 0 (known-bugs N3).
-    monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 0])
-    candidates = [{"left_q0": torch.tensor([0.3, 0.0])}, {"left_q0": torch.tensor([0.1, 0.0])}]
-    assert alg._planned_metrics(None, candidates, 1) == {
-        "motion_plan_rank": 1, "planned_com_margin": pytest.approx(0.1)}
+    # After a retry the plan comes from candidates[rank], not rank 0 (known-bugs N3). Tilt and travel are the worst
+    # over its pick and place confs, without the retract; planned_com_margin stays the min over all its confs.
+    from cutamp.particle_initialization import _BASE_JOINTS
+    monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 5])
+    world = SimpleNamespace(model=SimpleNamespace(joint_names=_BASE_JOINTS, home=(0.0, 0.0, 0.7, 0.0, 0.0, 0.0)))
+    op = lambda kind, *v: SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type=kind)), values=v)
+    skeleton = [op("pick", "block", "grasp1", "left_q1"), op("place", "block", "grasp1", "pose1", "table", "left_q2"),
+                op("retract", "block", "grasp1", "left_q2", "traj", "left_q3")]
+    conf = lambda z, pitch, margin: torch.tensor([0.0, 0.0, z, pitch, 0.0, margin])
+    candidates = [{name: conf(0.7, 0.0, 0.3) for name in ("left_q1", "left_q2", "left_q3")},
+                  {"left_q1": conf(0.5, 0.2, 0.1), "left_q2": conf(0.6, 0.1, 0.2), "left_q3": conf(0.0, 1.0, 0.4)}]
+    assert alg._planned_metrics(world, skeleton, candidates, 1) == {
+        "motion_plan_rank": 1, "planned_com_margin": pytest.approx(0.1),
+        "planned_trunk_tilt_deg": pytest.approx(math.degrees(0.2)), "planned_trunk_travel": pytest.approx(0.2)}
+
+
+def test_metrics_report_the_last_optimized_skeletons_grasp_choice(monkeypatch):
+    # The first skeleton's tries all fail and the second plans: its choice is the one reported. A run that never
+    # plans reports the last skeleton it optimized (G12).
+    objects = lambda results: [s["object"] for s in _run_skeletons(monkeypatch, results)["grasp_choice"]]
+    assert objects([(False, 3), (True, 2)]) == ["block1"]
+    assert objects([None]) == ["block0"]
 
 
 @needs_cuda
