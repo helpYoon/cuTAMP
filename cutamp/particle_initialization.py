@@ -12,7 +12,7 @@
 Each conf parameter (``left_q0``, ``right_q1``, etc.) is a single vector in
 the model's full cspace order (its 33 joints). A pick's and a place's conf come from :func:`gn_ik`, the
 planner's only IK: balance first, clear of collision. A pool walk first solves each GraspGenX grasp that the hand can
-take from the robot's side once, at its pick and its place; each pick row then takes one of the most upright balanced
+take, from any side, once at its pick and its place; each pick row then takes one of the most upright balanced
 ones in turn (:func:`choose_grasps`), and each place row draws its placement, with the yaw following the held grasp;
 the rows whose IK fails draw again (design 7.8).
 """
@@ -36,7 +36,7 @@ from cutamp.gn_refresh import (
     gn_project_balanced,
     soles_on_stance,
 )
-from cutamp.grasps import AZIMUTH_CONE, GRASP_REDRAW_ROUNDS, GRASP_SCORE_CUTOFF, approach_in_cone, near_vertical
+from cutamp.grasps import AZIMUTH_CONE, GRASP_REDRAW_ROUNDS, GRASP_SCORE_CUTOFF, near_vertical
 from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
 from cutamp.samplers import place_4dof_sampler
@@ -412,30 +412,25 @@ class ParticleInitializer:
         return particles
 
     def _pick_pools(self, plan_skeleton: PlanSkeleton) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
-        """Each pick's grasps ``[m, 7]`` and scores ``[m]``, keyed by its grasp parameter: the grasps its hand can take
-        from the robot's side, at the object's start pose (init picks only from start poses)."""
+        """Each pick's grasps ``[m, 7]`` and scores ``[m]``, keyed by its grasp parameter: every grasp its hand can take
+        (``world.grasp_candidates``), top or side, from any direction. The posture rule judges them all."""
         world = self.world
         pools = {}
         for idx, ground_op in enumerate(plan_skeleton):
             if ground_op.operator.metadata.action_type != "pick":
                 continue
-            header = f"{idx + 1}. {ground_op}"
             arm = ground_op.operator.metadata.arm
             obj, grasp, _q = ground_op.values
             if not world.has_object(obj):
                 raise ValueError(f"{obj=} not found in world")
-            world_from_obj = world.get_object_pose(obj)
             candidates = world.grasp_candidates(obj, arm)
-            in_cone = approach_in_cone(world_from_obj @ grasp_7dof_to_mat4x4(candidates.grasps),
-                                       world.stance_soles[:, :2, 3].mean(0), world_from_obj[:2, 3])
-            if not in_cone.any():
+            if not len(candidates.grasps):
                 below, touching = world.grasp_drops(obj, arm)
                 raise ValueError(
-                    f"{header}: no grasp of {obj} is left for the {arm} hand. Of its "
+                    f"{idx + 1}. {ground_op}: no grasp of {obj} is left for the {arm} hand. Of its "
                     f"{len(world.grasps[obj].grasps)} grasps, {below} reach below its bottom face and {touching} "
-                    f"touch it (a grasp may do both), and the approach cone drops the {len(candidates.grasps)} "
-                    f"others")
-            pools[grasp] = candidates.grasps[in_cone], candidates.scores[in_cone]
+                    f"touch it (a grasp may do both)")
+            pools[grasp] = candidates.grasps, candidates.scores
         return pools
 
     def _walk(
@@ -510,7 +505,7 @@ class ParticleInitializer:
                     arm, self.ik_tol, redraw=redraw, rounds=rounds, q_start=pool_start,
                 )
                 confs[q] = particles[q], ok
-                log_debug(f"{header}. {len(grasps)} grasps pass the drops and the cone; IK accepted: "
+                log_debug(f"{header}. {len(grasps)} grasps pass the drops; IK accepted: "
                           f"{accepted[0]}/{n}, after redraws {accepted[1:]}")
                 deferred_params.discard(q)
                 move_free_deferred.pop(q, None)

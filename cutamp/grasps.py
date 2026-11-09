@@ -1,7 +1,7 @@
 """Grasps (design 7.8). ``grasp_sets`` makes each object shape's grasps with GraspGenX, in this process, when the world
-loads. Init chooses among them: ``drop_grasps`` removes those the hand can't take, and ``approach_in_cone`` keeps the
-approaches from the robot's side. The motion solver's grasp geometry: each pick and place approaches along the grasp's
-axis and leaves the same way, or lifts and comes in from above.
+loads. Init chooses among them, after ``drop_grasps`` removes those the hand can't take. The motion solver's grasp
+geometry: each pick and place approaches along the grasp's axis and leaves the same way, or lifts and comes in from
+above.
 
 ``world_from_ee`` is the hand's tool frame (``*_base_link``, ``robots/t1.py``), whose +x is GraspGenX's approach axis
 (G's +z). The knobs are search settings, not robot limits (design section 12).
@@ -52,9 +52,9 @@ LINE_END_TOL = 0.005
 """m: the most a straight segment's last frame may end from the line's end."""
 
 AZIMUTH_CONE = math.pi / 3
-"""An approach that isn't near vertical (``VERTICAL_CONE``) must come from the robot's side: its horizontal direction
-within this angle of the direction from the stance to the object, at init's picks (``approach_in_cone``) and in its
-place yaws."""
+"""Init's place yaws turn a held grasp whose approach isn't near vertical (``VERTICAL_CONE``) to come from the robot's
+side: its horizontal direction within this angle of the direction from the stance to the placement. It removes no
+grasp: a pick judges every grasp the hand can take, from any side."""
 
 GRASP_SCORE_CUTOFF = 0.7
 """GraspGenX's own "``0.7`` keeps confident grasps" (``GraspGenX/SKILL.md:498``): a grasp scoring at or above it
@@ -96,17 +96,6 @@ def drop_grasps(
     below = (hand[..., 2] - hand[..., 3] < obj_bottom_z).any(-1)
     touching = sphere_to_sphere_overlap(obj_spheres.double(), hand) > 0
     return ~(below | touching)
-
-
-def approach_in_cone(world_from_G: torch.Tensor, stance_xy: torch.Tensor, obj_xy: torch.Tensor) -> torch.Tensor:
-    """``[K]`` bool: whether each grasp ``world_from_G`` ``[K, 4, 4]`` approaches the object at ``obj_xy`` from the side
-    of the robot standing at ``stance_xy`` (``[2]`` each). Its approach is Z_G. A near-vertical one (``near_vertical``)
-    always passes; any other passes when its horizontal direction is within ``AZIMUTH_CONE`` of ``obj_xy -
-    stance_xy``. A straight-up approach has no horizontal direction, and fails."""
-    approach = world_from_G[..., :3, 2]
-    away = torch.nn.functional.normalize(obj_xy - stance_xy, dim=-1)
-    cos = (torch.nn.functional.normalize(approach[..., :2], dim=-1) * away).sum(-1)
-    return near_vertical(approach) | (cos >= math.cos(AZIMUTH_CONE))
 
 
 def approach_targets(world_from_ee: torch.Tensor, kind: Literal["pick", "place"]) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -1,8 +1,8 @@
 """Init gives each row a grasp from its object's GraspGenX grasps (design 7.8): the load-time drops of grasps whose
-hand spheres reach below the object's bottom face or touch the object, per arm; the approach cone; each pick's chosen
-grasps and their pool confs, or the score draw where no grasp is balanced; the redraw of the rows whose IK failed, at
-picks and places; and the place yaw that follows the held grasp. The GPU tests share conftest's module-scoped
-``real_world``."""
+hand spheres reach below the object's bottom face or touch the object, per arm; each pick's pool of every grasp the
+hand can take; each pick's chosen grasps and their pool confs, or the score draw where no grasp is balanced; the
+redraw of the rows whose IK failed, at picks and places; and the place yaw that follows the held grasp. The GPU tests
+share conftest's module-scoped ``real_world``."""
 
 import math
 from types import SimpleNamespace
@@ -12,7 +12,7 @@ import torch
 from curobo.scene import Cuboid
 from curobo.types import DeviceCfg
 
-from cutamp.grasps import AZIMUTH_CONE, VERTICAL_CONE, GraspSet, approach_in_cone, drop_grasps
+from cutamp.grasps import AZIMUTH_CONE, GraspSet, drop_grasps
 from cutamp.robots.t1 import get_t1_gripper_spheres, load_sweep_volume
 from cutamp.tests.conftest import default_checker, needs_cuda
 from cutamp.utils.common import grasp_7dof_to_mat4x4, mat4x4_to_grasp_7dof
@@ -107,33 +107,21 @@ def test_drops_run_per_arm(real_world):
     assert int((keeps["left"] ^ keeps["right"]).sum()) > 0
 
 
-def test_cone():
-    # blocks_t1's stance and block3: a horizontal approach must come from the robot's side, within AZIMUTH_CONE of
-    # the direction from the stance to the object; a near-vertical one may come from anywhere.
-    stance, obj = torch.tensor([0.0101, 0.0]), torch.tensor([0.36, 0.32])
-    away = math.atan2(0.32, 0.36 - 0.0101)
+@needs_cuda
+def test_pick_pool_is_every_grasp_the_hand_can_take(real_world):
+    # No approach cone (user, 2026-11-08: "Top grasps are not always a good grasp"): each pick judges every grasp
+    # grasp_candidates keeps, top or side, from any direction. With the cone, blocks_t1's pools were 222 and 221.
+    from cutamp.config import TAMPConfiguration
+    from cutamp.particle_initialization import ParticleInitializer
 
-    def horizontal(azimuth):
-        return math.cos(azimuth), math.sin(azimuth), 0.0
-
-    def tilted(tilt, azimuth):  # ``tilt`` from straight down, leaning toward ``azimuth``
-        return math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), -math.cos(tilt)
-
-    cases = {
-        "from the far side": (horizontal(away + math.pi), False),
-        "from the robot's side": (horizontal(away), True),
-        "vertical": ((0.0, 0.0, -1.0), True),
-        "from below": ((0.0, 0.0, 1.0), False),
-        "just inside the cone": (horizontal(away + AZIMUTH_CONE - 0.02), True),
-        "just outside it": (horizontal(away - AZIMUTH_CONE - 0.02), False),
-        "near vertical, toward the robot": (tilted(VERTICAL_CONE - 0.02, away + math.pi), True),
-        "past near vertical, toward the robot": (tilted(VERTICAL_CONE + 0.02, away + math.pi), False),
-    }
-    world_from_G = torch.eye(4).repeat(len(cases), 1, 1)
-    for i, (z_axis, _) in enumerate(cases.values()):  # only Z_G, the approach, matters
-        world_from_G[i, :3, 2] = torch.tensor(z_axis)
-    got = approach_in_cone(world_from_G, stance, obj)
-    assert dict(zip(cases, got.tolist())) == {name: want for name, (_, want) in cases.items()}
+    skeleton, _, _ = _first_plan(real_world)
+    pools = ParticleInitializer(real_world, TAMPConfiguration(num_particles=8), default_checker())._pick_pools(skeleton)
+    picks = [op for op in skeleton if op.operator.metadata.action_type == "pick"]
+    assert len(picks) == len(pools) == 2
+    for op in picks:
+        obj, grasp, _ = op.values
+        want = real_world.grasp_candidates(obj, op.operator.metadata.arm)
+        assert torch.equal(pools[grasp][0], want.grasps) and torch.equal(pools[grasp][1], want.scores), obj
 
 
 def _first_plan(world):

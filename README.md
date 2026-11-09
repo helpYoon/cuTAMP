@@ -151,9 +151,8 @@ graph LR
    collision. Retract confs start at the model's home
    (`REAL_LEGS.home`). Each pick first tries every grasp of its object that the
    hand can take (`world.grasp_candidates`: none with a hand sphere below the
-   object's bottom face or touching the object, `grasps.drop_grasps`) and that,
-   unless near vertical, approaches from the robot's side
-   (`grasps.approach_in_cone`): one IK row per grasp at the pick and one at its
+   object's bottom face or touching the object, `grasps.drop_grasps`), top or
+   side, from any direction: one IK row per grasp at the pick and one at its
    place, on a placement drawn for it. Of the grasps balanced at both, those
    GraspGenX scores at `GRASP_SCORE_CUTOFF` (0.7, its own cutoff) or more rank
    upright first: the Trunk's tilt, then its travel from home, then the CoM
@@ -430,10 +429,10 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   world loads (its diffusion grasps and the box grasps on the top and the
   sides, all kept with their scores), seeded, so every process gets the same
   grasps. A grasp is a 6-DoF pose of GraspGenX's gripper frame in the object
-  frame, `[x, y, z, qw, qx, qy, qz]`. Here too: init's rules
-  (`drop_grasps`, `approach_in_cone`), each pick's and place's targets
-  (`approach_targets`, `is_vertical`) and their knobs, search settings rather
-  than robot limits (`APPROACH_DISTANCE`, `LIFT_HEIGHT`, `VERTICAL_CONE`,
+  frame, `[x, y, z, qw, qx, qy, qz]`. Here too: init's drop rule
+  (`drop_grasps`), each pick's and place's targets (`approach_targets`,
+  `is_vertical`) and their knobs, search settings rather than robot limits
+  (`APPROACH_DISTANCE`, `LIFT_HEIGHT`, `VERTICAL_CONE`, the place yaw's
   `AZIMUTH_CONE`, `GRASP_REDRAW_ROUNDS`, and the line check's `LINE_TOL`,
   `LINE_BACKTRACK` and `LINE_END_TOL`). So does `GRASP_SCORE_CUTOFF`,
   GraspGenX's own 0.7, the score from which a grasp counts as holding well
