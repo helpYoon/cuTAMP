@@ -283,13 +283,7 @@ class PickChoice(NamedTuple):
 
 def choice_stats(c: PickChoice) -> dict:
     """``c`` as plain JSON-ready values: pool and balanced counts, and ranges over the chosen grasps."""
-
-    def span(x: torch.Tensor, scale: float = 1.0) -> Optional[List[float]]:
-        if c.chosen is None:
-            return None
-        v = x[c.chosen]
-        return [float(v.min()) * scale, float(v.max()) * scale]
-
+    span = lambda x, s=1.0: None if c.chosen is None else [float(x[c.chosen].min()) * s, float(x[c.chosen].max()) * s]
     return {
         "object": c.obj, "pool": int(c.scores.numel()), "balanced": int(c.ok.sum()),
         "balanced_at_cutoff": int((c.ok & (c.scores >= GRASP_SCORE_CUTOFF)).sum()),

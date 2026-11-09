@@ -117,7 +117,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         seen["world"] = world
         return solve(plan_info, particle, world, *args, **kwargs)
 
-    def top_spy(plan_info, config, constraint_checker, cost_reducer, n):
+    def top_spy(plan_info, constraint_checker, cost_reducer, n):
         # The satisfying particles' retract values, which the Motion loss and the mask include.
         particles = plan_info["particles"]
         with torch.no_grad():
@@ -125,7 +125,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         mask = constraint_checker.get_mask(cost_dict, verbose=False)
         values = cost_dict[Motion.type]["values"]
         seen["retract"].append({k: values[k][mask].cpu() for k in ("retract_self_collision", "retract_joint_limit")})
-        return top(plan_info, config, constraint_checker, cost_reducer, n)
+        return top(plan_info, constraint_checker, cost_reducer, n)
 
     monkeypatch.setattr(rc, "run_cutamp", run_spy)
     monkeypatch.setattr(alg, "solve_curobo", solve_spy)

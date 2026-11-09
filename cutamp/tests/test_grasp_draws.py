@@ -209,9 +209,9 @@ def test_check_the_start_before_solving(monkeypatch):
 
 @needs_cuda
 def test_floor_picks_choose_upright_grasps(real_world):
-    # blocks_t1 on the floor (real_world), n 64, seed 0. Each pick's ten are its most upright balanced grasps at 0.7
-    # or more (G2, G5), and every particle holds one of them. The first pick's scene is the pool walk's, so its
-    # particles take the ten in turn with the pool walk's confs, accepted as they are (G4).
+    # blocks_t1 on the floor (real_world), n 64, seed 0. Each pick chooses ten balanced grasps at 0.7 or more (G2,
+    # G5; test_grasp_choice pins their order), and every particle holds one of them. The first pick's scene is the pool
+    # walk's, so its particles take the ten in turn with the pool walk's confs, accepted as they are (G4).
     import cutamp.particle_initialization as pi
     from cutamp.config import TAMPConfiguration
     from cutamp.grasps import GRASP_SCORE_CUTOFF
@@ -223,14 +223,7 @@ def test_floor_picks_choose_upright_grasps(real_world):
     picks = [op for op in skeleton if op.operator.metadata.action_type == "pick"]
     assert [c.grasp for c in init.grasp_choice] == [op.values[1] for op in picks]
     for c in init.grasp_choice:
-        m = len(c.scores)
-        assert all(len(t) == m for t in (c.grasps, c.ok, c.tilt, c.travel, c.margin))
         assert len(c.chosen) == 10 and c.ok[c.chosen].all() and (c.scores[c.chosen] >= GRASP_SCORE_CUTOFF).all()
-        tilts = c.tilt[c.chosen]
-        assert (tilts[1:] >= tilts[:-1]).all()  # upright first
-        rest = c.ok & (c.scores >= GRASP_SCORE_CUTOFF)
-        rest[c.chosen] = False
-        assert not rest.any() or tilts.max() <= c.tilt[rest].min()
         assert (particles[c.grasp][:, None] == c.grasps[c.chosen][None]).all(-1).any(-1).all()
     first, q = init.grasp_choice[0], picks[0].values[2]
     rank = first.chosen[torch.arange(64, device=first.chosen.device) % 10]

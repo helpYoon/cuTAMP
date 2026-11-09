@@ -58,18 +58,8 @@ def _run_skeletons(monkeypatch, results) -> dict:
     no particle satisfies, else ``(planned, attempts)``: its motion plan tries ``attempts`` candidates, each failing
     but the last if ``planned``. Everything else run_cutamp calls is a stand-in."""
 
-    class Timer:  # TorchTimer syncs CUDA
-        def time(self, *args, **kwargs):
-            return contextlib.nullcontext()
-
-        def start(self, metric):
-            pass
-
-        def stop(self, metric):
-            return 0.0
-
-        def get_summaries(self):
-            return {}
+    timer = SimpleNamespace(time=lambda *a, **k: contextlib.nullcontext(), start=lambda m: None,
+                            stop=lambda m: 0.0, get_summaries=dict)  # TorchTimer syncs CUDA
 
     def sample(plan_gen, world, config, timer, idx, *args):
         if idx == len(results):
@@ -88,7 +78,7 @@ def _run_skeletons(monkeypatch, results) -> dict:
         return ("PLAN", {}, attempts, attempts - 1, failures) if planned else (None, None, attempts, None, failures)
 
     logger, world = SimpleNamespace(log_dict=lambda name, d: None), SimpleNamespace(initial_state=None, goal_state=None)
-    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, Timer(), world))
+    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, timer, world))
     monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: SimpleNamespace(ik_tol=None))
     monkeypatch.setattr(alg, "build_motion_planner", lambda world: None)
     monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda world: None)
@@ -159,17 +149,14 @@ def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
 def test_planned_metrics_describe_the_planned_particle(monkeypatch):
     # After a retry the plan comes from candidates[rank], not rank 0 (known-bugs N3). Tilt and travel are the worst
     # over its pick and place confs, without the retract; planned_com_margin stays the min over all its confs.
-    from cutamp.particle_initialization import _BASE_JOINTS
+    from cutamp.tests.test_grasp_choice import _fake_world, _op
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 5])
-    world = SimpleNamespace(model=SimpleNamespace(joint_names=_BASE_JOINTS, home=(0.0, 0.0, 0.7, 0.0, 0.0, 0.0)))
-    op = lambda kind, *v: SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type=kind)),
-                                          values=v)
-    skeleton = [op("pick", "block", "grasp1", "left_q1"), op("place", "block", "grasp1", "pose1", "table", "left_q2"),
-                op("retract", "block", "grasp1", "left_q2", "traj", "left_q3")]
+    skeleton = [_op("pick", "block", "grasp1", "left_q1"), _op("place", "block", "grasp1", "pose1", "table", "left_q2"),
+                _op("retract", "block", "grasp1", "left_q2", "traj", "left_q3")]
     conf = lambda z, pitch, margin: torch.tensor([0.0, 0.0, z, pitch, 0.0, margin])
     candidates = [{name: conf(0.7, 0.0, 0.3) for name in ("left_q1", "left_q2", "left_q3")},
                   {"left_q1": conf(0.5, 0.2, 0.1), "left_q2": conf(0.6, 0.1, 0.2), "left_q3": conf(0.0, 1.0, 0.4)}]
-    assert alg._planned_metrics(world, skeleton, candidates, 1) == {
+    assert alg._planned_metrics(_fake_world(), skeleton, candidates, 1) == {
         "motion_plan_rank": 1, "planned_com_margin": pytest.approx(0.1),
         "planned_trunk_tilt_deg": pytest.approx(math.degrees(0.2)), "planned_trunk_travel": pytest.approx(0.2)}
 

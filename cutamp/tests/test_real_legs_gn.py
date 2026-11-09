@@ -164,11 +164,7 @@ def test_gn_holds_the_soles_out_of_reach(real_world, real_plan):
     # Hand targets no balanced conf on the stance can reach: four calls, each from the last result as successive
     # refreshes run, keep both soles on the stance after every call, and every hand stays over 2 cm off, so the feet
     # did not slide to fake the reach. Reaching for them drives joints into their limits on every call, where a
-    # clamped step or the drift of a saturated last step would move the soles. The score-weighted grasp draw's init
-    # whose first pick was block2's (PYTHONHASHSEED 1, 2026-11-08) held one row that call 4 left 2.9 mm off: GN's
-    # closing step re-solves once, freezing Right_Hip_Roll, and then Left_Hip_Roll, 0.27 mrad above its lower limit,
-    # would cross it, so the limits fraction 0.20 applies a fifth of the soles' 3.7 mm correction. The chosen grasps'
-    # inits hold no such row, on either first pick (2026-11-08).
+    # clamped step or the drift of a saturated last step would move the soles.
     from cutamp.gn_refresh import gn_project_balanced
     arm, _, q = _first_pick(real_world, real_plan)
     targets, _ = _moved_targets(real_world, q, arm, FAR)

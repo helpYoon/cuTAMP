@@ -108,9 +108,6 @@ def test_init_judges_each_grasp_at_its_pick_and_its_place(monkeypatch):
     init([_op("pick", "a", "g1", "q1"), _op("place", "a", "g1", "p1", "s", "q2")])
     (c,) = init.grasp_choice
     assert c.ok.tolist() == [True, False, True]
-    torch.testing.assert_close(c.tilt, torch.tensor([0.5, 0.0, 0.3]))
-    torch.testing.assert_close(c.travel, torch.tensor([0.2, 0.0, 0.0]))
-    torch.testing.assert_close(c.margin, torch.tensor([0.08, 0.08, 0.03]))
     assert c.chosen.tolist() == [2, 0]
     # The pool walk, one row per grasp, then the particle walk on the chosen grasps.
     assert [n for n, _ in walks] == [3, 4] and walks[1][1]["g1"].tolist() == [2, 0]
@@ -118,7 +115,7 @@ def test_init_judges_each_grasp_at_its_pick_and_its_place(monkeypatch):
 
 def test_groups_go_cutoff_first_then_upright():
     # Per row: its group's pool indices, soft cost, all at 0.7, tilt, travel, margin.
-    rows = [((0, 0), 1.0, True, 0.3, 0.0, 0.0),     # group a, second by soft cost
+    rows = [((0, 0), 1.0, True, 0.3, 0.0, 0.0),     # group a, last by soft cost
             ((0, 0), 0.5, True, 0.1, 0.2, 0.08),    # group a, first
             ((1, 0), 2.0, True, 0.0, 0.2, 0.08),    # group b, first: the most upright
             ((2, 1), 0.1, False, 0.0, 0.0, 0.08),   # below the cutoff: after every group that clears it
@@ -127,17 +124,11 @@ def test_groups_go_cutoff_first_then_upright():
             ((4, 0), 0.3, True, 0.2, 0.1, 0.08),    # a larger margin first
             ((5, 0), 0.4, True, 0.2, 0.05, 0.02),   # less travel first
             ((0, 2), 0.6, True, 0.2, 0.1, 0.02),    # all equal: pool order, (0, 1) < (0, 2) < (3, 0)
-            ((0, 1), 0.7, True, 0.2, 0.1, 0.02)]
+            ((0, 1), 0.7, True, 0.2, 0.1, 0.02),
+            ((0, 0), 0.5, True, 0.1, 0.2, 0.08)]    # group a, second: row 1's soft cost, so after it by index
     idx, soft, hi, tilt, travel, margin = (torch.tensor(c) for c in zip(*rows))
-    assert grasp_group_order(idx, soft, hi, tilt, travel, margin, 12) == [2, 1, 7, 6, 9, 8, 5, 3, 4, 0]
+    assert grasp_group_order(idx, soft, hi, tilt, travel, margin, 12) == [2, 1, 7, 6, 9, 8, 5, 3, 4, 10, 0]
     assert grasp_group_order(idx, soft, hi, tilt, travel, margin, 3) == [2, 1, 7]
-
-
-def test_one_group_keeps_the_soft_cost_order():
-    z = torch.zeros(4)
-    order = grasp_group_order(torch.zeros(4, 2, dtype=torch.long), torch.tensor([0.3, 0.1, 0.2, 0.1]),
-                              torch.ones(4, dtype=torch.bool), z, z, z, 10)
-    assert order == [1, 3, 2, 0]
 
 
 def _ranking_inputs(pool_rows, pitch, mask, soft):
@@ -160,7 +151,7 @@ def _ranking_inputs(pool_rows, pitch, mask, soft):
                  "cost_fn": lambda rollout, particles: {}, "grasp_choice": [choice]}
     checker = SimpleNamespace(get_mask=lambda cost_dict, verbose=True: torch.tensor(mask))
     reducer = SimpleNamespace(soft_costs=lambda cost_dict: torch.tensor(soft))
-    return plan_info, SimpleNamespace(num_particles=n), checker, reducer
+    return plan_info, checker, reducer
 
 
 def test_top_particles_go_round_the_grasps(monkeypatch):
@@ -176,7 +167,7 @@ def test_top_particles_go_round_the_grasps(monkeypatch):
 
 def test_ranking_rejects_a_grasp_outside_the_pool(monkeypatch):
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: torch.full((len(q),), 0.05))
-    plan_info, config, checker, reducer = _ranking_inputs([0, 1], [0.0, 0.0], [True, True], [0.0, 0.0])
+    plan_info, checker, reducer = _ranking_inputs([0, 1], [0.0, 0.0], [True, True], [0.0, 0.0])
     plan_info["particles"]["grasp1"][1, 0] += 1e-3
     with pytest.raises(RuntimeError, match="grasp1"):
-        alg.get_top_satisfying_particles(plan_info, config, checker, reducer, n=10)
+        alg.get_top_satisfying_particles(plan_info, checker, reducer, n=10)

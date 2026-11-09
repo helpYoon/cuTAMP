@@ -131,7 +131,6 @@ def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int) -> L
 
 def get_top_satisfying_particles(
     plan_info: dict,
-    config: TAMPConfiguration,
     constraint_checker: ConstraintChecker,
     cost_reducer: CostReducer,
     n: int,
@@ -149,9 +148,8 @@ def get_top_satisfying_particles(
         if not satisfying_mask.any():
             raise RuntimeError("No satisfying particles found")
         soft_costs = cost_reducer.soft_costs(cost_dict)
-        sat_indices = torch.arange(config.num_particles, device=soft_costs.device)[satisfying_mask]
         sat = {k: v[satisfying_mask] for k, v in particles.items()}
-        s = sat_indices.numel()
+        s = int(satisfying_mask.sum())
         rows, all_hi = [], torch.ones(s, dtype=torch.bool, device=soft_costs.device)
         for c in plan_info["grasp_choice"]:
             pool = c.grasps.to(sat[c.grasp])
@@ -167,8 +165,7 @@ def get_top_satisfying_particles(
             tilt, travel, margin = worst_posture(plan_info["rollout_fn"].world, [sat[name] for name in confs])
         else:
             tilt = travel = margin = torch.zeros(s)
-        order = grasp_group_order(pool_idx.cpu(), soft_costs[satisfying_mask].cpu(), all_hi.cpu(), tilt.cpu(),
-                                  travel.cpu(), margin.cpu(), n)
+        order = grasp_group_order(pool_idx, soft_costs[satisfying_mask], all_hi, tilt, travel, margin, n)
     return [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
 
 
@@ -530,7 +527,7 @@ def run_cutamp(
         if has_satisfying:
             if config.curobo_plan:
                 candidates = get_top_satisfying_particles(
-                    plan_info, config, constraint_checker, cost_reducer,
+                    plan_info, constraint_checker, cost_reducer,
                     n=config.motion_plan_max_retries,
                 )
                 curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
