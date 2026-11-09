@@ -155,10 +155,11 @@ def test_cost_function_is_run_to_run_bitwise(real_world, real_plan, monkeypatch)
     grad_outputs()                              # warm-up, as for the no_grad repeats
     want = grad_outputs()
     assert _grads(want)
-    # cuRobo's FK backward adds the grads of the confs it takes (rollout_fn.conf_params) with float atomics whose
-    # order varies between warps (README): right_q3's differed by 3.7e-9 on PYTHONHASHSEED 1 (2026-11-09). Those
-    # are float32-close; every other entry, the grasps' and placements' grads among them, stays bitwise.
-    fk = [("grad", c) for c in rollout_fn.conf_params]
+    # cuRobo's FK backward adds the confs' grads with float atomics whose order varies between warps (README):
+    # right_q3's differed by 3.7e-9 on PYTHONHASHSEED 1 (2026-11-09). Every conf goes through it (the CoM cost's FK
+    # takes each particle it names a conf, the rollout's and the retracts' FK theirs), so the confs' grads are
+    # float32-close; every other entry, the grasps' and placements' grads among them, stays bitwise.
+    fk = [k for k in want if k[0] == "grad" and k[1].startswith(("left_q", "right_q", "q"))]
     for r in range(8):
         got = grad_outputs()
         torch.testing.assert_close([got.pop(k) for k in fk], [want[k] for k in fk],
