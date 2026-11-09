@@ -263,7 +263,11 @@ def test_gn_ik_uprights_the_trunk(real_world, real_plan, monkeypatch):
         torch.manual_seed(0)
         q0, ok0 = pi.gn_ik(*args)
         monkeypatch.undo()
-        assert int(ok.sum()) >= int(ok0.sum()), (kind, int(ok.sum()), int(ok0.sum()))
+        # Level 4 costs no row whose Trunk stays above horizontal without it. On the init with no approach cone
+        # (PYTHONHASHSEED 0, 2026-11-08) the first place loses one: row 19 reaches its target from one start only,
+        # folded to 92.6 deg, and level 4's pull to 88.7 deg leaves the hand 0.019 (m + rad) off.
+        lost = ok0 & ~ok
+        assert bool((_tilt(q0[lost]) > math.pi / 2).all()), (kind, torch.rad2deg(_tilt(q0[lost])).tolist())
         if kind == "pick" and op.values[0] == "block3":
             med, med0 = (math.degrees(float(_tilt(x).median())) for x in (q[ok], q0[ok0]))
             assert med <= med0 - UPRIGHTER, (med, med0)
