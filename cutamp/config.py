@@ -70,10 +70,11 @@ class TAMPConfiguration:
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
-    # On RuntimeError from solve_curobo, retry on the next-best satisfying particle
+    # On RuntimeError from solve_curobo, retry on the next satisfying particle, going round the grasp groups,
     # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
     # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first plans on its 6th candidate.
+    # It also sets how many grasps each pick chooses at init (choose_grasps, G5).
     motion_plan_max_retries: int = 10
 
     ## Visualizer Args

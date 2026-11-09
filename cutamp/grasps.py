@@ -1,5 +1,5 @@
 """Grasps (design 7.8). ``grasp_sets`` makes each object shape's grasps with GraspGenX, in this process, when the world
-loads. Init draws from them: ``drop_grasps`` removes those the hand can't take, and ``approach_in_cone`` keeps the
+loads. Init chooses among them: ``drop_grasps`` removes those the hand can't take, and ``approach_in_cone`` keeps the
 approaches from the robot's side. The motion solver's grasp geometry: each pick and place approaches along the grasp's
 axis and leaves the same way, or lifts and comes in from above.
 
@@ -57,8 +57,8 @@ within this angle of the direction from the stance to the object, at init's pick
 place yaws."""
 
 GRASP_SCORE_CUTOFF = 0.7
-"""GraspGenX's own "``0.7`` keeps confident grasps" (``GraspGenX/SKILL.md``): a grasp scoring at or above it counts as
-holding well enough, and a pick chooses among those by the robot's posture instead of by score."""
+"""GraspGenX's own "``0.7`` keeps confident grasps" (``GraspGenX/SKILL.md:498``): a grasp scoring at or above it
+counts as holding well enough, and a pick chooses among those by the robot's posture instead of by score."""
 
 GRASP_REDRAW_ROUNDS = 2
 """How many times init draws again for the rows whose IK failed, and solves only those rows: a pick row draws a new

@@ -8,7 +8,8 @@ import cutamp.algorithm as alg
 import cutamp.com_polygon_cost as cpc
 from cutamp.algorithm import grasp_group_order
 from cutamp.particle_initialization import (
-    _BASE_JOINTS, PickChoice, choice_stats, choose_grasps, next_place, pick_place_confs, worst_posture,
+    _BASE_JOINTS, ParticleInitializer, PickChoice, choice_stats, choose_grasps, next_place, pick_place_confs,
+    worst_posture,
 )
 
 
@@ -34,7 +35,8 @@ def test_cutoff_beats_posture():
 
 def test_below_cutoff_fills_by_score_then_posture():
     # One grasp clears; the two best scores below fill (not the more upright 0.4), ordered by tilt among themselves.
-    rows = [(True, 0.8, 0.9, 0.0, 0.0), (True, 0.5, 0.3, 0.0, 0.0), (True, 0.6, 0.1, 0.0, 0.0), (True, 0.4, 0.0, 0.0, 0.0)]
+    rows = [(True, 0.8, 0.9, 0.0, 0.0), (True, 0.5, 0.3, 0.0, 0.0), (True, 0.6, 0.1, 0.0, 0.0),
+            (True, 0.4, 0.0, 0.0, 0.0)]
     assert _choose(rows, 3) == [0, 2, 1]
 
 
@@ -84,6 +86,36 @@ def test_choice_stats_describe_the_chosen():
     assert none["chosen"] == 0 and none["tilt_deg"] is none["travel"] is none["com_margin"] is None
 
 
+def test_init_judges_each_grasp_at_its_pick_and_its_place(monkeypatch):
+    # __call__'s pairing on the CPU, the walks stubbed (D4): the pick accepts grasp 1, the most upright there, but its
+    # place rejects it, so it is not balanced and not chosen. Posture is the worse of pick and place, so grasp 2 (tilt
+    # 0.3) goes before grasp 0, whose place tilts 0.5. Judged at the pick alone, the choice would be [1, 0, 2].
+    monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 5])  # the yaw stands in for the margin
+    conf = lambda x, pitch, margin: [x, 0.0, 0.7, pitch, 0.0, margin]
+    pick = torch.tensor([conf(0.0, 0.1, 0.08), conf(0.0, 0.0, 0.08), conf(0.0, 0.3, 0.08)])
+    place = torch.tensor([conf(0.2, 0.5, 0.08), conf(0.0, 0.0, 0.08), conf(0.0, 0.2, 0.03)])
+    confs = {"q1": (pick, torch.tensor([True, True, True])), "q2": (place, torch.tensor([True, False, True]))}
+    walks = []
+
+    def walk(plan_skeleton, n, pools, chosen=None, pool_q=None, log_debug=None):
+        walks.append((n, chosen))
+        return {}, confs
+
+    checker = SimpleNamespace(_get_tol=lambda constraint, name: 0.0)
+    init = ParticleInitializer(_fake_world(), SimpleNamespace(num_particles=4, motion_plan_max_retries=10), checker)
+    init._pick_pools = lambda plan_skeleton: {"g1": (torch.eye(7)[:3], torch.tensor([0.9, 0.8, 0.75]))}
+    init._walk = walk
+    init([_op("pick", "a", "g1", "q1"), _op("place", "a", "g1", "p1", "s", "q2")])
+    (c,) = init.grasp_choice
+    assert c.ok.tolist() == [True, False, True]
+    torch.testing.assert_close(c.tilt, torch.tensor([0.5, 0.0, 0.3]))
+    torch.testing.assert_close(c.travel, torch.tensor([0.2, 0.0, 0.0]))
+    torch.testing.assert_close(c.margin, torch.tensor([0.08, 0.08, 0.03]))
+    assert c.chosen.tolist() == [2, 0]
+    # The pool walk, one row per grasp, then the particle walk on the chosen grasps.
+    assert [n for n, _ in walks] == [3, 4] and walks[1][1]["g1"].tolist() == [2, 0]
+
+
 def test_groups_go_cutoff_first_then_upright():
     # Per row: its group's pool indices, soft cost, all at 0.7, tilt, travel, margin.
     rows = [((0, 0), 1.0, True, 0.3, 0.0, 0.0),     # group a, second by soft cost
@@ -117,8 +149,8 @@ def _ranking_inputs(pool_rows, pitch, mask, soft):
     retract = torch.zeros(n, 6)
     retract[:, 3] = 1.0
     zeros = torch.zeros(3)
-    choice = PickChoice("block", "grasp1", torch.eye(7)[:3], torch.tensor([0.9, 0.8, 0.5]), torch.ones(3, dtype=torch.bool),
-                        zeros, zeros, zeros, torch.arange(3))
+    choice = PickChoice("block", "grasp1", torch.eye(7)[:3], torch.tensor([0.9, 0.8, 0.5]),
+                        torch.ones(3, dtype=torch.bool), zeros, zeros, zeros, torch.arange(3))
     rollout_fn = lambda particles: None
     rollout_fn.world = _fake_world(home=(0.0,) * 6)
     skeleton = [_op("pick", "block", "grasp1", "left_q1"), _op("place", "block", "grasp1", "pose1", "table", "left_q2"),

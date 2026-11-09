@@ -26,16 +26,16 @@ MOVE = (0.03, 0.0, 0.0)
 #: A move no balanced conf standing on the stance can follow: 30 cm forward and 20 cm down.
 FAR = (0.30, 0.0, -0.20)
 #: The most GN IK's accepted first-pick rows' median |CoM| / half may be on either axis, with margin, on the init whose
-#: first pick is block3's (PYTHONHASHSEED 0): at most 0.001 there, where 43 and 44 of the 64 rows are under 0.01 on x
-#: and y (2026-11-08). That init's first place's medians are 0.33 (x) and 0.12 (y); on the init whose first pick is
-#: block2's (PYTHONHASHSEED 1) the first pick's are 0.39 and 0.77 and the first place's 0.63 and 0.34. Four times the
-#: larger of each pair passes 1, the rectangle's edge, and bounds nothing, so only block3's first pick is bounded.
+#: first pick is block3's (PYTHONHASHSEED 0, seed 0, n 64): 0.00075 (x) and 0.00039 (y) there (2026-11-08). That
+#: init's first place's medians are 0.29 (x) and 0.046 (y); on the init whose first pick is block2's (PYTHONHASHSEED 1)
+#: the first pick's are 0.29 and 0.61 and the first place's 0.26 and 0.043. Four times the larger of each pair passes
+#: 1, the rectangle's edge, and bounds nothing, so only block3's first pick is bounded.
 CENTRED = 0.004
 #: The least, deg, GN IK's level 4 must lower the median Trunk tilt of the accepted first-pick rows by, with margin, on
-#: the init whose first pick is block3's (PYTHONHASHSEED 0): by 7.1 there, and its 10-90% quantiles all by 5-8
-#: (2026-11-08). Elsewhere the median falls by 1.1 (that init's first place), 0.9 (the first pick on the init whose
-#: first pick is block2's, PYTHONHASHSEED 1) and 0.1 (that init's first place), and the lower quartile by 4.4-5.5:
-#: too little in the median for a bound that doesn't pass by noise, so only block3's first pick is bounded.
+#: the init whose first pick is block3's (PYTHONHASHSEED 0, seed 0, n 64): by 9.6 there, from 49.7 to 40.1
+#: (2026-11-08). Elsewhere the median falls by 5.4 (that init's first place), 2.4 (the first pick on the init whose
+#: first pick is block2's, PYTHONHASHSEED 1) and 1.1 (that init's first place): too little on two of them for this
+#: bound, which stays on block3's first pick alone.
 UPRIGHTER = 2.8
 
 
@@ -71,8 +71,8 @@ def _accepted(world, plan, conf):
 def _first_pick(world, plan):
     """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the init's GN IK
     accepted (the others hold its closest balanced iterate). The first skeleton follows PYTHONHASHSEED: on blocks_t1
-    its first pick accepts all 64 rows on both inits (PYTHONHASHSEED 0 and 1, 2026-11-08), every CoM inside the
-    keyframe rectangle."""
+    its first pick accepts all 64 rows on both inits (PYTHONHASHSEED 0 and 1, seed 0, 2026-11-08), in 10 distinct
+    confs, every CoM inside the keyframe rectangle."""
     skeleton, particles = plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     conf = op.values[-1]
@@ -200,9 +200,9 @@ def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monk
 def test_gn_ik_centres_the_com(real_world, real_plan, monkeypatch):
     # Level 3 pulls the CoM toward the keyframe rectangle's centre in the freedom the hand, the soles, balance and
     # collision leave. Without it GN IK leaves the init's accepted first-pick and first-place rows on the edge (a
-    # median |CoM| / half of 0.93-0.96 in x and 0.88-0.96 in y on blocks_t1, both inits, 2026-11-08), the base slid
-    # sideways onto one leg, where trajopt's move there from home needed more than the Left_Ankle_Roll's effort. With
-    # it the medians drop on both axes on both inits, to the centre only on block3's first pick (CENTRED).
+    # median |CoM| / half of 0.93-0.95 in x and 0.89-0.95 in y on blocks_t1, both inits, seed 0, 2026-11-08), the base
+    # slid sideways onto one leg, where trajopt's move there from home needed more than the Left_Ankle_Roll's effort.
+    # With it the medians drop on both axes on both inits, to the centre only on block3's first pick (CENTRED).
     import cutamp.gn_refresh as gn_refresh
     import cutamp.particle_initialization as pi
     from cutamp.optimize_plan import _build_ik_deps
@@ -230,9 +230,9 @@ def test_gn_ik_centres_the_com(real_world, real_plan, monkeypatch):
 def test_gn_ik_uprights_the_trunk(real_world, real_plan, monkeypatch):
     # Level 4 pulls the Trunk toward upright in the freedom levels 1-3 leave, and GN IK keeps each target's least
     # tilted accepted start. Without level 4 GN keeps whatever tilt a start or the reach gave a conf: on blocks_t1's
-    # floor the accepted first-pick rows' median tilt on the init whose first pick is block3's is 47.8 deg, and 40.7
-    # with it, on as many rows (2026-11-08). The other ops' medians fall by 1.1 deg or less (UPRIGHTER), so only that
-    # pick's is bounded.
+    # floor the accepted first-pick rows' median tilt on the init whose first pick is block3's is 49.7 deg, and 40.1
+    # with it, on as many rows (64; PYTHONHASHSEED 0, seed 0, 2026-11-08). The other ops' medians fall by 1.1-5.4 deg
+    # (UPRIGHTER), and the bound stays on that pick alone.
     import cutamp.gn_refresh as gn_refresh
     import cutamp.particle_initialization as pi
     from cutamp.optimize_plan import _build_ik_deps
@@ -380,7 +380,8 @@ def test_gn_ik_accepts_only_confs_that_pass_the_checks(real_world, real_plan):
     # The init's GN IK confs at the first pick and the first place: every row the IK accepts passes the checks on
     # their own, at the checker's tolerances: the hand, both soles, the CoM in the keyframe rectangle, cuRobo's
     # self-collision kernel, the scene, and the movables at the checker's zero activation distance. The IK accepts at
-    # least 48 first-pick rows (64 on both inits, 2026-11-06) and some first-place rows (42 on both).
+    # least 48 first-pick rows and some first-place rows (64 and 60 on the init whose first pick is block3's, 64 and 61
+    # on block2's; PYTHONHASHSEED 0 and 1, seed 0, 2026-11-08).
     from cutamp.com_polygon_cost import SOLE_POS_TOL, SOLE_ROT_TOL, compute_com_polygon_mask
     from cutamp.costs import curobo_pose_error, sphere_to_sphere_overlap
     from cutamp.optimize_plan import _build_ik_deps

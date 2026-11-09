@@ -324,12 +324,16 @@ def _motion_plan_with_retries(
 
 def _planned_metrics(world: TAMPWorld, plan_skeleton: PlanSkeleton, candidates: List[dict], rank: int) -> dict:
     """The planned particle's rank, CoM margin (over all its confs) and the Trunk's tilt (radians to degrees) and travel
-    (metres), the worst over its pick and place confs (G7). ``best_com_margin`` is rank 0's; after a retry the plan
-    comes from another particle (known-bugs N3)."""
+    (metres), the worst over its pick and place confs (G7; left out when the skeleton has none). ``best_com_margin``
+    is the lowest-soft-cost satisfying particle's (optimize_plan), which need not be the planned one: the tries go
+    round the grasp groups, and a retry plans another particle (known-bugs N3)."""
     particle = candidates[rank]
-    tilt, travel, _ = worst_posture(world, [particle[name][None] for name in pick_place_confs(plan_skeleton)])
-    return {"motion_plan_rank": rank, "planned_com_margin": particle_com_margin(world, particle),
-            "planned_trunk_tilt_deg": float(torch.rad2deg(tilt[0])), "planned_trunk_travel": float(travel[0])}
+    metrics = {"motion_plan_rank": rank, "planned_com_margin": particle_com_margin(world, particle)}
+    confs = pick_place_confs(plan_skeleton)
+    if confs:
+        tilt, travel, _ = worst_posture(world, [particle[name][None] for name in confs])
+        metrics.update(planned_trunk_tilt_deg=float(torch.rad2deg(tilt[0])), planned_trunk_travel=float(travel[0]))
+    return metrics
 
 
 def setup_cutamp(

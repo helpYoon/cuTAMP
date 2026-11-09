@@ -218,8 +218,8 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
 
 
 def worst_posture(world: TAMPWorld, confs: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per row of ``confs`` (each ``[B, dof]``): the Trunk's tilt in radians and its travel from home in metres, each the
-    largest over the confs, and the CoM margin in metres, the smallest."""
+    """Per row of ``confs`` (each ``[B, dof]``): the Trunk's tilt in radians and its travel from home in metres, each
+    the largest over the confs, and the CoM margin in metres, the smallest."""
     from cutamp.com_polygon_cost import compute_com_margin
 
     names = list(world.model.joint_names)
@@ -252,7 +252,8 @@ def choose_grasps(ok: torch.Tensor, scores: torch.Tensor, tilt: torch.Tensor, tr
 
 
 def next_place(plan_skeleton: PlanSkeleton, pick_idx: int) -> Optional[str]:
-    """The conf name of the first place after ``plan_skeleton[pick_idx]`` that moves the pick's object, else ``None``."""
+    """The conf name of the first place after ``plan_skeleton[pick_idx]`` that moves the pick's object, else
+    ``None``."""
     obj = plan_skeleton[pick_idx].values[0]
     for op in plan_skeleton[pick_idx + 1:]:
         if op.operator.metadata.action_type == "place" and op.values[0] == obj:
@@ -402,8 +403,9 @@ class ParticleInitializer:
             self.grasp_choice.append(choice)
             chosen[grasp], pool_q[q] = choice.chosen, confs[q][0]
             if choice.chosen is None:
-                _log.warning(f"{idx + 1}. {ground_op}: no grasp of {obj} is balanced at both its pick and its place, "
-                             f"so its particles draw by score")
+                judged = "its pick" if place is None else "its pick and its place"
+                _log.warning(f"{idx + 1}. {ground_op}: no grasp of {obj} is balanced at {judged}, so its particles "
+                             f"draw by score. {choice_stats(choice)}")
             else:
                 log_debug(f"{idx + 1}. {ground_op}. Grasp choice: {choice_stats(choice)}")
         particles, _ = self._walk(plan_skeleton, self.config.num_particles, pools, chosen, pool_q, log_debug)
@@ -488,7 +490,7 @@ class ParticleInitializer:
                     raise ValueError(f"{q=} shouldn't already be bound")
 
                 grasps, scores = pools[grasp]
-                redraw = q_start = None
+                redraw = pool_start = None
                 if chosen is None:  # the pool walk
                     draw = lambda rows: grasps[rows % len(grasps)]
                 elif chosen[grasp] is None:  # no grasp is balanced (G6): by score, as before the choice
@@ -497,7 +499,7 @@ class ParticleInitializer:
                     c = chosen[grasp]
                     draw = lambda rows: grasps[c[rows % len(c)]]
                     redraw = lambda rows: grasps[c[torch.randint(len(c), (len(rows),), device=device)]]
-                    q_start = pool_q[q][c[torch.arange(n, device=device) % len(c)]]
+                    pool_start = pool_q[q][c[torch.arange(n, device=device) % len(c)]]
                 world_from_obj = world.get_object_pose(obj)
                 tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
                 movables = movable_spheres_fn(world, plan_skeleton, idx)(particles)  # the grasp moves none of them
@@ -505,7 +507,7 @@ class ParticleInitializer:
                     world, particles, grasp, n, draw,
                     lambda rows: (world_from_obj @ grasp_7dof_to_mat4x4(particles[grasp][rows]) @ tool_from_ee,
                                   movables[rows]),
-                    arm, self.ik_tol, redraw=redraw, rounds=rounds, q_start=q_start,
+                    arm, self.ik_tol, redraw=redraw, rounds=rounds, q_start=pool_start,
                 )
                 confs[q] = particles[q], ok
                 log_debug(f"{header}. {len(grasps)} grasps pass the drops and the cone; IK accepted: "

@@ -188,11 +188,11 @@ graph LR
    up to `motion_plan_max_retries` satisfying particles, first success wins,
    taken round their grasp groups (`get_top_satisfying_particles`: groups
    whose grasps all score 0.7 or more first, then upright first on each
-   group's best particle by soft cost), through `motion_solver.py`: one `MotionPlanner` over the
-   model's cspace, built on a background thread while the optimizer runs,
-   and planned to each particle conf with `plan_cspace` (2 attempts per
-   segment; if no particle plans, those that ran out of attempts get cuRobo's
-   20), so a pick or place
+   group's best particle by soft cost), through `motion_solver.py`: one
+   `MotionPlanner` over the model's cspace, built on a background thread while
+   the optimizer runs, and planned to each particle conf with `plan_cspace` (2
+   attempts per segment; if no particle plans, those that ran out of attempts
+   get cuRobo's 20), so a pick or place
    ends exactly at the conf the optimizer approved and cuRobo can't
    re-resolve the redundancy at the endpoint. Each pick and place is three
    segments: an approach to a pre conf, a straight insert to the particle conf

@@ -147,8 +147,9 @@ def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_atte
 
 
 def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
-    # planned_com_margin: the planned particle's margin, computed as optimize_plan computes best_com_margin
-    # for rank 0, which a retry didn't plan (known-bugs N3). Grasps and placements aren't confs.
+    # planned_com_margin: the planned particle's margin, computed as optimize_plan computes best_com_margin for the
+    # lowest-soft-cost satisfying particle, which need not be the planned one (known-bugs N3). Grasps and placements
+    # aren't confs.
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 0])
     particle = {"left_q0": torch.tensor([0.3, 0.0]), "left_q1": torch.tensor([0.1, 0.0]),
                 "right_q3": torch.tensor([0.2, 0.0]), "grasp1": torch.tensor([-1.0, 0.0, 0.0, 0.0])}
@@ -161,7 +162,8 @@ def test_planned_metrics_describe_the_planned_particle(monkeypatch):
     from cutamp.particle_initialization import _BASE_JOINTS
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 5])
     world = SimpleNamespace(model=SimpleNamespace(joint_names=_BASE_JOINTS, home=(0.0, 0.0, 0.7, 0.0, 0.0, 0.0)))
-    op = lambda kind, *v: SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type=kind)), values=v)
+    op = lambda kind, *v: SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type=kind)),
+                                          values=v)
     skeleton = [op("pick", "block", "grasp1", "left_q1"), op("place", "block", "grasp1", "pose1", "table", "left_q2"),
                 op("retract", "block", "grasp1", "left_q2", "traj", "left_q3")]
     conf = lambda z, pitch, margin: torch.tensor([0.0, 0.0, z, pitch, 0.0, margin])

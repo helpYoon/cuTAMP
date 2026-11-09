@@ -253,27 +253,36 @@ def test_floor_picks_choose_upright_grasps(real_world):
 @needs_cuda
 def test_no_balanced_grasp_falls_back_to_the_score_draw(real_world, monkeypatch, caplog):
     # Every pool-walk IK fails (its calls are the ones wider than n), so no grasp is balanced: each pick warns and
-    # draws by score from its pool, as before (G6).
+    # draws by score from its pool, as before (G6): torch.multinomial on the pick's own scores, not the pool walk's
+    # draw in turn.
     import logging
     import cutamp.particle_initialization as pi
     from cutamp.config import TAMPConfiguration
 
-    n, real_gn_ik = 8, pi.gn_ik
+    n, real_gn_ik, real_multinomial, draws = 8, pi.gn_ik, torch.multinomial, []
 
     def pool_fails(world, world_from_ee, arms, movables, tol):
         q, ok = real_gn_ik(world, world_from_ee, arms, movables, tol)
         return q, ok & (len(ok) <= n)
 
+    def multinomial(input, *args, **kwargs):
+        draws.append(input.clone())
+        return real_multinomial(input, *args, **kwargs)
+
     monkeypatch.setattr(pi, "gn_ik", pool_fails)
     skeleton, _, _ = _first_plan(real_world)
     torch.manual_seed(0)
     init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=n), default_checker())
-    with caplog.at_level(logging.WARNING, logger="cutamp.particle_initialization"):
+    with caplog.at_level(logging.WARNING, logger="cutamp.particle_initialization"), monkeypatch.context() as m:
+        m.setattr(torch, "multinomial", multinomial)
         particles = init(skeleton)
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == "cutamp.particle_initialization" and r.levelno == logging.WARNING]
     assert init.grasp_choice
     for c in init.grasp_choice:
         assert c.chosen is None and not c.ok.any()
-        assert any(c.obj in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+        assert any(c.obj in message for message in warnings)
+        assert any(torch.equal(scores, c.scores) for scores in draws), c.obj
         assert (particles[c.grasp][:, None] == c.grasps[None]).all(-1).any(-1).all()
 
 
