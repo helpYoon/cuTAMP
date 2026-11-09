@@ -325,7 +325,7 @@ def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     link_name = _ATTACH_LINK_FOR_ARM[arm]
     kp = am.kinematics_params
     idx = kp.get_sphere_index_from_link_name(link_name)
-    scene = planner.scene_collision_checker.scene_model  # attach_from_scene's lookup
+    scene = planner.scene_collision_checker.scene_model  # the scene the attach disables the object in
     obstacle = (scene[0] if isinstance(scene, list) else scene).get_obstacle(obj_name)
     if obstacle is None:
         raise ValueError(f"{obj_name} is not in the motion planner's scene")

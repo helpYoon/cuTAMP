@@ -233,7 +233,8 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
     Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process
     (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame, and runs GraspGenX's
     graspmoe planner on them: 500 diffusion grasps and the box grasps on the top and the four sides, all kept.
-    GraspGenX always runs on ``.cuda()``; ``device`` only places the returned tensors.
+    GraspGenX always runs on ``.cuda()``; ``device`` places a shape's tensors on its first call, and later calls
+    return them as they are.
 
     The grasps repeat bit for bit across calls and processes: each run is seeded with ``GRASP_SEED`` and runs in FP32,
     with PTv3's segment reduction deterministic. The caller's random state (Python's, numpy's, torch's CPU and every
