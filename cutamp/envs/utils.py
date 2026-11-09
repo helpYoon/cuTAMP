@@ -48,12 +48,7 @@ class TAMPEnvironment:
                 raise ValueError(f"Unknown object type: {obj_type}")
 
 
-# The floor every scene's env file holds as a static cuboid named "floor" (top at z = 0).
-FLOOR = {"dims": [4.0, 4.0, 0.1], "pose": [0, 0, -0.05, 1, 0, 0, 0]}
-# raise_surface_height's table top: its overhang past the raised objects and its thickness.
-# 0: a 5 cm overhang left no plannable candidate on blocks_t1 s0/s2 at h 0.5 (trajopt could not take the hands over
-# the edge without sliding a sole or exceeding ankle torque), so the table is flush with the objects' xy box.
-TABLE_MARGIN = 0.0
+# raise_surface_height's table top: its thickness.
 TABLE_THICKNESS = 0.03
 
 _key_to_factory = {
@@ -85,11 +80,9 @@ def load_env(env_path: str) -> TAMPEnvironment:
         for name, obj_dict in obj_dicts.items():
             if name in name_to_obj:
                 raise ValueError(f"Cannot have duplicate object names: {name}")
-            obj_dict = dict(obj_dict)
             if "pose" in obj_dict:  # wxyz; keep the direction, fix the length
-                pose = [float(v) for v in obj_dict["pose"]]
-                pose[3:7] = (np.array(pose[3:7]) / np.linalg.norm(pose[3:7])).tolist()
-                obj_dict["pose"] = pose
+                q = np.array(obj_dict["pose"][3:7], dtype=float)
+                obj_dict["pose"] = [float(v) for v in obj_dict["pose"][:3]] + (q / np.linalg.norm(q)).tolist()
             if cls is Mesh and not os.path.isabs(obj_dict["file_path"]):
                 obj_dict["file_path"] = os.path.join(os.path.dirname(os.path.abspath(env_path)), obj_dict["file_path"])
             obj = cls(name=name, **obj_dict)
@@ -141,13 +134,10 @@ def load_env(env_path: str) -> TAMPEnvironment:
 def raise_surface_height(env: TAMPEnvironment, height: float) -> TAMPEnvironment:
     """Elevate the manipulation surface by ``height`` metres (mutates in place).
 
-    Shifts the z of every Movable and every Surface object up by ``height`` so
-    the boxes and goal pad sit at the given height instead of on the ground.
-    ``height == 0`` leaves the env unchanged (the ground variant). cuTAMP is a
-    kinematic planner, so the objects simply sit at the new z — no support
-    geometry is added except a static ``table`` top (``TABLE_THICKNESS`` thick, top at
-    ``height``) covering every raised object's xy box, grown by ``TABLE_MARGIN`` (0) on each side; the
-    floor stays put. Used by run_cutamp's ``--surface_height``.
+    Shifts the z of every Movable and every Surface object up by ``height`` and adds a static ``table`` top,
+    ``TABLE_THICKNESS`` thick with its top at ``height``, flush with their xy box (a 5 cm overhang left blocks_t1 s0/s2
+    at h 0.5 no plannable candidate); the floor stays put. ``height == 0`` leaves the env unchanged (the ground
+    variant). Used by run_cutamp's ``--surface_height``.
 
     A nonzero ``height`` raises ``ValueError``, before anything moves, where the env has any other static, which
     would stay behind (shelf_t1's boards), or already has an object named ``table``.
@@ -191,7 +181,6 @@ def _xy_half_extents(obj: Obstacle) -> Tuple[float, float]:
 def _table_top(objs: List[Obstacle], height: float) -> Cuboid:
     lo = np.min([[o.pose[0] - _xy_half_extents(o)[0], o.pose[1] - _xy_half_extents(o)[1]] for o in objs], axis=0)
     hi = np.max([[o.pose[0] + _xy_half_extents(o)[0], o.pose[1] + _xy_half_extents(o)[1]] for o in objs], axis=0)
-    lo, hi = lo - TABLE_MARGIN, hi + TABLE_MARGIN
     cx, cy = (lo + hi) / 2
     return Cuboid(
         name="table",
@@ -251,15 +240,5 @@ def get_env_dir() -> str:
 
 
 def resolve_env_path(arg: str) -> str:
-    """``--env``: an existing file as given, else the shipped scene ``arg`` names, with or without ``.yml``
-    (``shelf_t1`` and ``shelf_t1.yml`` are both ``assets/shelf_t1.yml``). Anything else, a folder included, raises
-    ``FileNotFoundError``."""
-    if os.path.isfile(arg):
-        return arg
-    name = arg.removesuffix(".yml")
-    shipped = sorted(f.removesuffix(".yml") for f in os.listdir(get_env_dir()) if f.endswith(".yml"))
-    if name in shipped:
-        return os.path.join(get_env_dir(), f"{name}.yml")
-    raise FileNotFoundError(f"--env {arg!r} is neither an existing file nor a shipped scene ({', '.join(shipped)})")
-
-
+    """``--env``: an existing file as given, else the shipped scene ``arg`` names, with or without ``.yml``."""
+    return arg if os.path.isfile(arg) else os.path.join(get_env_dir(), arg.removesuffix(".yml") + ".yml")

@@ -532,7 +532,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   onto a static `table` top, `TABLE_THICKNESS` thick with its top at the
   height, that covers their xy box; the floor and the other statics stay
   put). Each scene in `assets/` has a `floor`, a static cuboid whose top is at
-  z = 0 (`FLOOR`):
+  z = 0:
   - `blocks_t1`: two blocks and a goal pad on the floor;
   - `shelf_t1`: a box on the lower of two boards, to be placed on a pad on
     the same board. The upper board leaves no room for a top-down hand, so

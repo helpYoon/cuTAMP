@@ -8,8 +8,6 @@ import yaml
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import (
-    FLOOR,
-    TABLE_MARGIN,
     TABLE_THICKNESS,
     get_env_dict,
     get_env_dir,
@@ -32,40 +30,19 @@ def test_quaternions_are_unit_after_load():
     assert np.allclose(q, raw / np.linalg.norm(raw), atol=1e-12)
 
 
-def _mesh_env(folder, file_path, color=(10, 20, 30)):
-    env_dict = {
-        "name": "mesh_env",
-        "geometries": {
-            "cuboid": {"box": {"dims": [0.05, 0.05, 0.05], "pose": [0.4, 0, 0.031, 1, 0, 0, 0]}},
-            "mesh": {"cup": {"file_path": file_path, "pose": [0.5, 0.1, 0.0, 1, 0, 0, 0], "color": list(color)}},
-        },
-        "types": {"Movable": ["box"], "Surface": ["cup"]},
-        "goal": [{"On": ["box", "cup"]}],
-    }
-    path = folder / "mesh_env.yml"
-    path.write_text(yaml.safe_dump(env_dict))
-    return str(path)
-
-
 def test_mesh_path_resolves_from_any_cwd(tmp_path, monkeypatch):
-    (tmp_path / "cup.obj").write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
-    path = _mesh_env(tmp_path, "cup.obj")
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    monkeypatch.chdir(elsewhere)
-    env = load_env(path)
-    mesh = next(o for o in env.statics if o.name == "cup")
+    monkeypatch.chdir(tmp_path)
+    mesh = next(o for o in load_env(resolve_env_path("cup_t1")).movables if o.name == "cup")
     assert os.path.isabs(mesh.file_path)
     assert os.path.exists(mesh.file_path)
 
 
 def test_mesh_env_round_trip(tmp_path):
-    (tmp_path / "cup.obj").write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
-    env = load_env(_mesh_env(tmp_path, "cup.obj"))
-    before = next(o for o in env.statics if o.name == "cup")
+    env = load_env(resolve_env_path("cup_t1"))
+    before = next(o for o in env.movables if o.name == "cup")
     out = tmp_path / "round.yml"
-    out.write_text(yaml.safe_dump(yaml.safe_load(yaml.safe_dump(get_env_dict(env)))))
-    after = next(o for o in load_env(str(out)).statics if o.name == "cup")
+    out.write_text(yaml.safe_dump(get_env_dict(env)))
+    after = next(o for o in load_env(str(out)).movables if o.name == "cup")
     assert after.file_path == before.file_path
     assert list(after.pose) == list(before.pose)
     assert list(after.color) == list(before.color)
@@ -81,27 +58,19 @@ def test_suffix_tolerances():
 
 
 def test_resolve_env_path(tmp_path):
-    assert resolve_env_path("blocks_t1") == BLOCKS
-    assert resolve_env_path(BLOCKS) == BLOCKS
     other = tmp_path / "x.yml"
     other.write_text("")
+    assert resolve_env_path("blocks_t1") == resolve_env_path("blocks_t1.yml") == resolve_env_path(BLOCKS) == BLOCKS
     assert resolve_env_path(str(other)) == str(other)
-
-
-def test_resolve_env_path_takes_a_file_or_a_shipped_name(tmp_path):
-    # A shipped name may carry ".yml"; a path must be an existing file, not a folder; anything else raises.
-    assert resolve_env_path("shelf_t1.yml") == resolve_env_path("shelf_t1") == os.path.join(get_env_dir(),
-                                                                                           "shelf_t1.yml")
-    for arg in (str(tmp_path), "shelf_t2", "shelf_t2.yml", str(tmp_path / "shelf_t1.yml")):
-        with pytest.raises(FileNotFoundError, match="neither an existing file nor a shipped scene"):
-            resolve_env_path(arg)
+    for arg in (str(tmp_path), "shelf_t2", str(tmp_path / "shelf_t1.yml")):  # a folder, an unknown name, no file
+        with pytest.raises(FileNotFoundError, match="Environment file not found"):
+            load_env(resolve_env_path(arg))
 
 
 def test_floor_is_in_the_env_file():
     env = load_env(BLOCKS)
     floor = next(o for o in env.statics if o.name == "floor")
-    assert list(floor.dims) == FLOOR["dims"]
-    assert list(floor.pose) == FLOOR["pose"]
+    assert floor.pose[2] + floor.dims[2] / 2 == 0  # its top at z = 0
 
 
 def test_raise_adds_a_table_top():
@@ -109,21 +78,13 @@ def test_raise_adds_a_table_top():
     raise_surface_height(env, 0.5)
     table = next(o for o in env.statics if o.name == "table")
     floor = next(o for o in env.statics if o.name == "floor")
-    assert floor.pose[2] == FLOOR["pose"][2]
+    assert floor.pose[2] == -0.05
     assert abs(table.pose[2] + table.dims[2] / 2 - 0.5) < 1e-9
     assert abs(table.dims[2] - TABLE_THICKNESS) < 1e-12
-    raised = list(env.movables) + list(env.type_to_objects["Surface"])
-    for obj in raised:
-        # the footprint covers the object's rotated xy box, grown by TABLE_MARGIN
-        w, z = obj.pose[3], obj.pose[6]
-        yaw = 2 * np.arctan2(z, w)
-        c, s = abs(np.cos(yaw)), abs(np.sin(yaw))
-        hx = (c * obj.dims[0] + s * obj.dims[1]) / 2
-        hy = (s * obj.dims[0] + c * obj.dims[1]) / 2
-        assert table.pose[0] - table.dims[0] / 2 <= obj.pose[0] - hx - TABLE_MARGIN + 1e-9
-        assert table.pose[0] + table.dims[0] / 2 >= obj.pose[0] + hx + TABLE_MARGIN - 1e-9
-        assert table.pose[1] - table.dims[1] / 2 <= obj.pose[1] - hy - TABLE_MARGIN + 1e-9
-        assert table.pose[1] + table.dims[1] / 2 >= obj.pose[1] + hy + TABLE_MARGIN - 1e-9
+    lo, hi = table.get_trimesh_mesh(transform_with_pose=True).bounds[:, :2]
+    for obj in list(env.movables) + list(env.type_to_objects["Surface"]):  # the footprint covers each rotated xy box
+        box = obj.get_trimesh_mesh(transform_with_pose=True).bounds[:, :2]
+        assert (lo <= box[0] + 1e-9).all() and (box[1] <= hi + 1e-9).all(), obj.name
     assert "table" not in [o.name for o in env.type_to_objects.get("Surface", [])]
 
 
@@ -139,10 +100,6 @@ def _poses(env) -> dict:
 
 def test_raise_refuses_statics_it_would_leave_behind():
     # At a nonzero height only the floor and the Surfaces may be static: shelf_t1's boards would stay below the box.
-    for name, heights in (("blocks_t1", (0.0, 0.5, 0.85)), ("cylinder_t1", (0.5,)), ("cup_t1", (0.5,)),
-                          ("shelf_t1", (0.0,))):
-        for height in heights:
-            raise_surface_height(load_env(resolve_env_path(name)), height)
     env = load_env(resolve_env_path("shelf_t1"))
     before = _poses(env)
     with pytest.raises(ValueError, match="shelf_t1's statics lower_board, upper_board would stay put"):

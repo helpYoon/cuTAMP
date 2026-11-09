@@ -1,10 +1,7 @@
 # T1 shelf environment (design 7.7): a box on the lower of two boards, to be placed on a pad on the same board.
-# The upper board's underside (0.98 m) is 10.4 cm above the box's top (0.876 m), still too little room for a top-down
-# hand, whose highest sphere reaches at least 1.034 m: the pick needs a side or angled grasp. It is 5 cm above the
-# plan's (top 0.95 m), where an angled place's 5 cm drop-in (grasps.LIFT_HEIGHT) put the box 11-20 mm into it.
-# The box stands on the robot's left (+y) and the pad on its right. The planner tries a one-object scene's left-arm
-# skeleton first: the arm affinity ranks picks only, and the two arms' MoveFree tie before them. With the box on the
-# right, that arm reached across the body for its side grasp and planned 1 of 3 seeds.
+# The upper board's underside (0.98 m) leaves too little room for a top-down hand, whose highest sphere reaches at
+# least 1.034 m: the pick needs a side or angled grasp. The box stands on the robot's left (+y), where the left-arm
+# skeleton the planner tries first reaches it without crossing the body, and the pad on its right.
 # Run at height 0 (no --surface_height): raise_surface_height would lift the box and the pad, not the boards.
 
 name: shelf_t1

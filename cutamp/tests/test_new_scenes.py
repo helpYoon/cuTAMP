@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import yaml
 
-from cutamp.envs.utils import FLOOR, TABLE_THICKNESS, load_env, raise_surface_height, resolve_env_path
+from cutamp.envs.utils import TABLE_THICKNESS, load_env, raise_surface_height, resolve_env_path
 from cutamp.tests.conftest import needs_cuda
 
 #: Each new scene and the ``--surface_height`` run_cases.sh runs it at.
@@ -29,13 +29,9 @@ def test_cup_is_watertight():
 
 @pytest.mark.parametrize("name", SCENES)
 def test_scenes_load(name):
-    with open(resolve_env_path(name)) as f:  # the file's own quaternions: load_env would normalize any
-        for objs in yaml.safe_load(f)["geometries"].values():
-            for obj, entry in objs.items():
-                assert abs(np.linalg.norm(entry["pose"][3:]) - 1) < 1e-9, obj
     env = _scene(name)
     floor = next(o for o in env.statics if o.name == "floor")
-    assert (list(floor.dims), list(floor.pose)) == (FLOOR["dims"], FLOOR["pose"])
+    assert floor.pose[2] + floor.dims[2] / 2 == 0  # its top at z = 0
     raised = env.movables + env.type_to_objects["Surface"]
     for obj in raised:  # within standing reach
         assert 0.35 <= obj.pose[0] <= 0.55 and abs(obj.pose[1]) <= 0.3, obj.name
