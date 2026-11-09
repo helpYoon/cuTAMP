@@ -143,8 +143,8 @@ def test_line_motion_restores_the_row(planner):
 @needs_cuda
 def test_attached_block_clears_the_floor(real_world, real_plan, planner):
     # blocks_t1 on the floor (h 0.0): with the first pick's block attached at its grasp conf, where the lift starts,
-    # the planner's start-state check (the graph planner's, on the planner's spheres) passes. The same spheres moved
-    # just into the floor fail it, so the check sees the held block and the floor.
+    # the RRT's feasibility check (on the planner's spheres) passes. The same spheres moved just into the floor fail
+    # it, so the RRT that seeds the graph-seeded attempts sees the held block and the floor.
     import cutamp.motion_solver as ms
     from curobo.types import JointState
     from cutamp.tests.test_real_legs_gn import _first_pick
@@ -162,13 +162,14 @@ def test_attached_block_clears_the_floor(real_world, real_plan, planner):
         idx = idx[kp.link_spheres[0, idx, 3] > 0]
         spheres = planner.kinematics.compute_kinematics(js).robot_spheres.view(-1, 4)[idx]
         lowest = float((spheres[:, 2] - spheres[:, 3]).min())  # the floor's top is z = 0
-        assert bool(planner.graph_planner.check_samples_feasibility(q)), f"held block's lowest sphere at {lowest} m"
+        feasible = planner.graph_planner.resources.check_samples_feasibility
+        assert bool(feasible(q)), f"held block's lowest sphere at {lowest} m"
         # Into the floor by 1 mm: the attach link is the tool frame's identity child, so the shift is link-local.
         world_from_link = planner.kinematics.compute_kinematics(js).tool_poses.get_link_pose(ms.TOOL_FRAME_FOR_ARM[arm])
         down = world_from_link.get_matrix()[0, :3, :3].T @ torch.tensor([0.0, 0.0, -(lowest + 0.001)],
                                                                          device=q.device)
         kp.link_spheres[0, idx, :3] += down
-        assert not bool(planner.graph_planner.check_samples_feasibility(q))
+        assert not bool(feasible(q))
     finally:
         ms._reset_attachment_state(planner, real_world)
 

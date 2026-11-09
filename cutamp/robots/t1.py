@@ -276,7 +276,8 @@ def get_t1_motion_planner(
       weight), tracks the hands at the terminal only, and leaves the ``stance`` frame untracked (it is world-fixed,
       and the CoM cost's support frame);
     - turns cuRobo's timeopt off (its RNEA has no floor push; the balance gate paces each segment) and gives
-      trajopt's first solve ``TRAJOPT_INITIAL_ITERS``.
+      trajopt's first solve ``TRAJOPT_INITIAL_ITERS``;
+    - seeds the graph-seeded attempts with cuRobo's GPU bidirectional RRT, not its default PRM.
 
     The planner gets a soft cost penalizing trajectories whose mass-weighted
     COM projects outside the model's keyframe rectangle (``model.support``),
@@ -304,6 +305,10 @@ def get_t1_motion_planner(
         # (motion_trajectory_timeopt.py), so the soles' load never reaches the legs and the floor-push check rejects
         # its timing; the balance gate paces each segment instead.
         enable_timeopt=False,
+        # cuRobo's GPU bidirectional RRT seeds the graph-seeded attempts (create's default is its PRM). On the 8
+        # check cases (2026-11-09) its paths led to a plan on 2 of 2 tries, the PRM's on 1 of 3; trajopt refines
+        # every seed either way. Its samples are a fixed Halton sequence, so same-seed runs repeat.
+        graph_planner_algorithm="rrt",
     )
     planner = MotionPlanner(cfg)
     # The first solve runs TRAJOPT_INITIAL_ITERS L-BFGS iterations, cuRobo v0.8's budget, where v0.9.0 stops at 50

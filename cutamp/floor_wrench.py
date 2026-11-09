@@ -92,7 +92,7 @@ def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str]
     cuRobo gives each rollout two transitions: its cost's (``transition_model``) and its metrics'
     (``metrics_transition_model``, which the success test runs); the interpolated re-check runs on the
     extra metrics rollouts. All of them get the hook, and their FK computes the CoM (the split reads it, and so
-    does the planner's CoM cost). The IK solver and the graph planner keep RNEA's single pass (7.4a) and no CoM.
+    does the planner's CoM cost). The IK solver keeps RNEA's single pass (7.4a) and no CoM; the RRT runs no RNEA.
     Raises ``ValueError`` if a transition has no dynamics.
     """
     from cutamp._curobo_internals import set_external_wrench_fn

@@ -32,7 +32,6 @@ import collections
 import contextlib
 import logging
 import math
-import random
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -401,18 +400,17 @@ def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> Motio
     thread, and cuRobo captures in CUDA's global mode, where the main thread's
     allocations and syncs fail mid-capture. The first ``plan_cspace`` captures
     instead (~1 s), on the main thread after the join; every later segment has
-    the same shape and replays.
+    the same shape and replays. The RRT captures its own (always, whatever
+    ``use_cuda_graph``) on its first graph-seeded attempts, also on the main thread:
+    ~0.9 s, plus ~20 s the first time a machine compiles its kernels, which Warp
+    caches on disk.
     """
-    planner = get_t1_motion_planner(
+    return get_t1_motion_planner(
         world.model,
         get_world_cfg(world.env, include_movables=True),
         use_cuda_graph=use_cuda_graph,
         device_cfg=world.device_cfg,
     )
-    # cuRobo's PRM picks with Python's unseeded global random.choice (graph_planner_prm.py:506): seed it so
-    # same-seed runs stay identical.
-    random.seed(0)
-    return planner
 
 
 def solve_curobo(
