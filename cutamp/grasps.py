@@ -145,7 +145,8 @@ _README_FOLDERS = {
 
 
 class GraspSet(NamedTuple):
-    """One object shape's GraspGenX grasps, every one kept with no threshold: init weights its draws by score."""
+    """One object shape's GraspGenX grasps, every one kept with no threshold: init chooses among them
+    (``particle_initialization.choose_grasps``), those scoring ``GRASP_SCORE_CUTOFF`` or more first."""
 
     grasps: torch.Tensor
     """``[K, 7]`` float32 on the device: GraspGenX's gripper frame G in the object frame, ``[x, y, z, qw, qx, qy, qz]``

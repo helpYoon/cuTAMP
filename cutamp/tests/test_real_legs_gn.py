@@ -15,7 +15,6 @@ takes its confs from ``real_plan``."""
 
 import math
 
-import pytest
 import torch
 
 from cutamp.robots.t1 import REAL_LEGS
@@ -161,28 +160,22 @@ def test_gn_holds_the_soles(real_world, real_plan):
 
 
 @needs_cuda
-def test_gn_holds_the_soles_out_of_reach(real_world, real_plan, request):
+def test_gn_holds_the_soles_out_of_reach(real_world, real_plan):
     # Hand targets no balanced conf on the stance can reach: four calls, each from the last result as successive
     # refreshes run, keep both soles on the stance after every call, and every hand stays over 2 cm off, so the feet
     # did not slide to fake the reach. Reaching for them drives joints into their limits on every call, where a
-    # clamped step or the drift of a saturated last step would move the soles.
+    # clamped step or the drift of a saturated last step would move the soles. The score-weighted grasp draw's init
+    # whose first pick was block2's (PYTHONHASHSEED 1, 2026-11-08) held one row that call 4 left 2.9 mm off: GN's
+    # closing step re-solves once, freezing Right_Hip_Roll, and then Left_Hip_Roll, 0.27 mrad above its lower limit,
+    # would cross it, so the limits fraction 0.20 applies a fifth of the soles' 3.7 mm correction. The chosen grasps'
+    # inits hold no such row, on either first pick (2026-11-08).
     from cutamp.gn_refresh import gn_project_balanced
-    # Only call 4's soles check, on the init whose first pick is block2's, is expected to fail. It is the test's last
-    # check, and the marker goes on just before it, once every other check has passed.
-    block2_first = next(op for op in real_plan[0] if op.operator.metadata.action_type == "pick").values[0] == "block2"
-    xfail = pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-        "on the init whose first pick is block2's (PYTHONHASHSEED 1, 2026-11-08) call 4 leaves row 16's soles "
-        "2.9 mm off: GN's closing step re-solves once, freezing Right_Hip_Roll, and then Left_Hip_Roll, 0.27 mrad "
-        "above its lower limit, would cross it, so the limits fraction 0.20 applies a fifth of the soles' 3.7 mm "
-        "correction"))
     arm, _, q = _first_pick(real_world, real_plan)
     targets, _ = _moved_targets(real_world, q, arm, FAR)
-    for call in range(1, 5):
+    for _ in range(4):
         q = gn_project_balanced(real_world, q, targets, arm)
         hand = _hand_error(real_world, q, targets, arm)
         assert float(hand.min()) > 0.02, float(hand.min())
-        if call == 4 and block2_first:
-            request.node.add_marker(xfail)
         _assert_soles_held(real_world, q)
 
 

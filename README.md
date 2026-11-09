@@ -149,14 +149,25 @@ graph LR
    tolerances (`ik_check`): the hand, both soles on the stance, the CoM in the
    model's keyframe rectangle (`world.model.support.keyframe_half`) and no
    collision. Retract confs start at the model's home
-   (`REAL_LEGS.home`). Each pick row draws a 6-DoF grasp, weighted by
-   GraspGenX's score, from its object's grasps that the hand can take
-   (`world.grasp_candidates`: none with a hand sphere below the object's
-   bottom face or touching the object, `grasps.drop_grasps`) and that, unless
-   near vertical, approach from the robot's side (`grasps.approach_in_cone`).
-   Each place row draws its placement (`place_4dof_sampler`), its yaw turned so
-   the held grasp approaches from the robot's side. The rows whose IK fails
-   draw again, up to `GRASP_REDRAW_ROUNDS` times. Grasps are never optimized.
+   (`REAL_LEGS.home`). Each pick first tries every grasp of its object that the
+   hand can take (`world.grasp_candidates`: none with a hand sphere below the
+   object's bottom face or touching the object, `grasps.drop_grasps`) and that,
+   unless near vertical, approaches from the robot's side
+   (`grasps.approach_in_cone`): one IK row per grasp at the pick and one at its
+   place, on a placement drawn for it. Of the grasps balanced at both, those
+   GraspGenX scores at `GRASP_SCORE_CUTOFF` (0.7, its own cutoff) or more rank
+   upright first: the Trunk's tilt, then its travel from home, then the CoM
+   margin, each at the worse of the pick and the place, with ties going by
+   GraspGenX's order. The first `motion_plan_max_retries` of them are the
+   pick's chosen grasps; when fewer clear the cutoff, the best-scoring balanced
+   ones below it fill the rest (`choose_grasps`). The particles take the chosen
+   grasps in turn, each keeping its grasp's pick conf where `ik_check` accepts
+   it in the particle's own scene. Where no grasp is balanced, the pick draws
+   by score as before and logs a warning. Each place row draws its placement
+   (`place_4dof_sampler`), its yaw turned so the held grasp approaches from the
+   robot's side. The rows whose IK fails draw again, up to
+   `GRASP_REDRAW_ROUNDS` times, a pick from its chosen grasps. Grasps are never
+   optimized.
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic — the hand's pose and both soles on the stance — motion,
@@ -407,9 +418,10 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   safe one (every check but the hand's) with the smallest hand error, else
   the one with the smallest hand error. The movable objects' spheres at each
   conf come from `rollout.movable_spheres_fn`, placed as the rollout places
-  them. A pick row draws its grasp and a place row its placement, and the
-  rows whose IK fails draw again (`_draw_and_solve`; a placement keeps the
-  least-colliding of its candidates, `_draw_placements`).
+  them. A pick row takes one of its pick's chosen grasps (a pool walk solves
+  every eligible grasp once, then `choose_grasps`) and a place row draws its
+  placement, and the rows whose IK fails draw again (`_draw_and_solve`; a
+  placement keeps the least-colliding of its candidates, `_draw_placements`).
 
 - [`grasps.py`](cutamp/grasps.py) — the grasps: `grasp_sets` runs
   GraspGenX's graspmoe planner on each object shape's surface points when the
@@ -421,7 +433,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   (`approach_targets`, `is_vertical`) and their knobs, search settings rather
   than robot limits (`APPROACH_DISTANCE`, `LIFT_HEIGHT`, `VERTICAL_CONE`,
   `AZIMUTH_CONE`, `GRASP_REDRAW_ROUNDS`, and the line check's `LINE_TOL`,
-  `LINE_BACKTRACK` and `LINE_END_TOL`).
+  `LINE_BACKTRACK` and `LINE_END_TOL`). So does `GRASP_SCORE_CUTOFF`,
+  GraspGenX's own 0.7, the score from which a grasp counts as holding well
+  enough.
 
 - [`samplers.py`](cutamp/samplers.py) — the placement and yaw samplers
   (`place_4dof_sampler`, `sample_yaw`); grasps come from GraspGenX
