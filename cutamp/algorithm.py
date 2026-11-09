@@ -270,8 +270,9 @@ def _motion_plan_with_retries(
       - ``rank``: the index in ``candidates`` of the planned particle, or
         ``None`` if none was planned.
       - ``failures``: each planned candidate's failure message, in order, over
-        both passes. A failed trajopt's message names its reason (design
-        7.4a). The caller records them in
+        both passes: a failed trajopt's reads "cspace-anchored plan failed for
+        <op> <phase>", and only the balance gate fails a segment on torque,
+        naming the joint. The caller records them in
         ``overall_metrics["motion_plan_failures"]``.
     """
     skeleton = plan_info["plan_skeleton"]
@@ -307,6 +308,11 @@ def _motion_plan_with_retries(
                 failed.append({k: particle[k] for k in used})
                 # No budget changes the rest (a gate rejection, an approach-IK or line miss): plan_cspace returns
                 # its first success, so more attempts replan the same trajectory.
+                # ponytail: trajopt's success test leaves torque to the gate (t1._trajopt_metrics_dict), so a path
+                # the gate can't slow enough (past RETIME_MAX for the ZMP or an effort) ends the candidate here,
+                # where cuRobo's torque bound used to send it on to graph-seeded attempts. Unseen on the 13
+                # 2026-11-09 checks (at most 3.45x); if studies show "slowdown cap" rejections, replan that segment
+                # once with graph seeds first (plan_cspace's enable_graph_attempt=0).
                 if not getattr(e, "out_of_attempts", False):
                     rejected.append(failed[-1])
         if max_attempts != _PLAN_ATTEMPTS[-1]:

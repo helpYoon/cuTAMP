@@ -115,8 +115,8 @@ def install_floor_wrench(planner: MotionPlanner, base_joint_names: Sequence[str]
 
 class SegmentTorques:
     """cuRobo's two RNEA passes with the floor's push, as trajopt's transitions run them, on a plan's frames: the
-    balance gate's torque check, which with the speed limits sets each segment's pace, and the reason a trajopt
-    failed (design 7.4a); and the floor's wrench from the first pass (``floor``), the gate's ZMP.
+    balance gate's torque check, which with the speed limits sets each segment's pace (design 7.4a); and the floor's
+    wrench from the first pass (``floor``), the gate's ZMP.
 
     It runs on ``config``, ``model``'s KinematicsCfg (``TAMPWorld.kinematics``'s, which
     :func:`cutamp.robots.t1.get_t1_kinematics` builds and checks the joint order of). Calling it on a ``plan_js``

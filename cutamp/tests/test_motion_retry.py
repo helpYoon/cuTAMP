@@ -34,7 +34,7 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
         q1, q3 = float(particle["left_q1"][0]), float(particle["left_q3"][0])
         planned.append((q1, q3))
         if q1 == 0 or q3 == 0:  # pick fails on q1 == 0, else place fails on q3 == 0
-            e = RuntimeError("pick failed: torque" if q1 == 0 else "place failed: other")
+            e = RuntimeError("pick failed" if q1 == 0 else "place failed")
             e.op_idx = 1 if q1 == 0 else 2
             raise e
         return "PLAN", {}
@@ -49,8 +49,8 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
     assert planned == [(0, 0), (1, 0), (1, 1)]
     # rank names the planned particle, which attempts can't once candidates are skipped (known-bugs N3)
     assert (plan, attempts, rank) == ("PLAN", 3, 4)
-    # Each planned candidate that failed keeps its message, so a report can count those lost to torque (7.4a).
-    assert failures == ["pick failed: torque", "place failed: other"]
+    # Each planned candidate that failed keeps its message, so a report can count what each was lost to.
+    assert failures == ["pick failed", "place failed"]
 
 
 def _run_skeletons(monkeypatch, results) -> dict:
@@ -117,7 +117,7 @@ def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_atte
         q1 = float(particle["left_q1"][0])
         calls.append((q1, max_attempts))
         if q1 == 0 or max_attempts < 20:
-            e = RuntimeError("trajectory ZMP leaves the support region" if q1 == 0 else "pick failed: other")
+            e = RuntimeError("trajectory ZMP leaves the support region" if q1 == 0 else "pick failed")
             e.op_idx = 0
             if q1 == 0:
                 e.check = "zmp"
@@ -133,7 +133,7 @@ def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_atte
     )
     assert calls == [(0.0, 2), (1.0, 2), (1.0, 20)]
     assert (plan, attempts, rank) == ("PLAN", 3, 1)
-    assert failures == ["trajectory ZMP leaves the support region", "pick failed: other"]
+    assert failures == ["trajectory ZMP leaves the support region", "pick failed"]
 
 
 def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):

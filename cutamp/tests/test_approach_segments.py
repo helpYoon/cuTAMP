@@ -182,8 +182,7 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
     # test's miss is the first error the retry meets whatever the init drew: on the init whose first pick is block2's
     # (PYTHONHASHSEED 1, 3, 4 and 5) both candidates' approaches leave the stance by 6.5 and 9.3 mm (2026-11-08), which
     # would fail them first. test_real_legs_motion tests that check. On that init the second candidate's insert
-    # trajopt also passes an effort (torque), and does when planned alone (2026-11-09), so it never reaches its line
-    # check.
+    # plans (the gate slows it; trajopt dropped it on torque until 2026-11-09) and its lift misses its line by 1.5 mm.
     import cutamp.algorithm as alg
     import cutamp.motion_solver as ms
     from cutamp.config import TAMPConfiguration
@@ -225,5 +224,6 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
     assert errors and errors[0].op_idx == k and "the test's miss" in str(errors[0]), errors
     assert "insert" in str(errors[0]) and failures[0] == str(errors[0])
     assert not hasattr(errors[0], "out_of_attempts")  # a line miss: the retry's second pass skips it
-    # The next candidate planned its own insert: its line check ran, or its insert failed on its own.
-    assert attempts == 2 and (len(lines) >= 2 or f"{skeleton[k]} insert:" in str(errors[1])), errors
+    # The next candidate planned its own insert: its line check ran, or its insert failed on its own (a failed trajopt
+    # ends "for <op> insert", a gate rejection reads "<op> insert: ...").
+    assert attempts == 2 and (len(lines) >= 2 or f"{skeleton[k]} insert" in str(errors[1])), errors
