@@ -58,7 +58,7 @@ _PINNED_SOURCES = {
     # (set_external_wrench_fn); cuRobo's warp stream per launch (_patch_warp_streams); FK reads compute_com on every
     # call (install_floor_wrench flips it); RNEA's f_ext layout and reused torque buffer (set_external_wrench_fn); the
     # solver's rollout list (install_floor_wrench); the cost manager's six hardcoded costs (add_extra_cost); the
-    # attachment by name, which auto-disables the obstacle, and its fit, whose world-frame centres it writes as
+    # attachment, which disables the obstacles it names, and its fit, whose world-frame centres it writes as
     # link-local (motion_solver._attach_object); the kernel compile, which imports cuda.core.Program on each call and
     # compiles to a cubin (_patch_kernel_disk_cache).
     "curobo._src.robot.parser.parser_urdf:UrdfRobotParser.get_link_parameters": "7da2bd10430b",
@@ -69,7 +69,6 @@ _PINNED_SOURCES = {
     "curobo._src.solver.solver_trajopt:TrajOptSolver.get_all_rollout_instances": "284a926d8db7",
     "curobo._src.solver.solver_core:SolverCore.get_all_rollout_instances": "87a2594a222f",
     "curobo._src.rollout.cost_manager.cost_manager_robot:RobotCostManager.compute_costs": "06ce73fe202f",
-    "curobo._src.collision.attachment_manager:AttachmentManager.attach_from_scene": "c11743a31b72",
     "curobo._src.collision.attachment_manager:AttachmentManager.attach": "decf92a8d1f3",
     "curobo._src.collision.attachment_manager:AttachmentManager._obstacles_to_trimesh": "db3f10e800cf",
     "curobo._src.collision.attachment_manager:AttachmentManager.update": "70e3f1f9c584",

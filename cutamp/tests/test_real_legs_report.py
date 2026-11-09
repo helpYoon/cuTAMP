@@ -64,8 +64,7 @@ def test_real_legs_report_on_a_still_home_plan(tmp_path):
 def test_real_legs_report_counts_slowed_segments(tmp_path):
     # Each segment the balance gate slowed keeps the planner's timing, so its s is its frames over the planner's.
     # The report counts them, takes the gate's time scales and binding checks (by check) from overall_metrics, and
-    # writes them in its tables. The plan is stage 4's, whose segments carry phase tags; the test above reads a
-    # stage-3 one.
+    # writes them in its tables. The plan is stage 4's; the test above reads a stage-3 one.
     import pickle
 
     import numpy as np
@@ -79,10 +78,9 @@ def test_real_legs_report_counts_slowed_segments(tmp_path):
         position = np.tile(np.asarray(REAL_LEGS.home, dtype=np.float32), (n, 1))
         return {"position": position, "velocity": np.zeros_like(position), "acceleration": np.zeros_like(position)}
 
-    tags = {"op_idx": 1, "phase": "insert", "gripper": None}
-    segments = [{"arm": "left", "dt": 0.025, **tags, **still(4), "planner_timing": still(3)},   # slowed, s = 1.5
-                {"arm": "left", "dt": 0.025, **tags, **still(5), "planner_timing": still(3)},   # slowed, s = 2
-                {"arm": "right", "dt": 0.025, **tags, **still(3), "planner_timing": None}]       # s = 1
+    segments = [{"arm": "left", "dt": 0.025, **still(4), "planner_timing": still(3)},   # slowed, s = 1.5
+                {"arm": "left", "dt": 0.025, **still(5), "planner_timing": still(3)},   # slowed, s = 2
+                {"arm": "right", "dt": 0.025, **still(3), "planner_timing": None}]       # s = 1
     run = tmp_path / "study" / "real_legs_h000_s0"
     run.mkdir(parents=True)
     with open(run / "motion_plan.pkl", "wb") as f:

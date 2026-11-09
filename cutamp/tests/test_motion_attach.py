@@ -75,7 +75,7 @@ def _enabled(planner) -> dict:
 
 @needs_cuda
 def test_held_cup_sits_in_its_hull_and_its_place_reenables_only_it():
-    # _attach_object's Mesh branch: the cup's spheres are fit on its convex hull. After the link-local rewrite, FK
+    # _attach_object on a Mesh: the cup's spheres are fit on its convex hull. After the link-local rewrite, FK
     # at the attach conf puts every fitted sphere inside the cup's hull. The cup is out of the scene while held, and
     # its place re-enables it alone: the right hand's block stays out until its own place.
     world = _cup_world()

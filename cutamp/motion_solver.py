@@ -22,7 +22,7 @@ balance gate then checks and paces:
     (``grasps.is_vertical``) lifts straight up after a pick and comes in from above to a place.
   - Retract plans to the particle's retract conf, with no obstacle disabled.
 
-Each plan entry carries its op index, its phase and its gripper event (``add_segment``).
+Each plan entry carries its op index, its phase and its gripper event (``solve_curobo``'s ``segment``).
 
 Particles and the planner share one joint order, ``world.model.joint_names`` (``t1._check_joint_order``); every
 planner trajectory also carries the joints the planner locks (the head, the fingers).
@@ -166,16 +166,12 @@ def _hand_poses(world: TAMPWorld, q: torch.Tensor, arms: Union[str, Sequence[str
     return torch.where(is_left, pose("left"), pose("right"))
 
 
-def _palm(world: TAMPWorld, q: torch.Tensor, arm: str) -> torch.Tensor:
-    """``[T, 3]``: ``arm``'s palm (its tool frame's origin) at each conf of ``q`` ``[T, dof]`` (the model's order)."""
-    return _hand_poses(world, q, arm)[:, :3, 3]
-
-
 def _approach_confs(
     world: TAMPWorld, best_particle: Particles, plan_skeleton: PlanSkeleton, ik_tol: IKTol,
-) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
-    """``{op index: (q_pre, q_post)}`` for each pick and place of ``plan_skeleton``: the confs where its straight
-    insert starts and its leave ends, from one batched balance-aware GN call (design 7.8).
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, bool]]:
+    """``{op index: (q_pre, q_post, vertical)}`` for each pick and place of ``plan_skeleton``: the confs where its
+    straight insert starts and its leave ends, from one batched balance-aware GN call (design 7.8), and whether its hand
+    is vertical at its particle conf (``grasps.is_vertical``).
 
     Each op's targets are ``grasps.approach_targets`` of the hand's pose at its particle conf (FK, so the insert's
     line through the conf's palm starts on the pre target). Each row is seeded at that conf and runs
@@ -205,7 +201,7 @@ def _approach_confs(
             error = RuntimeError(f"approach IK failed for {op}: its {('pre', 'post')[row % 2]} conf {why}")
             error.op_idx = idx
             raise error
-    return {idx: (q[2 * k], q[2 * k + 1]) for k, (idx, _) in enumerate(ops)}
+    return {idx: (q[2 * k], q[2 * k + 1], is_vertical(hands[k])) for k, (idx, _) in enumerate(ops)}
 
 
 @contextlib.contextmanager
@@ -291,7 +287,7 @@ def _last_timestep_js(plan: JointState, planner) -> JointState:
 def held_fit_obstacle(obstacle: Obstacle) -> Obstacle:
     """The obstacle whose posed trimesh ``_attach_object`` fits a held object's spheres to: a Mesh's convex hull, as a
     Mesh with the world-frame vertices of its posed trimesh and the identity pose, so the fit's centres stay in the
-    world frame; any other obstacle as it is (``attach_from_scene``'s)."""
+    world frame; any other obstacle as it is (the scene's)."""
     if not isinstance(obstacle, Mesh):
         return obstacle
     hull = obstacle.get_trimesh_mesh(transform_with_pose=True).convex_hull
@@ -301,9 +297,9 @@ def held_fit_obstacle(obstacle: Obstacle) -> Obstacle:
 def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     """Attach a scene obstacle to ``arm``'s attach link via cuRobo's attach.
 
-    ``attach_from_scene`` fits spheres for the obstacle, mounts them on the
+    ``attach`` fits spheres for the obstacle, mounts them on the
     attach link (which has reserved sphere slots in t1_29dof.yml), and
-    auto-disables the obstacle in the world collision checker so it isn't
+    disables the obstacle by name in the world collision checker so it isn't
     double-counted; ``_detach_object`` undoes both. The held block then
     travels with the robot in subsequent plans and keeps collision against the
     rest of the world (table, other blocks).
@@ -320,11 +316,10 @@ def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     output. It fits as many spheres as the link has slots: build_planner_model.py's
     ``HELD_OBJECT_SPHERES``, 6, enough coverage for a 5 cm cube.
 
-    A held Mesh is fit on its convex hull (``held_fit_obstacle``), through ``attach`` as ``attach_from_scene`` does
-    with the obstacle swapped. ``held_fit_obstacle`` alone decides: an obstacle it returns as it is goes through
-    ``attach_from_scene``. VOXEL's spheres are inscribed in the mesh, and a thin wall holds none of use: cup_t1's
-    4 mm wall holds none over 2 mm, so its fit fell back to 2 mm surface spheres. cuRobo takes the hull itself only
-    when the mesh fills under 0.1 of its bbox (the cup: 0.257). A hull is the conservative shape for a held object.
+    A held Mesh is fit on its convex hull (``held_fit_obstacle``), the conservative shape for a held object. VOXEL's
+    spheres are inscribed in the mesh, and a thin wall holds none of use: cup_t1's 4 mm wall holds none over 2 mm, so
+    its fit fell back to 2 mm surface spheres. cuRobo takes the hull itself only when the mesh fills under 0.1 of its
+    bbox (the cup: 0.257).
     """
     am = planner.attachment_manager
     link_name = _ATTACH_LINK_FOR_ARM[arm]
@@ -332,20 +327,10 @@ def _attach_object(planner, obj_name: str, last_js: JointState, arm: str):
     idx = kp.get_sphere_index_from_link_name(link_name)
     scene = planner.scene_collision_checker.scene_model  # attach_from_scene's lookup
     obstacle = (scene[0] if isinstance(scene, list) else scene).get_obstacle(obj_name)
-    held = held_fit_obstacle(obstacle)
-    if held is obstacle:
-        am.attach_from_scene(
-            joint_states=last_js,
-            obstacle_names=[obj_name],
-            link_name=link_name,
-            num_spheres=len(idx),
-            sphere_fit_type=SphereFitType.VOXEL,
-        )
-    else:
-        am.attach(last_js, [held], link_name=link_name, num_spheres=len(idx),
-                  sphere_fit_type=SphereFitType.VOXEL, disable_obstacle_names=[obj_name])
-        _log.debug(f"Attached {obj_name}'s convex hull to {link_name}: radii (mm) "
-                   f"{[round(1000 * r, 1) for r in kp.link_spheres[0, idx, 3].tolist() if r > 0]}")
+    if obstacle is None:
+        raise ValueError(f"{obj_name} is not in the motion planner's scene")
+    am.attach(last_js, [held_fit_obstacle(obstacle)], link_name=link_name, num_spheres=len(idx),
+              sphere_fit_type=SphereFitType.VOXEL, disable_obstacle_names=[obj_name])
     # The attach link is a FIXED identity child of the arm's tool frame
     # (t1_29dof.yml), so the tool-frame pose is the link pose.
     world_from_link = planner.kinematics.compute_kinematics(last_js).tool_poses.get_link_pose(TOOL_FRAME_FOR_ARM[arm])
@@ -478,28 +463,17 @@ def solve_curobo(
     accum_plans: List[dict] = []
     gate_stats: List[dict] = []
 
-    def add_segment(plan, dt, arm, *, op_idx: int, phase: str, gripper: Optional[str] = None):
-        # The real robot's balance check: every frame's CoM and ZMP inside the support rectangle, and the
-        # segment's pace from its speeds, torques and ZMP; a RuntimeError fails the candidate. A retimed segment
-        # also keeps its motion planner's timing, with the held objects along it. The entry names its op, its phase
-        # ("approach", "insert", "lift", "back_out" or "retract") and the gripper event at its end ("close" after a
-        # pick's insert, "open" after a place's, else None).
-        entry = {"dt": dt, "arm": arm, "op_idx": op_idx, "phase": phase, "gripper": gripper}
-        plan, stats, fast = _balance_gate(world, plan, dt)
-        gate_stats.append(stats)
-        if fast is not None:
-            entry["planner_timing"] = {"plan": fast, "held_objs": _held_obj_poses(world, planner, held, fast)}
-        entry.update(plan=plan, held_objs=_held_obj_poses(world, planner, held, plan))
-        accum_plans.append(entry)
-        return plan
-
     up, down = torch.tensor([0.0, 0.0, 1.0]), torch.tensor([0.0, 0.0, -1.0])  # a straight lift's, a drop-in's line
 
     def segment(ground_op, idx, arm, conf, phase, *, disable=None, gripper=None, line=False, direction=None):
         # One segment of ground_op (index idx) from last_js to conf (_plan_arm_to_conf, disabling the obstacle
-        # `disable`), through the gate (add_segment). A straight one (`line`) plans under _line_motion, along the
-        # goal palm's +x or the world `direction`, and FK of its frames checks the palm's line (check_line) from where
-        # it starts to the conf's palm. A failure names the op and the phase.
+        # `disable`), through the real robot's balance check (_balance_gate): every frame's CoM and ZMP inside the
+        # support rectangle, and the segment's pace from its speeds, torques and ZMP; a RuntimeError fails the
+        # candidate. A retimed segment also keeps its motion planner's timing, with the held objects along it. The entry
+        # names its op, its phase ("approach", "insert", "lift", "back_out" or "retract") and the gripper event at its
+        # end ("close" after a pick's insert, "open" after a place's, else None). A straight segment (`line`) plans
+        # under _line_motion, along the goal palm's +x or the world `direction`, and FK of its frames checks the palm's
+        # line (check_line) from where it starts to the conf's palm. A failure names the op and the phase.
         nonlocal last_js
         what = f"{ground_op} {phase}"
         with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
@@ -507,11 +481,17 @@ def solve_curobo(
                 result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
                                            world=world, max_attempts=max_attempts)
         try:
-            plan = add_segment(_interp_plan(result), _plan_dt(planner), arm, op_idx=idx, phase=phase,
-                               gripper=gripper)
+            plan, dt = _interp_plan(result), _plan_dt(planner)
+            entry = {"dt": dt, "arm": arm, "op_idx": idx, "phase": phase, "gripper": gripper}
+            plan, stats, fast = _balance_gate(world, plan, dt)
+            gate_stats.append(stats)
+            if fast is not None:
+                entry["planner_timing"] = {"plan": fast, "held_objs": _held_obj_poses(world, planner, held, fast)}
+            entry.update(plan=plan, held_objs=_held_obj_poses(world, planner, held, plan))
+            accum_plans.append(entry)
             if line:
-                palm = _palm(world, _full_positions(world, plan), arm)
-                check_line(palm, palm[0], _palm(world, conf.reshape(1, -1), arm)[0])
+                palm = _hand_poses(world, _full_positions(world, plan), arm)[:, :3, 3]
+                check_line(palm, palm[0], _hand_poses(world, conf.reshape(1, -1), arm)[0, :3, 3])
         except RuntimeError as e:
             e.args = (f"{what}: {e}",)  # the same error object, so a gate error keeps its `check`
             raise
@@ -545,8 +525,7 @@ def solve_curobo(
                 obj_name, grasp_name, q_name = ground_op.values
                 obj_from_grasp = grasp_7dof_to_mat4x4(best_particle[grasp_name].clone())
                 q_grasp = best_particle[q_name].clone()
-                q_pre, q_post = approach[idx]
-                vertical = is_vertical(_hand_poses(world, q_grasp.reshape(1, -1), arm)[0])
+                q_pre, q_post, vertical = approach[idx]
 
                 # The insert ends at the COM-safe particle conf, an exact IK solution for the grasp pose, with the
                 # target block disabled so gripper-block contact at the grasp isn't rejected; gripper-table and
@@ -562,8 +541,7 @@ def solve_curobo(
                 obj_name, grasp_name, place_name, surface_name, q_name = ground_op.values
                 world_from_obj_target = action_4dof_to_mat4x4(best_particle[place_name].clone())
                 q_place = best_particle[q_name].clone()
-                q_pre, q_post = approach[idx]
-                vertical = is_vertical(_hand_poses(world, q_place.reshape(1, -1), arm)[0])
+                q_pre, q_post, vertical = approach[idx]
 
                 # GN cannot see a held object (gn_refresh.collision_penetration), so the held block's spheres at the
                 # pre conf are checked against the statics here.

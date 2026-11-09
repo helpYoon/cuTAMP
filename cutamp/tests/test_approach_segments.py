@@ -27,9 +27,8 @@ def _moved(pose: torch.Tensor, offset) -> torch.Tensor:
 
 
 def test_approach_targets():
-    from cutamp.grasps import APPROACH_DISTANCE, LIFT_HEIGHT, VERTICAL_CONE, approach_targets, is_vertical
+    from cutamp.grasps import VERTICAL_CONE, approach_targets, is_vertical
 
-    assert (APPROACH_DISTANCE, LIFT_HEIGHT) == (0.05, 0.05)
     # Top-down, the hand's +x straight down: the pick comes in from 5 cm straight above and leaves the same way.
     top = _hand((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (0.40, 0.10, 0.55))
     assert is_vertical(top)

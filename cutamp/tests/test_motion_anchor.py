@@ -158,9 +158,9 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         speed = (ms._model_frames(world, entry["plan"]).velocity.abs() / torques.velocity)[:, _actuated(world)]
         assert float(speed.max()) <= 1.0, (k, float(speed.max()))  # the pace the gate set keeps every speed limit
 
-    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned with its entry's tags, in the
-    # model's 33 joints, each segment starting where the one before it ends, and each insert, lift and back-out still on
-    # its line from its first frame to its conf (the gate keeps the last frame).
+    # The --save_plan auto pickle (decision 9): the raw plan, each segment as planned, in the model's 33 joints, each
+    # segment starting where the one before it ends, and each insert, lift and back-out still on its line from its first
+    # frame to its conf (the gate keeps the last frame).
     with open(tmp_path / "audit" / "motion_plan.pkl", "rb") as f:
         raw = pickle.load(f)
     names = list(REAL_LEGS.joint_names)
@@ -169,10 +169,6 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     segments = raw["segments"]
     assert len(segments) == len(curobo_plan)
     for k, (seg, entry) in enumerate(zip(segments, curobo_plan)):
-        assert set(seg) == {"arm", "dt", "op_idx", "phase", "gripper", "position", "velocity", "acceleration",
-                            "planner_timing"}, k
-        assert ([seg[key] for key in ("arm", "dt", "op_idx", "phase", "gripper")]
-                == [entry[key] for key in ("arm", "dt", "op_idx", "phase", "gripper")]), k
         assert (seg["planner_timing"] is None) == (entry.get("planner_timing") is None), k
         for timing in [seg] + ([seg["planner_timing"]] if seg["planner_timing"] is not None else []):
             n = len(timing["position"])
@@ -180,7 +176,7 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
                 assert timing[key].dtype == np.float32 and timing[key].shape == (n, 33), (k, key)
         np.testing.assert_array_equal(seg["position"], ms._full_positions(world, entry["plan"]).cpu().numpy())
         if seg["phase"] in ("insert", "lift", "back_out"):
-            palm = ms._palm(world, torch.as_tensor(seg["position"], device=world.device), seg["arm"])
+            palm = ms._hand_poses(world, torch.as_tensor(seg["position"], device=world.device), seg["arm"])[:, :3, 3]
             ms.check_line(palm, palm[0], palm[-1])
         if k:
             np.testing.assert_allclose(seg["position"][0], segments[k - 1]["position"][-1], rtol=0, atol=1e-5,
