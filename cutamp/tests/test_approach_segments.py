@@ -180,7 +180,8 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
     # approach IK has only that pick's confs, which the init's GN accepted. The gate's soles check is off, so the
     # test's miss is the first error the retry meets whatever the init drew: on the init whose first pick is block2's
     # (PYTHONHASHSEED 1) both candidates' approaches leave the stance by 6.5 and 9.3 mm (2026-11-08), which would fail
-    # them first. test_real_legs_motion tests that check.
+    # them first. test_real_legs_motion tests that check. On that init the second candidate's insert trajopt also
+    # passes an effort (torque), planned alone too (2026-11-09), so it never reaches its line check.
     import cutamp.algorithm as alg
     import cutamp.motion_solver as ms
     from cutamp.config import TAMPConfiguration
@@ -222,4 +223,5 @@ def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeyp
     assert errors and errors[0].op_idx == k and "the test's miss" in str(errors[0]), errors
     assert "insert" in str(errors[0]) and failures[0] == str(errors[0])
     assert not hasattr(errors[0], "out_of_attempts")  # a line miss: the retry's second pass skips it
-    assert attempts == 2 and len(lines) >= 2  # the next candidate planned its own insert
+    # The next candidate planned its own insert: its line check ran, or its insert failed on its own.
+    assert attempts == 2 and (len(lines) >= 2 or f"{skeleton[k]} insert:" in str(errors[1])), errors
