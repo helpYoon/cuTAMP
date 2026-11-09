@@ -153,7 +153,7 @@ def test_no_grasp_left_names_the_rules(real_world, monkeypatch):
         ParticleInitializer(world, TAMPConfiguration(num_particles=8), default_checker())(skeleton)
     message = str(err.value)
     assert obj in message and f"{arm} hand" in message, message
-    assert "2 reach below" in message and "3 touch" in message, message
+    assert "5 grasps" in message and "each reaches below its bottom face or touches it" in message, message
 
 
 def _fake_ik(monkeypatch, accept):

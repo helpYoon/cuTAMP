@@ -69,7 +69,6 @@ def _build_ik_deps(
     (Retract, MoveFree, MoveHolding) are skipped.
     """
     deps: List[IKDep] = []
-    grasp_to_mat = grasp_7dof_to_mat4x4
     for idx, ground_op in enumerate(plan_skeleton):
         meta = ground_op.operator.metadata
         if not getattr(meta, "is_actionable", False):
@@ -89,13 +88,13 @@ def _build_ik_deps(
             # IK target should follow A's placed pose, not its initial one —
             # not handled today; blocks_t1 has no such re-grasp pattern.
             world_from_obj = world.get_object_pose(obj)
-            def target_fn(p, _wo=world_from_obj, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
-                return _wo @ _gm(p[_g]) @ _t
+            def target_fn(p, _wo=world_from_obj, _g=grasp_name, _t=tool_from_ee):
+                return _wo @ grasp_7dof_to_mat4x4(p[_g]) @ _t
             deps.append(IKDep(q_name, arm, target_fn, movable_spheres_fn(world, plan_skeleton, idx)))
         elif action_type == "place":
             obj, grasp_name, placement, surface, q_name = params
-            def target_fn(p, _pl=placement, _g=grasp_name, _t=tool_from_ee, _gm=grasp_to_mat):
-                return action_4dof_to_mat4x4(p[_pl]) @ _gm(p[_g]) @ _t
+            def target_fn(p, _pl=placement, _g=grasp_name, _t=tool_from_ee):
+                return action_4dof_to_mat4x4(p[_pl]) @ grasp_7dof_to_mat4x4(p[_g]) @ _t
             deps.append(IKDep(q_name, arm, target_fn, movable_spheres_fn(world, plan_skeleton, idx)))
         # action_type in {"retract", None}: no IK target, skip.
     return deps

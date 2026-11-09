@@ -104,8 +104,7 @@ def test_missing_graspgenx_names_the_platform(monkeypatch, tmp_path):
 def test_missing_model_names_the_readme(monkeypatch, tmp_path):
     blocks = _blocks()
     # A warm cache: the check runs before the lookup, so it raises even where every shape's grasps exist.
-    monkeypatch.setattr(g, "_SETS", {(g.mesh_sha256(b), torch.device("cpu")): g.GraspSet(torch.zeros(0, 7),
-                                                                                       torch.zeros(0)) for b in blocks})
+    monkeypatch.setattr(g, "_SETS", {g.mesh_sha256(b): g.GraspSet(torch.zeros(0, 7), torch.zeros(0)) for b in blocks})
     monkeypatch.setenv("GRASPGENX_CHECKPOINT_DIR", str(tmp_path / "missing"))
     monkeypatch.setenv("GRASPGENX_GRIPPER_CFG_DIR", str(tmp_path))
     before = _trap_graspgenx(monkeypatch)
@@ -130,27 +129,12 @@ def test_setup_check_takes_the_readme_folders(monkeypatch, tmp_path, value):
     assert _graspgenx_modules() == before
 
 
-@pytest.mark.parametrize("missing", ["model", "grippers"])
-def test_setup_check_names_the_readme_without_a_readme_folder(monkeypatch, tmp_path, missing):
-    _readme_folders(monkeypatch, tmp_path, made={"model", "grippers"} - {missing})
+def test_setup_check_names_the_readme_without_a_readme_folder(monkeypatch, tmp_path):
+    _readme_folders(monkeypatch, tmp_path, made={"model"})
     before = _trap_graspgenx(monkeypatch)
     with pytest.raises(RuntimeError, match=README):
         g._checked_model_dir()
     assert _graspgenx_modules() == before
-
-
-@needs_cuda
-@needs_graspgenx
-def test_each_device_gets_its_own_set(monkeypatch):
-    # A second world on another device gets tensors of its own, the same grasps; the first device's set stays.
-    monkeypatch.setattr(g, "_SETS", dict(g._SETS))  # the CPU set goes when the test ends
-    blocks = _blocks()
-    on_cuda = g.grasp_sets(blocks, DEVICE)["block2"]
-    on_cpu = g.grasp_sets(blocks, "cpu")["block2"]
-    assert {t.device for t in on_cuda} == {DEVICE} and {t.device for t in on_cpu} == {torch.device("cpu")}
-    assert torch.equal(on_cpu.scores, on_cuda.scores.cpu())
-    torch.testing.assert_close(on_cpu.grasps, on_cuda.grasps.cpu(), rtol=0, atol=1e-6)  # quaternions made per device
-    assert g.grasp_sets(blocks, DEVICE)["block2"] is on_cuda and g.grasp_sets(blocks, "cpu")["block2"] is on_cpu
 
 
 @needs_cuda
@@ -190,7 +174,7 @@ def test_generation_repeats_and_keeps_the_run_rng(monkeypatch):
         monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", tf32)
         monkeypatch.setattr(g, "_SETS", {})
         if cold:
-            monkeypatch.setattr(g, "_SAMPLER", None)  # the model is built again, drawing from torch's CPU generator
+            g._load_sampler.cache_clear()  # the model is built again, drawing from torch's CPU generator
         rng, flags = _rng_states(), _flags()
         made.append(g.grasp_sets(blocks, DEVICE)["block2"])
         assert _rng_states() == rng, f"cold={cold} tf32={tf32}: a generator's state changed"

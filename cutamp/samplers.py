@@ -7,33 +7,20 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import Optional
-
 import torch
 from curobo.scene import Cuboid, Mesh, Obstacle
 
 from cutamp.utils.common import approximate_goal_aabb, pose_list_to_mat4x4, transform_points
 
-Place4DOF = torch.Tensor  # [n, 4]
 
-
-def sample_yaw(num_samples: int, num_faces: Optional[int], device: torch.device):
-    """Sample yaws. Continuous if num_faces is None, otherwise discrete."""
-    if num_faces is None:
-        yaw = torch.rand(num_samples, device=device) * 2 * torch.pi  # [0, 2pi)
-    else:
-        assert num_faces >= 1
-        two_pi = 2 * torch.pi
-        endpoint = two_pi - (two_pi / num_faces)
-        yaw_choices = torch.linspace(0, endpoint, num_faces, device=device)
-        yaw_idxs = torch.randint(0, num_faces, (num_samples,), device=device)
-        yaw = yaw_choices[yaw_idxs]
-    return yaw
+def sample_yaw(num_samples: int, device: torch.device) -> torch.Tensor:
+    """``[num_samples]`` yaws, uniform in [0, 2pi)."""
+    return torch.rand(num_samples, device=device) * 2 * torch.pi
 
 
 def place_4dof_sampler(
     num_samples: int, obj: Obstacle, obj_spheres: torch.Tensor, surface: Obstacle
-) -> Place4DOF:
+) -> torch.Tensor:  # [n, 4]
     """Sample 4-DOF placement poses in the world frame. This does not yet fully support surfaces with yaw."""
     if not isinstance(surface, (Cuboid, Mesh)):
         raise NotImplementedError(f"Only Cuboid or Mesh surfaces supported for now, not {type(surface)}")
@@ -74,6 +61,6 @@ def place_4dof_sampler(
         xyz_surface = xyz
 
     # Sample yaw
-    yaw = sample_yaw(num_samples, None, obj.device_cfg.device)
+    yaw = sample_yaw(num_samples, obj.device_cfg.device)
     place_4dof = torch.cat([xyz_surface, yaw.unsqueeze(-1)], dim=1)
     return place_4dof

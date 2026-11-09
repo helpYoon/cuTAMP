@@ -339,8 +339,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   model's home. It also holds the stance (`stance_soles`), the movables'
   GraspGenX grasps (`grasps`, same-shaped movables share one set), each hand's
   spheres for the grasp drops (`hand_spheres`) and each object and arm's grasps
-  that pass them (`grasp_candidates`, with each rule's count in
-  `grasp_drops`). Built lazily:
+  that pass them (`grasp_candidates`). Built lazily:
   `kinematics_jac` (the Jacobian twin for GN), `segment_torques` (the gate's
   torque, speed and ZMP checks), and one `site_kinematics(name)` per Adam-loop
   FK site in `FK_SITES`; all run on the single `Kinematics`'s config.

@@ -425,11 +425,8 @@ class ParticleInitializer:
                 raise ValueError(f"{obj=} not found in world")
             candidates = world.grasp_candidates(obj, arm)
             if not len(candidates.grasps):
-                below, touching = world.grasp_drops(obj, arm)
-                raise ValueError(
-                    f"{idx + 1}. {ground_op}: no grasp of {obj} is left for the {arm} hand. Of its "
-                    f"{len(world.grasps[obj].grasps)} grasps, {below} reach below its bottom face and {touching} "
-                    f"touch it (a grasp may do both)")
+                raise ValueError(f"{idx + 1}. {ground_op}: none of {obj}'s {len(world.grasps[obj].grasps)} grasps is "
+                                 f"left for the {arm} hand: each reaches below its bottom face or touches it")
             pools[grasp] = candidates.grasps, candidates.scores
         return pools
 

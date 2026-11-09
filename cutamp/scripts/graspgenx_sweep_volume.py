@@ -68,8 +68,7 @@ def compute() -> dict:
     nums = {k: [float(x) for x in v] if isinstance(v, list) else float(v) for k, v in nums.items()}
     sha = hashlib.sha256(json.dumps(nums, sort_keys=True).encode()).hexdigest()
     return {
-        **nums, "base_from_G": BASE_FROM_G, "theta_open": 0.0, "theta_mid": theta_mid,
-        "gripper_urdf_sha256": hashlib.sha256(urdf.read_bytes()).hexdigest(), "sha256": sha,
+        **nums, "base_from_G": BASE_FROM_G, "theta_mid": theta_mid, "sha256": sha,
     }
 
 

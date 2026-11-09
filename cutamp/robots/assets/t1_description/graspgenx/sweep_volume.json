@@ -46,8 +46,6 @@
       1
     ]
   ],
-  "theta_open": 0.0,
   "theta_mid": 0.4217,
-  "gripper_urdf_sha256": "3602350c5e94374d651e1155c5cba0025158471700860136595d26ef3c4ac4b9",
   "sha256": "0ddcfe3c8a0e092e4b917dde1a8aa6c5fab7e0768ae7ad229c4582bce4372929"
 }

@@ -53,8 +53,7 @@ LINE_END_TOL = 0.005
 
 AZIMUTH_CONE = math.pi / 3
 """Init's place yaws turn a held grasp whose approach isn't near vertical (``VERTICAL_CONE``) to come from the robot's
-side: its horizontal direction within this angle of the direction from the stance to the placement. It removes no
-grasp: a pick judges every grasp the hand can take, from any side."""
+side: its horizontal direction within this angle of the direction from the stance to the placement."""
 
 GRASP_SCORE_CUTOFF = 0.7
 """GraspGenX's own "``0.7`` keeps confident grasps" (``GraspGenX/SKILL.md:498``): a grasp scoring at or above it
@@ -144,14 +143,8 @@ class GraspSet(NamedTuple):
     """``[K]`` float32 in [0, 1]: GraspGenX's discriminator scores."""
 
 
-_SETS: Dict[Tuple[str, torch.device], GraspSet] = {}
-"""Each shape's grasps by ``(mesh_sha256, device)``, kept for the life of the process: a world on another device gets
-tensors of its own."""
-
-_SAMPLER = None
-"""GraspGenX's ``GraspGenXSampler`` for the T1 gripper, its model on the GPU (538 MB), kept for the life of the
-process. One serves every device: GraspGenX runs on ``.cuda()`` and returns numpy arrays, which ``grasp_sets`` places
-on each call's device."""
+_SETS: Dict[str, GraspSet] = {}
+"""Each shape's grasps by ``mesh_sha256``, kept for the life of the process."""
 
 
 def mesh_sha256(obj: Obstacle) -> str:
@@ -198,9 +191,11 @@ def _deterministic(fn):
     return wrapper
 
 
+@functools.cache
 def _load_sampler(ckpt: str):
     """Import GraspGenX, keeping its logging out of cuTAMP's; make PTv3's segment reduction deterministic; and build
-    the sampler on the T1 gripper's sweep volume (``load_sweep_volume``), which loads the model's weights."""
+    the sampler on the T1 gripper's sweep volume (``load_sweep_volume``), which loads the model's weights onto the GPU
+    (538 MB). Cached: the sampler stays for the life of the process."""
     root = logging.getLogger()
     level, handlers = root.level, root.handlers[:]
     try:  # graspgenx's import sets the root logger to INFO and adds a stdout handler (utils/logging_config.py)
@@ -235,7 +230,7 @@ def _z_offsets_cm(mesh: trimesh.Trimesh) -> Tuple[int, ...]:
 def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Dict[str, GraspSet]:
     """Each object's GraspGenX grasps, keyed by name, made in this process.
 
-    Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process and device
+    Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process
     (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame, and runs GraspGenX's
     graspmoe planner on them: 500 diffusion grasps and the box grasps on the top and the four sides, all kept.
     GraspGenX always runs on ``.cuda()``; ``device`` only places the returned tensors.
@@ -251,7 +246,6 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
     model folders (``_checked_model_dir``), before anything imports ``graspgenx`` or touches CUDA. Either check raises
     ``RuntimeError`` naming the README.
     """
-    global _SAMPLER
     if importlib.util.find_spec("graspgenx") is None:  # finds the package only: its first-import hook doesn't run
         raise RuntimeError(
             "GraspGenX is not installed, and planning needs it: every world loads its movables' grasps from it "
@@ -259,16 +253,14 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
             "See README.md, Installation, the GraspGenX paragraph."
         )
     ckpt = _checked_model_dir()
-    device = torch.device(device)  # a str and a torch.device of one device share a key
     shape_of = {obj.name: mesh_sha256(obj) for obj in objs}
-    new = {shape_of[obj.name]: obj for obj in objs if (shape_of[obj.name], device) not in _SETS}
+    new = {shape_of[obj.name]: obj for obj in objs if shape_of[obj.name] not in _SETS}
     if new:
         rng = random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all()
         tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
         try:
-            if _SAMPLER is None:
-                _SAMPLER = _load_sampler(ckpt)
+            sampler = _load_sampler(ckpt)
             from graspgenx.samplers.planner import run_planner_on_object
 
             for shape, obj in new.items():
@@ -279,12 +271,12 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
                 np.random.seed(GRASP_SEED)
                 torch.manual_seed(GRASP_SEED)  # and every CUDA generator
                 grasps, scores, tags, _ = run_planner_on_object(
-                    points, _SAMPLER, planner="graspmoe", num_grasps=500, grasp_threshold=-1.0, topk_num_grasps=-1,
+                    points, sampler, planner="graspmoe", num_grasps=500, grasp_threshold=-1.0, topk_num_grasps=-1,
                     moe_obb_density="dense-topandside", moe_z_offsets_cm=_z_offsets_cm(mesh), moe_num_yaws=36,
                     moe_obb_mode="advanced", moe_skip_obb_rule="auto", moe_obb_position_spacing_cm=1.0,
                     moe_outlier_threshold=0.014, moe_outlier_k=20,
                 )
-                _SETS[shape, device] = GraspSet(
+                _SETS[shape] = GraspSet(
                     mat4x4_to_grasp_7dof(torch.from_numpy(grasps).to(device)), torch.from_numpy(scores).to(device)
                 )
                 n_box, names = tags.count("obb"), ", ".join(n for n, s in shape_of.items() if s == shape)
@@ -295,4 +287,4 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
             torch.set_rng_state(rng[2])
             torch.cuda.set_rng_state_all(rng[3])
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
-    return {name: _SETS[shape, device] for name, shape in shape_of.items()}
+    return {name: _SETS[shape] for name, shape in shape_of.items()}

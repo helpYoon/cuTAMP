@@ -22,15 +22,10 @@ def test_quaternion_order_is_curobos():
     assert torch.allclose(m, ref, atol=1e-6)
 
 
-def test_round_trip():
-    m = grasp_7dof_to_mat4x4(torch.cat([torch.randn(8, 3), roma.quat_xyzw_to_wxyz(roma.random_unitquat(8))], -1))
+def test_round_trip():  # on a [2, 4] batch: two leading dims
+    g = torch.cat([torch.randn(2, 4, 3), roma.quat_xyzw_to_wxyz(roma.random_unitquat((2, 4)))], -1)
+    m = grasp_7dof_to_mat4x4(g)
     assert torch.allclose(grasp_7dof_to_mat4x4(mat4x4_to_grasp_7dof(m)), m, atol=1e-6)
-
-
-def test_batched_leading_dims():
-    g = torch.cat([torch.randn(2, 3, 3), roma.quat_xyzw_to_wxyz(roma.random_unitquat((2, 3)))], -1)
-    assert grasp_7dof_to_mat4x4(g).shape == (2, 3, 4, 4)
-    assert mat4x4_to_grasp_7dof(grasp_7dof_to_mat4x4(g)).shape == (2, 3, 7)
 
 
 def test_widths_are_checked():
