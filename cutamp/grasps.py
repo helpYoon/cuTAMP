@@ -56,6 +56,10 @@ AZIMUTH_CONE = math.pi / 3
 within this angle of the direction from the stance to the object, at init's picks (``approach_in_cone``) and in its
 place yaws."""
 
+GRASP_SCORE_CUTOFF = 0.7
+"""GraspGenX's own "``0.7`` keeps confident grasps" (``GraspGenX/SKILL.md``): a grasp scoring at or above it counts as
+holding well enough, and a pick chooses among those by the robot's posture instead of by score."""
+
 GRASP_REDRAW_ROUNDS = 2
 """How many times init draws again for the rows whose IK failed, and solves only those rows: a pick row draws a new
 grasp, a place row a new placement. Nothing Adam moves sets a pick's target (grasps are never optimized), so only a

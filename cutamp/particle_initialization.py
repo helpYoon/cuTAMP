@@ -35,7 +35,7 @@ from cutamp.gn_refresh import (
     gn_project_balanced,
     soles_on_stance,
 )
-from cutamp.grasps import AZIMUTH_CONE, GRASP_REDRAW_ROUNDS, approach_in_cone, near_vertical
+from cutamp.grasps import AZIMUTH_CONE, GRASP_REDRAW_ROUNDS, GRASP_SCORE_CUTOFF, approach_in_cone, near_vertical
 from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
 from cutamp.samplers import place_4dof_sampler
@@ -214,6 +214,86 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     best = (torch.where(ok, tilt, err) + 100.0 * ~ok + 1e4 * ~safe).view(k, n).argmin(0) * n
     best = best + torch.arange(n, device=q.device)
     return q[best], ok[best]
+
+
+def worst_posture(world: TAMPWorld, confs: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per row of ``confs`` (each ``[B, dof]``): the Trunk's tilt in radians and its travel from home in metres, each the
+    largest over the confs, and the CoM margin in metres, the smallest."""
+    from cutamp.com_polygon_cost import compute_com_margin
+
+    names = list(world.model.joint_names)
+    pitch, roll = names.index("base_j_pitch"), names.index("base_j_roll")
+    xyz = [names.index(n) for n in _BASE_JOINTS[:3]]
+    tilts, travels, margins = [], [], []
+    for q in confs:
+        tilts.append(torch.acos(trunk_tilt_cosine(q, pitch, roll).clamp(-1, 1)))
+        home = torch.as_tensor(world.model.home, dtype=q.dtype, device=q.device)
+        travels.append((q[:, xyz] - home[xyz]).norm(dim=-1))
+        margins.append(compute_com_margin(world, q))
+    return (torch.stack(tilts).amax(0), torch.stack(travels).amax(0), torch.stack(margins).amin(0))
+
+
+def choose_grasps(ok: torch.Tensor, scores: torch.Tensor, tilt: torch.Tensor, travel: torch.Tensor,
+                  margin: torch.Tensor, k: int) -> Optional[torch.Tensor]:
+    """Pool indices (a LongTensor on ``scores.device``, at most ``k``, in try order) of the grasps a pick tries, or
+    ``None`` when none is balanced. The balanced grasps scoring at least ``GRASP_SCORE_CUTOFF``, upright first (by
+    tilt, travel, larger CoM margin, then index), first ``k``; when fewer clear it, the best-scoring balanced grasps
+    below it (score ties by index) fill, ordered among themselves by the same key."""
+    okl, sc, ti, tr, mg = (t.tolist() for t in (ok, scores, tilt, travel, margin))
+    clears = (scores >= GRASP_SCORE_CUTOFF).tolist()  # in the scores' dtype, so a float32 0.7 clears
+    balanced = [i for i, o in enumerate(okl) if o]
+    key = lambda i: (ti[i], tr[i], -mg[i], i)
+    chosen = sorted((i for i in balanced if clears[i]), key=key)[:k]
+    if len(chosen) < k:
+        below = sorted((i for i in balanced if not clears[i]), key=lambda i: (-sc[i], i))
+        chosen += sorted(below[:k - len(chosen)], key=key)
+    return torch.tensor(chosen, dtype=torch.long, device=scores.device) if chosen else None
+
+
+def next_place(plan_skeleton: PlanSkeleton, pick_idx: int) -> Optional[str]:
+    """The conf name of the first place after ``plan_skeleton[pick_idx]`` that moves the pick's object, else ``None``."""
+    obj = plan_skeleton[pick_idx].values[0]
+    for op in plan_skeleton[pick_idx + 1:]:
+        if op.operator.metadata.action_type == "place" and op.values[0] == obj:
+            return op.values[-1]
+    return None
+
+
+def pick_place_confs(plan_skeleton: PlanSkeleton) -> List[str]:
+    """The conf name of every pick and place op, in skeleton order."""
+    return [op.values[-1] for op in plan_skeleton if op.operator.metadata.action_type in ("pick", "place")]
+
+
+class PickChoice(NamedTuple):
+    """One pick's grasp pool and its pool-walk results; ``ok``, ``tilt``, ``travel`` and ``margin`` are taken at the
+    worse of the pick and its place. ``chosen``: pool indices in try order, or ``None`` when none is balanced."""
+
+    obj: str
+    grasp: str
+    grasps: torch.Tensor  # [m, 7]
+    scores: torch.Tensor  # [m]
+    ok: torch.Tensor  # [m] bool
+    tilt: torch.Tensor  # [m] radians
+    travel: torch.Tensor  # [m] metres
+    margin: torch.Tensor  # [m] metres
+    chosen: Optional[torch.Tensor]
+
+
+def choice_stats(c: PickChoice) -> dict:
+    """``c`` as plain JSON-ready values: pool and balanced counts, and ranges over the chosen grasps."""
+
+    def span(x: torch.Tensor, scale: float = 1.0) -> Optional[List[float]]:
+        if c.chosen is None:
+            return None
+        v = x[c.chosen]
+        return [float(v.min()) * scale, float(v.max()) * scale]
+
+    return {
+        "object": c.obj, "pool": int(c.scores.numel()), "balanced": int(c.ok.sum()),
+        "balanced_at_cutoff": int((c.ok & (c.scores >= GRASP_SCORE_CUTOFF)).sum()),
+        "chosen": 0 if c.chosen is None else int(c.chosen.numel()),
+        "tilt_deg": span(c.tilt, math.degrees(1.0)), "travel": span(c.travel), "com_margin": span(c.margin),
+    }
 
 
 def _draw_and_solve(
