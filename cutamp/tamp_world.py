@@ -218,7 +218,8 @@ class TAMPWorld:
 
     @property
     def grasps(self) -> Dict[str, GraspSet]:
-        """Each movable's GraspGenX grasps by name (``grasps.grasp_sets``); same-shaped movables share one set."""
+        """GraspGenX's grasps by object name (``grasps.grasp_sets``), for the movables a skeleton has picked so far
+        (``algorithm.run_cutamp`` adds them); same-shaped movables share one set."""
         return self._grasps
 
     def hand_spheres(self, arm: str) -> torch.Tensor:

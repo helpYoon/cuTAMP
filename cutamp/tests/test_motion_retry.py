@@ -81,8 +81,9 @@ def _run_skeletons(monkeypatch, results) -> dict:
     monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, timer, world))
     monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: SimpleNamespace(ik_tol=None))
     monkeypatch.setattr(alg, "build_motion_planner", lambda world: None)
+    monkeypatch.setattr(alg, "start_sampler_load", lambda: None)  # no model in a stand-in run
     monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda world: None)
-    monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: None)
+    monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: iter(()))
     monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
     monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: optimize)
     monkeypatch.setattr(alg, "get_top_satisfying_particles", lambda *args, **kwargs: [])

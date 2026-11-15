@@ -25,7 +25,7 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
-from cutamp.grasps import GRASP_SCORE_CUTOFF, grasp_sets
+from cutamp.grasps import GRASP_SCORE_CUTOFF, grasp_sets, start_sampler_load, wait_for_sampler_load
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import (
@@ -339,6 +339,13 @@ def _planned_metrics(world: TAMPWorld, plan_skeleton: PlanSkeleton, candidates: 
     return metrics
 
 
+def ungrasped(world: TAMPWorld, plan_skeleton: PlanSkeleton) -> list:
+    """The objects ``plan_skeleton`` picks that have no grasps in ``world.grasps`` yet, each once, in plan order. A
+    sampler runs for the parameters of a skeleton, so a movable that no skeleton picks never gets grasps."""
+    names = dict.fromkeys(op.values[0] for op in plan_skeleton if op.operator.metadata.action_type == "pick")
+    return [world.get_object(name) for name in names if name not in world.grasps]
+
+
 def setup_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
@@ -347,9 +354,10 @@ def setup_cutamp(
     experiment_id: str,
 ):
     # cuRobo runs a full gc.collect() before every CUDA graph capture (cuda_graph_util.py:197), 11-27 per problem, and
-    # each walks the whole heap: 2.2-2.6 s per problem. Frozen here and again once the world is built (GraspGenX's import
-    # and grasps are most of the heap), those collections skip it. Frozen objects are still freed by refcount, but frozen
-    # garbage, and what it holds, waits for the next problem's unfreeze below or for the one at exit (atexit, above).
+    # each walks the whole heap: 2.2-2.6 s per problem. Frozen here, once the world is built, and once a skeleton's
+    # grasps are made (run_cutamp; GraspGenX's import and grasps are most of the heap), those collections skip it.
+    # Frozen objects are still freed by refcount, but frozen garbage, and what it holds, waits for the next problem's
+    # unfreeze below or for the one at exit (atexit, above).
     gc.unfreeze()
     gc.collect()
     gc.freeze()
@@ -369,23 +377,19 @@ def setup_cutamp(
         q_init = model.home
     q_init = device_cfg.to_device(q_init)
 
-    # Load TAMP world
+    # Load TAMP world. It starts with no grasps: run_cutamp makes them for the objects a skeleton picks.
     timer = TorchTimer()
-    # GraspGenX's grasps, once per object shape and process, timed apart from planning. grasp_sets turns process-wide
-    # settings on while it runs, so it comes before the motion planner's warmup thread starts (run_cutamp).
-    with timer.time("generate_grasps", log_callback=_log.info):
-        grasps = grasp_sets(env.movables, device_cfg.device)
     with timer.time("load_tamp_world", log_callback=_log.info):
         world = TAMPWorld(
             env=env,
             device_cfg=device_cfg,
             robot=robot_container,
             q_init=q_init,
-            grasps=grasps,
+            grasps={},
         )
         check_tamp_world_not_in_collision(world)
     gc.collect()
-    gc.freeze()  # the grasps and the world too, before run_cutamp's planner thread starts capturing graphs
+    gc.freeze()  # the world too, before run_cutamp's planner thread starts capturing graphs
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -407,8 +411,53 @@ def run_cutamp(
     experiment_id: str,
 ):
     """Overall cuTAMP algorithm implementation."""
+    # GraspGenX's model loads on a background thread while the robot and the world load and the task planner runs.
+    start_sampler_load()
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
     particle_initializer = ParticleInitializer(world, config, constraint_checker)
+
+    # Task plan generator
+    _log.info(f"Initial State: {world.initial_state}")
+    _log.info(f"Goal State: {world.goal_state}")
+    all_operators = all_t1_operators
+    with timer.time("get_plan_generator", log_callback=_log.info):
+        arm_affinity_priority = make_arm_affinity_priority_fn(world)
+        skeletons = task_plan_generator(
+            world.initial_state,
+            world.goal_state,
+            operators=all_operators,
+            ground_op_priority_fn=arm_affinity_priority,
+        )
+        first = next(skeletons, None)
+
+    # GraspGenX's grasps, for the objects a skeleton picks and for no other: once per object shape and process, timed
+    # apart from planning (the timer covers the wait for the model's background load, then the sampling). grasp_sets
+    # turns process-wide settings on while it runs, so the first skeleton's grasps are made here, before the motion
+    # planner's warmup thread starts, and a later skeleton's wait for that thread to end.
+    planner_thread = None
+
+    def make_grasps(plan_skeleton: PlanSkeleton) -> None:
+        objs = ungrasped(world, plan_skeleton)
+        if not objs:
+            return
+        if planner_thread is not None:
+            planner_thread.join()
+        with timer.time("generate_grasps", log_callback=_log.info):
+            world.grasps.update(grasp_sets(objs, world.device))
+        gc.collect()
+        gc.freeze()  # GraspGenX's import and the grasps (setup_cutamp), before the next graph capture
+
+    def plan_skeletons():
+        if first is not None:
+            yield first
+        for plan_skeleton in skeletons:
+            make_grasps(plan_skeleton)
+            yield plan_skeleton
+
+    if first is not None:
+        make_grasps(first)
+    wait_for_sampler_load()  # also when the first skeleton picks nothing: a capture fails on another thread's CUDA work
+    plan_gen = plan_skeletons()
 
     # Build the trajopt planner on a background thread, overlapped with
     # particle init and the Adam loop. The build runs no solves, so no CUDA graph
@@ -442,19 +491,6 @@ def run_cutamp(
             if "error" in planner_box:
                 raise planner_box["error"]
             return planner_box["planner"]
-
-    # Task plan generator
-    _log.info(f"Initial State: {world.initial_state}")
-    _log.info(f"Goal State: {world.goal_state}")
-    all_operators = all_t1_operators
-    with timer.time("get_plan_generator", log_callback=_log.info):
-        arm_affinity_priority = make_arm_affinity_priority_fn(world)
-        plan_gen = task_plan_generator(
-            world.initial_state,
-            world.goal_state,
-            operators=all_operators,
-            ground_op_priority_fn=arm_affinity_priority,
-        )
 
     # Sample initial plans and particles
     found_solution_initially = False

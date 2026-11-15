@@ -80,10 +80,11 @@ folder is empty, and `uv sync` and `uv run` fail. Both are shallow
 [GraspGenX](https://github.com/NVlabs/GraspGenX) (6-DoF grasps) is pinned at
 `b9429097`. On x86_64, `uv sync` installs it editable into the same env with its
 `serve` extra. One of its dependencies, sharedarray, builds from source, so that
-needs a C compiler. Planning needs GraspGenX, since every world loads its
-grasps from it, so cuTAMP plans on x86_64 only: on aarch64 `uv sync` leaves
-GraspGenX out, because its scene tools need `usd-core`, and setup stops with a
-`RuntimeError` that names the platform and this paragraph. Its pins on torch,
+needs a C compiler. Planning a pick needs GraspGenX, since every picked
+object's grasps come from it, so cuTAMP plans picks on x86_64 only: on aarch64
+`uv sync` leaves GraspGenX out, because its scene tools need `usd-core`, and
+planning stops at the first skeleton that picks with a `RuntimeError` that
+names the platform and this paragraph. Its pins on torch,
 torchvision, numpy, trimesh and yourdfpy are overridden to cuTAMP's
 (`override-dependencies` in `pyproject.toml`). Its
 179 MB of LFS gripper meshes and sample data are not needed: GraspGenX can take
@@ -108,10 +109,14 @@ mkdir -p ~/graspgenx-model/no-gripper-descriptions
 export GRASPGENX_CHECKPOINT_DIR=$M GRASPGENX_GRIPPER_CFG_DIR=~/graspgenx-model/no-gripper-descriptions
 ```
 
-The planner runs GraspGenX in its own process: when the world loads,
-`grasp_sets` ([`cutamp/grasps.py`](cutamp/grasps.py)) makes each object
-shape's 6-DoF grasps once, in about 3.6 s per process (`generate_grasps`, timed
-apart from the planning time), and there is no grasp server or grasp file. It
+The planner runs GraspGenX in its own process, and there is no grasp server or
+grasp file. Its model loads once per process, on a background thread that
+starts when planning starts (`start_sampler_load`). When a plan skeleton first
+picks an object, `grasp_sets` ([`cutamp/grasps.py`](cutamp/grasps.py)) waits
+for that load and makes that object shape's 6-DoF grasps once
+(`generate_grasps`, about 1.6 s: the rest of the load, then the sampling;
+timed apart from the planning time). An object that no skeleton picks gets no
+grasps. It
 sets either variable that is unset or empty to its folder above
 (`~/graspgenx-model/7c834043`, `~/graspgenx-model/no-gripper-descriptions`)
 and stops with an error naming this paragraph if a folder is missing, before
@@ -232,8 +237,9 @@ graph LR
    gate slowed down also carries `planner_timing`, the
    same segment at the motion planner's own timing (`None` otherwise).
 
-`run_cutamp` (`algorithm.py`) orchestrates these stages; `setup_cutamp` makes
-the grasps (`grasp_sets`) and builds the shared `TAMPWorld`.
+`run_cutamp` (`algorithm.py`) orchestrates these stages and makes the grasps
+(`grasp_sets`) of the objects a skeleton picks; `setup_cutamp` builds the
+shared `TAMPWorld`.
 
 ## T1 Single-Planner Architecture (cuRobo v0.9.0)
 
@@ -430,8 +436,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   each redraw round in one more (`_solve_steps`).
 
 - [`grasps.py`](cutamp/grasps.py) — the grasps: `grasp_sets` runs
-  GraspGenX's graspmoe planner on each object shape's surface points when the
-  world loads (its diffusion grasps and the box grasps on the top and the
+  GraspGenX's graspmoe planner on an object shape's surface points when a
+  skeleton first picks it (its diffusion grasps and the box grasps on the top and the
   sides, all kept with their scores), seeded, so every process gets the same
   grasps. A grasp is a 6-DoF pose of GraspGenX's gripper frame in the object
   frame, `[x, y, z, qw, qx, qy, qz]`. Here too: init's drop rule

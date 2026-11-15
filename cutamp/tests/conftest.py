@@ -21,10 +21,10 @@ needs_cuda = pytest.mark.skipif(
     _cvd in ("", "-1") or (_cvd is None and not os.path.exists("/dev/nvidia0")),
     reason="Requires a CUDA device.",
 )
-#: Whether GraspGenX is installed: it installs on x86_64 only (pyproject.toml), and every world loads its grasps from
-#: it (``grasps.grasp_sets``). find_spec only finds the package, so its first-import hook never runs here.
+#: Whether GraspGenX is installed: it installs on x86_64 only (pyproject.toml), and every picked object's grasps come
+#: from it (``grasps.grasp_sets``). find_spec only finds the package, so its first-import hook never runs here.
 HAS_GRASPGENX = importlib.util.find_spec("graspgenx") is not None
-_NO_GRASPGENX = "Requires GraspGenX, which installs on x86_64 only: every world loads its grasps from it."
+_NO_GRASPGENX = "Requires GraspGenX, which installs on x86_64 only: every picked object's grasps come from it."
 #: Skips unless GraspGenX is installed. ``make_blocks_t1_world`` skips by itself: a mark can't skip a fixture.
 needs_graspgenx = pytest.mark.skipif(not HAS_GRASPGENX, reason=_NO_GRASPGENX)
 

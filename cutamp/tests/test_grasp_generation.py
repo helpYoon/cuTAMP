@@ -1,5 +1,5 @@
-"""GraspGenX's grasps, made in-process when the world loads (``cutamp.grasps.grasp_sets``): one set per object shape,
-bit-identical in every process, and outside the run's random state and numeric settings."""
+"""GraspGenX's grasps, made in-process for the objects a skeleton picks (``cutamp.grasps.grasp_sets``): one set per
+object shape, bit-identical in every process, and outside the run's random state and numeric settings."""
 
 import importlib.util
 import os
@@ -7,6 +7,7 @@ import platform
 import random
 import subprocess
 import sys
+import threading
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 
@@ -83,6 +84,61 @@ def test_mesh_hash_is_shared_by_shape():
     assert g.mesh_sha256(blocks["block2"]) == g.mesh_sha256(blocks["block3"])  # same shape, different poses
     big = Cuboid(name="big", pose=list(blocks["block2"].pose), dims=[0.06, 0.06, 0.06])
     assert g.mesh_sha256(big) != g.mesh_sha256(blocks["block2"])
+
+
+def test_grasps_are_made_for_the_objects_a_skeleton_picks(monkeypatch):
+    # A sampler runs for a skeleton's parameters: block3 is in the scene and gets no grasps until a skeleton picks it,
+    # and block4, which none picks, never does. grasp_sets turns process-wide settings on while it runs, so the first
+    # skeleton's grasps are made before the planner's warmup thread starts and a later skeleton's after it ends. The
+    # model's background load starts before anything else and has ended before that thread starts.
+    import contextlib
+    import time
+    from types import SimpleNamespace
+
+    import cutamp.algorithm as alg
+    from cutamp.config import TAMPConfiguration
+
+    def op(kind, *values):
+        return SimpleNamespace(values=values, operator=SimpleNamespace(metadata=SimpleNamespace(action_type=kind)))
+
+    skeletons = [
+        [op(None, "q0", "traj1", "q1"), op("pick", "block2", "grasp1", "q1"), op("place", "block2", "grasp1", "q2")],
+        [op("pick", "block2", "grasp1", "q1"), op("pick", "block3", "grasp2", "q2"), op("pick", "block3", "grasp3")],
+    ]
+    events = []
+
+    def warmup(world):
+        events.append("warmup starts")
+        time.sleep(0.2)
+        events.append("warmup ends")
+
+    def fake_grasp_sets(objs, device):
+        events.append(list(objs))
+        return dict.fromkeys(objs, "grasps")
+
+    def sample(plan_gen, *args):
+        next(plan_gen)  # StopIteration after the two skeletons
+        return None, False
+
+    timer = SimpleNamespace(time=lambda *a, **k: contextlib.nullcontext(), start=lambda m: None,
+                            stop=lambda m: 0.0, get_summaries=dict)  # TorchTimer syncs CUDA
+    world = SimpleNamespace(initial_state=None, goal_state=None, grasps={}, device="cpu", get_object=lambda name: name)
+    logger = SimpleNamespace(log_dict=lambda name, d: None)
+    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, timer, world))
+    monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: None)
+    monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda world: None)
+    monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: iter(skeletons))
+    monkeypatch.setattr(alg, "build_motion_planner", warmup)
+    monkeypatch.setattr(alg, "grasp_sets", fake_grasp_sets)
+    monkeypatch.setattr(alg, "start_sampler_load", lambda: events.append("model load starts"))
+    monkeypatch.setattr(alg, "wait_for_sampler_load", lambda: events.append("model load ended"))
+    monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
+    config = TAMPConfiguration(curobo_plan=True, enable_visualizer=False)
+    alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
+                   experiment_id="fake")
+    assert events == ["model load starts", ["block2"], "model load ended", "warmup starts", "warmup ends", ["block3"]]
+    assert sorted(world.grasps) == ["block2", "block3"]
 
 
 def test_missing_graspgenx_names_the_platform(monkeypatch, tmp_path):
@@ -181,6 +237,30 @@ def test_generation_repeats_and_keeps_the_run_rng(monkeypatch):
         assert _flags() == flags, f"cold={cold} tf32={tf32}: {_flags()} != {flags}"
     assert_bitwise(made[1], made[0], "warm vs cold", raw=True)
     assert_bitwise(made[2], made[0], "TF32 off vs on", raw=True)
+
+
+@needs_cuda
+@needs_graspgenx
+def test_a_background_load_is_the_only_load(monkeypatch):
+    # run_cutamp starts the model's load on a background thread. grasp_sets waits for it and samples with that model:
+    # one load, a foreground load's grasps bit for bit, and every generator as the caller left it.
+    blocks = _blocks()
+    monkeypatch.setattr(g, "_SETS", {})
+    want = g.grasp_sets(blocks, DEVICE)["block2"]  # a foreground load, if this process has no sampler yet
+    server, loads = sys.modules["graspgenx.grasp_server"], []
+    load = server.load_grasp_gen_model
+    monkeypatch.setattr(
+        server, "load_grasp_gen_model", lambda cfg: loads.append(threading.current_thread().name) or load(cfg)
+    )
+    monkeypatch.setattr(g, "_SETS", {})
+    monkeypatch.setattr(g, "_LOAD", None)
+    g._load_sampler.cache_clear()
+    rng = _rng_states()
+    g.start_sampler_load()
+    got = g.grasp_sets(blocks, DEVICE)["block2"]
+    assert loads == ["graspgenx-load"]
+    assert _rng_states() == rng, "a generator's state changed"
+    assert_bitwise(got, want, "background vs foreground load", raw=True)
 
 
 # A fresh process: cwd is this tree's root, so ``-c`` imports this tree's cutamp. Its root logger is untouched.

@@ -1,7 +1,7 @@
-"""Grasps (design 7.8). ``grasp_sets`` makes each object shape's grasps with GraspGenX, in this process, when the world
-loads. Init chooses among them, after ``drop_grasps`` removes those the hand can't take. The motion solver's grasp
-geometry: each pick and place approaches along the grasp's axis and leaves the same way, or lifts and comes in from
-above.
+"""Grasps (design 7.8). ``grasp_sets`` makes each object shape's grasps with GraspGenX, in this process, when a
+skeleton first picks the object; the model loads once, on a background thread (``start_sampler_load``). Init chooses
+among them, after ``drop_grasps`` removes those the hand can't take. The motion solver's grasp geometry: each pick and
+place approaches along the grasp's axis and leaves the same way, or lifts and comes in from above.
 
 ``world_from_ee`` is the hand's tool frame (``*_base_link``, ``robots/t1.py``), whose +x is GraspGenX's approach axis
 (G's +z). The knobs are search settings, not robot limits (design section 12).
@@ -15,7 +15,8 @@ import math
 import os
 import platform
 import random
-from typing import Dict, Literal, NamedTuple, Sequence, Tuple, Union
+import threading
+from typing import Dict, Literal, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -119,7 +120,7 @@ def approach_targets(world_from_ee: torch.Tensor, kind: Literal["pick", "place"]
     return pre.clone(), post.clone()
 
 
-# ---- GraspGenX's grasps, made in-process when the world loads ----------------------------------------------------
+# ---- GraspGenX's grasps, made in-process for the objects a skeleton picks -----------------------------------------
 
 GRASP_SEED = 0
 """Seeds each shape's surface sample, and every generator right before GraspGenX runs: every process, and a cold
@@ -217,7 +218,47 @@ def _load_sampler(ckpt: str):
     flat = [x for field in FLAT_FIELD_ORDER for x in sv[field]]
     cfg = load_model_cfg(f"{ckpt}/release/gen", f"{ckpt}/release/dis")  # the latest epoch_*.pth: gen 736, dis 1056
     params = SweepVolumeParams.from_flat(flat, fingertip_depth=sv["fingertip_depth"])
-    return GraspGenXSampler.from_sweep_volume(cfg, params)
+    # The model build draws its initial weights from torch's CPU generator, and from no other. Put back here, so a
+    # background load (start_sampler_load) leaves the generator as it found it. That holds only while no other thread
+    # draws from it during the load: run_cutamp's setup, which the load overlaps, draws nothing.
+    cpu_rng = torch.get_rng_state()
+    try:
+        return GraspGenXSampler.from_sweep_volume(cfg, params)
+    finally:
+        torch.set_rng_state(cpu_rng)
+
+
+_LOAD: Optional[threading.Thread] = None
+"""The background load ``start_sampler_load`` started, if any."""
+
+
+def start_sampler_load() -> None:
+    """Start loading GraspGenX's sampler (``_load_sampler``: the import and the model, about 2 s) on a background
+    thread, once per process, and return at once. ``grasp_sets`` waits for it and samples with that sampler, so the
+    model loads once. It changes no process-wide setting. It does copy the weights to the GPU, so the caller must
+    ``wait_for_sampler_load`` before any CUDA graph capture.
+
+    Does nothing when GraspGenX or its model folders are missing, and a load that fails is tried again by
+    ``grasp_sets``, which raises on its caller's thread."""
+    global _LOAD
+    if _LOAD is not None or importlib.util.find_spec("graspgenx") is None:
+        return
+
+    def load():
+        try:
+            _load_sampler(_checked_model_dir())
+        except Exception:  # noqa: BLE001 — grasp_sets loads again and raises there
+            pass
+
+    # Not a daemon: a process that ends without picking anything still waits for the load, not killed mid-copy.
+    _LOAD = threading.Thread(target=load, name="graspgenx-load")
+    _LOAD.start()
+
+
+def wait_for_sampler_load() -> None:
+    """Return once the background load, if one was started, has ended."""
+    if _LOAD is not None:
+        _LOAD.join()
 
 
 def _z_offsets_cm(mesh: trimesh.Trimesh) -> Tuple[int, ...]:
@@ -240,8 +281,10 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
     with PTv3's segment reduction deterministic. The caller's random state (Python's, numpy's, torch's CPU and every
     CUDA generator) and both TF32 flags are restored afterwards.
 
-    Call it only inside ``setup_cutamp``, before the motion planner's warmup thread starts, and in tests: deterministic
-    mode and the TF32 pin are process-wide, which is safe only while no other CUDA work runs.
+    Call it only from ``run_cutamp``, which makes a skeleton's grasps before the motion planner's warmup thread starts
+    or after it ends, and in tests: deterministic mode and the TF32 pin are process-wide, which is safe only while no
+    other CUDA work runs. The sampler is loaded once per process: by ``start_sampler_load``'s background thread when
+    one was started, which a call that needs the sampler waits for, else by the first such call.
 
     Every call first checks that GraspGenX is installed, which it is on x86_64 only (``pyproject.toml``), and then its
     model folders (``_checked_model_dir``), before anything imports ``graspgenx`` or touches CUDA. Either check raises
@@ -249,7 +292,7 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
     """
     if importlib.util.find_spec("graspgenx") is None:  # finds the package only: its first-import hook doesn't run
         raise RuntimeError(
-            "GraspGenX is not installed, and planning needs it: every world loads its movables' grasps from it "
+            "GraspGenX is not installed, and planning needs it: every picked object's grasps come from it "
             f"(cutamp/grasps.py). uv sync installs it on x86_64 only, and this machine is {platform.machine()}. "
             "See README.md, Installation, the GraspGenX paragraph."
         )
@@ -257,6 +300,7 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
     shape_of = {obj.name: mesh_sha256(obj) for obj in objs}
     new = {shape_of[obj.name]: obj for obj in objs if shape_of[obj.name] not in _SETS}
     if new:
+        wait_for_sampler_load()  # before the random state is saved: a background load puts the CPU generator back
         rng = random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all()
         tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
