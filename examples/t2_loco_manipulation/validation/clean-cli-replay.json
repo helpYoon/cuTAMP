@@ -1,0 +1,116 @@
+{
+  "execution": {
+    "completed": true,
+    "fault": null,
+    "sim_seconds": 113.11200000000001,
+    "wall_seconds": 80.54510864289477,
+    "max_active_sole_error_m": 0.0027666852127638353,
+    "actual_physics": true,
+    "continuous_mjdata": true,
+    "object_pose_writes_after_initialization": 0,
+    "body_state_writes_after_initialization": 0,
+    "admission_verified": true,
+    "fall_check": "actual trunk height below reference by15cm or absolute trunk height below18cm"
+  },
+  "object_task": {
+    "gripper_lifecycle": {
+      "close_events": 1,
+      "open_events": 1,
+      "retention_interval": "First close+0.7s through LAST release; intervening openings cannot hide a drop"
+    },
+    "actual_support_body": "floor",
+    "target_region": "goal",
+    "support_contact_fraction_final_second": 1.0,
+    "contact_sampling": "Every10th frame plus every final-second frame; TCP/object retention allframes",
+    "qualified": true,
+    "qualification_checks": {
+      "single_grasp_release_lifecycle": true,
+      "completed": true,
+      "active_soles_1cm": true,
+      "lift_3cm": true,
+      "gripper_contact": true,
+      "retained": true,
+      "released": true,
+      "goal_footprint": true,
+      "height_5mm": true,
+      "goal_contact_95pct": true,
+      "settled_speed_2cm_s": true,
+      "settled_drift_5mm": true
+    },
+    "objects": {
+      "block": {
+        "max_lift_m": 0.47213362791380575,
+        "object_relative_tcp_drift_max_m": 0.0010375145362199383,
+        "goal_footprint_contained": true,
+        "settled_bottom_height_error_m": 6.243229519059534e-07,
+        "goal_contact_fraction_final_second": 1.0,
+        "maximum_speed_final_second_m_s": 2.4975676108646954e-15,
+        "position_range_final_second_m": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "final_position": [
+          0.7558399323622085,
+          0.21452739120063916,
+          0.029999375677048055
+        ]
+      }
+    },
+    "foot_max_drift_m": 0.0027666852127638353,
+    "continuous_mjdata": true,
+    "object_pose_writes_after_initialization": 0,
+    "scope": "Measured physical object state; one continuous simulation; references never set object pose"
+  },
+  "actuators": {
+    "peak_actuator_effort_fraction": 0.999999999582132,
+    "saturated_actuator_frames": 1,
+    "maximum_joint_limit_violation_rad": 8.108731303212934e-05,
+    "finite_actual_state_and_torque": true
+  },
+  "posture": {
+    "passed": true,
+    "checks": {
+      "torso_forward_pitch": true,
+      "torso_lateral_lean": true,
+      "forward_hinge": true
+    },
+    "actual_tracking_allowance_deg": 0.0
+  },
+  "unit_tests": {
+    "passed": true,
+    "count": 9
+  },
+  "restored_reference_arrays_identical": true,
+  "scope": "Release execution/evaluation CLI replay using archived qualified model and baseline contact controller; this is not a new planning/runtime benchmark",
+  "sources_sha256": {
+    "audit_reference_cad.py": "5b987835711ae799339a59a35619c443011e37800a42aab327d6a680ed80823b",
+    "restore_evidence.py": "1a88e723f5048268ae2baf5f5a6a15dbcf1d0cbd2cb98e1d834f3c9ab3c13e84",
+    "audit_body_posture.py": "a9eca505e4d3ddab69edbd96275451fccdf7fcf1069c6b29ef312fa324a61d8a",
+    "test_gripper_continuity.py": "024ec133a0e6e7d1533bef33d48b9146898a12fc5031c1903d36b0109804d9cb",
+    "test_admission.py": "6cf2d97a78e09f1bbf5fcfb2ddad877158bd25eb01be06e8c4a2a40a121837bc",
+    "audit_reference_comfort.py": "9c72fa0e9ba79a1e9a453734184b18abe79c4bcc5814f83a6f7e5f35ab279d0c",
+    "cached_packets.py": "222ceca0a3264b606a4f73b0a861abd4df1ceeaa849fdf087068e919c64dd85c",
+    "execute_admitted.py": "eb4ff2a5e8553c9839217ef077132ee5694c4faaabca81e88aebb277e157b4b2",
+    "render_contact.py": "df4792b0c191335e6d5bd6ce2797aad0e54157466f6dbe400fadc451d19b8fdd",
+    "audit_reference_kinematics.py": "d3865db77f794744aaa1f0c4fb5a38925707ea3cd80fe62232c8f70af56488bf",
+    "compose_reference.py": "5508cdae53ffacb4275ec005645ed9313fac0754744147820c06b4488446928c",
+    "audit_actuators.py": "41651baed70526165373d102f8b80446467a2daec4db3cc47406dc8bda08a004",
+    "make_bridge.py": "b4379ed8e910e816adc1deca945a2493eb1ef52012aaf34799f63cc5c671d5c2",
+    "object_lifecycle.py": "d50fe971a415f0a3993612983959920099dc5be792593b30be15513e57dfa0ae",
+    "test_object_lifecycle.py": "ad1d00a8eae0edea0102bddf95ca4c009fc0eff1ba8d692308104e77209c98c7",
+    "audit_box_pair_clearance.py": "046e40593c585042c2f04e1b10360be32c098ecf47d9e23740c3477cfe173622",
+    "settle_scene.py": "fbb75546f082fdda65f924e7fe16039edabfb689d676343c11b2779c318d83ca",
+    "test_model_assets.py": "42b976214f787f937f6ce96f06118b36ab7fb40e9ba696a4c0cb7df91c2f13fc",
+    "qualify_reference_batch.py": "4293136746e9dc28855bab6e6971931ca9fe01449f5fc65024823f3e63415fed",
+    "evaluation.py": "b9a657b7fe6fb7f2a83b01322c75554be2da51df454256255607f34a4bee699b",
+    "test_restore_evidence.py": "76447018893b0c1fff3490693b9610b5408ef5b26395e32d22830ad423e4bdbb",
+    "model_assets.py": "cf104838a551bbd6efdccb07636829aa3a477d4bec074973bff148f9c7851b3c",
+    "admission.py": "0616907bd043a599513009bade1833b450e5c4e80f26a2544be0d0026210865d",
+    "audit_floor_clearance.py": "7457a7afc093641ba84947df16e350720699c58ee316ad1c4ec7444a959c9319",
+    "native_to_bundle.py": "883990d9fbadf2af7da74b983161f6f00f1052c2ce78675889b5ce396b9fff5e",
+    "known_payload.py": "190237b6168135aaff75a67b380ff634f5fbede63676ca65d827d8224bba498c",
+    "analyze_composed.py": "4470a73b3875cdee14e41944c7befda21ea1b3a46b275115fe6e868c7fb41d04",
+    "build_admission.py": "e3afb79f56f24807871f1fed35714edbb753fb3babd0509e112e57c3bd2eb5ef"
+  }
+}

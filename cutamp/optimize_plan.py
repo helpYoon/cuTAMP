@@ -469,6 +469,12 @@ class ParticleOptimizer:
             rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
         ) if ik_deps else None
 
+        fixed_conf_names = {
+            op.values[-1] for op in plan_skeleton
+            if op.operator.metadata.action_type == "retract"
+            and "RetractHolding" in op.operator.name
+            and op.operator.metadata.arm in getattr(world, "retract_configuration_hints", {})
+        }
         pairs = []  # (tensor, is a Conf) per optimized param, for _adam_param_groups
         # Initial configurations that we don't optimize
         initial_confs = {"q0", "left_q0", "right_q0"}
@@ -479,7 +485,7 @@ class ParticleOptimizer:
             param_type = param_to_type[param]
             if param_type not in self.types_to_optimize:
                 continue
-            if param in initial_confs:
+            if param in initial_confs or param in fixed_conf_names:
                 continue  # we don't optimize the initial configuration(s)
             if param in dropped_conf_names:
                 # Coupled re-IK: q is determined by IK from current Pose/Grasp,

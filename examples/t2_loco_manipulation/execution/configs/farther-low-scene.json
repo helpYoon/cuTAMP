@@ -1,0 +1,114 @@
+{
+  "name": "low-pick-floor-place",
+  "geometries": {
+    "cuboid": {
+      "block": {
+        "dims": [
+          0.06,
+          0.06,
+          0.06
+        ],
+        "pose": [
+          0.95,
+          0.25,
+          0.17999958378453307,
+          1.0,
+          4.95042923319226e-18,
+          2.4472370706085882e-23,
+          -1.3484625308297408e-21
+        ],
+        "color": [
+          245,
+          145,
+          20
+        ]
+      },
+      "support_block": {
+        "dims": [
+          0.14,
+          0.14,
+          0.15
+        ],
+        "pose": [
+          0.95,
+          0.25,
+          0.075,
+          1,
+          0,
+          0,
+          0
+        ],
+        "color": [
+          150,
+          150,
+          150
+        ]
+      },
+      "goal": {
+        "dims": [
+          0.16,
+          0.16,
+          0.02
+        ],
+        "pose": [
+          0.8,
+          0.25,
+          -0.01,
+          1,
+          0,
+          0,
+          0
+        ],
+        "color": [
+          80,
+          200,
+          100
+        ]
+      },
+      "floor": {
+        "dims": [
+          4,
+          4,
+          0.1
+        ],
+        "pose": [
+          0,
+          0,
+          -0.05,
+          1,
+          0,
+          0,
+          0
+        ],
+        "color": [
+          200,
+          200,
+          200
+        ]
+      }
+    }
+  },
+  "types": {
+    "Movable": [
+      "block"
+    ],
+    "Surface": [
+      "goal"
+    ]
+  },
+  "goal": [
+    {
+      "LeftHolding": [
+        "block"
+      ]
+    }
+  ],
+  "settled_scene_receipt": "2s object-only MuJoCo gravity/contact settling; robot absent",
+  "physical_scene": {
+    "noncolliding_regions": [
+      "goal"
+    ],
+    "placement_support_body": "floor",
+    "description": "Visual placement region; actual floor is sole support"
+  }
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "link": "left_ankle_roll_link",
+    "old_radius": 0.051453645030260856,
+    "new_radius": 0.017377939393939397
+  },
+  {
+    "link": "left_ankle_roll_link",
+    "old_radius": 0.050405200284793776,
+    "new_radius": 0.03304660109289617
+  },
+  {
+    "link": "left_ankle_roll_link",
+    "old_radius": 0.05040520028479374,
+    "new_radius": 0.03304660109289617
+  },
+  {
+    "link": "right_ankle_roll_link",
+    "old_radius": 0.051453645030260856,
+    "new_radius": 0.017377939393939397
+  },
+  {
+    "link": "right_ankle_roll_link",
+    "old_radius": 0.050405200284793776,
+    "new_radius": 0.03304660109289617
+  },
+  {
+    "link": "right_ankle_roll_link",
+    "old_radius": 0.05040520028479374,
+    "new_radius": 0.03304660109289617
+  }
+]

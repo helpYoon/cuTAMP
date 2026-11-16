@@ -58,10 +58,14 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
             out[key] = x.detach().reshape(x.shape[-2:])[:, cols].to(torch.float32).cpu().numpy()
         return out
 
+    import copy
     segments = []
     for entry in curobo_plan:
         fast = entry.get("planner_timing")
         segments.append({"arm": entry.get("arm"), "dt": float(entry["dt"]), "op_idx": entry["op_idx"],
                          "phase": entry["phase"], "gripper": entry["gripper"], **frames(entry["plan"]),
                          "planner_timing": None if fast is None else frames(fast["plan"])})
+        # Preserve measured generator provenance; never infer old missing labels.
+        for key in ("trajectory_generator","trajectory_diagnostics","trajectory_generator_status","native_fallback_status","stance"):
+            if key in entry:segments[-1][key]=copy.deepcopy(entry[key])
     return {"schema_version": RAW_SCHEMA_VERSION, "model": model.name, "joint_names": names, "segments": segments}

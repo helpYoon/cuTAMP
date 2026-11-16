@@ -1,0 +1,88 @@
+geometries:
+  cuboid:
+    block:
+      color:
+      - 245
+      - 145
+      - 20
+      dims:
+      - 0.06
+      - 0.06
+      - 0.06
+      pose:
+      - 0.9639249868673546
+      - 0.23487677701924162
+      - 0.6408685351856068
+      - 0.9994192860527578
+      - 0.0018184314161503973
+      - 0.034017381328823336
+      - 0.000775719350019878
+    floor:
+      color:
+      - 200
+      - 200
+      - 200
+      dims:
+      - 4
+      - 4
+      - 0.1
+      pose:
+      - 0
+      - 0
+      - -0.05
+      - 1
+      - 0
+      - 0
+      - 0
+    goal:
+      color:
+      - 80
+      - 200
+      - 100
+      dims:
+      - 0.16
+      - 0.16
+      - 0.02
+      pose:
+      - 0.8
+      - 0.25
+      - -0.01
+      - 1
+      - 0
+      - 0
+      - 0
+    support_block:
+      color:
+      - 150
+      - 150
+      - 150
+      dims:
+      - 0.14
+      - 0.14
+      - 0.15
+      pose:
+      - 0.95
+      - 0.25
+      - 0.075
+      - 1
+      - 0
+      - 0
+      - 0
+goal:
+- 'On':
+  - block
+  - goal
+- LeftHandEmpty: []
+- RightHandEmpty: []
+name: low-pick-floor-place
+physical_scene:
+  description: Visual placement region; actual floor is sole support
+  noncolliding_regions:
+  - goal
+  placement_support_body: floor
+settled_scene_receipt: 2s object-only MuJoCo gravity/contact settling; robot absent
+types:
+  Movable:
+  - block
+  Surface:
+  - goal

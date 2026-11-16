@@ -539,6 +539,8 @@ def gn_project_balanced(
     iters: int = GN_ITERS,
     movables: Optional[torch.Tensor] = None,
     collision: bool = True,
+    joint_limit_inset: Optional[torch.Tensor] = None,
+    hand_constraint_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Project ``q_full`` (``[N, dof]`` full-cspace joint positions, not modified) toward
     ``FK(q) == world_from_ee`` (``[N, 4, 4]`` target tool poses), balance first, on ``world.kinematics_jac``.
@@ -603,6 +605,10 @@ def gn_project_balanced(
     arms = (arms,) if isinstance(arms, str) else tuple(arms)
     support = world.model.support
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
+    if joint_limit_inset is not None:
+        lower=lower+joint_limit_inset
+        upper=upper-joint_limit_inset
+        q=q.clamp(lower,upper)
     sole_idx = tuple(list(kin.tool_frames).index(frame) for frame in world.model.sole_frames)
     upright = (joint_names.index("base_j_pitch"), joint_names.index("base_j_roll"))
 
@@ -621,26 +627,40 @@ def gn_project_balanced(
                     state.tool_poses.get_link_pose(support.link, make_contiguous=True)
                     .get_matrix().reshape(N, 4, 4)
                 )
-            com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
+            if hasattr(world,"_planning_stance"):
+                margin=world.support_margin_world(state.robot_com[...,:3].reshape(N,3))
+                # Reuse the two-row hierarchy with a signed distance row. The
+                # second row is identically inactive; no rectangle surrogate.
+                com_g=torch.stack((1.-margin,torch.zeros_like(margin)),-1)
+            else:
+                com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
             # Clone: cuRobo's backward writes into a reused buffer, so without
             # it the next grad call overwrites the x row with the y row.
             jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
             jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g, retain_graph=collision)[0].clone()
             if collision:
                 pen_g = collision_penetration(world, state.robot_spheres, movables)
+                if hasattr(world,"trajectory_waist_comfort"):
+                    from cutamp.anatomical_comfort import residual as comfort_residual
+                    pen_g = pen_g + comfort_residual(world,q_g)
+                if hasattr(world,"extra_posture_residual"):
+                    pen_g=pen_g+world.extra_posture_residual(q_g)
                 jpen = torch.autograd.grad(pen_g.sum(), q_g)[0]
         with torch.no_grad():
             jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
             com = com_g.detach()
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
+            if hand_constraint_mask is not None:
+                mask=hand_constraint_mask.to(device=q.device,dtype=q.dtype).reshape(N,1)
+                r=r*mask;jac=jac*mask.unsqueeze(-1)
             r_sole, jac_sole = _sole_residual_and_jacobian(state, sole_idx, world.stance_soles, col_mask)
             coll = (pen_g.detach().unsqueeze(-1), (jpen * col_mask).unsqueeze(1)) if collision else None
             # Levels 3 and 4 run beside the collision row, whose contact tests below them need, and not on the last
             # iteration: level 3's second-order drift moves the hand (about 3 mm per 0.3 rad step on noisy
             # self-contact confs, 2026-11-06), which the next iteration's level 2 closes and the last would leave.
-            centre = collision and it < iters - 1
+            centre = collision and it < iters - 1 and not hasattr(world,"_planning_stance")
             step, step3, step12 = _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask,
-                                                 half=support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole,
+                                                 half=(1.,1.) if hasattr(world,"_planning_stance") else support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole,
                                                  coll=coll, centre=centre, upright=upright)
             if centre:
                 # Levels 3 and 4 never take a row into contact: where levels 1-3's step ends in contact, levels 1-2's
@@ -687,7 +707,11 @@ def gn_gate(
     ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
     pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
     pose_ok = (pos_err < pos_tol) & (rot_err < rot_tol) & soles_on_stance(world, state, pos_tol, rot_tol)
-    return pose_ok, com_polygon_mask_from_state(state, world.model.support)
+    com_ok = (world.support_margin_world(state.robot_com[...,:3].reshape(-1,3))>=0) if hasattr(world,"_planning_stance") else com_polygon_mask_from_state(state,world.model.support)
+    if hasattr(world,"trajectory_waist_comfort"):
+        from cutamp.anatomical_comfort import violations
+        com_ok = com_ok & (violations(world,q_full)<=1e-6).all(-1)
+    return pose_ok, com_ok
 
 
 def soles_on_stance(world, state, pos_tol: float, rot_tol: float) -> torch.Tensor:

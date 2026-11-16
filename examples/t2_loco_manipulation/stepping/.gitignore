@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+*.npz
+*.mjb
+*.mp4
+outputs/

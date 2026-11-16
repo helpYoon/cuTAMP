@@ -155,7 +155,37 @@ def com_polygon_penalty(com_world: torch.Tensor, base_T: torch.Tensor, half_exte
     return (outside ** 2).sum(dim=-1) + COM_INSIDE_WEIGHT * (inside ** 2).max(dim=-1).values
 
 
+def stance_pose_penalty(actual: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-knot smooth planted-foot residual; targets are world-frame sole poses.
+
+    actual: [N, 2, 4, 4], target: [2, 4, 4]. The rotation chordal
+    residual has the small-angle limit theta**2. A 0.10 m lever converts
+    it to squared metres. This optimization cost never replaces hard
+    planted-foot, collision, torque or balance acceptance checks.
+    """
+    translation = (actual[..., :3, 3] - target[..., :3, 3]).square().sum(-1)
+    rotation = 0.5 * (actual[..., :3, :3] - target[..., :3, :3]).square().sum((-1, -2))
+    return (translation + 0.01 * rotation).sum(-1)
+
+
 class ComOverBasePolygonCost(BaseCost):
+    def bind_stance(self, world):
+        """Bind before CUDA capture; changing stance requires a fresh planner.
+
+        Every cspace optimizer knot then receives absolute sole targets,
+        including solves without Cartesian goals. No FK outside the native
+        rollout and no tensor-to-host synchronization are introduced.
+        """
+        self.stance_world = world
+        self.stance_frames = tuple(world.model.sole_frames)
+        self.stance_targets = world.stance_soles.detach().clone()
+        # Optional low-task comfort preference, configured before graph capture.
+        # It never imposes a crouch/root-height target or changes hard limits.
+        comfort = getattr(world, "trajectory_waist_comfort", None)
+        if comfort is not None:
+            self.waist_comfort_bounds = tuple(map(float, comfort))
+            self.waist_comfort_column = list(world.model.joint_names).index("waist_pitch_joint")
+
     def forward(self, state) -> torch.Tensor:
         # cuRobo uses inconsistent batch layouts across kinematics fields:
         # robot_com is [B, H, 4]; tool_poses' link matrices come back
@@ -170,7 +200,29 @@ class ComOverBasePolygonCost(BaseCost):
             .get_matrix()
             .reshape(n, 4, 4)
         )
-        cost = com_polygon_penalty(com_world, base_T, cfg.half_extents)
+        if hasattr(self,"stance_world") and hasattr(self.stance_world,"_planning_stance"):
+            margin=self.stance_world.support_margin_world(com_world)
+            cost=(-margin).clamp_min(0).square()+(COM_INSIDE_MARGIN-margin).clamp_min(0).square()
+        else:
+            cost = com_polygon_penalty(com_world, base_T, cfg.half_extents)
+        if hasattr(self, "stance_targets"):
+            soles = torch.stack([
+                state.tool_poses.get_link_pose(frame, make_contiguous=True)
+                .get_matrix().reshape(n, 4, 4)
+                for frame in self.stance_frames
+            ], dim=1)
+            # Existing CoM cost weight is 5e5. This additional 100x penalty
+            # penalizes centimetre-scale foot drift during optimization;
+            # final sole tolerances remain the unchanged hard gates.
+            cost = cost + 100.0 * stance_pose_penalty(soles, self.stance_targets)
+        if hasattr(self, "waist_comfort_bounds"):
+            lower, upper = self.waist_comfort_bounds
+            waist = state.joint_state.position[..., self.waist_comfort_column].reshape(n)
+            cost = cost + 0.01 * ((waist-upper).clamp_min(0).square()
+                                   + (lower-waist).clamp_min(0).square())
+            from cutamp.anatomical_comfort import violations
+            fullq = state.joint_state.position.reshape(n,-1)
+            cost = cost + 0.01 * violations(self.stance_world, fullq).square().sum(-1)
         return cost.reshape(b, h, 1) * self._weight
 
 
@@ -241,7 +293,9 @@ def compute_com_polygon_mask(world, q_batch: torch.Tensor) -> torch.Tensor:
         ``<= COM_TOL`` (COM inside-or-on the support hull) — the same gate
         the hard ComPolygon constraint uses, so the two cannot diverge.
     """
-    return com_polygon_mask_from_state(_fk_state(world, q_batch), world.model.support)
+    state=_fk_state(world,q_batch)
+    if hasattr(world,"_planning_stance"):return world.support_margin_world(state.robot_com[...,:3].reshape(-1,3))>=0
+    return com_polygon_mask_from_state(state, world.model.support)
 
 
 def com_margin_from_base(com_in_base: torch.Tensor, half_extents: Tuple[float, float]) -> torch.Tensor:
@@ -260,6 +314,8 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     Measure-only companion to :func:`compute_com_polygon_mask`, through :func:`particle_com_margin`."""
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q_batch)
+    if hasattr(world,"_planning_stance"):
+        return world.support_margin_world(com)
     return com_margin_from_base(_project_com_to_base(com, base_T), support.keyframe_half)
 
 
@@ -284,7 +340,7 @@ def com_zmp_in_support(world, plan_js):
 
     The floor can only push. A frame whose F_z is not positive would need it to pull: the soles would leave the floor
     and there is no ZMP, so that frame's is +inf, outside every support region."""
-    force, moment, com = world.segment_torques.floor(plan_js)
+    force, moment, com = (world.segment_torques.floor_world(plan_js) if hasattr(world,"_planning_stance") else world.segment_torques.floor(plan_js))
     zmp = torch.stack([-moment[:, 1], moment[:, 0]], dim=-1) / force[:, 2:]
     return com[:, :2], torch.where(force[:, 2:] > 0, zmp, math.inf)
 
@@ -327,5 +383,9 @@ def compute_com_polygon_penalties(
     support = world.model.support
     com_world, base_T = _fk_com_and_base(world, q_all, world.site_kinematics("com"))
     half = _half_extents(support.keyframe_half, com_world.device, com_world.dtype)
-    pen = com_polygon_penalty(com_world, base_T, half)
+    if hasattr(world,"_planning_stance"):
+        margin=world.support_margin_world(com_world)
+        pen=(-margin).clamp_min(0).square()+(COM_INSIDE_MARGIN-margin).clamp_min(0).square()
+    else:
+        pen = com_polygon_penalty(com_world, base_T, half)
     return dict(zip(conf_names, pen.split([q.shape[0] for q in qs])))

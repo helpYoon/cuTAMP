@@ -124,7 +124,7 @@ def _stand_on_the_stance(
     new_pos = (rot @ (q_base[:, :3] - sole[:, :3, 3]).unsqueeze(-1)).squeeze(-1) + stance[:3, 3]
     new_base = torch.cat([new_pos, roma.rotmat_to_euler("YXZ", new_rot)], dim=-1)
     inside = ((lower[model.base] <= new_base) & (new_base <= upper[model.base])).all(-1, keepdim=True)
-    home = torch.tensor(model.home, device=seed.device, dtype=seed.dtype)
+    home = world.q_init.to(seed.device,seed.dtype)
     out = seed.clone()
     out[:, model.base] = torch.where(inside, new_base, home[model.base])
     out[:, model.body] = torch.where(inside, seed[:, model.body], home[model.body])
@@ -177,9 +177,13 @@ def ik_check(world: TAMPWorld, q: torch.Tensor, world_from_ee: torch.Tensor, arm
     pos_err, rot_err = curobo_pose_error(
         Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix(), world_from_ee,
     )
-    safe = (com_polygon_mask_from_state(state, world.model.support)
+    com_ok = (world.support_margin_world(state.robot_com[...,:3].reshape(-1,3))>=0) if hasattr(world,"_planning_stance") else com_polygon_mask_from_state(state,world.model.support)
+    safe = (com_ok
             & soles_on_stance(world, state, tol.sole_pos, tol.sole_rot)
             & (collision_penetration(world, state.robot_spheres, movables) <= 0))
+    if hasattr(world,"trajectory_waist_comfort"):
+        from cutamp.anatomical_comfort import violations
+        safe = safe & (violations(world,q)<=1e-6).all(-1)
     return safe & (pos_err <= tol.pos) & (rot_err <= tol.rot), safe, pos_err + rot_err
 
 
@@ -200,6 +204,7 @@ def gn_ik(world: TAMPWorld, world_from_ee: torch.Tensor, arms: Union[str, Sequen
     batch = n // len(arms)
     noisy = [torch.cat([_noisy_start(world, batch, arm, s) for arm in arms]) for s in GN_IK_START_SIGMAS]
     starts = [world.q_init.expand(n, -1)] + noisy
+    starts += [q.to(device=world.device,dtype=torch.float32).expand(n,-1) for q in getattr(world,"ik_seed_postures",())]
     k = len(starts)
     targets, mov, rows_arms = world_from_ee.repeat(k, 1, 1), movables.repeat(k, 1, 1), arms * k
     q = gn_project_balanced(world, torch.cat(starts), targets, rows_arms, iters=GN_IK_ITERS, collision=False)
@@ -228,7 +233,7 @@ def worst_posture(world: TAMPWorld, confs: Sequence[torch.Tensor]) -> Tuple[torc
     tilts, travels, margins = [], [], []
     for q in confs:
         tilts.append(torch.acos(trunk_tilt_cosine(q, pitch, roll).clamp(-1, 1)))
-        home = torch.as_tensor(world.model.home, dtype=q.dtype, device=q.device)
+        home = world.q_init.to(dtype=q.dtype,device=q.device)
         travels.append((q[:, xyz] - home[xyz]).norm(dim=-1))
         margins.append(compute_com_margin(world, q))
     return (torch.stack(tilts).amax(0), torch.stack(travels).amax(0), torch.stack(margins).amin(0))
@@ -506,6 +511,10 @@ class ParticleInitializer:
             draw = lambda rows: grasps[c[rows % len(c)]]
             redraw = lambda rows: grasps[c[torch.randint(len(c), (len(rows),), device=device)]]
             q_start = pool_q[q][c[torch.arange(n, device=device) % len(c)]]
+        hint=getattr(world,"configuration_hints",{}).get((obj,arm))
+        if hint is not None:
+            if hint.shape!=(len(world.model.joint_names),):raise ValueError("configuration hint has wrong full-body shape")
+            q_start=hint.to(device=device,dtype=torch.float32).expand(n,-1).clone()
         world_from_obj = world.get_object_pose(obj)
         tool_from_ee = world.tool_from_ee[world.tool_frame_for_arm(arm)]
         movables = movable_spheres_fn(world, plan_skeleton, idx)  # the earlier placements; the grasp moves none
@@ -626,7 +635,11 @@ class ParticleInitializer:
                     raise ValueError(f"{q_start_param=} should already be bound")
                 if q_retract in particles:
                     raise ValueError(f"{q_retract=} shouldn't already be bound")
-                home = torch.tensor(world.model.home, device=device)
+                home = world.q_init.to(device=device)
+                hint=(getattr(world,"retract_configuration_hints",{}).get(metadata.arm)
+                      if "RetractHolding" in ground_op.operator.name else None)
+                if hint is not None:
+                    home=hint.to(device=world.device,dtype=torch.float32)
                 particles[q_retract] = home.expand(n, -1).clone()
                 log_debug(f"{header}. Initialized q_retract to the model's home")
 

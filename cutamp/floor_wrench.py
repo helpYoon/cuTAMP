@@ -164,6 +164,13 @@ class SegmentTorques:
             js, tau_free, ks = self._free_pass(plan_js)
             return self.dyn.compute_inverse_dynamics(js, f_ext=self.fn(js, ks, tau_free)).clone()[0]
 
+    def floor_world(self, plan_js):
+        """Floor wrench about world origin, for arbitrary planar stance polygons."""
+        with torch.no_grad():
+            js,tau_free,ks=self._free_pass(plan_js)
+            F,M,P=base_wrench(js.position[0][:,self.base],tau_free[0][:,self.base])
+            return F,M+torch.cross(P,F,dim=-1),ks.robot_com[0,:,:3]
+
     def floor(self, plan_js: JointState):
         """``(force, moment, com)``, each ``[T, 3]`` in the support frame (``model.support.link``): the floor's wrench
         on the robot, which is the first pass's base wrench (``base_wrench``), with its moment about the support

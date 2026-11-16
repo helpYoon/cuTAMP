@@ -1,0 +1,60 @@
+{
+  "schema_version": "prescribed_t2_gaits_v1",
+  "scope": "Tested prescribed flat-ground contacts; not general walking or proof these steps are necessary",
+  "empty_steps": [
+    {
+      "foot": "left",
+      "dx_m": 0.15,
+      "clearance_m": 0.035,
+      "knee_bump_rad": 0.3,
+      "support_bias_m": 0.0,
+      "waist_upper_rad": 0.04
+    },
+    {
+      "foot": "right",
+      "dx_m": 0.15,
+      "clearance_m": 0.035,
+      "knee_bump_rad": 0.2,
+      "support_bias_m": 0.0,
+      "waist_upper_rad": 0.04
+    },
+    {
+      "foot": "left",
+      "dx_m": 0.15,
+      "clearance_m": 0.035,
+      "knee_bump_rad": 0.2,
+      "support_bias_m": 0.0,
+      "waist_upper_rad": 0.04
+    },
+    {
+      "foot": "right",
+      "dx_m": 0.15,
+      "clearance_m": 0.035,
+      "knee_bump_rad": 0.2,
+      "support_bias_m": 0.0,
+      "waist_upper_rad": 0.04
+    },
+    {
+      "foot": "left",
+      "dx_m": 0.15,
+      "clearance_m": 0.035,
+      "knee_bump_rad": 0.2,
+      "support_bias_m": 0.0,
+      "waist_upper_rad": 0.04
+    }
+  ],
+  "loaded_step": {
+    "foot": "right",
+    "dx_m": 0.15,
+    "clearance_m": 0.035,
+    "knee_bump_rad": 0.1,
+    "support_bias_m": -0.07,
+    "waist_upper_rad": 0.04,
+    "expected_holding": "left",
+    "gripper_command": [
+      255,
+      0
+    ]
+  },
+  "actual_qualification_required": true
+}

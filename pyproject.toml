@@ -32,6 +32,7 @@ dependencies = [
     "nvidia-curobo[cu12]",
     "rerun-sdk==0.27.3",
     "roma==1.5.4",
+    "scipy==1.15.3",  # WB-Manifold-2 C2 spline reconstruction and analytic bound checks
     "torch==2.9.1",
     "tqdm",
     "trimesh==4.10.1",

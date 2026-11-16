@@ -69,6 +69,9 @@ def _cspace_plan_succeeded(result) -> bool:
     interpolated trajectory (timeopt off, as get_t1_motion_planner sets it). Feasible leaves torque out: the balance
     gate slows the segment until every effort holds. Trust it: ``cspace_error`` is never set, and the last waypoint is
     pinned to the goal, so neither shows a mid-path violation."""
+    from cutamp.manifold_trajectory import ManifoldTrajectory
+    if isinstance(result, ManifoldTrajectory):
+        return result.geometric_verified
     return result is not None and bool(result.success.any())
 
 
@@ -80,6 +83,7 @@ def _plan_arm_to_conf(
     disable_obstacle: Optional[str],
     ground_op,
     max_attempts: int = 20,
+    world=None, arm=None, phase=None,
 ):
     """Plan a collision-free trajectory whose TERMINAL is the COM-safe particle
     conf ``conf`` (``[n]``, in the planner's joint order), via ``plan_cspace`` — so the executed
@@ -94,13 +98,29 @@ def _plan_arm_to_conf(
     the same trajectory (blocks_t1: 54 of 54 repeats bit-identical, none succeeded).
     """
     target_js = JointState.from_position(conf.reshape(1, -1), joint_names=list(planner.kinematics.joint_names))
+    fallback_used=False
     # _disabled_world_obstacle no-ops on name=None.
     with _disabled_world_obstacle(planner, disable_obstacle):
-        result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
+        import os
+        if os.environ.get("CUTAMP_WB_SEED_VERSION","0")=="2":
+            if world is None or arm is None:raise ValueError("WB-Manifold-2 requires world and active arm")
+            from cutamp.manifold_trajectory import plan_manifold
+            result=plan_manifold(world,planner,last_js,target_js,arm,phase)
+        elif os.environ.get("CUTAMP_WB_SEED_VERSION","0")=="1":
+            if world is None or arm is None:raise ValueError("WB-Seed-1 requires explicit world and active arm")
+            from cutamp.whole_body_seed import solve_balanced_cspace
+            result=solve_balanced_cspace(world,planner,target_js,last_js,arm,phase,max_attempts=max_attempts)
+            if not _cspace_plan_succeeded(result):
+                fallback_used=True
+                result=planner.plan_cspace(target_js,last_js,max_attempts=max_attempts)
+                if result is not None:result.trajectory_source="native_cspace_after_wb_seed_v1_failure"
+        else:
+            result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
     if not _cspace_plan_succeeded(result):
         error = RuntimeError(f"cspace-anchored plan failed for {ground_op}")
         error.out_of_attempts = True  # more attempts may plan it (_motion_plan_with_retries' second pass)
         raise error
+    result.native_fallback_status={"requested_version":os.environ.get("CUTAMP_WB_SEED_VERSION","0"),"fallback_used":fallback_used}
     return result
 
 
@@ -161,12 +181,31 @@ def _approach_confs(
     arms = tuple(op.operator.metadata.arm for _, op in ops)
     confs = torch.stack([best_particle[op.values[-1]] for _, op in ops])
     hands = _hand_poses(world, confs, arms)
-    targets = torch.stack([t for (_, op), hand in zip(ops, hands)
-                           for t in approach_targets(hand, op.operator.metadata.action_type)])  # [2K, 4, 4]
+    target_pairs=[]
+    vertical_flags=[]
+    for (_,op),hand in zip(ops,hands):
+        kind=op.operator.metadata.action_type
+        pre,post=approach_targets(hand,kind)
+        vertical=is_vertical(hand)
+        clearance=getattr(world,"manipulation_clearance",{})
+        if kind=="pick" and "pick_lift_height_m" in clearance:
+            post=hand.clone();post[2,3]+=float(clearance["pick_lift_height_m"]);vertical=False
+        if kind=="place" and "place_approach_height_m" in clearance:
+            pre=hand.clone();pre[2,3]+=float(clearance["place_approach_height_m"]);vertical=False
+        target_pairs.extend((pre,post));vertical_flags.append(vertical)
+    targets=torch.stack(target_pairs)
     one = {name: v.unsqueeze(0) for name, v in best_particle.items()}  # a batch of one particle
     movables = torch.cat([movable_spheres_fn(world, plan_skeleton, idx)(one).expand(2, -1, -1) for idx, _ in ops])
     seeds = confs.repeat_interleave(2, dim=0)  # rows (pre, post) per op: len(arms) dep-major blocks of 2
-    q = gn_project_balanced(world, seeds, targets, arms, iters=GN_IK_CLEAR_ITERS, movables=movables)
+    carry_mask=torch.zeros(len(seeds),device=world.device,dtype=torch.bool)
+    if getattr(world,"carry_posture_at_lift",False):
+        for k,(_,op) in enumerate(ops):
+            if op.operator.metadata.action_type=="pick":carry_mask[2*k+1]=True;seeds[2*k+1]=world.q_init
+    from cutamp.carry_posture import project_endpoint,valid as carry_valid
+    with project_endpoint(world,carry_mask) if bool(carry_mask.any()) else contextlib.nullcontext():
+        q = gn_project_balanced(world, seeds, targets, arms, iters=getattr(world,"approach_ik_iters",GN_IK_CLEAR_ITERS), movables=movables)
+    if bool(carry_mask.any()) and not bool(carry_valid(world,q[carry_mask]).all()):
+        raise RuntimeError("Pick carry endpoint misses declared stand-up posture constraints")
     ok, safe, err = ik_check(world, q, targets, arms, movables, ik_tol)
     ok, safe, err = ok.tolist(), safe.tolist(), err.tolist()
     for row, accepted in enumerate(ok):
@@ -177,7 +216,7 @@ def _approach_confs(
             error = RuntimeError(f"approach IK failed for {op}: its {('pre', 'post')[row % 2]} conf {why}")
             error.op_idx = idx
             raise error
-    return {idx: (q[2 * k], q[2 * k + 1], is_vertical(hands[k])) for k, (idx, _) in enumerate(ops)}
+    return {idx: (q[2 * k], q[2 * k + 1], vertical_flags[k]) for k, (idx, _) in enumerate(ops)}
 
 
 @contextlib.contextmanager
@@ -382,12 +421,23 @@ def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> Motio
     ~0.9 s, plus ~20 s the first time a machine compiles its kernels, which Warp
     caches on disk.
     """
-    return get_t1_motion_planner(
+    planner = get_t1_motion_planner(
         world.model,
         get_world_cfg(world.env, include_movables=True),
         use_cuda_graph=use_cuda_graph,
         device_cfg=world.device_cfg,
     )
+    solver=planner.trajopt_solver
+    rollouts=list(solver.get_all_rollout_instances())+list(solver.additional_metrics_rollouts.values())
+    for rollout in rollouts:
+        for manager in (rollout.cost_manager,rollout.metrics_cost_manager):
+            if manager is not None:
+                term=manager.get_cost("com_polygon")
+                if term is not None:term.bind_stance(world)
+    from cutamp.support_contact_pairs import configure
+    configure(world,planner)
+    return planner
+
 
 
 def solve_curobo(
@@ -451,14 +501,21 @@ def solve_curobo(
         # line (check_line) from where it starts to the conf's palm. A failure names the op and the phase.
         nonlocal last_js
         what = f"{ground_op} {phase}"
-        with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
-            with timer.time("curobo_planning"):
-                result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
-                                           max_attempts=max_attempts)
+        from cutamp.support_contact_pairs import contact_phase
+        with contact_phase(world,planner,arm,phase,ground_op):
+            with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
+                with timer.time("curobo_planning"):
+                    result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
+                                               max_attempts=max_attempts, world=world, arm=arm, phase=phase)
         try:
-            plan, dt = _interp_plan(result), _plan_dt(planner)
+            plan, dt = _interp_plan(result), (getattr(result,"sample_dt",None) or _plan_dt(planner))
             entry = {"dt": dt, "arm": arm, "op_idx": idx, "phase": phase, "gripper": gripper}
+            entry["trajectory_generator"] = getattr(result,"trajectory_source","native_cspace")
+            if hasattr(result,"diagnostics"):entry["trajectory_diagnostics"]=result.diagnostics
+            if hasattr(result,"native_fallback_status"):entry["native_fallback_status"]=result.native_fallback_status
+            if hasattr(world,"stance_record"):entry["stance"]=world.stance_record
             plan, stats, fast = _balance_gate(world, plan, dt)
+            entry["trajectory_generator_status"]="all_planner_gates_passed"
             gate_stats.append(stats)
             if fast is not None:
                 entry["planner_timing"] = {"plan": fast, "held_objs": _held_obj_poses(world, planner, held, fast)}
@@ -506,6 +563,8 @@ def solve_curobo(
                 # target block disabled so gripper-block contact at the grasp isn't rejected; gripper-table and
                 # gripper-other-block collision stay enforced. The block attaches AT the grasp conf, tracked from
                 # there by inverse(obj_from_grasp).
+                ready=getattr(world,"ready_configurations",{}).get(arm)
+                if ready is not None:segment(ground_op,idx,arm,ready.clone(),"pre_reach")
                 segment(ground_op, idx, arm, q_pre, "approach")
                 segment(ground_op, idx, arm, q_grasp, "insert", disable=obj_name, gripper="close", line=True)
                 _attach_object(planner, obj_name, last_js, arm)
@@ -763,7 +822,8 @@ def _zmp_margins(world: TAMPWorld, js: JointState, scales: torch.Tensor) -> torc
     from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
 
     _, zmp = com_zmp_in_support(world, _at_scales(js, scales))
-    return com_margin_from_base(zmp, world.model.support.gate_half).reshape(len(scales), -1).amin(-1)
+    margin=world.support_margin_world(zmp,keyframe=False) if hasattr(world,"_planning_stance") else com_margin_from_base(zmp,world.model.support.gate_half)
+    return margin.reshape(len(scales),-1).amin(-1)
 
 
 def _zmp_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tuple[float, bool]:
@@ -776,12 +836,21 @@ def _zmp_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tuple[
     passes; a NaN fails."""
     q, v, a = js.position, js.velocity, js.acceleration
     T, rest = q.shape[0], torch.zeros_like(v)
-    force, moment, _ = world.segment_torques.floor(JointState(
+    floor=world.segment_torques.floor_world if hasattr(world,"_planning_stance") else world.segment_torques.floor
+    force, moment, _ = floor(JointState(
         position=torch.cat([q, q]), velocity=torch.cat([rest, v]), acceleration=torch.cat([rest, a]),
         joint_names=js.joint_names))
     hx, hy = map(float, world.model.support.gate_half)
     fz, mx, my = force[:, 2], moment[:, 0], moment[:, 1]
-    g = torch.stack([hx * fz - my, hx * fz + my, hy * fz - mx, hy * fz + mx])  # [4, 2T]: each >= 0 inside
+    if hasattr(world,"_planning_stance"):
+        from cutamp.com_polygon_cost import COM_SAFETY_MARGIN
+        normal,offset,edge=world._support_halfspaces
+        # n dot (-My,Mx)/Fz >= offset+inset, plus positive force.
+        g=normal[:,0,None]*(-my)+normal[:,1,None]*mx-(offset[:,None]+COM_SAFETY_MARGIN)*fz
+        g=torch.where(edge[:,None],g,torch.ones_like(g))
+        g=torch.cat((g,fz[None]),0)
+    else:
+        g = torch.stack([hx * fz - my, hx * fz + my, hy * fz - mx, hy * fz + mx])
     c0, c1 = g[:, :T], g[:, T:] - g[:, :T]  # c0 + c1 u >= 0
     bound, still = -c0 / c1, c1 == 0
     lower = torch.where(still, torch.where(c0 >= 0, -math.inf, math.inf), torch.where(c1 > 0, bound, -math.inf))
@@ -808,7 +877,8 @@ def _recheck(world: TAMPWorld, js: JointState, planted: bool = True) -> Tuple[fl
     if planted:
         _check_planted(world, _full_positions(world, js))
     com, zmp = com_zmp_in_support(world, js)
-    com_m, zmp_m = com_margin_from_base(com, half).min().item(), com_margin_from_base(zmp, half).min().item()
+    margin=lambda x: world.support_margin_world(x,keyframe=False) if hasattr(world,"_planning_stance") else com_margin_from_base(x,half)
+    com_m,zmp_m=margin(com).min().item(),margin(zmp).min().item()
     if not com_m >= 0:
         raise _gate_error("com", f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
     lifted = int(torch.isposinf(zmp).any(-1).sum())  # com_zmp_in_support: no ZMP where the floor would have to pull
@@ -849,7 +919,7 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
         _check_planted(world, _full_positions(world, plan_js))
         js = _model_frames(world, plan_js)
         com, _ = com_zmp_in_support(world, js)
-        com_planner = com_margin_from_base(com, world.model.support.gate_half).min().item()
+        com_planner = (world.support_margin_world(com,keyframe=False) if hasattr(world,"_planning_stance") else com_margin_from_base(com,world.model.support.gate_half)).min().item()
         if not com_planner >= 0:
             raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_planner:.1f} cm")
         n = js.position.shape[0]

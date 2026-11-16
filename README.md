@@ -1,3 +1,51 @@
+# T2 checkpoint: humanoid last-mile manipulation
+
+This `t2_ckpt` branch extends the humanoid cuTAMP fork with T2 planning, prescribed contact-switching steps, whole-body QP execution, and reproducible physical-simulation evaluation. Original cuTAMP documentation follows below.
+
+## Implemented contributions
+
+- T2 planning assets, joint/tool/gripper mappings, physical sole geometry and persistent translated/rotated/staggered stances.
+- Whole-body trajectory generation (`WB-Manifold-2`): GPU projected optimization, planted-foot and CoM constraints, anatomical torso/pelvis comfort, collision checks, C2 derivatives and joint-extrema validation. Independent ZMP, torque, velocity and Cartesian-line gates remain mandatory.
+- Correct initial-Holding and motion-only continuations, front carry, payload/support contact handling, and orientation-aware placement.
+- Contact-switching inverse-dynamics QP, prescribed empty/loaded step references, swing/contact/friction audits and actual object lifecycle checks.
+- Settled-scene evaluation, hash-bound reference admission, held-gripper continuity guards, perturbation tests and physical rendering.
+
+## Validated results
+
+The final deterministic T2 episode executes five prescribed 15 cm empty steps, a low pickup from a 15 cm pedestal, front carry, a loaded 15 cm step, and placement onto the physical floor. It runs continuously for **113.112 seconds** with simulated finger contacts, no object welds and no robot/object pose resets after initialization.
+
+| Measurement | Final run |
+|---|---:|
+| Maximum planted-foot error | 2.766 mm |
+| Object lift | 472.13 mm |
+| Held-object relative TCP drift | 1.045 mm |
+| Minimum finger-floor clearance | 30.81 mm |
+| Minimum combined support CoP margin | 13.18 mm |
+| Unexpected body/self contacts | 0 |
+| Final floor placement/contact/settling | Passed |
+
+Actual torso pitch was -1.22..59.22 degrees and knees reached approximately 84 degrees. One actuator saturated for one control frame; maximum joint-bound overshoot was 84 microradians. A conservative individual-foot CoP bound grazed by 18.46 micrometers during a lightly loaded transition while combined support remained positive.
+
+Earlier reach qualification generated references for 32/40 development targets; all 32 physical reaches passed. A marginal cohort qualified 104/105 perturbed executions (all TCP hold gates passed; one foot-drift failure). No success advantage for learned execution ranking was demonstrated, so predictor training is not part of the validated pipeline.
+
+## Setup and reproduction
+
+- [Planner setup, inputs and generation](examples/t2_last_mile/README.md)
+- [Physical execution, model assets and evidence reproduction](examples/t2_loco_manipulation/execution/README.md)
+- [Prescribed stepping implementation](examples/t2_loco_manipulation/stepping/README.md)
+
+Use the pinned Linux/CUDA environments described by each component. Physical model assets and recorded evidence are separate inputs; this repository does not bundle videos, simulator traces, network weights or private credentials. Planner assets are included; execution documentation lists external meshes and validates their hashes. Planner and simulation dependencies may require separate environments.
+
+## Limits and provenance
+
+Steps are prescribed, not autonomously selected. Same-scene finite search found 0/225 initial-standing, 3/225 two-step and 193/225 five-step accepted configurations under the declared posture/inactive-arm policy. These are bounded-search results, not global unreachability proofs or evidence that five steps are minimal. The loaded step is optional for the selected floor target.
+
+This is a custom cuTAMP extension, not unchanged stock cuRobo. GPU projection is combined with CPU SciPy spline calculations; no fully GPU-only or five-second end-to-end claim is made. The final result is one deterministic simulation, not hardware validation, general walking, hard-real-time qualification or broad manipulation robustness. The earlier failed gripper-command composition trial informed explicit holding lifecycle guards.
+
+The branch preserves T1 interfaces and defaults. T2 research behavior is opt-in through the example adapters and documented settings. Source manifests distinguish the checked experiment sources from later packaging cleanup; exact numerical reproduction additionally requires the recorded model/reference environment.
+
+---
+
 # cuTAMP with Booster T1
 
 cuTAMP plans on one model, the real-legs T1: bfm_wm's T1 on its home stance.

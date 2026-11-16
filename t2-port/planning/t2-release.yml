@@ -1,0 +1,825 @@
+robot_cfg:
+  kinematics:
+    format_version: 2.0
+    asset_root_path: ''
+    urdf_path: t2_planner.urdf
+    base_link: world
+    tool_frames:
+    - left_base_link
+    - right_base_link
+    - left_sole_link
+    - right_sole_link
+    - stance
+    grasp_contact_link_names:
+    - left_gripper_mount
+    - left_gripper/base
+    - left_gripper/left_driver
+    - left_gripper/left_coupler
+    - left_gripper/left_spring_link
+    - left_gripper/left_follower
+    - left_gripper/left_pad
+    - left_gripper/right_driver
+    - left_gripper/right_coupler
+    - left_gripper/right_spring_link
+    - left_gripper/right_follower
+    - left_gripper/right_pad
+    - right_gripper_mount
+    - right_gripper/base
+    - right_gripper/left_driver
+    - right_gripper/left_coupler
+    - right_gripper/left_spring_link
+    - right_gripper/left_follower
+    - right_gripper/left_pad
+    - right_gripper/right_driver
+    - right_gripper/right_coupler
+    - right_gripper/right_spring_link
+    - right_gripper/right_follower
+    - right_gripper/right_pad
+    - left_base_link
+    - right_base_link
+    - attached_object_left
+    - attached_object_right
+    collision_link_names:
+    - trunk
+    - head_pitch_link
+    - left_elbow_pitch_link
+    - left_elbow_yaw_link
+    - left_wrist_pitch_link
+    - left_wrist_roll_link
+    - left_gripper_mount
+    - left_gripper/base
+    - left_gripper/left_driver
+    - left_gripper/left_coupler
+    - left_gripper/left_spring_link
+    - left_gripper/left_follower
+    - left_gripper/left_pad
+    - left_gripper/right_driver
+    - left_gripper/right_coupler
+    - left_gripper/right_spring_link
+    - left_gripper/right_follower
+    - left_gripper/right_pad
+    - right_elbow_pitch_link
+    - right_elbow_yaw_link
+    - right_wrist_pitch_link
+    - right_wrist_roll_link
+    - right_gripper_mount
+    - right_gripper/base
+    - right_gripper/left_driver
+    - right_gripper/left_coupler
+    - right_gripper/left_spring_link
+    - right_gripper/left_follower
+    - right_gripper/left_pad
+    - right_gripper/right_driver
+    - right_gripper/right_coupler
+    - right_gripper/right_spring_link
+    - right_gripper/right_follower
+    - right_gripper/right_pad
+    - waist_yaw_link
+    - left_hip_pitch_link
+    - left_hip_roll_link
+    - left_hip_yaw_link
+    - left_knee_pitch_link
+    - left_ankle_roll_link
+    - right_hip_pitch_link
+    - right_hip_roll_link
+    - right_hip_yaw_link
+    - right_knee_pitch_link
+    - right_ankle_roll_link
+    - attached_object_left
+    - attached_object_right
+    collision_spheres: spheres-fast.yml
+    collision_sphere_buffer: {}
+    extra_collision_spheres:
+      attached_object_left: 6
+      attached_object_right: 6
+    extra_links:
+      base_link_x:
+        parent_link_name: world
+        link_name: base_link_x
+        joint_name: base_j_x
+        joint_type: X_PRISM
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_limits:
+        - -0.3
+        - 0.4
+        joint_velocity_limits:
+        - -2.0
+        - 2.0
+        link_mass: 0.0
+      base_link_y:
+        parent_link_name: base_link_x
+        link_name: base_link_y
+        joint_name: base_j_y
+        joint_type: Y_PRISM
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_limits:
+        - -0.2
+        - 0.2
+        joint_velocity_limits:
+        - -2.0
+        - 2.0
+        link_mass: 0.0
+      base_link_z:
+        parent_link_name: base_link_y
+        link_name: base_link_z
+        joint_name: base_j_z
+        joint_type: Z_PRISM
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_limits:
+        - 0.35
+        - 1.1
+        joint_velocity_limits:
+        - -2.0
+        - 2.0
+        link_mass: 0.0
+      base_link_pitch:
+        parent_link_name: base_link_z
+        link_name: base_link_pitch
+        joint_name: base_j_pitch
+        joint_type: Y_ROT
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_limits:
+        - -0.3
+        - 1.5
+        joint_velocity_limits:
+        - -2.0
+        - 2.0
+        link_mass: 0.0
+      base_link_roll:
+        parent_link_name: base_link_pitch
+        link_name: base_link_roll
+        joint_name: base_j_roll
+        joint_type: X_ROT
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_limits:
+        - -0.45
+        - 0.45
+        joint_velocity_limits:
+        - -2.0
+        - 2.0
+        link_mass: 0.0
+      base_link_yaw:
+        parent_link_name: base_link_roll
+        child_link_name: trunk
+        link_name: base_link_yaw
+        joint_name: base_j_yaw
+        joint_type: Z_ROT
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_limits:
+        - -0.5
+        - 0.5
+        joint_velocity_limits:
+        - -2.0
+        - 2.0
+        link_mass: 0.0
+      attached_object_left:
+        parent_link_name: left_base_link
+        link_name: attached_object_left
+        joint_name: attach_joint_left
+        joint_type: FIXED
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        link_mass: 0.0
+      attached_object_right:
+        parent_link_name: right_base_link
+        link_name: attached_object_right
+        joint_name: attach_joint_right
+        joint_type: FIXED
+        fixed_transform:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        link_mass: 0.0
+    lock_joints:
+      aa_head_yaw_joint: 0.0
+      head_pitch_joint: 0.0
+    use_global_cumul: true
+    mesh_link_names: null
+    self_collision_buffer: {}
+    self_collision_ignore:
+      left_elbow_pitch_link:
+      - left_elbow_yaw_link
+      left_elbow_yaw_link:
+      - left_elbow_pitch_link
+      - left_wrist_pitch_link
+      left_wrist_pitch_link:
+      - left_elbow_yaw_link
+      left_wrist_roll_link:
+      - left_gripper/base
+      - left_gripper_mount
+      left_gripper_mount:
+      - left_gripper/base
+      - left_wrist_roll_link
+      left_gripper/base:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      - left_gripper_mount
+      - left_wrist_roll_link
+      left_gripper/left_driver:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/left_coupler:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/left_spring_link:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/left_follower:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/left_pad:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/right_driver:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/right_coupler:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/right_spring_link:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/right_follower:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      left_gripper/right_pad:
+      - left_gripper/base
+      - left_gripper/left_coupler
+      - left_gripper/left_driver
+      - left_gripper/left_follower
+      - left_gripper/left_pad
+      - left_gripper/left_spring_link
+      - left_gripper/right_coupler
+      - left_gripper/right_driver
+      - left_gripper/right_follower
+      - left_gripper/right_pad
+      - left_gripper/right_spring_link
+      right_elbow_pitch_link:
+      - right_elbow_yaw_link
+      right_elbow_yaw_link:
+      - right_elbow_pitch_link
+      - right_wrist_pitch_link
+      right_wrist_pitch_link:
+      - right_elbow_yaw_link
+      right_wrist_roll_link:
+      - right_gripper/base
+      - right_gripper_mount
+      right_gripper_mount:
+      - right_gripper/base
+      - right_wrist_roll_link
+      right_gripper/base:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      - right_gripper_mount
+      - right_wrist_roll_link
+      right_gripper/left_driver:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/left_coupler:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/left_spring_link:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/left_follower:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/left_pad:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/right_driver:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/right_coupler:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/right_spring_link:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/right_follower:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      right_gripper/right_pad:
+      - right_gripper/base
+      - right_gripper/left_coupler
+      - right_gripper/left_driver
+      - right_gripper/left_follower
+      - right_gripper/left_pad
+      - right_gripper/left_spring_link
+      - right_gripper/right_coupler
+      - right_gripper/right_driver
+      - right_gripper/right_follower
+      - right_gripper/right_pad
+      - right_gripper/right_spring_link
+      waist_yaw_link:
+      - left_hip_pitch_link
+      - right_hip_pitch_link
+      left_hip_pitch_link:
+      - left_hip_roll_link
+      - waist_yaw_link
+      left_hip_roll_link:
+      - left_hip_pitch_link
+      - left_hip_yaw_link
+      left_hip_yaw_link:
+      - left_hip_roll_link
+      - left_knee_pitch_link
+      left_knee_pitch_link:
+      - left_hip_yaw_link
+      right_hip_pitch_link:
+      - right_hip_roll_link
+      - waist_yaw_link
+      right_hip_roll_link:
+      - right_hip_pitch_link
+      - right_hip_yaw_link
+      right_hip_yaw_link:
+      - right_hip_roll_link
+      - right_knee_pitch_link
+      right_knee_pitch_link:
+      - right_hip_yaw_link
+    cspace:
+      joint_names:
+      - base_j_x
+      - base_j_y
+      - base_j_z
+      - base_j_pitch
+      - base_j_roll
+      - base_j_yaw
+      - left_shoulder_pitch_joint
+      - left_shoulder_roll_joint
+      - left_elbow_pitch_joint
+      - left_elbow_yaw_joint
+      - left_wrist_pitch_joint
+      - left_wrist_yaw_joint
+      - left_wrist_roll_joint
+      - right_shoulder_pitch_joint
+      - right_shoulder_roll_joint
+      - right_elbow_pitch_joint
+      - right_elbow_yaw_joint
+      - right_wrist_pitch_joint
+      - right_wrist_yaw_joint
+      - right_wrist_roll_joint
+      - waist_pitch_joint
+      - waist_roll_joint
+      - waist_yaw_joint
+      - left_hip_pitch_joint
+      - left_hip_roll_joint
+      - left_hip_yaw_joint
+      - left_knee_pitch_joint
+      - left_ankle_pitch_joint
+      - left_ankle_roll_joint
+      - right_hip_pitch_joint
+      - right_hip_roll_joint
+      - right_hip_yaw_joint
+      - right_knee_pitch_joint
+      - right_ankle_pitch_joint
+      - right_ankle_roll_joint
+      default_joint_position:
+      - 0.0
+      - 0.0
+      - 0.9774120822760001
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - -1.35
+      - 0.0
+      - -0.12
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.35
+      - 0.0
+      - 0.12
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      cspace_distance_weight:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      null_space_weight:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      acceleration_scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      velocity_scale:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      position_limit_clip:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      max_acceleration: 15.0
+      max_jerk: 100.0

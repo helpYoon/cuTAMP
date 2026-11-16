@@ -1,0 +1,270 @@
+{
+  "source_robot_sha256": "a71b73364d4668d97596071191b7a1bdc5dd314f92648437fda18ec7961de79c",
+  "assets": [
+    {
+      "filename": "000-trunk.STL",
+      "sha256": "52afacf37b3380f4dc7e028d5cef2cfb1e36145cac2ee73a9b5fcfe1167b81c0",
+      "bytes": 4222284
+    },
+    {
+      "filename": "001-head_yaw_link.STL",
+      "sha256": "82837cb3b7d1f2a416cf7839bb680cfe468c558c8875531c224cbb673c40fe6d",
+      "bytes": 317284
+    },
+    {
+      "filename": "002-head_pitch_link.STL",
+      "sha256": "f1f59dab47d9e93ce63174b69722c22db9cd336d59ddece822befb1813b501d0",
+      "bytes": 3057184
+    },
+    {
+      "filename": "003-head_pitch_link_collision.STL",
+      "sha256": "3ee342ea15b2c0fcff291f98611ed6752447c120edc9b95b990b3fe6697e112c",
+      "bytes": 12684
+    },
+    {
+      "filename": "004-left_shoulder_pitch_link.STL",
+      "sha256": "37a19783477a3b4ad62a22c25b7a4058cbaab9af92df15435baade6ea131fde7",
+      "bytes": 1328984
+    },
+    {
+      "filename": "005-left_shoulder_roll_link.STL",
+      "sha256": "d10c4f38c0fd8c434e5f6fcbda260a34405160b96280638aea77b0d629594568",
+      "bytes": 1004984
+    },
+    {
+      "filename": "006-left_elbow_pitch_link.STL",
+      "sha256": "7a629fe2ce0501cdfaaba3d5020ca044d0c71fd44bba85d3818a1c493444cb0c",
+      "bytes": 1487584
+    },
+    {
+      "filename": "007-left_elbow_yaw_link.STL",
+      "sha256": "35afa050a21fcdd20d70307b5d3f4a567a3aef9302daf91659e83502502fd054",
+      "bytes": 1227984
+    },
+    {
+      "filename": "008-left_wrist_pitch_link.STL",
+      "sha256": "85085ba79d4c1755bbe35a4bce7b0dad732342c9f15cb3732e9d234b12098074",
+      "bytes": 1657384
+    },
+    {
+      "filename": "009-left_wrist_yaw_link.STL",
+      "sha256": "bfc1d2685458c649466daffe1535a79a25576950fae41be0c78a60c77addb499",
+      "bytes": 489184
+    },
+    {
+      "filename": "010-left_wrist_roll_link_with_hand.STL",
+      "sha256": "2d866fe2e7e0fe9b5472322655d52ba357ef3b1d22bdb14aaa5c207404b93d32",
+      "bytes": 2647684
+    },
+    {
+      "filename": "011-left_wrist_roll_link_collision.STL",
+      "sha256": "fa648fbdc092241c6c7d2340c149827c2f89c263c64a75a7eca699387457669b",
+      "bytes": 12484
+    },
+    {
+      "filename": "012-right_shoulder_pitch_link.STL",
+      "sha256": "0e4ca045ba6d27dad6755b426581455ee00c28a32a9d4232f96af30e089535d2",
+      "bytes": 1324184
+    },
+    {
+      "filename": "013-right_shoulder_roll_link.STL",
+      "sha256": "0c3b6f453e934d41b519a22affafc6c9002b0356bc40c425a61a35c82970593c",
+      "bytes": 1021984
+    },
+    {
+      "filename": "014-right_elbow_pitch_link.STL",
+      "sha256": "1d8d06a76e0fa9897cf740d7ae6fb5c735d36e4ce9cdb6ad8f739c7b50700a24",
+      "bytes": 1481084
+    },
+    {
+      "filename": "015-right_elbow_yaw_link.STL",
+      "sha256": "d6600efeefb0f0189cdf9158173b66e3b76c9104576e11efaa1f72a648be6732",
+      "bytes": 1237484
+    },
+    {
+      "filename": "016-right_wrist_pitch_link.STL",
+      "sha256": "25538e72b962faac3c76c7d08ee1839b72cbaeb5403ec0e465546e7d48e27b9e",
+      "bytes": 1638284
+    },
+    {
+      "filename": "017-right_wrist_yaw_link.STL",
+      "sha256": "2b6ce1d4710e95a8f45d58b313f4350168460162f80d788120baeda4f069348a",
+      "bytes": 487084
+    },
+    {
+      "filename": "018-right_wrist_roll_link_with_hand.STL",
+      "sha256": "f5b4955689b6c868b75f1fdace04e976ff39e0bb6ab1ff88c4516d49cd70575c",
+      "bytes": 2707084
+    },
+    {
+      "filename": "019-right_wrist_roll_link_collision.STL",
+      "sha256": "a90f223f0a93547b64a98ff211711213d24edb6fa870a9c35b027e53fd5a226c",
+      "bytes": 12484
+    },
+    {
+      "filename": "020-waist_pitch_link.STL",
+      "sha256": "ba2d7dd2d4c811618e86931f6fd6480770fd5168f51b640b94ff79d59d19c953",
+      "bytes": 233884
+    },
+    {
+      "filename": "021-waist_roll_link.STL",
+      "sha256": "2196475c282ff1ab40c6f9f761725d6411032fcead9ade993703bfbc5bc78967",
+      "bytes": 849884
+    },
+    {
+      "filename": "022-waist_yaw_link.STL",
+      "sha256": "c0950ebf894fd9ebf00a69678a713c1b4f2e1a2f1827864707b3d3a8e09ea061",
+      "bytes": 1987684
+    },
+    {
+      "filename": "023-waist_yaw_link_collision.STL",
+      "sha256": "3767612763d5b005c21ac1217b3e078742f51ed63860383ebba61f07da55c481",
+      "bytes": 12684
+    },
+    {
+      "filename": "024-left_hip_pitch_link.STL",
+      "sha256": "75e86c93f4f3be75ae854391d03230f6f032026c32548caef918d359d3178a8f",
+      "bytes": 1451284
+    },
+    {
+      "filename": "025-left_hip_roll_link.STL",
+      "sha256": "a712069ff4730a942879c30cdba00f6051d74993589462870acff50873741d6d",
+      "bytes": 838884
+    },
+    {
+      "filename": "026-left_hip_yaw_link.STL",
+      "sha256": "1a48820e718a9724d125ef7dd8717501fbfc8e033139267fc66de3c386af8672",
+      "bytes": 1801984
+    },
+    {
+      "filename": "027-left_knee_pitch_link.STL",
+      "sha256": "ee66d048f4157b2e5ed221423d1f69d1d72b03609eea124700fa7dbf82166efc",
+      "bytes": 3525234
+    },
+    {
+      "filename": "028-left_ankle_pitch_link.STL",
+      "sha256": "68e0ea886e54c3159b2ae5a94a18917dfb05381298f95df438651968c60f740d",
+      "bytes": 233884
+    },
+    {
+      "filename": "029-left_ankle_roll_link.STL",
+      "sha256": "feeb92e5ff3590817c9b8078c314b0b16a0e03654ba0b8bd6551fd058b341dd4",
+      "bytes": 1590484
+    },
+    {
+      "filename": "030-right_hip_pitch_link.STL",
+      "sha256": "9ba8462670328616b80ffdc9ca4fcb9b956a63bc1945fe3c2915d4c4c4be0eef",
+      "bytes": 1455384
+    },
+    {
+      "filename": "031-right_hip_roll_link.STL",
+      "sha256": "1aacf29649c00da1d9e276804f3793353dcf2e5d11fb8a834557be03c5a56773",
+      "bytes": 833384
+    },
+    {
+      "filename": "032-right_hip_yaw_link.STL",
+      "sha256": "5bfda02be1109f10b30f1aa87848c0c064a516d917b86df11d6bbe46af371620",
+      "bytes": 1795684
+    },
+    {
+      "filename": "033-right_knee_pitch_link.STL",
+      "sha256": "a04304cce3fea19a23abee6a22e3910feffba16b59b051b087c50295d058a9f9",
+      "bytes": 3538134
+    },
+    {
+      "filename": "034-right_ankle_pitch_link.STL",
+      "sha256": "c65638beb7e080057b10bb46f8a6db311cbeb80aa1b189b4d682f5e1b26d48a0",
+      "bytes": 233884
+    },
+    {
+      "filename": "035-right_ankle_roll_link.STL",
+      "sha256": "a61e8f7879fd8c575506fdf78b82805d67f9a70d3bca9a30bcabb424b89b75c1",
+      "bytes": 1590484
+    },
+    {
+      "filename": "036-logo.STL",
+      "sha256": "58edab292a58607e30a92c332bd6283b8b8b76366802bcd8a2c168e754b6a760",
+      "bytes": 175984
+    },
+    {
+      "filename": "043-base.stl",
+      "sha256": "1019b87c1dcff4a08a2fdca2dfd4893d60a5e2fc53512c6b5fe2e372b75c9aa3",
+      "bytes": 2307084
+    },
+    {
+      "filename": "044-base_coupling.stl",
+      "sha256": "6a2517f9d6d78f89d9edb617fb93a279b4d52ac61c12d9cb743c701676eeb06d",
+      "bytes": 540884
+    },
+    {
+      "filename": "045-c-a01-85-open.stl",
+      "sha256": "13ad73ef491f6f28b9ed6b8fbb3d6fb45896110ea7d415cda1689fc8daa5d925",
+      "bytes": 283384
+    },
+    {
+      "filename": "046-driver.stl",
+      "sha256": "baf8b4dde18ce59eeebc0928a289c69dccec9da81bb186e2838e2e304274e106",
+      "bytes": 438284
+    },
+    {
+      "filename": "047-coupler.stl",
+      "sha256": "54949f7355c35c976d854fb77272feb92d9201213e343a8852429556fc81d416",
+      "bytes": 641884
+    },
+    {
+      "filename": "048-spring_link.stl",
+      "sha256": "56e9f28ce90841d654ab6d953161aeb62142b1459c210335d5862e7fcb281aab",
+      "bytes": 656084
+    },
+    {
+      "filename": "049-follower.stl",
+      "sha256": "28811d3651345dbb5f2020c67d3bd05f754b5e3e791e379c3c4d1d87418bb9c5",
+      "bytes": 572284
+    },
+    {
+      "filename": "050-tongue.stl",
+      "sha256": "2bd5df8a2132542703d40d94be36a990bbc3eabe070283232871147081348d52",
+      "bytes": 383384
+    },
+    {
+      "filename": "054-base.stl",
+      "sha256": "1019b87c1dcff4a08a2fdca2dfd4893d60a5e2fc53512c6b5fe2e372b75c9aa3",
+      "bytes": 2307084
+    },
+    {
+      "filename": "055-base_coupling.stl",
+      "sha256": "6a2517f9d6d78f89d9edb617fb93a279b4d52ac61c12d9cb743c701676eeb06d",
+      "bytes": 540884
+    },
+    {
+      "filename": "056-c-a01-85-open.stl",
+      "sha256": "13ad73ef491f6f28b9ed6b8fbb3d6fb45896110ea7d415cda1689fc8daa5d925",
+      "bytes": 283384
+    },
+    {
+      "filename": "057-driver.stl",
+      "sha256": "baf8b4dde18ce59eeebc0928a289c69dccec9da81bb186e2838e2e304274e106",
+      "bytes": 438284
+    },
+    {
+      "filename": "058-coupler.stl",
+      "sha256": "54949f7355c35c976d854fb77272feb92d9201213e343a8852429556fc81d416",
+      "bytes": 641884
+    },
+    {
+      "filename": "059-spring_link.stl",
+      "sha256": "56e9f28ce90841d654ab6d953161aeb62142b1459c210335d5862e7fcb281aab",
+      "bytes": 656084
+    },
+    {
+      "filename": "060-follower.stl",
+      "sha256": "28811d3651345dbb5f2020c67d3bd05f754b5e3e791e379c3c4d1d87418bb9c5",
+      "bytes": 572284
+    },
+    {
+      "filename": "061-tongue.stl",
+      "sha256": "2bd5df8a2132542703d40d94be36a990bbc3eabe070283232871147081348d52",
+      "bytes": 383384
+    }
+  ]
+}

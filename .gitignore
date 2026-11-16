@@ -9,3 +9,10 @@ __pycache__/
 *.pyc
 *.egg-info/
 runs/
+
+# T2 generated experiment artifacts
+outputs/
+*.npz
+*.mjb
+*.mp4
+*.pt

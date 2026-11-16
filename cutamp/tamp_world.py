@@ -129,7 +129,7 @@ class TAMPWorld:
         self._hand_spheres: Dict[str, torch.Tensor] = {}
         for arm in ("left", "right"):
             tool = self.tool_frame_for_arm(arm)
-            links = (f"{arm}_hand_link", f"A{arm[0].upper()}6")
+            links = ((f"{arm}_wrist_pitch_link",f"{arm}_wrist_roll_link") if self.model.name.startswith("t2_") else (f"{arm}_hand_link",f"A{arm[0].upper()}6"))
             idx = torch.cat([kp.get_sphere_index_from_link_name(link) for link in links])
             world_from_tool = stance_ks.tool_poses.get_link_pose(tool, make_contiguous=True).get_matrix().reshape(4, 4)
             # In float64: a float32 CUDA matmul runs in TF32 here, 0.2 mm off at these world coordinates.
@@ -190,6 +190,62 @@ class TAMPWorld:
         """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction)."""
         return self._stance_soles
 
+    def set_planning_stance(self, state, q_seed, sole_half):
+        """Set one persistent double-support stance for a complete standing plan.
+
+        Call before building optimizers/graphs. A physical transition into this stance
+        is a separate action; initialization here is an explicit experiment condition.
+        """
+        from cutamp.stance import StanceState
+        if state.soles.ndim != 3 or not bool(state.contacts.all()):
+            raise ValueError("whole-plan stance must be unbatched double support")
+        state.support_vertices(sole_half)  # validate planar support before any mutation
+        if q_seed.shape != self._q_init.shape: raise ValueError("whole-body seed shape")
+        lo,hi=self.joint_limits.to(q_seed.device,q_seed.dtype)
+        if not bool(torch.isfinite(q_seed).all() & (q_seed>=lo-1e-6).all() & (q_seed<=hi+1e-6).all()):raise ValueError("stance seed violates joint limits")
+        js = JointState.from_position(q_seed.unsqueeze(0))
+        ks = self.kinematics.compute_kinematics(js)
+        actual = torch.stack([ks.tool_poses.get_link_pose(f, make_contiguous=True).get_matrix().reshape(4,4)
+                              for f in self.model.sole_frames])
+        if not torch.allclose(actual,state.soles,atol=1e-4,rtol=0):
+            raise ValueError("whole-body seed does not realize requested soles")
+        import hashlib,json
+        record=dict(soles=state.soles.detach().cpu().tolist(),contacts=state.contacts.cpu().tolist(),
+                    q_seed=q_seed.detach().cpu().tolist(),sole_half=list(sole_half),
+                    initialization="explicit settled stance, not a physically executed step")
+        record["stance_id"]=hashlib.sha256(json.dumps(record,sort_keys=True).encode()).hexdigest()[:20]
+        self.stance_record=record
+        self.arm_home_ee_world={arm:ks.tool_poses.get_link_pose(self.tool_frame_for_arm(arm),make_contiguous=True).position.flatten().detach().cpu() for arm in ("left","right")}
+        self._planning_stance = state
+        self._stance_soles = state.soles
+        self._q_init = q_seed.detach().clone()
+        self.sole_half = tuple(map(float,sole_half))
+        self._support_halfspaces = state.support_halfspaces(self.sole_half)
+
+    def bind_stance_schedule(self, schedule, *, experimental_keyframe_only=False):
+        """Bind configuration IDs. Differing states require an explicit transition."""
+        for state in schedule.states.values():
+            if not torch.allclose(state.soles,self._stance_soles.expand_as(state.soles),atol=1e-7,rtol=0) or not bool(state.contacts.all()):
+                raise NotImplementedError("a changed stance/contact mode needs an explicit Step transition")
+        self.stance_schedule = schedule
+
+    def stance_for_configuration(self, name):
+        from cutamp.stance import StanceState
+        schedule = getattr(self, "stance_schedule", None)
+        if schedule is not None: return schedule.for_configuration(name)
+        return getattr(self,"_planning_stance",None) or StanceState(self._stance_soles,torch.ones(2,dtype=torch.bool,device=self.device))
+
+    def sole_targets(self, configuration_names):
+        if getattr(self,"stance_schedule",None) is None: return self._stance_soles
+        return torch.stack([self.stance_for_configuration(n).soles for n in configuration_names], dim=-4)
+
+    def support_margin_world(self, points, keyframe=True):
+        from cutamp.com_polygon_cost import COM_SAFETY_MARGIN,COM_DYNAMIC_RESERVE
+        normal,offset,edge=self._support_halfspaces
+        distances=(normal*points[...,:2].unsqueeze(-2)).sum(-1)-offset
+        inset=COM_SAFETY_MARGIN+(COM_DYNAMIC_RESERVE if keyframe else 0.)
+        return torch.where(edge,distances,torch.inf).amin(-1)-inset
+
     # ---- Movables and indexing ---------------------------------------------
 
     @property
@@ -218,8 +274,7 @@ class TAMPWorld:
 
     @property
     def grasps(self) -> Dict[str, GraspSet]:
-        """GraspGenX's grasps by object name (``grasps.grasp_sets``), for the movables a skeleton has picked so far
-        (``algorithm.run_cutamp`` adds them); same-shaped movables share one set."""
+        """GraspGenX grasps for movables requested by task skeletons; same-shaped objects share a set."""
         return self._grasps
 
     def hand_spheres(self, arm: str) -> torch.Tensor:

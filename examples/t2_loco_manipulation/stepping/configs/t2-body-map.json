@@ -1,0 +1,98 @@
+{
+  "schema_version": "t2_body_map_v1",
+  "mapping": [
+    {
+      "joint": "aa_head_yaw_joint"
+    },
+    {
+      "joint": "head_pitch_joint"
+    },
+    {
+      "joint": "left_shoulder_pitch_joint"
+    },
+    {
+      "joint": "left_shoulder_roll_joint"
+    },
+    {
+      "joint": "left_elbow_pitch_joint"
+    },
+    {
+      "joint": "left_elbow_yaw_joint"
+    },
+    {
+      "joint": "left_wrist_pitch_joint"
+    },
+    {
+      "joint": "left_wrist_yaw_joint"
+    },
+    {
+      "joint": "left_wrist_roll_joint"
+    },
+    {
+      "joint": "right_shoulder_pitch_joint"
+    },
+    {
+      "joint": "right_shoulder_roll_joint"
+    },
+    {
+      "joint": "right_elbow_pitch_joint"
+    },
+    {
+      "joint": "right_elbow_yaw_joint"
+    },
+    {
+      "joint": "right_wrist_pitch_joint"
+    },
+    {
+      "joint": "right_wrist_yaw_joint"
+    },
+    {
+      "joint": "right_wrist_roll_joint"
+    },
+    {
+      "joint": "waist_pitch_joint"
+    },
+    {
+      "joint": "waist_roll_joint"
+    },
+    {
+      "joint": "waist_yaw_joint"
+    },
+    {
+      "joint": "left_hip_pitch_joint"
+    },
+    {
+      "joint": "left_hip_roll_joint"
+    },
+    {
+      "joint": "left_hip_yaw_joint"
+    },
+    {
+      "joint": "left_knee_pitch_joint"
+    },
+    {
+      "joint": "left_ankle_pitch_joint"
+    },
+    {
+      "joint": "left_ankle_roll_joint"
+    },
+    {
+      "joint": "right_hip_pitch_joint"
+    },
+    {
+      "joint": "right_hip_roll_joint"
+    },
+    {
+      "joint": "right_hip_yaw_joint"
+    },
+    {
+      "joint": "right_knee_pitch_joint"
+    },
+    {
+      "joint": "right_ankle_pitch_joint"
+    },
+    {
+      "joint": "right_ankle_roll_joint"
+    }
+  ]
+}

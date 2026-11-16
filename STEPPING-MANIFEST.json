@@ -1,0 +1,75 @@
+{
+  "scope": "Source/config/test-only stepping package; no checkpoints, meshes, models, traces or video binaries",
+  "files": [
+    {
+      "path": "examples/t2_loco_manipulation/stepping/.gitignore",
+      "bytes": 55,
+      "sha256": "c49de7844295402d1f2c8d63f5e590cb08178304fed72e9ac60e8ce0db43dd65"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/README.md",
+      "bytes": 5628,
+      "sha256": "29cf24f6cefe0269dee9c314da80e2675ac2b94aeab0fedef75bf365473071b5"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/RELEASE_VALIDATION.md",
+      "bytes": 2393,
+      "sha256": "2a7d545e10b60da20119faa11df2d0070acf71930a65146856e643f8d24dce28"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/audit_all_contacts.py",
+      "bytes": 2209,
+      "sha256": "f59c1787f02adf69cf91fc1c43a9baba257a4dfb5f192be36ddf50f286cfb9e9"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/audit_contacts.py",
+      "bytes": 5194,
+      "sha256": "69ffd30c6e0088ad6168b172368ef70d777a9d06d72b04af24111a8ccb7eb24f"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/configs/prescribed-gaits.json",
+      "bytes": 1329,
+      "sha256": "0ed97f062d0e0b19e82a0400c747f3d5d9cf62648a733e554378ea9c6c411c47"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/configs/t2-body-map.json",
+      "bytes": 1665,
+      "sha256": "2c1aab5f541dd163ad80802dd2cc9bcc07fbc49721e3723d17a85213604989f3"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/configs/terminal-arm-home.json",
+      "bytes": 588,
+      "sha256": "82170cfc09697d0b377f4994defd6a7f2732202b15301ca38588a51bbb2cf0ee"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/contact_wbc.py",
+      "bytes": 11687,
+      "sha256": "025b997f9830661163d57a678a708bdb747ce2b3cad011d75ca6c35bb1afb128"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/make_step_reference.py",
+      "bytes": 10913,
+      "sha256": "ba3a7f48d9d6f7c5b337022368c46794daccecc53732febb758bd24265e0dde2"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/requirements.txt",
+      "bytes": 206,
+      "sha256": "7f28c5e77db0579674776eae24254f48a2296fc94dab01a5d46f73539cd2279d"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/run_step.py",
+      "bytes": 5722,
+      "sha256": "2eec6090dcf8c030ad7e8cd1ace838a25893c6b8bb97b77ffd090ab779d8f5d9"
+    },
+    {
+      "path": "examples/t2_loco_manipulation/stepping/tests/test_reference_contract.py",
+      "bytes": 2889,
+      "sha256": "574bbb6b8a80cf3aef40cc5c86f9aee6da79b78c0ac23b417d5ceb5902d05c5c"
+    }
+  ],
+  "validation": {
+    "asset_free_contract_tests": 3,
+    "reference_packet_max_abs_difference": 0.0,
+    "controller_torque_max_abs_difference_Nm": 5.387260733000221e-11
+  }
+}

@@ -1,0 +1,7 @@
+# Qualified CPU simulation/controller environment: CPython 3.12.3.
+# Keep separate from the planner's Python 3.10 / CUDA environment.
+mujoco==3.8.1
+numpy==2.2.6
+scipy==1.15.3
+proxsuite==0.8.2
+pytest>=8,<10

@@ -1,0 +1,872 @@
+{
+  "mapping": [
+    {
+      "body_index": 0,
+      "joint": "aa_head_yaw_joint",
+      "joint_id": 1,
+      "qpos_address": 7,
+      "velocity_address": 6,
+      "actuator_id": 0,
+      "range_rad": [
+        -1.09956,
+        1.09956
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 1,
+      "joint": "head_pitch_joint",
+      "joint_id": 2,
+      "qpos_address": 8,
+      "velocity_address": 7,
+      "actuator_id": 1,
+      "range_rad": [
+        -0.314159,
+        0.401426
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 2,
+      "joint": "left_shoulder_pitch_joint",
+      "joint_id": 3,
+      "qpos_address": 9,
+      "velocity_address": 8,
+      "actuator_id": 2,
+      "range_rad": [
+        -3.01942,
+        1.71042
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -74.0,
+        74.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -74.0,
+        74.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.017
+    },
+    {
+      "body_index": 3,
+      "joint": "left_shoulder_roll_joint",
+      "joint_id": 4,
+      "qpos_address": 10,
+      "velocity_address": 9,
+      "actuator_id": 3,
+      "range_rad": [
+        -1.51844,
+        1.51844
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -60.0,
+        60.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -60.0,
+        60.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0137
+    },
+    {
+      "body_index": 4,
+      "joint": "left_elbow_pitch_joint",
+      "joint_id": 5,
+      "qpos_address": 11,
+      "velocity_address": 10,
+      "actuator_id": 4,
+      "range_rad": [
+        -2.05949,
+        2.05949
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -60.0,
+        60.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -60.0,
+        60.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0137
+    },
+    {
+      "body_index": 5,
+      "joint": "left_elbow_yaw_joint",
+      "joint_id": 6,
+      "qpos_address": 12,
+      "velocity_address": 11,
+      "actuator_id": 5,
+      "range_rad": [
+        -2.10312,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -60.0,
+        60.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -60.0,
+        60.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0137
+    },
+    {
+      "body_index": 6,
+      "joint": "left_wrist_pitch_joint",
+      "joint_id": 7,
+      "qpos_address": 13,
+      "velocity_address": 12,
+      "actuator_id": 6,
+      "range_rad": [
+        -2.05949,
+        2.05949
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 7,
+      "joint": "left_wrist_yaw_joint",
+      "joint_id": 8,
+      "qpos_address": 14,
+      "velocity_address": 13,
+      "actuator_id": 7,
+      "range_rad": [
+        -0.748746,
+        0.678933
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 8,
+      "joint": "left_wrist_roll_joint",
+      "joint_id": 9,
+      "qpos_address": 15,
+      "velocity_address": 14,
+      "actuator_id": 8,
+      "range_rad": [
+        -1.36136,
+        0.925025
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 9,
+      "joint": "right_shoulder_pitch_joint",
+      "joint_id": 10,
+      "qpos_address": 16,
+      "velocity_address": 15,
+      "actuator_id": 9,
+      "range_rad": [
+        -3.01942,
+        1.71042
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -74.0,
+        74.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -74.0,
+        74.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.017
+    },
+    {
+      "body_index": 10,
+      "joint": "right_shoulder_roll_joint",
+      "joint_id": 11,
+      "qpos_address": 17,
+      "velocity_address": 16,
+      "actuator_id": 10,
+      "range_rad": [
+        -1.51844,
+        1.51844
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -60.0,
+        60.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -60.0,
+        60.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0137
+    },
+    {
+      "body_index": 11,
+      "joint": "right_elbow_pitch_joint",
+      "joint_id": 12,
+      "qpos_address": 18,
+      "velocity_address": 17,
+      "actuator_id": 11,
+      "range_rad": [
+        -2.05949,
+        2.05949
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -60.0,
+        60.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -60.0,
+        60.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0137
+    },
+    {
+      "body_index": 12,
+      "joint": "right_elbow_yaw_joint",
+      "joint_id": 13,
+      "qpos_address": 19,
+      "velocity_address": 18,
+      "actuator_id": 12,
+      "range_rad": [
+        0.0,
+        2.10312
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -60.0,
+        60.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -60.0,
+        60.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0137
+    },
+    {
+      "body_index": 13,
+      "joint": "right_wrist_pitch_joint",
+      "joint_id": 14,
+      "qpos_address": 20,
+      "velocity_address": 19,
+      "actuator_id": 13,
+      "range_rad": [
+        -2.05949,
+        2.05949
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 14,
+      "joint": "right_wrist_yaw_joint",
+      "joint_id": 15,
+      "qpos_address": 21,
+      "velocity_address": 20,
+      "actuator_id": 14,
+      "range_rad": [
+        -0.678933,
+        0.748746
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 15,
+      "joint": "right_wrist_roll_joint",
+      "joint_id": 16,
+      "qpos_address": 22,
+      "velocity_address": 21,
+      "actuator_id": 15,
+      "range_rad": [
+        -0.925025,
+        1.36136
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -22.0,
+        22.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -22.0,
+        22.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.007209
+    },
+    {
+      "body_index": 16,
+      "joint": "waist_pitch_joint",
+      "joint_id": 17,
+      "qpos_address": 23,
+      "velocity_address": 22,
+      "actuator_id": 16,
+      "range_rad": [
+        -0.750492,
+        0.558505
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -138.0,
+        138.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -138.0,
+        138.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.039514279799999996
+    },
+    {
+      "body_index": 17,
+      "joint": "waist_roll_joint",
+      "joint_id": 18,
+      "qpos_address": 24,
+      "velocity_address": 23,
+      "actuator_id": 17,
+      "range_rad": [
+        -0.357792,
+        0.357792
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -144.0,
+        144.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -144.0,
+        144.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0524116653
+    },
+    {
+      "body_index": 18,
+      "joint": "waist_yaw_joint",
+      "joint_id": 19,
+      "qpos_address": 25,
+      "velocity_address": 24,
+      "actuator_id": 18,
+      "range_rad": [
+        -2.40855,
+        2.40855
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 19,
+      "joint": "left_hip_pitch_joint",
+      "joint_id": 20,
+      "qpos_address": 26,
+      "velocity_address": 25,
+      "actuator_id": 19,
+      "range_rad": [
+        -2.93215,
+        2.23402
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 20,
+      "joint": "left_hip_roll_joint",
+      "joint_id": 21,
+      "qpos_address": 27,
+      "velocity_address": 26,
+      "actuator_id": 20,
+      "range_rad": [
+        -0.575959,
+        1.53589
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 21,
+      "joint": "left_hip_yaw_joint",
+      "joint_id": 22,
+      "qpos_address": 28,
+      "velocity_address": 27,
+      "actuator_id": 21,
+      "range_rad": [
+        -2.75762,
+        2.75762
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 22,
+      "joint": "left_knee_pitch_joint",
+      "joint_id": 23,
+      "qpos_address": 29,
+      "velocity_address": 28,
+      "actuator_id": 22,
+      "range_rad": [
+        0.0,
+        2.58309
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 23,
+      "joint": "left_ankle_pitch_joint",
+      "joint_id": 24,
+      "qpos_address": 30,
+      "velocity_address": 29,
+      "actuator_id": 23,
+      "range_rad": [
+        -0.645771823,
+        0.331612558
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -132.0,
+        132.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -132.0,
+        132.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0358941096
+    },
+    {
+      "body_index": 24,
+      "joint": "left_ankle_roll_joint",
+      "joint_id": 25,
+      "qpos_address": 31,
+      "velocity_address": 30,
+      "actuator_id": 24,
+      "range_rad": [
+        -0.314159,
+        0.314159
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -72.0,
+        72.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -72.0,
+        72.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.01333560603
+    },
+    {
+      "body_index": 25,
+      "joint": "right_hip_pitch_joint",
+      "joint_id": 26,
+      "qpos_address": 32,
+      "velocity_address": 31,
+      "actuator_id": 25,
+      "range_rad": [
+        -2.93215,
+        2.23402
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 26,
+      "joint": "right_hip_roll_joint",
+      "joint_id": 27,
+      "qpos_address": 33,
+      "velocity_address": 32,
+      "actuator_id": 26,
+      "range_rad": [
+        -1.53589,
+        0.575959
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 27,
+      "joint": "right_hip_yaw_joint",
+      "joint_id": 28,
+      "qpos_address": 34,
+      "velocity_address": 33,
+      "actuator_id": 27,
+      "range_rad": [
+        -2.75762,
+        2.75762
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 28,
+      "joint": "right_knee_pitch_joint",
+      "joint_id": 29,
+      "qpos_address": 35,
+      "velocity_address": 34,
+      "actuator_id": 28,
+      "range_rad": [
+        0.0,
+        2.58309
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -135.0,
+        135.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -135.0,
+        135.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0281
+    },
+    {
+      "body_index": 29,
+      "joint": "right_ankle_pitch_joint",
+      "joint_id": 30,
+      "qpos_address": 36,
+      "velocity_address": 35,
+      "actuator_id": 29,
+      "range_rad": [
+        -0.645771823,
+        0.331612558
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -132.0,
+        132.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -132.0,
+        132.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.0358941096
+    },
+    {
+      "body_index": 30,
+      "joint": "right_ankle_roll_joint",
+      "joint_id": 31,
+      "qpos_address": 37,
+      "velocity_address": 36,
+      "actuator_id": 30,
+      "range_rad": [
+        -0.314159,
+        0.314159
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "motor_control_range": [
+        -72.0,
+        72.0
+      ],
+      "motor_control_limited": true,
+      "joint_effort_range_nm": [
+        -72.0,
+        72.0
+      ],
+      "joint_effort_limited": true,
+      "armature": 0.01333560603
+    }
+  ]
+}

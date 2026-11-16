@@ -1,0 +1,340 @@
+{
+  "source": "authoritative active Robovision isolated source snapshot",
+  "baseline_commit": "890579f",
+  "integration_target": "latest main b3a0535; algorithm.py deliberately absent to preserve async-grasp change",
+  "source_commit": null,
+  "notes": [
+    "Active source snapshot has no Git metadata; exact file hashes are authoritative.",
+    "run_t2_stance.py optional demo uses corrected physical sole half-sizes (.10791,.040886).",
+    "pyproject.toml adds direct scipy1.15.3 dependency; regenerate uv.lock in integration checkout.",
+    "Default-disabled untested floor robustness experiment excluded.",
+    "No logs, rollout arrays, videos, trained checkpoints, credentials or tokens included."
+  ],
+  "tests": {
+    "native_four_modules": "5 passed in .59s",
+    "motion_only_rollout": "4 passed in8.29s",
+    "all_python_ast": "passed"
+  },
+  "files": [
+    {
+      "path": "STANCE-PR03.md",
+      "sha256": "bf890d2af023855d652df4ce6fb90d03fb21dd7bd05168a9c509f6f673f39352",
+      "bytes": 4432
+    },
+    {
+      "path": "cutamp/anatomical_comfort.py",
+      "sha256": "c6e7b06e5a10af2609fadbfb973b030e4ec8a213a5fb5c7f1d61428eb34d5128",
+      "bytes": 1914
+    },
+    {
+      "path": "cutamp/carry_configuration.py",
+      "sha256": "5b2e61a488a519a19b1ba42c91d0aafc93a5790c365ccba497c79842fd90f806",
+      "bytes": 1978
+    },
+    {
+      "path": "cutamp/carry_posture.py",
+      "sha256": "8e3bcce0019df698909dc382e757d99837771747a121c44d8fe06480f13f2aa8",
+      "bytes": 920
+    },
+    {
+      "path": "cutamp/com_polygon_cost.py",
+      "sha256": "620ef77ad5aeee0e1d7620696423efee53f3ccc2f09adf8e25d2dfed1799d629",
+      "bytes": 19993
+    },
+    {
+      "path": "cutamp/cost_function.py",
+      "sha256": "7433238d1eb8ac9475106bfc37f2c3ecca2161e7b2d71030ca94a4984d9ea1f6",
+      "bytes": 20314
+    },
+    {
+      "path": "cutamp/floor_wrench.py",
+      "sha256": "fa5ad42629c4dcddb5c225e8f00d6c917fa95f544f600914b388a7c2de29f158",
+      "bytes": 10815
+    },
+    {
+      "path": "cutamp/gn_refresh.py",
+      "sha256": "230a986dbd56baa8f96f78156bf9a1200e761479f8cec27bd6d8f2ad94e04b0e",
+      "bytes": 44838
+    },
+    {
+      "path": "cutamp/manifold_trajectory.py",
+      "sha256": "52022c151e4c795b9ac95d0e1c51a3eb1f557eabe515fd3e366cb6f87dfddd89",
+      "bytes": 12839
+    },
+    {
+      "path": "cutamp/motion_solver.py",
+      "sha256": "deedc9470d5fddcfcf86f905e959d8d9d9ebc58bb004b18abf341881b9a3c11a",
+      "bytes": 55440
+    },
+    {
+      "path": "cutamp/optimize_plan.py",
+      "sha256": "9a18545492ac315389aadab03be02c1facdd398c0ee7b305ac799f48e0e748d6",
+      "bytes": 37519
+    },
+    {
+      "path": "cutamp/particle_initialization.py",
+      "sha256": "5ed29b9b1a8daadf0d86e8895e06ccbe91de4812453fa09c5d380a952246fe5e",
+      "bytes": 38867
+    },
+    {
+      "path": "cutamp/rollout.py",
+      "sha256": "3cbe9bc953d4deaf581b2b01cc25ac6ec5defea3a91627eebdebaf3b45d71206",
+      "bytes": 13375
+    },
+    {
+      "path": "cutamp/scripts/utils.py",
+      "sha256": "b99328e3e57a0771b42ebac4d55a6d562345bf8beb0aaf7df2ffe130f13e3880",
+      "bytes": 4774
+    },
+    {
+      "path": "cutamp/stance.py",
+      "sha256": "eaf29e4cf19a7f3344b0a381f281eca37f2b469a03ef875e36360f2a06a37301",
+      "bytes": 5697
+    },
+    {
+      "path": "cutamp/support_contact_pairs.py",
+      "sha256": "62b0ba5d54643a9242f6416cbef095dac0170307cf82ea727f2e4b3778ad1712",
+      "bytes": 2631
+    },
+    {
+      "path": "cutamp/tamp_world.py",
+      "sha256": "efbe0382deb1f87c547e4b13f9b2ba6ca6fc158b2210c8f9a0acac4f5f71f683",
+      "bytes": 18406
+    },
+    {
+      "path": "cutamp/tests/test_anatomical_capture.py",
+      "sha256": "938cd655236e591b9663ce7e4e584175456f9f5fea32012b37ad6bdd8a1da938",
+      "bytes": 1048
+    },
+    {
+      "path": "cutamp/tests/test_cubic_bounds.py",
+      "sha256": "ec851c016a96f0acbe265ccefca003ee827e5e63e3ef6638c9db9278f347a08d",
+      "bytes": 636
+    },
+    {
+      "path": "cutamp/tests/test_intrinsic_stance.py",
+      "sha256": "1d827be00ecbe101973c62fd1af4aa19b3d2f6ece76ad33b365df80d115566bc",
+      "bytes": 1540
+    },
+    {
+      "path": "cutamp/tests/test_plan_provenance.py",
+      "sha256": "2207e0f828a93389f5bb7e8bf14b31088b1db2b56f690f4ce9235832c166cc26",
+      "bytes": 1311
+    },
+    {
+      "path": "cutamp/utils/plan_processor.py",
+      "sha256": "d9c4f65877a1bb200f6304417e4ee45c0273e5c0483ae2cbce22d6ab894bbe98",
+      "bytes": 3687
+    },
+    {
+      "path": "cutamp/whole_body_seed.py",
+      "sha256": "b43500c475bf929bf8a0c296c9e40798cc5cdf21a7e9bc1e462d211276dd61f1",
+      "bytes": 3104
+    },
+    {
+      "path": "examples/t2_last_mile/README.md",
+      "sha256": "894c6ab0b17a42fec2727e8b681f9969ce2c20fc6d29da55dba0494294b11944",
+      "bytes": 4454
+    },
+    {
+      "path": "examples/t2_last_mile/connected/comfort_profile.py",
+      "sha256": "43c03dcfc5bcc6a600ee074a7116334f8b7f1b43dd5a3d03f8e94d8fd6be0ab1",
+      "bytes": 1459
+    },
+    {
+      "path": "examples/t2_last_mile/connected/exact_placement.py",
+      "sha256": "5ba8f2f07634b146c6497df3be1990836fd1b185b92c7681b61008e39b37dfe3",
+      "bytes": 1939
+    },
+    {
+      "path": "examples/t2_last_mile/connected/fixed_pick.py",
+      "sha256": "c8069bd08f12ce9c610668859e2bfbcfac7b05dfe9df829da9e25c09dc255b7f",
+      "bytes": 1352
+    },
+    {
+      "path": "examples/t2_last_mile/connected/held_start.py",
+      "sha256": "a40795ab2231326ab8178692daa72901fb9043d02e5338d3a645badda9b30d55",
+      "bytes": 2882
+    },
+    {
+      "path": "examples/t2_last_mile/connected/prescribed_stance.py",
+      "sha256": "c4855efb5cc9fd5226cbe4b4db5af96f713d20d113c052058ce9e2d577199a93",
+      "bytes": 1213
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-S6-floor-state/held.json",
+      "sha256": "8a967bdb4b5409ec2857e6a64eff1bb168e228541ae262caef035fd57baf9daf",
+      "bytes": 1271
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-S6-floor-state/scene.yml",
+      "sha256": "d9e07e148520c87b604b317d34a7d9123da8f00f8e944b7eb4c5251fef5b8778",
+      "bytes": 1325
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-S6-floor-state/stance.json",
+      "sha256": "ad0a80ceef4209968d0eab02e11018778d438970614c3fb933a9356ee1d970e7",
+      "bytes": 3002
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-held-carry-state/held.json",
+      "sha256": "d5922ca31ea66b749a73364328f190c4d54759225a5aac7c6fca51b8401d54ac",
+      "bytes": 1293
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-held-carry-state/scene.yml",
+      "sha256": "67623d1ac497610f98a835c06502f6c0304a7ffa45bcaf66622e353d231af0cf",
+      "bytes": 1304
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-held-carry-state/stance.json",
+      "sha256": "d25f7628faa05849a05cb1dea5db5386d7e3da3f7327740d608ef96328289ebb",
+      "bytes": 2995
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-hint.json",
+      "sha256": "a797336ea8b895b518c5743fb945eef67334d80e52e691841855009179268fdd",
+      "bytes": 1958
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-stance.json",
+      "sha256": "44c76c5cd71a3dcfdf9bb43bfc296347e66fda29bd1e571aba685429812063dc",
+      "bytes": 3039
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable-walk-scene.yml",
+      "sha256": "4f30374ed9d63cc457306619a67c6c45050f6cda8ffde321ac115cef62bdb7f6",
+      "bytes": 1093
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/comfortable_entry.py",
+      "sha256": "af408b47712e9cc051780b24829409d35f30cf7d8b283de8bcf80f381ee52879",
+      "bytes": 2836
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/grasp1.json",
+      "sha256": "435bda0f2723c92512688b5305c075007eab1e9e9e3df753822f4b486452c1b4",
+      "bytes": 272
+    },
+    {
+      "path": "examples/t2_last_mile/low-task/test_motion_only_rollout.py",
+      "sha256": "7a845bf054648fe415b4a5752e72cad1cc24b81c57c75230be4ce1590d3c1483",
+      "bytes": 2704
+    },
+    {
+      "path": "examples/t2_last_mile/support_contact.py",
+      "sha256": "5b45489709dbe051010478864809762016e076027ceb3364febc46ba6e3debad",
+      "bytes": 2675
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "54a0720b762322cdd6ebbac10b7af9cc178a730b312b798a10f3208d2925b281",
+      "bytes": 3687
+    },
+    {
+      "path": "run_t2.py",
+      "sha256": "2ab4139dbba3054cad70e6f0fd8b6800259ac930ffdb7ed98ad793f3b1fe3536",
+      "bytes": 193
+    },
+    {
+      "path": "run_t2_stance.py",
+      "sha256": "844c3c0593dbafe7fbe7a6f33a5f1873453e06312fc027079aa9392117213200",
+      "bytes": 1193
+    },
+    {
+      "path": "t2-port/gripper_spheres_virtual.json",
+      "sha256": "07c29bcb5af770a0d86efbbc853ed9b2501e3670fff4329823ea476d956f1b5c",
+      "bytes": 38857
+    },
+    {
+      "path": "t2-port/legacy_adapter.py",
+      "sha256": "f8d37650e897dbbf40b435bfea3e8d72bf1674c56e5b020e79e13b0af1d29d1d",
+      "bytes": 6892
+    },
+    {
+      "path": "t2-port/planning/foot-proxy-refit.json",
+      "sha256": "88b8ae3ade03fc921078046958798566aadcdb5a9e4918695cac038165ef7eed",
+      "bytes": 743
+    },
+    {
+      "path": "t2-port/planning/gripper_spheres.json",
+      "sha256": "b164b45311333f666c0c11010d6e7d8e3cb0c6d3e85c48c6c32c2466f77eff8e",
+      "bytes": 39471
+    },
+    {
+      "path": "t2-port/planning/model.json",
+      "sha256": "c775e0a45a384ff3cea57242166a200b610a6c2dd41de688aa0f17eecd2276fc",
+      "bytes": 1498
+    },
+    {
+      "path": "t2-port/planning/release-model.json",
+      "sha256": "40a92f59d583a22dafa179b78f80f69a3edff90ce31d6b539b9562c257ab89de",
+      "bytes": 2453
+    },
+    {
+      "path": "t2-port/planning/spheres-compact.yml",
+      "sha256": "522ad625251d2c3b4e87c5a99fd9e28deaa3e2ac67f0bcd2c261f19d494f4068",
+      "bytes": 22377
+    },
+    {
+      "path": "t2-port/planning/spheres-fast.yml",
+      "sha256": "c3d0b5f48961166f14a66941a3b2cdcf8383c69eadb37a0c5896e62b7e2b4278",
+      "bytes": 108781
+    },
+    {
+      "path": "t2-port/planning/spheres-graspgen.yml",
+      "sha256": "ddd69068fb8cdbd66cd5fe20030484b77db42ececf2fbff7cc8fbc6607ff6612",
+      "bytes": 22375
+    },
+    {
+      "path": "t2-port/planning/spheres.yml",
+      "sha256": "39cc003237a5556ee4610dddbe65c3ecea91b70ad4a6d6c741d5e243842bd7cd",
+      "bytes": 616767
+    },
+    {
+      "path": "t2-port/planning/t2-compact.yml",
+      "sha256": "cc75688568d9d31e99d3878faab07e490f0614cf030e89eaa43513026131f559",
+      "bytes": 20291
+    },
+    {
+      "path": "t2-port/planning/t2-graspgen.yml",
+      "sha256": "f48ffd85c9803ba960414095a8f41426f34a606a0823424947a95d5a06650133",
+      "bytes": 20301
+    },
+    {
+      "path": "t2-port/planning/t2-release-dense.yml",
+      "sha256": "7109a25fd7b2b540d606f592f21c03216302b79c9e1dcf8fd81f67ba7d71d8ab",
+      "bytes": 20283
+    },
+    {
+      "path": "t2-port/planning/t2-release.yml",
+      "sha256": "412f966f7a97969c9b7169d0c224f38dadfe62939f17ef0086fa228f5ba2c750",
+      "bytes": 20288
+    },
+    {
+      "path": "t2-port/planning/t2.yml",
+      "sha256": "af1a2f6d3404572bd58ee717bf4236006953b6b5a81e80c067996e4995dd74fd",
+      "bytes": 20440
+    },
+    {
+      "path": "t2-port/planning/t2_graspgen_planner.urdf",
+      "sha256": "e0cad67ed59257f67f599a5e9f686a6502f63a929a5485b4ebb48d5684ad1f07",
+      "bytes": 30950
+    },
+    {
+      "path": "t2-port/planning/t2_planner.urdf",
+      "sha256": "0b13ae2310845fd6d4a7362aa70f922d440e9aaa1b61b8277ca81d65a203effd",
+      "bytes": 30904
+    },
+    {
+      "path": "t2-port/sweep_volume.json",
+      "sha256": "2d64ffb27af07032ca73fee659a4501b36d0507f8150b48adbc43852e24a9848",
+      "bytes": 851
+    },
+    {
+      "path": "t2_adapter.py",
+      "sha256": "725d1cac7da49aec49a7d4cb253cab7d5ab8ac85d60bd3230ee838e46d093626",
+      "bytes": 1529
+    }
+  ]
+}

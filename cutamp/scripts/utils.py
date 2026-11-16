@@ -23,7 +23,7 @@ from cutamp.com_polygon_cost import COM_TOL, SOLE_POS_TOL, SOLE_ROT_TOL
 
 default_constraint_to_mult = {
     # sole_*: the soles against the stance at every conf (design 7.4), weighted as the hand is.
-    KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0},
+    KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0, "anatomical_err": 5.0},
     StablePlacement.type: {"*_support": 2.0},
     TrajectoryLength.type: {"traj_length": 1e-3},
     # ComPolygon penalty values are O(1e-4 to 1e-3) in m²; multiplier 10
@@ -52,7 +52,7 @@ default_constraint_to_tol = {
     # sole_*: the soles against the stance (design 7.4), on the hand's tolerances; the balance gate holds
     # every trajectory frame to the same two.
     KinematicConstraint.type: {
-        "pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": SOLE_POS_TOL, "sole_rot_err": SOLE_ROT_TOL,
+        "pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": SOLE_POS_TOL, "sole_rot_err": SOLE_ROT_TOL, "anatomical_err": 1e-6,
     },
     # retract_*: the retract confs, which join the motion constraints (design 7.3).
     Motion.type: {

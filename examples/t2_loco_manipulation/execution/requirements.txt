@@ -1,0 +1,9 @@
+# Versions used for the qualified physical rollout; Python 3.12 on Linux.
+numpy==2.2.6
+scipy==1.15.3
+mujoco==3.8.1
+proxsuite==0.8.2
+# Rendering only (no change to physics).
+imageio==2.38.1
+imageio-ffmpeg==0.8.1
+Pillow==13.0.0

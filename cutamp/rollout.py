@@ -38,6 +38,10 @@ def get_conf_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
         if ground_op.operator.metadata.is_actionable:
             conf_idx = [i for i, p in enumerate(ground_op.operator.parameters) if p.type == Conf]
             conf_params.extend([ground_op.values[i] for i in conf_idx])
+    if not conf_params:
+        # A valid held-state continuation may contain only Motion operators.
+        for op in plan_skeleton:
+            conf_params.extend(value for value,param in zip(op.values,op.operator.parameters) if param.type==Conf)
     return list(dict.fromkeys(conf_params))
 
 
@@ -169,6 +173,28 @@ class RolloutFunction:
 
         # Robot spheres: shared across tool frames; reshape directly.
         robot_spheres = kin_state.robot_spheres.view(num_particles, confs.shape[1], -1, 4)
+
+        if not any(op.operator.metadata.is_actionable for op in self.plan_skeleton):
+            # Motion-only plans have no Cartesian action target. Their actual
+            # endpoint configurations remain subject to the usual geometry,
+            # support, joint, anatomical and downstream trajectory constraints.
+            obj_to_pose={name:T.expand(num_particles,confs.shape[1],4,4).clone() for name,T in self.obj_to_initial_pose.items()}
+            from cutamp.t1_domain import _ARM_FLUENTS
+            held_arms=set()
+            for arm in ("left","right"):
+                fluent=_ARM_FLUENTS[arm]["HoldingWithGrasp"]
+                for atom in self.world.initial_state:
+                    if atom.fluent!=fluent:continue
+                    obj,grasp=atom.values;held_arms.add(arm)
+                    G=grasp_7dof_to_mat4x4(particles[grasp])
+                    frame=self.world.tool_frame_for_arm(arm)
+                    hand=ee_pose.get_link_pose(frame,make_contiguous=True).get_matrix().view(num_particles,confs.shape[1],4,4)
+                    obj_to_pose[obj]=hand@torch.linalg.inv(self.world.tool_from_ee[frame])@torch.linalg.inv(G).unsqueeze(1)
+            return Rollout(num_particles=num_particles,confs=confs,conf_params=self.conf_params,
+                robot_spheres=robot_spheres,world_from_ee=world_from_ee,world_from_soles=world_from_soles,
+                world_from_ee_desired=world_from_ee.clone(),gripper_close=[self.conf_to_arm.get(c) in held_arms for c in self.conf_params],
+                action_params=[],obj_to_pose=obj_to_pose,action_to_pose_ts={},
+                ts_to_pose_ts={i:i for i in range(confs.shape[1])})
 
         # Walk operators to produce action targets.
         world_from_tool_desired: List[torch.Tensor] = []

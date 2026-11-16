@@ -21,7 +21,7 @@ from cutamp.com_polygon_cost import compute_com_polygon_penalties
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
 from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
-from cutamp.rollout import Rollout, get_retract_parameters
+from cutamp.rollout import Rollout, get_retract_parameters, get_conf_parameters
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import (
@@ -115,8 +115,15 @@ class CostFunction:
         whose feet drifted would pass the CoM gate on a support polygon it no longer stands on (design 7.4)."""
         pos_errs, rot_errs = curobo_pose_error(rollout["world_from_ee"], rollout["world_from_ee_desired"])
         values = {"pos_err": pos_errs, "rot_err": rot_errs}
-        sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.stance_soles)  # [N, H, 2]
+        sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.sole_targets(get_conf_parameters(self.plan_skeleton)))  # [N, H, 2]
         values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
+        if hasattr(self.world,"trajectory_waist_comfort"):
+            from cutamp.anatomical_comfort import violations
+            confs=rollout["confs"]
+            if self.retract_info:
+                retract=torch.stack([self._particles[name] for name,_,_ in self.retract_info],dim=1)
+                confs=torch.cat((confs,retract),dim=1)
+            values["anatomical_err"]=violations(self.world,confs).flatten(1)
         return {"type": "constraint", "values": values}
 
     def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
