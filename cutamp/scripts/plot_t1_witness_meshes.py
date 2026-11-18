@@ -13,7 +13,7 @@ from matplotlib.figure import Figure
 from yourdfpy import URDF
 
 from cutamp.reachability import canonical_stance
-from cutamp.robots.t1 import REAL_LEGS, TOOL_FRAME_FOR_ARM, load_sweep_volume, trunk_pose_from_q
+from cutamp.robots.t1 import GRIPPER_JOINT_NAMES, REAL_LEGS, TOOL_FRAME_FOR_ARM, load_sweep_volume, trunk_pose_from_q
 
 
 def _unit(vector):
@@ -85,18 +85,23 @@ def _pose(urdf, report, row, cfg, contact_offset):
 def _draw_meshes(ax, urdf, root, view, arm, box, accent):
     triangles, colors = [], []
     geometries = []
+    gripper_links = {TOOL_FRAME_FOR_ARM[arm], *GRIPPER_JOINT_NAMES[arm]}
+    gripper_clearances = {}
     for node in urdf.scene.graph.nodes_geometry:
         local, key = urdf.scene.graph[node]
+        link = urdf.scene.graph.transforms.parents[node]
         name = node.lower()
         active = name.startswith(("al", "left_") if arm == "left" else ("ar", "right_"))
         active = active and "foot" not in name
         dark = any(part in name for part in ("ankle", "waist", "link11", "link22", "logo", "h1.", "hip_yaw"))
         color = accent if active else ([0.29, 0.36, 0.40] if dark else [0.71, 0.76, 0.78])
-        geometries.append((urdf.scene.geometry[key], root @ local, np.array(color)))
-    geometries.append((box, np.eye(4), np.array([0.91, 0.20, 0.44])))
+        geometries.append((link, urdf.scene.geometry[key], root @ local, np.array(color)))
+    geometries.append((None, box, np.eye(4), np.array([0.91, 0.20, 0.44])))
     light = _unit(np.array([0.9, 0.35, 1]))
-    for mesh, pose, rgb in geometries:
+    for link, mesh, pose, rgb in geometries:
         vertices = _transform(mesh.vertices, pose)
+        if link in gripper_links:
+            gripper_clearances[link] = min(gripper_clearances.get(link, np.inf), float(vertices[:, 2].min()))
         normals = mesh.face_normals @ pose[:3, :3].T
         # Discard rear-facing triangles and draw the visible triangles in one
         # far-to-near order across all links and the pick box.
@@ -117,7 +122,10 @@ def _draw_meshes(ax, urdf, root, view, arm, box, accent):
         zorder=2,
     )
     ax.add_collection(collection)
-    return triangles[:, :, :2].reshape(-1, 2)
+    if set(gripper_clearances) != gripper_links:
+        raise ValueError("Visual URDF is missing part of the gripper used for the floor clearance")
+    lowest = min(gripper_clearances, key=gripper_clearances.get)
+    return triangles[:, :, :2].reshape(-1, 2), lowest, gripper_clearances[lowest]
 
 
 def plot_witness_meshes(report, output_path):
@@ -144,12 +152,12 @@ def plot_witness_meshes(report, output_path):
     fig = Figure(figsize=(9, 5.35), dpi=165, facecolor="#fafbf8")
     FigureCanvasAgg(fig)
     axes = fig.subplots(1, 2)
-    fig.subplots_adjust(left=0.035, right=0.985, top=0.84, bottom=0.12, wspace=0.10)
+    fig.subplots_adjust(left=0.035, right=0.985, top=0.84, bottom=0.16, wspace=0.10)
     fig.text(0.05, 0.947, "Fixed-foot T1 poses for the low pick", color="#20333b", weight="bold", fontsize=17)
     fig.text(
         0.05,
         0.90,
-        "Colored mesh: acting arm   •   Ring: hand contact center   •   Pink box: pick region",
+        "Colored mesh = acting arm   •   Ring = gripper center   •   Pink box = pick region",
         color="#455a63",
         fontsize=9,
     )
@@ -164,12 +172,16 @@ def plot_witness_meshes(report, output_path):
             ):
                 pts = np.array(line) @ view
                 ax.plot(pts[:, 0], pts[:, 1], color="#d0d9d8", lw=0.55, zorder=0)
-        extents.append(_draw_meshes(ax, urdf, root, view, report["arm"], box, rgb))
+        outline, lowest_link, clearance = _draw_meshes(ax, urdf, root, view, report["arm"], box, rgb)
+        extents.append(outline)
+        checks[mode.lower()].update(gripper_mesh_lowest_link=lowest_link, gripper_mesh_min_z_m=clearance)
         hand2d = hand @ view
         ax.scatter(*hand2d[:2], s=24, facecolors="none", edgecolors="#1c2730", linewidths=1.25, zorder=3)
         delta = row["point_distance_m"]
         metric = "inside pick region" if delta == 0 else f"{100 * delta:.1f} cm from pick region"
         ax.set_title(f"{mode}   ·   {metric}", fontsize=10.5, color="#20333b", fontweight="bold", pad=7)
+        ax.text(.5, -.025, f"Center height {100 * hand[2]:.1f} cm   ·   Lowest gripper mesh {100 * clearance:.1f} cm",
+                ha="center", va="top", transform=ax.transAxes, color="#455a63", fontsize=8.2)
         ax.set(aspect="equal", facecolor="#fafbf8")
         ax.set_axis_off()
     bounds = np.concatenate(extents)
@@ -186,7 +198,8 @@ def plot_witness_meshes(report, output_path):
     fig.text(
         0.5,
         0.055,
-        "Both soles fixed to the same floor poses     |     Orthographic view     |     10 cm floor grid",
+        f"Both soles fixed   ·   Box spans z = {100 * (center[2] - size[2] / 2):g}–"
+        f"{100 * (center[2] + size[2] / 2):g} cm   ·   Floor grid at z = 0, every 10 cm",
         ha="center",
         color="#52666c",
         fontsize=9,

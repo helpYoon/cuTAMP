@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import xml.etree.ElementTree as ET
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -13,10 +14,12 @@ from curobo.kinematics import Kinematics, KinematicsCfg
 from curobo.types import DeviceCfg, JointState
 from scipy.optimize import least_squares
 from scipy.spatial import ConvexHull
+from yourdfpy import URDF
 
 from cutamp.gn_refresh import _sole_residual_and_jacobian
 from cutamp.robots.envelope import ENVELOPES_DIR
 from cutamp.robots.t1 import (
+    GRIPPER_JOINT_NAMES,
     REAL_LEGS,
     SWEEP_VOLUME_PATH,
     TOOL_FRAME_FOR_ARM,
@@ -25,7 +28,21 @@ from cutamp.robots.t1 import (
     t1_curobo_cfg,
 )
 
-BENDS = {"standing": 0.0, "crouch_0.30": 0.30, "crouch_0.60": 0.60}
+
+class PostureSeed(NamedTuple):
+    trunk_pitch: float
+    knee_pitch: float
+    ankle_pitch: float
+
+
+# Absolute sagittal angles in radians. Hip flexion in the deep squat moves the pelvis
+# back while the trunk pitches forward. Each fitted stance is screened below.
+POSTURES = {
+    "standing": PostureSeed(0.0, .40, -.20),
+    "crouch_0.30": PostureSeed(0.0, 1.00, -.50),
+    "crouch_0.60": PostureSeed(0.0, 1.60, -.80),
+    "deep_squat_hinge": PostureSeed(.60, 1.97, -.45),
+}
 COM_MARGIN_M = 0.05
 SOLE_POS_TOL_M = 0.0003
 SOLE_ANGLE_TOL_RAD = 0.001
@@ -54,6 +71,30 @@ def _support_planes(transforms, sole_box):
     return ConvexHull(xy.reshape(-1, 2)).equations
 
 
+def _gripper_hulls(model, locked_joints):
+    """Vertices supporting each locked gripper in every direction, in its palm frame."""
+    urdf = URDF.load(str(model.asset_root / "t1_planner.urdf"),
+                     filename_handler=lambda fname: str(model.asset_root / fname), load_collision_meshes=False)
+    urdf.update_cfg(locked_joints)
+    hulls, assets = {}, []
+    for arm, palm in TOOL_FRAME_FOR_ARM.items():
+        links = [palm, *GRIPPER_JOINT_NAMES[arm]]
+        vertices = []
+        for link in links:
+            nodes = [node for node in urdf.scene.graph.nodes_geometry if urdf.scene.graph.transforms.parents[node] == link]
+            if not nodes:
+                raise ValueError(f"Missing gripper mesh for {link}")
+            for node in nodes:
+                _, geometry = urdf.scene.graph[node]
+                local = urdf.scene.geometry[geometry].vertices
+                pose = urdf.get_transform(node, frame_from=palm)
+                vertices.append(local @ pose[:3, :3].T + pose[:3, 3])
+            assets.extend(model.asset_root / vis.geometry.mesh.filename for vis in urdf.link_map[link].visuals)
+        points = np.concatenate(vertices)
+        hulls[arm] = points[ConvexHull(points).vertices]
+    return hulls, assets
+
+
 class T1MapSampler:
     """Sample arm and waist joints about physically planted upright/crouched poses with native cuRobo."""
 
@@ -79,7 +120,11 @@ class T1MapSampler:
         self.sole_idx = tuple(self.kin.tool_frames.index(link) for link in self.model.sole_frames)
         home_poses = self._feet(self._fk(self.kin, self.cfg.to_device(self.home)))[0].cpu().numpy()
         self.home_soles = np.column_stack((home_poses[:, :2, 3], np.arctan2(home_poses[:, 1, 0], home_poses[:, 0, 0])))
-        self.sole_box = yaml.safe_load(self.model.cfg_path.read_text())["cutamp"]["sole_box"]
+        robot_config = yaml.safe_load(self.model.cfg_path.read_text())
+        self.sole_box = robot_config["cutamp"]["sole_box"]
+        locked = robot_config["robot_cfg"]["kinematics"]["lock_joints"]
+        hulls, mesh_assets = _gripper_hulls(self.model, locked)
+        self.gripper_hulls = {arm: torch.as_tensor(points, device=self.device) for arm, points in hulls.items()}
         self.waist_index = self.joint_names.index("Waist")
         waist = ET.parse(self.model.asset_root / "t1_planner.urdf").find("joint[@name='Waist']")
         self.waist_origin = self.cfg.to_device(np.fromstring(waist.find("origin").get("xyz"), sep=" "))
@@ -87,11 +132,15 @@ class T1MapSampler:
         self.contact_offset = self.cfg.to_device((np.array(asset["base_from_G"]) @ [*asset["offset_mid"], 1.0])[:3])
         self.draws = torch.quasirandom.SobolEngine(8, scramble=True, seed=seed).draw(self.samples).to(self.device)
         assets = [self.model.cfg_path, self.model.asset_root / "t1_planner.urdf",
-                  self.model.asset_root / "t1_29dof_spheres.yml", ENVELOPES_DIR / "route_a_start.yml", SWEEP_VOLUME_PATH]
+                  self.model.asset_root / "t1_29dof_spheres.yml", ENVELOPES_DIR / "route_a_start.yml", SWEEP_VOLUME_PATH,
+                  *mesh_assets]
         self.metadata = {
             "backend": "cuRobo T1 real_legs", "device": torch.cuda.get_device_name(self.device),
             "joint_names": self.joint_names, "seed": seed, "samples_per_arm_posture": self.samples,
-            "posture_bend_rad": BENDS.copy(), "physical_margin_m": COM_MARGIN_M, "sole_box_m": self.sole_box,
+            "posture_seed_rad": {name: seed._asdict() for name, seed in POSTURES.items()},
+            "gripper_floor_check": "both locked grippers, minimum URDF palm/finger mesh vertex z >= 0 m",
+            "gripper_hull_vertices": {arm: len(points) for arm, points in hulls.items()},
+            "physical_margin_m": COM_MARGIN_M, "sole_box_m": self.sole_box,
             "sole_position_tolerance_m": SOLE_POS_TOL_M, "sole_angle_tolerance_rad": SOLE_ANGLE_TOL_RAD,
             "asset_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in assets},
         }
@@ -104,15 +153,18 @@ class T1MapSampler:
         return torch.stack([state.tool_poses.get_link_pose(link, make_contiguous=True).get_matrix().reshape(-1, 4, 4)
                             for link in self.model.sole_frames], dim=1)
 
-    def _planted_pose(self, goals, bend):
-        # Anchor the symmetric squat to the floor, then refit both legs for the requested split and yaw.
+    def _planted_pose(self, goals, posture):
+        # Close the sagittal chain for a flat foot, then refit both legs for the requested split and yaw.
         q0 = self.home.copy()
+        q0[3] = posture.trunk_pitch
+        hip_pitch = -(posture.trunk_pitch + posture.knee_pitch + posture.ankle_pitch)
         for side in ("Left", "Right"):
-            for name, offset in (("Hip_Pitch", -bend), ("Knee_Pitch", 2*bend), ("Ankle_Pitch", -bend)):
-                q0[self.joint_names.index(f"{side}_{name}")] += offset
+            for name, angle in (("Hip_Pitch", hip_pitch), ("Knee_Pitch", posture.knee_pitch),
+                                ("Ankle_Pitch", posture.ankle_pitch)):
+                q0[self.joint_names.index(f"{side}_{name}")] = angle
         feet = self._feet(self._fk(self.kin, self.cfg.to_device(q0)))[0]
         q0[:3] += (goals[:, :3, 3] - feet[:, :3, 3]).mean(0).cpu().numpy()
-        # Upright trunk with freely translating base; include both 6-DOF legs in the support solve.
+        # Keep the trunk pitch and let the floating base translate over both 6-DOF legs.
         active = np.array([i for i, name in enumerate(self.joint_names)
                            if i < 3 or name.startswith(("Left_Hip", "Right_Hip", "Left_Ankle", "Right_Ankle",
                                                        "Left_Knee", "Right_Knee"))])
@@ -156,8 +208,13 @@ class T1MapSampler:
         q[:, 5] = -waist
         x, y = self.waist_origin[:2]
         c, s = torch.cos(waist), torch.sin(waist)
-        q[:, 0] += x - (c*x + s*y)
+        # Base angles compose as Ry(pitch) Rx(roll) Rz(yaw), with roll zero in these
+        # seeds. Rotate the pivot correction into the world frame to keep the soles fixed.
+        dx = x - (c*x + s*y)
+        pitch = posture_q[3]
+        q[:, 0] += torch.cos(pitch) * dx
         q[:, 1] += y - (-s*x + c*y)
+        q[:, 2] -= torch.sin(pitch) * dx
         q[0] = posture_q
         return q
 
@@ -165,6 +222,12 @@ class T1MapSampler:
         frame = state.tool_poses.get_link_pose(TOOL_FRAME_FOR_ARM[arm], make_contiguous=True)
         mat = frame.get_matrix().reshape(-1, 4, 4)
         return mat[:, :3, :3] @ self.contact_offset + mat[:, :3, 3]
+
+    def _gripper_clearance(self, state, arm):
+        frame = state.tool_poses.get_link_pose(TOOL_FRAME_FOR_ARM[arm], make_contiguous=True)
+        z_row = frame.get_matrix().reshape(-1, 4, 4)[:, 2].double()
+        # The minimum height over a mesh is attained at one of its convex hull vertices.
+        return z_row[:, 3] + (z_row[:, :3] @ self.gripper_hulls[arm].T).amin(1)
 
     @torch.no_grad()
     def map_stance(self, soles):
@@ -177,8 +240,8 @@ class T1MapSampler:
         planes = self.cfg.to_device(_support_planes(transforms, self.sole_box))
         batches = []
         lower, upper = self.cfg.to_device(self.limits)
-        for posture, bend in BENDS.items():
-            posture_q = self._planted_pose(goals, bend)
+        for posture, seed in POSTURES.items():
+            posture_q = self._planted_pose(goals, seed)
             if posture_q is None:
                 continue
             for arm in ("left", "right"):
@@ -197,6 +260,8 @@ class T1MapSampler:
                     rot_error = (feet[:, :, :3, :3] - goals[:, :3, :3]).norm(dim=(-2, -1)).amax(1)
                     valid = ((q >= lower - 1e-7) & (q <= upper + 1e-7)).all(1)
                     valid &= (collision == 0) & (min_height >= 0) & (margin >= COM_MARGIN_M)
+                    for hand in self.gripper_hulls:
+                        valid &= self._gripper_clearance(state, hand) >= 0
                     valid &= (pos_error <= SOLE_POS_TOL_M) & (rot_error <= 2*np.sqrt(2)*np.sin(SOLE_ANGLE_TOL_RAD/2))
                     points = self._contact(state, arm)
                     chunks.append(tuple(x[valid].cpu().numpy() for x in (points, q, margin)))

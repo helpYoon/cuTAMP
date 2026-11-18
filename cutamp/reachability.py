@@ -59,6 +59,13 @@ def stance_key(soles):
     return tuple(np.round(local.ravel(), 7))
 
 
+def _rectangle_separation(offset, first_half, second_half, yaw):
+    """Largest separating-axis gap between two rectangles in the first rectangle’s frame."""
+    axes = np.vstack((np.eye(2), _rot(yaw)))
+    extent = np.abs(axes) @ first_half + np.abs(axes @ _rot(-yaw)) @ second_half
+    return np.max(np.abs(axes @ offset) - extent)
+
+
 def apply_command(soles, side, command):
     """Apply one support-relative endpoint satisfying bfm_wm's landing envelope, or return None."""
     if side not in ("L", "R"):
@@ -71,10 +78,7 @@ def apply_command(soles, side, command):
         return None
     # bfm_wm/src/landing.py::_separated, in the planted sole's frame.
     half = np.array([0.112434, 0.05])
-    axes = np.vstack((np.eye(2), _rot(yaw)))
-    project = np.abs(axes @ np.array([x, y]))
-    extents = np.abs(axes) @ half + np.abs(axes @ _rot(-yaw)) @ half
-    if np.max(project - extents) < 0.02:
+    if _rectangle_separation([x, y], half, half, yaw) < 0.02:
         return None
     support = old[1 - idx]
     dest = np.r_[support[:2] + np.array([x, y]) @ _rot(support[2]), _wrap(support[2] + yaw)]
@@ -247,12 +251,15 @@ def _world_point(local_point, frame):
     return [*(local_point[:2] @ _rot(frame[2]) + frame[:2]).tolist(), float(local_point[2])]
 
 
-def rank_orders(atlas, home_soles, target_center, target_size, arm="left", posture="all", target_yaw=0.0, orders=None):
+def rank_orders(atlas, home_soles, target_center, target_size, arm="left", posture="all", target_yaw=0.0,
+                orders=None, *, solid_pick=False):
     """Score exact orders by distance to a pick box given its center, full side lengths and world yaw.
 
     A zero distance means the volume of an occupied voxel overlaps the box. The
     actual FK witness may differ by up to one voxel diagonal; its position and
     distance are reported separately. A missing distance means no covered samples.
+    For a solid pick resting on the floor, discard endpoints whose physical sole
+    interiors overlap the object footprint when the map contains sole dimensions.
     """
     center = np.asarray(target_center, dtype=float)
     size = np.asarray(target_size, dtype=float)
@@ -262,13 +269,27 @@ def rank_orders(atlas, home_soles, target_center, target_size, arm="left", postu
         raise ValueError("invalid target size, arm or posture selection")
     if orders is None:
         orders = endpoint_orders(home_soles)
+    sole_half = None
+    if solid_pick and abs(center[2] - size[2] / 2) <= 1e-9 and "sole_box_m" in atlas.metadata:
+        sole_half = np.asarray(atlas.metadata["sole_box_m"], dtype=float) / 2
+        if sole_half.shape != (2,) or not np.isfinite(sole_half).all() or np.any(sole_half <= 0):
+            raise ValueError("sole_box_m must contain positive sole length and width")
+        world_to_box = _rot(-target_yaw)
     results = []
     for order, endpoints in orders.items():
         steps = 0 if order == "none" else len(order)
         winner = None
         best = (np.inf, np.inf)
         covered = 0
+        sole_overlaps = 0
         for endpoint_idx, soles in enumerate(endpoints):
+            if sole_half is not None:
+                feet = _soles_array(soles)
+                in_box = (feet[:, :2] - center[:2]) @ world_to_box
+                if any(_rectangle_separation(xy, size[:2] / 2, sole_half, yaw - target_yaw) < -1e-12
+                       for xy, yaw in zip(in_box, feet[:, 2])):
+                    sole_overlaps += 1
+                    continue
             _, frame = canonical_stance(soles)
             local_center = np.r_[(center[:2] - frame[:2]) @ _rot(-frame[2]), center[2]]
             local_yaw = target_yaw - frame[2]
@@ -314,7 +335,10 @@ def rank_orders(atlas, home_soles, target_center, target_size, arm="left", postu
                     "margin_m",
                 )
             )
-        status = "uncovered" if not covered else ("hit" if winner["distance_m"] == 0.0 else "miss")
+        if covered:
+            status = "hit" if winner["distance_m"] == 0.0 else "miss"
+        else:
+            status = "blocked" if sole_overlaps and sole_overlaps == len(endpoints) else "uncovered"
         results.append(
             dict(
                 order=order,
@@ -322,7 +346,8 @@ def rank_orders(atlas, home_soles, target_center, target_size, arm="left", postu
                 status=status,
                 endpoint_count=len(endpoints),
                 covered_count=covered,
-                uncovered_count=len(endpoints) - covered,
+                uncovered_count=len(endpoints) - covered - sole_overlaps,
+                sole_overlap_count=sole_overlaps,
                 **winner,
             )
         )
@@ -330,6 +355,7 @@ def rank_orders(atlas, home_soles, target_center, target_size, arm="left", postu
     def priority(row):
         distance = row["distance_m"]
         return (
+            row["status"] == "blocked",
             row["status"] != "hit",
             row["steps"],
             math.inf if distance is None else round(distance, 12),

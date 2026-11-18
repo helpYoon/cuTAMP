@@ -124,3 +124,37 @@ def test_roundoff_in_equal_gaps_preserves_stable_order():
     orders = {"LR": [HOME], "RL": [placed(HOME, 1e-15, 0, 0)]}
     rows = rank_orders(atlas, HOME, [0.20, 0.05, 0.05], [0.02, 0.02, 0.02], orders=orders)
     assert [r["order"] for r in rows] == ["LR", "RL"]
+
+
+def test_solid_floor_pick_excludes_only_sole_overlaps_and_counts_missing_stances():
+    atlas = ReachMap(0.01, metadata={"sole_box_m": [0.2, 0.06]})
+    atlas.add_stance(HOME, [layer("crouching", [[0, -0.1, 0.025]])])
+    other = placed(HOME, 0.35, 0, 0)
+    missing = other.copy()
+    missing[0, 0] += 0.04
+    orders = {"none": [HOME], "RL": [HOME, other, missing]}
+    kwargs = {"target_size": [0.05] * 3, "orders": orders}
+    floor_center = [0, -0.1, 0.025]  # Under the right sole of HOME.
+    alternate, blocked = rank_orders(atlas, HOME, floor_center, solid_pick=True, **kwargs)
+    assert blocked["order"] == "none" and blocked["status"] == "blocked" and blocked["q"] is None
+    assert alternate["order"] == "RL" and alternate["endpoint_index"] == 1
+    assert [alternate[key] for key in ("sole_overlap_count", "covered_count", "uncovered_count")] == [1, 1, 1]
+    for target, flag in [(floor_center, False), ([0, -0.1, 0.15], True)]:
+        rows = rank_orders(atlas, HOME, target, solid_pick=flag, **kwargs)
+        assert all(r["sole_overlap_count"] == 0 for r in rows)
+    del atlas.metadata["sole_box_m"]  # Old map can still score a floor pick.
+    assert rank_orders(atlas, HOME, floor_center, solid_pick=True, **kwargs)[0]["status"] == "hit"
+
+
+def test_floor_pick_uses_oriented_sole_and_box_interiors():
+    atlas = ReachMap(0.01, metadata={"sole_box_m": [0.2, 0.06]})
+    atlas.add_stance(HOME, [layer("crouching", [[0, 0.1, 0.025]])])
+    # Thin box crosses the thin left sole at right angles without containing any
+    # of its vertices. Translating by .11 m leaves only an edge in contact.
+    for shift, expected in [(0, 1), (0.11, 0)]:
+        for angle in (0, 0.73):
+            home = placed(HOME, 0.3, 0.4, angle)
+            xy = placed(np.array([[shift, 0.1, 0]]), 0.3, 0.4, angle)[0, :2]
+            (row,) = rank_orders(atlas, home, [*xy, 0.025], [0.12, 0.02, 0.05],
+                                 target_yaw=angle + np.pi / 2, orders={"none": [home]}, solid_pick=True)
+            assert row["sole_overlap_count"] == expected

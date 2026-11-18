@@ -5,6 +5,30 @@ import sys
 import numpy as np
 
 
+def test_floor_report_distinguishes_voxel_overlap_from_sample_gap(tmp_path):
+    from cutamp.scripts.plot_t1_reachability import _html_report
+
+    data = {
+        "target_center": [0.30, 0.18, 0.025], "target_size": [0.05] * 3, "voxel_size": 0.015,
+        "home_soles": [[0, 0.1, 0], [0, -0.1, 0]], "arm": "left",
+        "standing_points": [], "crouching_points": [[0.30, 0.18, 0.0525]],
+        "skeletons": {"standing": [], "crouching": []},
+        "hand_points": {"standing": [0.30, 0.18, 0.30], "crouching": [0.30, 0.18, 0.055]},
+        "min_hand_z_m": {"standing": 0.30, "crouching": 0.055},
+    }
+    row = {"order": "none", "standing_m": 0.24, "combined_m": 0.0, "combined_point_m": 0.005,
+           "rank_standing": 1, "rank": 1, "feet": data["home_soles"]}
+    path = tmp_path / "report.html"
+    _html_report(data, [row], path)
+    report = path.read_text()
+    assert "on the floor" in report
+    assert "0–5 cm" in report
+    assert "<td>Overlap</td><td>0.5 cm</td>" in report
+    assert json.loads(report.split('<script id="data" type="application/json">')[1].split("</script>")[0])[
+        "hand_points"
+    ] == data["hand_points"]
+
+
 def test_saved_map_can_score_all_orders_without_the_robot_or_grasp_models(tmp_path):
     from cutamp.reachability import ReachMap
 

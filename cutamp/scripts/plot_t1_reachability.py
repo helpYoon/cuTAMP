@@ -20,11 +20,11 @@ TARGET = "#a51e56"
 ORDER = {"none": "No step", "L": "L", "R": "R", "LR": "LR", "RL": "RL"}
 
 
-def _distance(meters):
+def _distance(meters, zero="Overlap", blocked=False):
     if meters is None or not np.isfinite(meters):
-        return "Unresolved"
+        return "Foot overlap" if blocked else "Unresolved"
     if meters == 0:
-        return "Overlap"
+        return zero
     if meters < 0.001:
         return "< 0.1 cm"
     return f"{100 * meters:.1f} cm"
@@ -32,6 +32,14 @@ def _distance(meters):
 
 def _xyz(points):
     return np.asarray(points, dtype=float).reshape(-1, 3)
+
+
+def _box_height(data):
+    center, half = data["target_center"][2], data["target_size"][2] / 2
+    bottom, top = center - half, center + half
+    if abs(bottom) < 1e-9:
+        return f"Box on the floor, z = 0–{100 * top:g} cm"
+    return f"Box z = {100 * bottom:g}–{100 * top:g} cm"
 
 
 def _side_views(axes, data):
@@ -57,6 +65,8 @@ def _side_views(axes, data):
         points, in_band = clouds[key]
         ax.set_facecolor(PAPER)
         ax.grid(axis="both", color=GRID, lw=.65, zorder=0)
+        ax.axhspan(zlim[0], 0, facecolor="#e8ede9", zorder=0)
+        ax.axhline(0, color=MUTED, lw=1, zorder=1)
         # Collapse identical projected centers so dense layers do not hide sparse ones.
         for part, shade, alpha, marker_size in ((points, color, .11, 8), (in_band, color, .68, 11)):
             xz = np.unique(np.round(part[:, (0, 2)], 5), axis=0)
@@ -68,13 +78,18 @@ def _side_views(axes, data):
         ax.scatter(sols[:, 0], [0, 0], marker="^", color=INK, s=24, zorder=4)
         ax.add_patch(Rectangle((center[0] - size[0] / 2, center[2] - size[2] / 2),
                                size[0], size[2], fc="none", ec=TARGET, lw=2.5, zorder=5))
-        ax.set(title=title, xlim=xlim, ylim=zlim, aspect="equal", xlabel="Forward x (m)", ylabel="Height z (m)")
+        hand = data["hand_points"][key]
+        if hand is not None:
+            ax.scatter([hand[0]], [hand[2]], s=52, facecolors="none", edgecolors=INK, linewidths=1.3, zorder=6)
+        minimum_cm = 100 * data["min_hand_z_m"][key]
+        ax.set(title=f"{title} · lowest center {minimum_cm:.1f} cm", xlim=xlim, ylim=zlim, aspect="equal",
+               xlabel="Forward x (m)", ylabel="Height z (m)")
         ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
         ax.spines[["top", "right"]].set_visible(False)
         ax.spines[["left", "bottom"]].set_color(GRID)
         ax.tick_params(length=0, labelsize=8, labelcolor=MUTED)
-        ax.title.set(color=color, size=14, weight="bold")
+        ax.title.set(color=color, size=12, weight="bold")
 
 
 def _static_report(data, rows, path):
@@ -82,24 +97,28 @@ def _static_report(data, rows, path):
     FigureCanvasAgg(fig)
     fig.text(.08, .95, "T1 reach for a low pick", color=INK, size=23, weight="bold")
     center = np.asarray(data["target_center"]) * 100
-    desc = (f"{data['arm'].capitalize()} hand   ·   target center ({center[0]:g}, {center[1]:g}, {center[2]:g}) cm"
+    desc = (f"{data['arm'].capitalize()} hand   ·   {_box_height(data)}   ·   center ({center[0]:g}, {center[1]:g}, {center[2]:g}) cm"
             f"   ·   {100 * data['voxel_size']:g} cm voxels")
     fig.text(.08, .916, desc, color=MUTED, size=11)
     fig.text(.08, .875, "Fixed feet  /  side view", color=INK, size=13, weight="bold")
-    fig.text(.08, .85, "Magenta box = target. Dark cells share its lateral span. Faint cells show the remaining workspace.",
+    subtitle = ("The target intersects an initial sole. Both panels show the cached workspace."
+                if data["hand_points"]["standing"] is None else
+                "Magenta box = target. Ring = sampled gripper center. Dark cells share the box’s lateral span.")
+    fig.text(.08, .85, subtitle,
              color=MUTED, size=9.6)
     axes = [fig.add_axes([.07, .43, .43, .37]), fig.add_axes([.54, .43, .43, .37])]
     _side_views(axes, data)
     fig.text(.08, .354, "Foot-order ranking", color=INK, size=13, weight="bold")
-    fig.text(.08, .328, "3D distance from the closest occupied voxel to the target box. Overlap = 0 cm.",
+    fig.text(.08, .328, "3D gaps to the box for the nearest occupied voxel and its saved gripper center.",
              color=MUTED, size=9.5)
     table_ax = fig.add_axes([.075, .078, .85, .229])
     table_ax.axis("off")
-    cols = ["Order", "Standing rank", "Standing gap", "With crouch rank", "With crouch gap"]
+    cols = ["Order", "Standing rank", "Standing voxel", "With crouch rank", "With crouch voxel", "Sample gap¹"]
     table = table_ax.table(
-        cellText=[[ORDER[r["order"]], r["rank_standing"], _distance(r["standing_m"]),
-                   r["rank"], _distance(r["combined_m"])] for r in rows],
-        colLabels=cols, colWidths=[.15, .21, .22, .22, .20], cellLoc="left", colLoc="left", bbox=[0, 0, 1, 1])
+        cellText=[[ORDER[r["order"]], r["rank_standing"], _distance(r["standing_m"], blocked=r.get("blocked")),
+                   r["rank"], _distance(r["combined_m"], blocked=r.get("blocked")),
+                   _distance(r["combined_point_m"], "Inside", r.get("blocked"))] for r in rows],
+        colLabels=cols, colWidths=[.12, .17, .18, .19, .20, .14], cellLoc="left", colLoc="left", bbox=[0, 0, 1, 1])
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     for (i, _), cell in table.get_celld().items():
@@ -107,7 +126,7 @@ def _static_report(data, rows, path):
         cell.set_edgecolor(GRID)
         cell.set_linewidth(.75)
         cell.set_text_props(color=MUTED if i == 0 else INK, weight="bold" if i in (0, 1) else "normal")
-    fig.text(.08, .037, "Rank by overlap, then step count, then gap. Ties follow a stable order. Zero grasps sampled.",
+    fig.text(.08, .037, "¹ With crouching enabled. Rank by voxel overlap, then step count, then voxel gap. Zero grasps sampled.",
              color=MUTED, size=9)
     fig.savefig(path, facecolor=PAPER)
 
@@ -115,6 +134,7 @@ def _static_report(data, rows, path):
 def _payload(data):
     payload = {k: np.asarray(data[k]).tolist() for k in ("target_center", "target_size", "home_soles")}
     payload["skeletons"] = {k: [_xyz(line).round(5).tolist() for line in data["skeletons"][k]] for k in STYLES}
+    payload["hand_points"] = {k: np.asarray(data["hand_points"][k]).tolist() for k in STYLES}
     # Use the entire fixed-stance map; compact quantization affects display only.
     payload["points"] = {k: np.unique(_xyz(data[k + "_points"]).round(5), axis=0).tolist() for k in STYLES}
     payload["voxel"] = float(data["voxel_size"])
@@ -166,20 +186,26 @@ def _html_report(data, rows, path):
     table = []
     for row, feet in zip(rows, _foot_views(data, rows)):
         table.append(f'<tr><th scope="row">{ORDER[row["order"]]}</th>'
-                     f'<td>{row["rank_standing"]}</td><td>{_distance(row["standing_m"])}</td>'
-                     f'<td class="rank">{row["rank"]}</td><td>{_distance(row["combined_m"])}</td>'
+                     f'<td>{row["rank_standing"]}</td><td>{_distance(row["standing_m"], blocked=row.get("blocked"))}</td>'
+                     f'<td class="rank">{row["rank"]}</td><td>{_distance(row["combined_m"], blocked=row.get("blocked"))}</td>'
+                     f'<td>{_distance(row["combined_point_m"], "Inside", row.get("blocked"))}</td>'
                      f'<td>{feet}</td></tr>')
     center = ", ".join(f"{100 * float(x):g}" for x in data["target_center"])
     source = _HTML.replace("{{TABLE}}", "".join(table)).replace("{{DATA}}", _payload(data))
     mesh = path.with_name("t1-fixed-feet-poses.png")
     panel = ""
-    if mesh.is_file():
+    if data["hand_points"]["standing"] is None:
+        panel = '<p class="note">The target intersects an initial sole. Both panels show the cached workspace.</p>'
+    elif mesh.is_file():
         pixels = base64.b64encode(mesh.read_bytes()).decode("ascii")
         panel = ('<figure class="mesh"><img alt="T1 mesh views of standing and crouched fixed-foot poses" '
                  f'src="data:image/png;base64,{pixels}"></figure>')
     source = source.replace("{{ROBOT_POSES}}", panel)
     source = source.replace("{{ARM}}", html.escape(data["arm"].capitalize()))
     source = source.replace("{{CENTER}}", center).replace("{{VOXEL}}", f"{100 * data['voxel_size']:g}")
+    source = source.replace("{{BOX_HEIGHT}}", _box_height(data))
+    for key in STYLES:
+        source = source.replace("{{MIN_" + key.upper() + "}}", f"{100 * data['min_hand_z_m'][key]:.1f}")
     path.write_text(source, encoding="utf-8")
 
 
@@ -210,6 +236,7 @@ figcaption{padding:10px 14px 0;font-size:.98rem;font-weight:650}
 .st{color:#227293}.cr{color:#ad542a}canvas{width:100%;height:auto;aspect-ratio:1.12;display:block;touch-action:none;cursor:grab}
 canvas:active{cursor:grabbing}.legend{display:flex;gap:1rem;flex-wrap:wrap;font-size:.86rem;color:#52666c;margin:.5rem 0 2rem}
 .key{width:.65rem;height:.65rem;display:inline-block;background:#a51e56;margin-right:.3rem}.key.pose{background:#20333b}
+.key.hand{background:transparent;border:2px solid #20333b;border-radius:50%}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:3px 10px;border-bottom:1px solid #d9e1df;white-space:nowrap}
 thead th{font-size:.85rem;font-weight:580;color:#52666c;padding-top:8px;padding-bottom:8px}
@@ -217,21 +244,20 @@ tbody th,.rank{font-weight:700}tbody tr:first-child{background:#ecf2ee}td svg{di
 footer{margin-top:1.2rem}.tech{max-width:80ch}
 @media(max-width:620px){.views{grid-template-columns:1fr}table{font-size:.85rem}th,td{padding:3px 6px}}
 </style></head><body><main><header><h1>T1 reach for a low pick</h1>
-<p>{{ARM}} hand · target center ({{CENTER}}) cm · {{VOXEL}} cm voxels</p></header>
+<p>{{ARM}} hand · {{BOX_HEIGHT}} · center ({{CENTER}}) cm · {{VOXEL}} cm voxels</p></header>
 <section><h2>Fixed feet</h2>{{ROBOT_POSES}}<p class="note">Drag either view to rotate both. Each dot marks an occupied 3D voxel center.</p>
 <div class="controls" aria-label="Camera presets"><button data-view="orbit" aria-pressed="true">3D view</button>
 <button data-view="side" aria-pressed="false">Side</button><button data-view="front" aria-pressed="false">Front</button>
 <button data-view="top" aria-pressed="false">Top</button></div>
-<div class="views"><figure><figcaption class="st">Standing</figcaption><canvas id="standing" aria-label="Standing hand reach"></canvas></figure>
-<figure><figcaption class="cr">Crouching</figcaption><canvas id="crouching" aria-label="Crouched hand reach"></canvas></figure></div>
-<div class="legend"><span><i class="key"></i>Pick target</span><span><i class="key pose"></i>Representative pose for this target</span>
+<div class="views"><figure><figcaption class="st">Standing · lowest sampled center {{MIN_STANDING}} cm</figcaption><canvas id="standing" aria-label="Standing hand reach"></canvas></figure>
+<figure><figcaption class="cr">Crouching · lowest sampled center {{MIN_CROUCHING}} cm</figcaption><canvas id="crouching" aria-label="Crouched hand reach"></canvas></figure></div>
+<div class="legend"><span><i class="key"></i>Pick target</span><span><i class="key pose"></i>Selected pose</span><span><i class="key hand"></i>Its gripper center</span>
 <span>Axes in meters · x forward · y left · z up</span></div></section>
-<section><h2>Foot-order ranking</h2><p class="note tech">Gap is the 3D distance from an occupied voxel to the target box. Overlap is 0 cm.
+<section><h2>Foot-order ranking</h2><p class="note tech">Voxel gap measures the distance from an occupied cell to the box. Sample gap measures the distance from its saved gripper center to the box, with crouching enabled.
 Schedules with overlap rank first, followed by fewer steps and smaller gap. Exact ties use a stable order.</p>
-<div class="scroll"><table><thead><tr><th>Order</th><th>Standing rank</th><th>Standing gap</th><th>With crouch rank</th>
-<th>With crouch gap</th><th>Soles</th></tr></thead><tbody>{{TABLE}}</tbody></table></div>
-<footer class="note tech">Top views show the best sampled endpoint with crouching enabled. Forward is up. Dotted marks show the initial soles;
-solid marks show final soles. The magenta point is the target. Scores use robot geometry without sampling grasps.</footer></section>
+<div class="scroll"><table><thead><tr><th>Order</th><th>Standing rank</th><th>Standing voxel gap</th><th>With crouch rank</th>
+<th>With crouch voxel gap</th><th>Sample gap</th><th>Soles</th></tr></thead><tbody>{{TABLE}}</tbody></table></div>
+<footer class="note tech">Top views show the selected endpoints with crouching enabled. Forward is up. Dotted marks show the initial soles and solid marks show the final soles. The magenta point is the target. Each score measures static reach under the planner’s configured self-collision checks. Grasp orientation, closure and the approach path belong to refinement.</footer></section>
 </main><script id="data" type="application/json">{{DATA}}</script><script>
 const data=JSON.parse(document.getElementById('data').textContent);
 const colors={standing:'#227293',crouching:'#ad542a'};
@@ -282,6 +308,10 @@ function draw(key){
     const [x,y,a]=p;line([[-.055,0],[.075,0]].map(([f,l])=>[x+f*Math.cos(a)-l*Math.sin(a),y+f*Math.sin(a)+l*Math.cos(a),0]),'#20333b',3.3)
   }
   for(let i=0;i<8;i++)for(const bit of [1,2,4])if(!(i&bit))line([target[i],target[i|bit]],'#a51e56',2);
+  if(data.hand_points[key]){
+    const [hx,hy]=screen(data.hand_points[key]);ctx.beginPath();ctx.arc(hx,hy,5,0,Math.PI*2);
+    ctx.strokeStyle='white';ctx.lineWidth=3.5;ctx.stroke();ctx.strokeStyle='#20333b';ctx.lineWidth=1.7;ctx.stroke();
+  }
   // Orthographic scale in the plane of the screen, valid for every preset.
   const bar=.2*scale;ctx.strokeStyle='#52666c';ctx.lineWidth=1.3;ctx.beginPath();
   ctx.moveTo(12,h-11);ctx.lineTo(12+bar,h-11);ctx.stroke();
