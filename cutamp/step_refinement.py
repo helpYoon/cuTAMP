@@ -85,7 +85,10 @@ def stance_center_residual(ik: StanceIK) -> torch.Tensor:
 
 
 def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, extra_rows, anchor, geometry_rows):
-    pred = predictor.rollout(initial, order, u) if predictor is not None else None
+    pred = None
+    if predictor is not None:
+        forward = getattr(predictor, "linearize", predictor.rollout) if u.requires_grad else predictor.rollout
+        pred = forward(initial, order, u)
     before = incoming
     rows = {}
     hard = torch.ones(len(u), dtype=torch.bool, device=u.device)
@@ -263,7 +266,7 @@ def refine_gap(
         effort = ((c - commands).flatten(1) * metric).square().sum(-1)
         return effort + centering_weight * evaluation.center.square().sum((1, 2))
 
-    for i in range(max_iterations + 1):
+    for i in range(max(max_iterations, 1)):
         with torch.enable_grad():
             u = u.detach().requires_grad_(bool(order))
             cur = evaluate(u)

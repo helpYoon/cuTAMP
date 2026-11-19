@@ -71,3 +71,22 @@ def test_two_locally_accurate_issues_can_miss_the_intended_world_stance():
     assert all(step.tracking_ok.item() for step in out.steps)
     assert not out.tracking_ok.item()
     torch.testing.assert_close(out.final_xy_error, torch.tensor([[0.012, 0.024]]))
+
+
+def test_packed_clock_change_keeps_the_original_derivative():
+    from types import SimpleNamespace
+
+    from cutamp.landing_predictor import LandingPredictor, LandingState
+
+    # Simulate two batched kernels rounding to opposite sides of an issue tick.
+    class ClockBoundary:
+        def rollout(self, state, order, u):
+            clock = torch.full((len(u),), 45 if len(u) == 1 else 46)
+            return SimpleNamespace(steps=(SimpleNamespace(clock=clock),), value=u.square().sum(-1))
+
+    u = torch.tensor([[[0.12, 0.21, 0.0]]], requires_grad=True)
+    state = LandingState((torch.zeros(1, 3),), torch.zeros(1, 38), "boundary fixture")
+    result = LandingPredictor.linearize(ClockBoundary(), state, "L", u)
+    assert result.steps[0].clock.item() == 45
+    (grad,) = torch.autograd.grad(result.value.sum(), u)
+    torch.testing.assert_close(grad, 2 * u)

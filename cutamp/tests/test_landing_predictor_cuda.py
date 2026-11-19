@@ -1,4 +1,5 @@
 import os
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 import pytest
@@ -151,3 +152,57 @@ def test_command_grid_directional_derivative_on_smooth_clocks(side, predictor):
     smooth = (lc == clock) & (hc == clock)
     assert smooth.sum() >= 2
     torch.testing.assert_close((jac[:, 0] * v).sum(1)[smooth], ((hi - lo) / 0.0014)[smooth], rtol=0.035, atol=0.015)
+
+
+@needs_cuda
+@pytest.mark.parametrize("order", ["L", "RL", "LR"])
+def test_cached_command_jacobian_matches_the_deployment_and_reverse_mode(order, predictor):
+    batch = len(order)
+    d = torch.zeros(batch, 38, device=predictor.device)
+    d[:, 0] = 0.25 / 0.45
+    d[:, -5:] = -1.0
+    if batch > 1:
+        d[1, -5:] = 1.0  # an independent actuator-lag condition
+    initial = predictor.standing_start(d)
+    c = d.new_tensor([[0.12, 0.21 if side == "L" else -0.21, 0.0] for side in order])[None].repeat(batch, 1, 1)
+    c[-1, 0, 0] += 0.03
+    c.requires_grad_()
+
+    def same_value(a, b):
+        if is_dataclass(a):
+            for f in fields(a):
+                same_value(getattr(a, f.name), getattr(b, f.name))
+        elif isinstance(a, tuple):
+            for x, y in zip(a, b, strict=True):
+                same_value(x, y)
+        elif torch.is_tensor(a):
+            assert torch.equal(a, b)
+        else:
+            assert a == b
+
+    def diagnostic(p):
+        s = p.steps[-1]
+        # Terminal FK, trajectory, phase gates, pending commands and the second issue frame.
+        return torch.stack(
+            [
+                s.achieved[:, 0, 0],
+                s.terminal.tensors[-2][:, -1, :].mean(1),
+                s.sole_trace[:, :, 1, 1].mean(1),
+                s.actions[:, :, 2].mean(1),
+                s.trajectory[4][:, :, 3].mean(1),
+                s.reference[:, 0, 0] + s.phases.support_xy + s.phases.deadline_xy,
+                p.final_xy_error.sum(1) + p.final_yaw_error.sum(1),
+            ],
+            -1,
+        )
+
+    with prediction_precision():
+        a = predictor.rollout(initial, order, c)
+        b = predictor.linearize(initial, order, c)
+        same_value(a, b)
+        assert all(type(s.actions.grad_fn).__name__ == "_CommandJacobianBackward" for s in b.steps)
+        ea, eb = diagnostic(a), diagnostic(b)
+        for k in range(ea.shape[1]):
+            (ga,) = torch.autograd.grad(ea[:, k].sum(), c, retain_graph=True)
+            (gb,) = torch.autograd.grad(eb[:, k].sum(), c, retain_graph=True)
+            torch.testing.assert_close(gb, ga, rtol=7e-4, atol=1.5e-4)

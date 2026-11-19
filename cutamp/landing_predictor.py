@@ -8,7 +8,7 @@ the second step. All poses below are sole-center (x, y, yaw), in m, m, rad.
 import json
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -28,7 +28,11 @@ def prediction_precision():
     previous = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
-        yield
+        # A profiling-mode HOLD can specialize the deployed tick before planning
+        # and silently drop its input tangents on a subsequent batch shape. Use
+        # the same ATen path for state preparation, FK and differentiation.
+        with torch.jit.optimized_execution(False):
+            yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
 
@@ -181,6 +185,22 @@ class LandingPrediction:
     tracking_ok: Tensor  # precision only, full manipulation/motion feasibility is assessed by the caller
 
 
+class _CommandJacobian(torch.autograd.Function):
+    """Keep the deployed primal exactly. Its batch-independent command Jacobian is already known."""
+
+    @staticmethod
+    def forward(ctx, primal, tangent, commands):
+        ctx.save_for_backward(tangent)
+        ctx.command_shape = commands.shape
+        return primal
+
+    @staticmethod
+    def backward(ctx, adjoint):
+        (tangent,) = ctx.saved_tensors  # [particles, command coordinates, output coordinates]
+        grad = torch.bmm(tangent, adjoint.reshape(len(adjoint), -1, 1)).reshape(ctx.command_shape)
+        return None, None, grad
+
+
 class LandingPredictor:
     def __init__(self, bundle: Path, device="cuda", hold_ticks=75, profile=None, *, expected_deployment=None):
         device = torch.device(device)
@@ -285,7 +305,6 @@ class LandingPredictor:
         )
 
     @prediction_precision()
-    @torch.jit.optimized_execution(False)
     def rollout(self, initial: LandingState, order: str, commands: Tensor) -> LandingPrediction:
         """Evaluate one exact gap order in parallel across all rows, with a fresh clock on each call.
 
@@ -318,3 +337,89 @@ class LandingPredictor:
             accurate = accurate & step.tracking_ok
         xy, yaw, final_ok = landing_errors(achieved, intended)
         return LandingPrediction(tuple(steps), state, intended, xy, yaw, accurate & final_ok)
+
+    @prediction_precision()
+    def linearize(self, initial: LandingState, order: str, commands: Tensor) -> LandingPrediction:
+        """Exact nominal values and first-order command derivatives at a fixed incoming state.
+
+        Propagate the three or six basis directions together through the same frozen
+        feedback recurrence. Subsequent reverse sweeps through IK, phase reductions
+        and swept collisions use these per-particle Jacobians without replaying the
+        recurrent backward. Fresh trials always run the original deployed clocks.
+        """
+        if not commands.requires_grad or not torch.is_grad_enabled() or order in ("", "none"):
+            return self.rollout(initial, order, commands)
+        batch, steps, coords = commands.shape
+        directions = steps * coords
+        # Use the exact nominal kernels of the original differentiated rollout.
+        # Some PyTorch operators choose a different FP32 path under no_grad.
+        primal = self.rollout(initial, order, commands)
+        with torch.no_grad():
+            copies = LandingState(
+                tuple(x.repeat_interleave(directions, 0) for x in initial.tensors),
+                initial.dynamics.repeat_interleave(directions, 0),
+                initial.history_source,
+            )
+            basis = torch.eye(directions, device=commands.device, dtype=commands.dtype)
+            basis = basis.repeat(batch, 1).reshape(batch * directions, steps, coords)
+        with torch.autograd.forward_ad.dual_level():
+            with torch.no_grad():
+                packed = torch.autograd.forward_ad.make_dual(commands.detach().repeat_interleave(directions, 0), basis)
+                forward = self.rollout(copies, order, packed)
+                matching = torch.stack(
+                    [
+                        torch.eq(p.clock[:, None], f.clock.view(batch, directions)).all()
+                        for p, f in zip(primal.steps, forward.steps)
+                    ]
+                ).all()
+            # GEMM shapes can differ slightly in FP32. At a rounded clock boundary
+            # use the original-batch derivative on precisely the observed branch.
+            if not matching:
+                return primal
+
+            def attach(value, dual):
+                tangent = torch.autograd.forward_ad.unpack_dual(dual).tangent
+                if tangent is None:
+                    # Includes constants. If an external raw ScriptModule call has
+                    # specialized this output, retain its native reverse path.
+                    return value
+                return _CommandJacobian.apply(value.detach(), tangent.reshape(batch, directions, -1), commands)
+
+            connected = []
+            for side, p, f in zip(order, primal.steps, forward.steps):
+                achieved = attach(p.achieved, f.achieved)
+                reference = attach(p.reference, f.reference)
+                trace = attach(p.sole_trace, f.sole_trace)
+                height = attach(p.sole_height, f.sole_height)
+                end = replace(
+                    p.terminal, tensors=tuple(attach(x, y) for x, y in zip(p.terminal.tensors, f.terminal.tensors))
+                )
+                xy, yaw, _ = landing_errors(achieved, reference)
+                connected.append(
+                    replace(
+                        p,
+                        achieved=achieved,
+                        reference=reference,
+                        xy_error=xy,
+                        yaw_error=yaw,
+                        terminal=end,
+                        trajectory=tuple(attach(x, y) for x, y in zip(p.trajectory, f.trajectory)),
+                        sole_trace=trace,
+                        sole_height=height,
+                        sole_tilt=attach(p.sole_tilt, f.sole_tilt),
+                        actions=attach(p.actions, f.actions),
+                        phases=phase_checks(
+                            trace, height, reference, "LR".index(side), p.clock, p.valid_ticks, self.profile
+                        ),
+                    )
+                )
+            intended = attach(primal.intended_final, forward.intended_final)
+            xy, yaw, _ = landing_errors(connected[-1].achieved, intended)
+            return replace(
+                primal,
+                steps=tuple(connected),
+                terminal=connected[-1].terminal,
+                intended_final=intended,
+                final_xy_error=xy,
+                final_yaw_error=yaw,
+            )
