@@ -144,9 +144,13 @@ def test_captured_qp_updates_different_grasp_rows_like_eager():
     device = torch.device("cuda:0")
     g = torch.tensor([[-0.008963], [0.004524]], device=device, dtype=torch.float64)
     jac = g.new_tensor([[[-0.490531, 0.230353, 0.000792]], [[-0.556350, 0.272953, 0.002734]]])
-    offset = g.new_zeros(2, 3)
+    offset = g.new_zeros(2, 5)
     metric = g.new_tensor([1.0, 1.0, 0.1124])
     J = torch.diag(metric).expand(2, 3, 3).contiguous()
+    # Replay the augmented effort matrix for two coordinate residuals as well as
+    # the three command offsets. A feasible row can improve a nonzero offset.
+    xy_jac = g.new_tensor([[0.46, 0.08, 0.01], [-0.05, 0.38, -0.01]]).expand(2, -1, -1)
+    J = torch.cat((J, xy_jac), 1)
     limit = g.new_tensor([0.018, 0.018, 0.0349]).expand(2, -1).contiguous()
 
     def update():
@@ -160,12 +164,14 @@ def test_captured_qp_updates_different_grasp_rows_like_eager():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = update()
-    for demand in (0.004524, 0.0015):
+    for demand, center_x in ((0.004524, 0.0), (0.0015, -0.02)):
         g[1, 0] = demand
+        offset[:, 3] = center_x
         expected = update()
         graph.replay()
         torch.testing.assert_close(captured, expected, rtol=2e-7, atol=3e-8)
-        assert captured[0].norm() < 1e-6 and captured[1, 0] > 0.001
+        assert captured[1, 0] > 0.001
+        assert (captured[0].norm() < 1e-6).item() == (center_x == 0)
 
 
 @needs_cuda
