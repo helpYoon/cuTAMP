@@ -363,6 +363,7 @@ def com_zmp_in_support(world, plan_js):
 def compute_com_polygon_penalties(
     world,
     particles: "dict[str, torch.Tensor]",
+    achieved_stances=None,
 ) -> "dict[str, torch.Tensor]":
     """Per-conf differentiable COM-polygon penalty.
 
@@ -397,6 +398,103 @@ def compute_com_polygon_penalties(
     q_all = torch.cat(qs)
     support = world.model.support
     com_world, base_T = _fk_com_and_base(world, q_all, world.site_kinematics("com"))
+    if achieved_stances is not None:
+        soles = torch.cat([achieved_stances[name] for name in conf_names])
+        n, b = support_region_planes(soles, world.model.sole_box, keyframe=True)
+        g = -margin_from_support_planes(com_world[..., :2], n, b)
+        pen = g.clamp_min(0).square() + COM_INSIDE_WEIGHT * (g + COM_INSIDE_MARGIN).clamp_min(0).square()
+        return dict(zip(conf_names, pen.split([q.shape[0] for q in qs])))
     half = _half_extents(support.keyframe_half, com_world.device, com_world.dtype)
     pen = com_polygon_penalty(com_world, base_T, half)
     return dict(zip(conf_names, pen.split([q.shape[0] for q in qs])))
+
+
+@lru_cache(maxsize=None)
+def _corner_signs(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """``[4, 2]``: the signs of a rectangle's four corners along its axes, made once per device and dtype (a tensor
+    from a Python list is a host-to-device copy, which fails a CUDA graph capture). Shared; never mutate or evict it:
+    a captured graph keeps reading its address."""
+    return torch.tensor([[1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]], device=device, dtype=dtype)
+
+
+def _sole_corners(soles: torch.Tensor, sole_box: Tuple[float, float]) -> torch.Tensor:
+    """``[N, 2, 4, 2]``: the corners of each ``sole_box`` rectangle, centred on its sole frame."""
+    c, s = torch.cos(soles[..., 2]), torch.sin(soles[..., 2])
+    ex, ey = torch.stack([c, s], -1), torch.stack([-s, c], -1)
+    sg = _corner_signs(soles.device, soles.dtype)
+    return (soles[..., None, :2] + sg[:, 0, None] * (sole_box[0] / 2) * ex[..., None, :]
+            + sg[:, 1, None] * (sole_box[1] / 2) * ey[..., None, :])
+
+
+def physical_support_centroid(soles_xyyaw: torch.Tensor, sole_box: Tuple[float, float]) -> torch.Tensor:
+    """Area centroid of the physical convex sole hull, in world XY.
+
+    Keep consecutive counterclockwise hull edges. Removing duplicate corners
+    and subdividing collinear faces avoids double-counting aligned soles. The
+    signed-area formula differentiates through both moving vertices of every
+    selected edge. Center the coordinates for numerical stability.
+    """
+    vertices = _sole_corners(soles_xyyaw, sole_box).flatten(-3, -2)
+    origin = vertices.mean(-2)
+    v = vertices - origin.unsqueeze(-2)
+    a, b = v.unsqueeze(-2), v.unsqueeze(-3)
+    delta = b - a
+    length = delta.norm(dim=-1)
+    tol = 8 * torch.finfo(v.dtype).eps * length.amax(dim=(-1, -2), keepdim=True)
+    distinct = ~(length <= tol).tril(-1).any(-1)
+    unit = delta / torch.where(length > tol, length, 1.0).unsqueeze(-1)
+    inward = torch.stack((-unit[..., 1], unit[..., 0]), dim=-1)
+    # [i,j,k] tests corner k against directed segment i→j.
+    side = (inward.unsqueeze(-2) * delta.unsqueeze(-3)).sum(-1)
+    along = (unit.unsqueeze(-2) * delta.unsqueeze(-3)).sum(-1)
+    eps = tol.unsqueeze(-1)
+    between = (side.abs() <= eps) & (along > eps) & (along < length.unsqueeze(-1) - eps)
+    edges = (length > tol) & distinct.unsqueeze(-1) & distinct.unsqueeze(-2)
+    edges &= (side.amin(dim=-1) >= -tol) & ~between.any(-1)
+    cross = (a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]).masked_fill(~edges, 0.0)
+    numerator = ((a + b) * cross.unsqueeze(-1)).sum(dim=(-2, -3))
+    return origin + numerator / (3 * cross.sum(dim=(-1, -2), keepdim=False).unsqueeze(-1))
+
+
+def _perp_unit(d: torch.Tensor):
+    """Both unit normals of ``d`` ``[..., 2]`` (stacked on a new axis -2) and whether ``d`` is not degenerate."""
+    length = d.norm(dim=-1, keepdim=True)
+    u = d / length.clamp_min(1e-9)
+    n = torch.stack([torch.stack([u[..., 1], -u[..., 0]], -1), torch.stack([-u[..., 1], u[..., 0]], -1)], -2)
+    return n, (length > 1e-9).squeeze(-1)
+
+
+def support_region_planes(soles: torch.Tensor, sole_box: Tuple[float, float], keyframe: bool):
+    """``(n [..., 552, 2], b [..., 552])`` whose intersection is the support region of ``soles`` ``[..., 2, 3]``.
+    The 552 candidate normals: the soles' 8 edges, the 32 segments from a corner of one sole to a corner of the other
+    (the hull's edges) and the 512 segments from a vertex of a L + (1 - a) R to one of (1 - a) L + a R (the load
+    guard's edges). For each, b is the smaller of the two sets' support values, the hull's moved in by
+    ``COM_SAFETY_MARGIN``: an intersection of convex sets is the intersection of their supporting half-planes, and
+    moving a set in by a distance lowers each support value by it. The keyframe region moves in by
+    ``COM_DYNAMIC_RESERVE`` more. A degenerate candidate gets b = +inf."""
+    lead = soles.shape[:-2]
+    soles = soles.reshape(-1, 2, 3)
+    N, a = soles.shape[0], LOAD_GUARD_A
+    V = _sole_corners(soles, sole_box)                                   # [N, 2, 4, 2]
+    VL, VR = V[:, 0], V[:, 1]
+    c, s = torch.cos(soles[..., 2]), torch.sin(soles[..., 2])
+    ex, ey = torch.stack([c, s], -1), torch.stack([-s, c], -1)          # [N, 2, 2]
+    n_edge = torch.cat([ex, -ex, ey, -ey], 1)                           # [N, 8, 2]
+    ok_edge = torch.ones(N, 8, dtype=torch.bool, device=soles.device)
+    n_h, ok_h = _perp_unit((VR[:, None, :, :] - VL[:, :, None, :]).reshape(N, 16, 2))
+    n_h, ok_h = n_h.reshape(N, 32, 2), ok_h[:, :, None].expand(N, 16, 2).reshape(N, 32)
+    A_ = (a * VL[:, :, None, :] + (1 - a) * VR[:, None, :, :]).reshape(N, 16, 2)
+    B_ = ((1 - a) * VL[:, :, None, :] + a * VR[:, None, :, :]).reshape(N, 16, 2)
+    n_s, ok_s = _perp_unit((B_[:, None, :, :] - A_[:, :, None, :]).reshape(N, 256, 2))
+    n_s, ok_s = n_s.reshape(N, 512, 2), ok_s[:, :, None].expand(N, 256, 2).reshape(N, 512)
+    n = torch.cat([n_edge, n_h, n_s], 1)                                 # [N, 552, 2]
+    ok = torch.cat([ok_edge, ok_h, ok_s], 1)
+    # The two sole rectangles' support values along every normal.
+    hx, hy = sole_box[0] / 2, sole_box[1] / 2
+    h = ((n[:, None] * soles[:, :, None, :2]).sum(-1) + hx * (n[:, None] * ex[:, :, None]).sum(-1).abs()
+         + hy * (n[:, None] * ey[:, :, None]).sum(-1).abs())             # [N, 2, K]
+    hL, hR = h[:, 0], h[:, 1]
+    h_guard = torch.maximum(a * hL + (1 - a) * hR, (1 - a) * hL + a * hR)
+    b = torch.minimum(h_guard, torch.maximum(hL, hR) - COM_SAFETY_MARGIN) - (COM_DYNAMIC_RESERVE if keyframe else 0.0)
+    b = torch.where(ok, b, torch.full_like(b, float("inf")))
+    return n.reshape(*lead, -1, 2), b.reshape(*lead, -1)

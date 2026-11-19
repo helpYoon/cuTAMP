@@ -17,7 +17,10 @@ from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo.types import JointState
 
-from cutamp.com_polygon_cost import compute_com_polygon_penalties, margin_from_support_planes, physical_support_planes
+from cutamp.com_polygon_cost import (
+    compute_com_polygon_penalties, margin_from_support_planes, physical_support_centroid,
+    physical_support_planes, physical_support_margin,
+)
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
 from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
@@ -33,7 +36,7 @@ from cutamp.task_planning.constraints import (
     StablePlacement,
 )
 from cutamp.task_planning.costs import TrajectoryLength
-from cutamp.utils.common import transform_spheres
+from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4, transform_spheres
 
 
 @lru_cache(maxsize=None)
@@ -71,6 +74,7 @@ class CostFunction:
         yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
         soles_xyyaw = torch.cat((soles[..., :2, 3], yaw.unsqueeze(-1)), dim=-1)
         self.support_planes = physical_support_planes(soles_xyyaw, world.model.sole_box)
+        self.support_centroid = physical_support_centroid(soles_xyyaw, world.model.sole_box)
 
         # Single self-collision cost over the whole robot — both arms in one
         # kinematic chain, so one cost per query covers both.
@@ -117,13 +121,17 @@ class CostFunction:
                 [o_idx for o_idx, n in enumerate(counts) for _ in range(n)], dtype=torch.int64, device=world.device
             )
 
-    def kinematic_costs(self, rollout: Rollout) -> Union[dict, None]:
+    def kinematic_costs(self, rollout: Rollout, stance_xyyaw=None) -> Union[dict, None]:
         """Kinematic constraints - i.e., pose error between actual and desired end-effector poses, and both
         soles' error against the stance at every conf, ``sole_pos_err`` and ``sole_rot_err`` ``[N, 2H]``: a conf
         whose feet drifted would pass the CoM gate on a support polygon it no longer stands on (design 7.4)."""
         pos_errs, rot_errs = curobo_pose_error(rollout["world_from_ee"], rollout["world_from_ee_desired"])
         values = {"pos_err": pos_errs, "rot_err": rot_errs}
-        sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], self.world.stance_soles)  # [N, H, 2]
+        target_soles = self.world.stance_soles
+        if stance_xyyaw is not None:
+            x, y, yaw = stance_xyyaw.unbind(-1)
+            target_soles = action_4dof_to_mat4x4(torch.stack((x, y, torch.zeros_like(x), yaw), dim=-1))
+        sole_pos, sole_rot = curobo_pose_error(rollout["world_from_soles"], target_soles)
         values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
         return {"type": "constraint", "values": values}
 
@@ -262,7 +270,76 @@ class CostFunction:
 
         return {"type": "constraint", "values": coll_values}
 
-    def com_polygon_constraint(self) -> Union[dict, None]:
+    def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None):
+        """Reconstruct the loose and held objects at each manipulation and retract."""
+        from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
+        from cutamp.step_set import _facts
+        from cutamp.step_validation import _obb_gap, _object_box
+
+        if ops is None:
+            ops = [op for op in self.plan_skeleton if op.operator.metadata.action_type in ("pick", "place", "retract")]
+        key = {"step": "q_land", "retract": "q_retract", "pick": "q", "place": "q"}
+        q = torch.stack([particles[op.arg(key[op.operator.metadata.action_type])] for op in ops], dim=1)
+        b, h = q.shape[:2]
+        if q.requires_grad:
+            # cuRobo reuses the backward buffers of one FK instance on the next call.
+            from curobo.kinematics import Kinematics
+            kin = Kinematics(self.world.kinematics.config)
+        else:
+            kin = self.world.kinematics
+        fk = kin.compute_kinematics(JointState.from_position(q.flatten(0, 1).contiguous()))
+        robot = fk.robot_spheres.reshape(b, h, -1, 4)
+        values = {"robot_to_world": self.world.collision_fn(robot)}
+        kp = kin.kinematics_config
+        held = dict(initial_held or {})
+        loose = (dict(initial_loose) if initial_loose is not None else
+                 {o.name: self.world.get_object_pose(o).expand(b, -1, -1) for o in self.world.movables})
+        foot_half = q.new_tensor(_facts(self.world.model)["foot_box"]) / 2
+        feet = []
+        for frame in self.world.model.sole_frames:
+            foot = fk.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(b, h, 4, 4).clone()
+            foot[..., :3, 3] += foot[..., :3, 2] * foot_half[2]
+            feet.append(foot)
+        for t, op in enumerate(ops):
+            kind = op.operator.metadata.action_type
+            arm = op.operator.metadata.arm
+            if kind == "place":
+                held.pop(op.arg("obj"))
+                loose[op.arg("obj")] = action_4dof_to_mat4x4(particles[op.arg("placement")])
+            object_spheres = {}
+            peaks = []
+            for obj in self.world.movables:
+                name = obj.name
+                spheres = robot[:, t]
+                if name in held:
+                    owner, ee_from_obj = held[name]
+                    frame = self.world.tool_frame_for_arm(owner)
+                    ee = fk.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(b, h, 4, 4)
+                    pose = ee[:, t] @ ee_from_obj
+                    keep = torch.ones(spheres.shape[1], dtype=torch.bool, device=q.device)
+                    for link in (frame, f"{owner}_hand_link", *GRIPPER_JOINT_NAMES[owner]):
+                        if link in kp.link_name_to_idx_map:
+                            keep[kp.get_sphere_index_from_link_name(link).long()] = False
+                    spheres = spheres[:, keep]
+                else:
+                    pose = loose[name]
+                obj_s = transform_spheres(self.world.get_collision_spheres(obj), pose)
+                object_spheres[name] = obj_s
+                peaks.append(sphere_to_sphere_overlap(spheres, obj_s))
+                peaks.append(self.world.collision_fn(obj_s[:, None].contiguous()).reshape(b))
+                box, half = _object_box(obj, pose)
+                for foot in feet:
+                    peaks.append((-_obb_gap(foot[:, t], foot_half, box, half)).clamp_min(0))
+            for a, c in itertools.combinations(object_spheres.values(), 2):
+                peaks.append(sphere_to_sphere_overlap(a, c))
+            if kind == "pick":
+                frame = self.world.tool_frame_for_arm(arm)
+                g = grasp_7dof_to_mat4x4(particles[op.arg("grasp")])
+                held[op.arg("obj")] = arm, torch.linalg.inv(g @ self.world.tool_from_ee[frame])
+            values[f"{t}_movables"] = torch.stack(peaks, dim=1).amax(1, keepdim=True)
+        return {"type": "constraint", "values": values}
+
+    def com_polygon_constraint(self, stances=None) -> Union[dict, None]:
         """Hard COM-over-base-polygon filter, per conf.
 
         Mirrors how Collision works: per-conf continuous penalty values
@@ -271,7 +348,7 @@ class CostFunction:
         inside-barrier function, so Adam receives a real gradient toward
         COM-feasibility instead of a dead-weight 0/1 Boolean.
         """
-        pens = compute_com_polygon_penalties(self.world, self._particles)
+        pens = compute_com_polygon_penalties(self.world, self._particles, stances)
         if not pens:
             return None
         return {"type": "constraint", "values": pens}
@@ -339,7 +416,7 @@ class CostFunction:
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
 
-    def __call__(self, rollout: Rollout, particles: Dict[str, torch.Tensor]) -> Dict[str, dict]:
+    def __call__(self, rollout: Rollout, particles: Dict[str, torch.Tensor], *, achieved_stances=None) -> Dict[str, dict]:
         cost_dict = {}
         self._particles = particles
 
@@ -359,7 +436,8 @@ class CostFunction:
             obj_spheres = transform_spheres(self.world.get_collision_spheres(obj), obj_pose)
             obj_to_spheres[obj.name] = obj_spheres
 
-        collision_cost = self.collision_costs(rollout, obj_to_spheres)
+        collision_cost = (self.collision_costs(rollout, obj_to_spheres) if achieved_stances is None
+                          else self.stepped_scene_costs(particles))
         add_cost(Collision.type, collision_cost)
 
         stable_placement_cost = self.stable_placement_costs(rollout, obj_to_spheres)
@@ -369,20 +447,30 @@ class CostFunction:
         motion_cost = self.motion_costs(rollout)
         add_cost(Motion.type, motion_cost)
 
-        kinematic_cost = self.kinematic_costs(rollout)
+        stances = None if achieved_stances is None else torch.stack(
+            [achieved_stances[name] for name in rollout["conf_params"]], dim=1
+        )
+        kinematic_cost = self.kinematic_costs(rollout, stances)
         add_cost(KinematicConstraint.type, kinematic_cost)
 
         # COM-over-base-polygon hard filter (mirrors Collision)
-        com_polygon_cost = self.com_polygon_constraint()
+        com_polygon_cost = self.com_polygon_constraint(achieved_stances)
         add_cost(ComPolygon.type, com_polygon_cost)
 
-        margin = margin_from_support_planes(rollout["com_xy"], *self.support_planes)
+        margin = (
+            margin_from_support_planes(rollout["com_xy"], *self.support_planes) if stances is None
+            else physical_support_margin(rollout["com_xy"], stances, self.world.model.sole_box)
+        )
         shortfall = (self.config.com_comfort_margin_m - margin).clamp_min(0)
         add_cost(ComComfort.type, {"type": "constraint", "values": {"margin_shortfall_squared": shortfall.square()}})
 
         # Soft costs
-        if self.config.soft_cost:
+        if self.config.soft_cost or self.config.com_center_weight:
             soft_cost = self.soft_costs(rollout)
+            if self.config.com_center_weight:
+                center = self.support_centroid if stances is None else physical_support_centroid(stances, self.world.model.sole_box)
+                distance_squared = (rollout["com_xy"] - center).square().sum(dim=-1)
+                soft_cost["values"]["com_center_distance_squared"] = self.config.com_center_weight * distance_squared
             add_cost("soft", soft_cost)
 
         return cost_dict

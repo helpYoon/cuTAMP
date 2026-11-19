@@ -52,8 +52,12 @@ def test_changing_only_grasp_changes_optimized_landing_in_run_cutamp(tmp_path):
     assert steps[0]["commands"] != steps[1]["commands"]
     assert torch.dist(torch.tensor(steps[0]["achieved"][0][:2]), torch.tensor(steps[1]["achieved"][0][:2])) > 0.004
     assert steps[0]["initial_margin_gradient"] != steps[1]["initial_margin_gradient"]
+    assert steps[0]["initial_center_gradient"] != steps[1]["initial_center_gradient"]
     assert steps[1]["initial_margin_m"] < 0.05 <= steps[1]["margin_m"]
     for g in steps:
+        assert g["center_distance_m"] < g["initial_center_distance_m"] - 0.001
+        measured = torch.dist(torch.tensor(g["com_xy"]), torch.tensor(g["hull_centroid_xy"]))
+        assert abs(measured.item() - g["center_distance_m"]) < 1e-6
         assert g["margin_m"] >= 0.05
         assert max(g["steps"][0]["xy_error_m"]) < 0.02
         assert max(g["steps"][0]["yaw_error_deg"]) < 1.0
