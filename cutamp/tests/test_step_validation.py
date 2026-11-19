@@ -173,6 +173,7 @@ def test_independent_timeline_must_match_issued_command_and_velocity(rollout_sce
 @needs_cuda
 def test_step_record_and_supported_motion_handoff_in_solver(rollout_scene, monkeypatch):
     """A controlled validator and cuRobo segment isolate joining/serialization without a simulator."""
+    from dataclasses import replace
     from types import SimpleNamespace
 
     from curobo.types import JointState
@@ -194,9 +195,17 @@ def test_step_record_and_supported_motion_handoff_in_solver(rollout_scene, monke
     q, v = torch.cat((q0, q[0])), torch.cat((v0, v[0]))
     acc = torch.zeros_like(v)
     committed = {}
+    # This controlled independent source parks the two extra physical head joints
+    # during HOLD. The supported cuRobo model locks them at zero.
+    terminal = [x.clone() for x in state.terminal.tensors]
+    head = [adapter.names.index(n) for n in ("AAHead_yaw", "Head_pitch")]
+    terminal[4][:, head] = terminal[5][:, head] = 0
+    terminal[7][:, -1, head] = -pred.model.home_joints.reshape(-1)[head]
+    terminal[7][:, -1, [len(adapter.names) + i for i in head]] = 0
+    measured = replace(state.terminal, tensors=tuple(terminal), history_source="controlled_head_handoff")
 
     def evidence(req):
-        return TransitionEvidence("controlled_trace", q, v, acc, 0.02, True, True, False, state.terminal)
+        return TransitionEvidence("controlled_trace", q, v, acc, 0.02, True, True, False, measured)
 
     step = LeftStep.ground({param.name: param.name for param in LeftStep.parameters})
     retract = LeftRetractFree.ground({param.name: param.name for param in LeftRetractFree.parameters})
@@ -222,6 +231,15 @@ def test_step_record_and_supported_motion_handoff_in_solver(rollout_scene, monke
     args = ([step, retract], {"left_q0": q0[0], "q_retract": q[-1]}, {0: (start, command, out)}, adapter, world, cfg)
     unavailable, status = ms.plan_validated_step_motion(*args, None, timer=TorchTimer(), visualizer=vis, ik_tol=None)
     assert unavailable is None and status["motion_validation"] == "unavailable"
+    head_missing, status = ms.plan_validated_step_motion(
+        *args,
+        lambda req: replace(evidence(req), terminal=None),
+        timer=TorchTimer(),
+        visualizer=vis,
+        ik_tol=None,
+        get_planner=lambda: planner,
+    )
+    assert head_missing is None and "measured terminal head" in status["reason"]
     plan, met = ms.plan_validated_step_motion(
         *args, evidence, timer=TorchTimer(), visualizer=vis, ik_tol=None, get_planner=lambda: planner
     )
@@ -342,3 +360,29 @@ def test_rebind_grasp_and_approach_to_independently_achieved_soles(rollout_scene
         actual = _hand_poses(world, particle["q"][None], "left")[0]
         assert torch.linalg.vector_norm(actual[:3, 3] - wrist[:3, 3]) < 0.005
         torch.testing.assert_close(particle["grasp"], grasp)
+
+
+@needs_cuda
+def test_selected_model_evidence_replays_synthetic_preparation_from_its_true_first_frame(rollout_scene):
+    from cutamp.landing_predictor import prediction_precision
+    from cutamp.step_particles import _evidence
+
+    predictor, adapter, world, context, _, command = rollout_scene
+    q = world.q_init.repeat(2, 1)
+    q[1, 0] += 0.03
+    dynamics = context.expand(2, -1)
+    with torch.no_grad(), prediction_precision():
+        start = adapter.initialize(q, dynamics, world=world)
+        cmds = command.expand(2, -1, -1)
+        result = predictor.rollout(start.state, "L", cmds)
+        record = _evidence(adapter, {1: (start.state, cmds, result, start.preparation)}, 1)()["1"][0]
+        prep = record["preparation"]
+        assert prep["history_source"] == "synthetic_hold_issue"
+        assert prep["hold_ticks"] == 50 and len(prep["actions"]) == 50 and len(prep["sole_trace"]) == 51
+        assert prep["trajectory"]["root_position"][0] == q[1, :3].tolist()
+        assert prep["terminal"] == record["initial"]
+        values = tuple(q.new_tensor(x)[None] for x in prep["initial"].values())
+        for _ in range(prep["hold_ticks"]):
+            values = predictor.model(values, q.new_zeros(1, 5), context)
+        for v, target in zip(values, record["initial"].values()):
+            torch.testing.assert_close(v[0], q.new_tensor(target), atol=1.0e-4, rtol=1.0e-4)

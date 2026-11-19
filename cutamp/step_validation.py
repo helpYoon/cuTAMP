@@ -151,10 +151,12 @@ class StepStateAdapter:
             initial = LandingState(full, dynamics, "synthetic_hold_issue")
             speeds = []
             states = [physical] if world is not None else []
+            actions = []
             for t in range(50):
                 full = self.predictor.model(full, q.new_zeros(len(q), 5), dynamics)
                 if world is not None:
                     states.append(full[:6])
+                    actions.append(full[6][:, : len(self.names)])
                 if t >= 25:
                     speeds.append(torch.stack((full[5].square().mean(-1).sqrt(), full[2].norm(dim=-1)), -1))
             state = LandingState(full, dynamics, "synthetic_retract_50_hold")
@@ -177,6 +179,7 @@ class StepStateAdapter:
                     tilt,
                     torch.ones((b, t), device=q.device, dtype=torch.bool),
                     (xy < 0.020) & (yaw < torch.pi / 180),
+                    torch.stack(actions, dim=1),
                 )
                 preparation = HoldPrediction((prepared,), prepared.tracking_ok, initial)
             peak = torch.stack(speeds, dim=1).amax(1)
@@ -254,6 +257,7 @@ class HoldPreparation:
     sole_tilt: Tensor
     valid_ticks: Tensor
     tracking_ok: Tensor
+    actions: Tensor
     side: str = "HOLD"
 
 
@@ -558,7 +562,7 @@ class TransitionUnavailable(RuntimeError):
     """No independent evidence at the requested validation level."""
 
 
-def model_step_record(adapter, initial, step, command, row=0):
+def model_step_record(adapter, initial, step, command, row=0, *, preparation=None):
     """A CPU replay record for a selected row, including its actual control and whole-body traces."""
     labels = (
         "root_position",
@@ -581,7 +585,7 @@ def model_step_record(adapter, initial, step, command, row=0):
 
     ticks = int(step.valid_ticks[row].sum())
     model = adapter.predictor
-    return {
+    record = {
         "foot": step.side,
         "command": array(command[row]),
         "dt_s": 0.02,
@@ -605,6 +609,24 @@ def model_step_record(adapter, initial, step, command, row=0):
         "sole_height": array(step.sole_height[row, :ticks]),
         "sole_tilt": array(step.sole_tilt[row, :ticks]),
     }
+    if preparation is not None:
+        hold = preparation.steps[0]
+        frames = int(hold.valid_ticks[row].sum())
+        record["preparation"] = {
+            "mode": "HOLD",
+            "hold_ticks": frames - 1,
+            "dt_s": 0.02,
+            "history_source": preparation.initial.history_source,
+            "initial": snapshot(preparation.initial),
+            "terminal": record["initial"],
+            "actions": array(hold.actions[row, : frames - 1]),
+            "trajectory": {name: array(value[row, :frames]) for name, value in zip(labels, hold.trajectory)},
+            "sole_trace": array(hold.sole_trace[row, :frames]),
+            "sole_height": array(hold.sole_height[row, :frames]),
+            "sole_tilt": array(hold.sole_tilt[row, :frames]),
+            "sole_drift_ok": bool(hold.tracking_ok[row]),
+        }
+    return record
 
 
 def verify_transition(request, evidence, adapter, intended_final=None):
@@ -714,6 +736,22 @@ class SteppedMotion:
             elif typ in ("pick", "place"):
                 offset = 0
                 gap += 1
+
+    def check_supported_start(self):
+        """The arm planner pins both head joints. Verify their measured handoff before using its geometry."""
+        if self.stance is None:
+            return
+        if self.last_state is None:
+            raise TransitionUnavailable("Supported motion requires measured terminal head position and velocity")
+        names = ("AAHead_yaw", "Head_pitch")
+        columns = [self.adapter.names.index(n) for n in names]
+        from cutamp.robots.t1 import t1_curobo_cfg
+
+        q, qd = self.last_state.tensors[4:6]
+        pinned = t1_curobo_cfg(self.world.model)["robot_cfg"]["kinematics"]["lock_joints"]
+        err = (q[:, columns] - q.new_tensor([pinned[n] for n in names])).abs()
+        if not ((err <= 0.05).all() and (qd[:, columns].abs() <= 0.05).all()):
+            raise TransitionUnavailable("Measured head state cannot join the supported planner's locked head")
 
     def initial_velocity(self):
         initial, _, _, *preparations = self.inputs[0]

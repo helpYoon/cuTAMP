@@ -464,6 +464,8 @@ def solve_curobo(
         # line (check_line) from where it starts to the conf's palm. A failure names the op and the phase.
         nonlocal last_js
         what = f"{ground_op} {phase}"
+        if step_motion is not None:
+            step_motion.check_supported_start()
         with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
             with timer.time("curobo_planning"):
                 result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
