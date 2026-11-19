@@ -51,6 +51,13 @@ def near_rest(max_joint_rms, max_root_speed):
     return (max_joint_rms < 0.010) & (max_root_speed < 0.020)
 
 
+def _sole_trajectory(model, physical):
+    """Read world sole pose, height and tilt for every [particle, tick] state in one FK call."""
+    batch, ticks = physical[0].shape[:2]
+    outputs = model.feet(tuple(value.flatten(0, 1) for value in physical))
+    return tuple(value.reshape(batch, ticks, *value.shape[1:]) for value in outputs)
+
+
 @dataclass(frozen=True)
 class LandingProfile:
     """Phase tolerances in meters and radians for the model-predicted foot trace."""
@@ -236,23 +243,21 @@ class LandingPredictor:
         end = clock + self.hold_ticks
         times = torch.arange(1, int(end.max()) + 1, device=end.device)
         valid = times[None, :] <= end[:, None]
-        traces, poses, heights, tilts, actions = [], [], [], [], []
+        traces, actions = [], []
         for i in range(len(times)):
             if i:
                 advanced = self.model(state, hold, initial.dynamics)
                 state = tuple(
                     torch.where(valid[:, i].view(-1, *([1] * (v.ndim - 1))), v, old) for v, old in zip(advanced, state)
                 )
-            pose, height, tilt = self.model.feet(state[:6])
             traces.append(state[:6])
-            poses.append(pose)
-            heights.append(height)
-            tilts.append(tilt)
             actions.append(state[6][:, : state[4].shape[1]])
         trajectory = tuple(torch.stack(sequence, dim=1) for sequence in zip(*traces))
-        sole_trace = torch.stack(poses, dim=1)
-        sole_height = torch.stack(heights, dim=1)
-        xy, yaw, tracks = landing_errors(poses[-1], reference)
+        # These world-frame measurements are readouts. The policy's observation
+        # feedback and command latch were already advanced inside each model tick.
+        sole_trace, sole_height, sole_tilt = _sole_trajectory(self.model, trajectory)
+        achieved = sole_trace[:, -1]
+        xy, yaw, tracks = landing_errors(achieved, reference)
         with torch.no_grad():
             window = valid & (times[None, :] > end[:, None] - SETTLING_TICKS)
             joint_rms = trajectory[5].square().mean(-1).sqrt().masked_fill(~window, 0).amax(1)
@@ -261,7 +266,7 @@ class LandingPredictor:
         return StepPrediction(
             "LR"[side],
             reference,
-            poses[-1],
+            achieved,
             clock,
             xy,
             yaw,
@@ -273,7 +278,7 @@ class LandingPredictor:
             trajectory,
             sole_trace,
             sole_height,
-            torch.stack(tilts, 1),
+            sole_tilt,
             torch.stack(actions, 1),
             valid,
             phase_checks(sole_trace, sole_height, reference, side, clock, valid, self.profile),
