@@ -20,8 +20,6 @@ def paired_case(label, output, *, place=False, motion=False, validator=None):
         num_particles=1,
         enable_visualizer=False,
         curobo_plan=motion,
-        # Match the amount of refinement across grasps even on a shared GPU.
-        step_refine_iterations=4,
         max_step_schedules=1,
         experiment_root=str(output),
         landing_bundle=str(bundle),
@@ -46,6 +44,10 @@ def paired_case(label, output, *, place=False, motion=False, validator=None):
 @needs_cuda
 def test_changing_only_grasp_changes_optimized_landing_in_run_cutamp(tmp_path):
     pairs = [paired_case(label, tmp_path) for label in ("near", "far")]
+    for result in pairs:
+        assert result["step_derivative_method"] == "finite_difference"
+        assert result["step_refine_iterations"] == 2 and result["step_trust_scale"] == 2
+        assert result["com_center_weight"] == 4
     # Metrics refer to the actual row that met all checks.
     steps = [r["gaps"][0] for r in pairs]
     assert steps[0]["seed_commands"] == steps[1]["seed_commands"]

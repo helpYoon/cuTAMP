@@ -113,20 +113,25 @@ def run_case(directory, name, env, q, inputs, cfg):
         "rank_seconds",
         "furthest_endpoint",
     )
+    stepped = cfg.for_refinement(stepped=True)
+    standing = cfg.for_refinement(stepped=False)
     report = {
         "scene": env.name,
         "device": torch.cuda.get_device_name(),
         "timing_scope": "end-to-end public planner; includes initialization; concurrent GPU work is possible",
         "requested_motion": cfg.curobo_plan,
         "require_modeled_load": cfg.require_modeled_load,
-        "com_center_weight": cfg.com_center_weight,
+        "com_center_weight": stepped.com_center_weight,
+        "standing_com_center_weight": standing.com_center_weight,
+        "step_derivative_method": stepped.step_derivative_method,
+        "step_trust_scale": stepped.step_trust_scale,
         "seed": SEED,
         "mode": cfg.step_mode,
         "strategy": cfg.step_search_order,
         "budget": cfg.max_step_schedules,
         "time_budget_s": cfg.max_loop_dur,
         "num_particles": cfg.num_particles,
-        "step_refine_iterations": cfg.step_refine_iterations,
+        "step_refine_iterations": stepped.step_refine_iterations,
         **{
             key: m.get(key)
             for key in (
@@ -184,9 +189,11 @@ def main():
     parser.add_argument("--particles", type=int, default=1, help="Particle rows used per schedule.")
     parser.add_argument("--max-seconds", type=float, default=180.0, help="Public search time limit.")
     parser.add_argument(
+        "--autodiff-reference", action="store_true", help="Use the historical four-update model settings."
+    )
+    parser.add_argument(
         "--center-weight",
         type=float,
-        default=TAMPConfiguration().com_center_weight,
         help="Centroid preference coefficient. Use 0 for a margin-only ablation.",
     )
     args = parser.parse_args()
@@ -204,6 +211,7 @@ def main():
     directory = Path(tempfile.mkdtemp(prefix=args.section + "-", dir=args.output))
     cfg = TAMPConfiguration(
         step_mode="model",
+        step_derivative_method="autodiff" if args.autodiff_reference else "finite_difference",
         com_center_weight=args.center_weight,
         enable_visualizer=False,
         experiment_root=str(directory),
@@ -211,7 +219,6 @@ def main():
         max_step_schedules=2,
         num_initial_plans=2,
         num_particles=args.particles,
-        step_refine_iterations=4,
         max_loop_dur=args.max_seconds,
         num_opt_steps=20,
         cuda_graphs=False,
@@ -223,8 +230,10 @@ def main():
         suffix += f"-p{args.particles}"
     if args.max_seconds != 180.0:
         suffix += f"-{args.max_seconds:g}s"
-    if args.section != "atlas":
+    if args.section != "atlas" and args.center_weight is not None:
         suffix += f"-cw{args.center_weight:g}"
+    if args.section != "atlas" and not args.autodiff_reference:
+        suffix += "-fast"
     output = args.output / (args.section + suffix + ".json")
 
     def save():

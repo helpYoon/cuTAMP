@@ -82,7 +82,12 @@ class Timings:
 
         def rollout_kind(predictor, initial, order, commands):
             dual = torch.autograd.forward_ad.unpack_dual(commands)
-            return "directional_policy_wm" if dual.tangent is not None else "learned_rollout"
+            if dual.tangent is not None:
+                return "directional_policy_wm"
+            in_linearization = any(frame[0] == "learned_linearization" for frame in self.stack)
+            if in_linearization and predictor.derivative_method == "finite_difference" and not torch.is_grad_enabled():
+                return "finite_difference_probes"
+            return "learned_rollout"
 
         self.wrap(stack, LandingPredictor, "rollout", rollout_kind)
         if hasattr(LandingPredictor, "linearize"):
@@ -112,9 +117,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pick-only", action="store_true")
     parser.add_argument("--label", default="far", choices=("far", "near"))
-    parser.add_argument("--updates", default=4, type=int, help="Maximum SQP updates for the single grounded schedule")
+    parser.add_argument("--updates", type=int, help="Override the selected method's SQP update budget")
     parser.add_argument("--clock-only", action="store_true", help="Measure end-to-end latency without phase probes")
-    parser.add_argument(
+    reference = parser.add_mutually_exclusive_group()
+    reference.add_argument(
+        "--autodiff-reference", action="store_true", help="Run the four-update automatic-differentiation reference"
+    )
+    reference.add_argument(
         "--reverse-reference", action="store_true", help="Use the original full reverse tape at each SQP linearization"
     )
     args = parser.parse_args()
@@ -125,6 +134,7 @@ def main():
     fixture_seconds = perf_counter() - started
     cfg = TAMPConfiguration(
         step_mode="model",
+        step_derivative_method="autodiff" if args.autodiff_reference or args.reverse_reference else "finite_difference",
         num_particles=1,
         step_refine_iterations=args.updates,
         max_step_schedules=1,
@@ -155,6 +165,7 @@ def main():
                 experiment_id="plan",
             )
     wall = sum(timings.seconds.values())
+    settings = cfg.for_refinement(stepped=True)
     report = {
         "gpu": torch.cuda.get_device_name(),
         "scene": env.name,
@@ -162,7 +173,10 @@ def main():
         "step_mode": cfg.step_mode,
         "particles": cfg.num_particles,
         "orders": inputs.orders,
-        "updates": cfg.step_refine_iterations,
+        "updates": settings.step_refine_iterations,
+        "derivative_method": "native_reverse" if args.reverse_reference else settings.step_derivative_method,
+        "trust_scale": settings.step_trust_scale,
+        "com_center_weight": settings.com_center_weight,
         "accepted": n,
         "status": m["status"],
         "wall_s": wall,
