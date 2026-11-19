@@ -11,7 +11,7 @@ from time import monotonic
 
 import torch
 
-from cutamp.com_polygon_cost import margin_from_support_planes, support_region_planes
+from cutamp.com_polygon_cost import margin_from_support_planes, physical_support_centroid, support_region_planes
 from cutamp.landing_predictor import LandingPrediction, LandingState, prediction_precision
 from cutamp.landing_qp import composite_step
 from cutamp.robots.t1 import REAL_LEGS
@@ -35,6 +35,10 @@ class GapRefinement:
     ok: torch.Tensor
     rows: dict[str, torch.Tensor]
     iterations: int
+    initial_center_distance: torch.Tensor
+    center_distance: torch.Tensor
+    initial_center_gradient: torch.Tensor
+    initial_center_residual_xy: torch.Tensor
 
 
 @dataclass
@@ -43,6 +47,7 @@ class _Evaluation:
     ik: StanceIK
     rows: dict[str, torch.Tensor]
     ok: torch.Tensor
+    center: torch.Tensor  # [B, manipulations on this stance, xy]
 
     def matrix(self, comfort_buffer=0.0):
         b = len(self.ok)
@@ -72,6 +77,11 @@ def stance_ik_rows(ik: StanceIK, margin_m: float) -> dict[str, torch.Tensor]:
     ):
         rows[key] = getattr(ik, key) / tol - 1
     return rows
+
+
+def stance_center_residual(ik: StanceIK) -> torch.Tensor:
+    """Signed xy displacement of the projected robot CoM from the physical hull's area centroid."""
+    return ik.com[:, :2] - physical_support_centroid(ik.soles.double(), REAL_LEGS.sole_box)
 
 
 def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, extra_rows, anchor, geometry_rows):
@@ -125,8 +135,12 @@ def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, 
     soles = before if anchor is None else anchor(before)
     ik = solve_stance_ik(soles, wrist, seed, arm)
     rows.update(stance_ik_rows(ik, margin))
+    centers = [stance_center_residual(ik)]
     if extra_rows is not None:
         more = extra_rows(pred, ik)
+        if isinstance(more, tuple):
+            more, future_centers = more
+            centers.extend(future_centers)
         if rows.keys() & more.keys():
             raise ValueError("Scene constraints must have distinct names")
         rows.update(more)
@@ -138,7 +152,8 @@ def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, 
     hard = hard & ik.ok
     for r in rows.values():
         hard = hard & torch.isfinite(r.reshape(len(u), -1)).all(-1) & (r.reshape(len(u), -1) <= 0).all(-1)
-    return _Evaluation(pred, ik, rows, hard)
+    center = torch.stack(centers, dim=1)
+    return _Evaluation(pred, ik, rows, hard & center.isfinite().all(dim=(1, 2)), center)
 
 
 def _check_deadline(deadline):
@@ -180,6 +195,7 @@ def refine_gap(
     anchor=None,
     geometry_rows=None,
     deadline=None,
+    centering_weight=1.0,
 ):
     """Optimize K commanded soles from a common actual state with one bound wrist per row.
 
@@ -188,6 +204,11 @@ def refine_gap(
     model-world planar soles into the planner world. With predictor=None, initial is
     a [B,2,3] planar stance and outputs describe a geometric ablation. The
     geometric sweep can append constraints with `geometry_rows(incoming, order, commands)`.
+    A callback may return (hard_rows, future_center_residuals) to optimize all grasps
+    on the achieved stance in one QP. Each residual is an unsquared [B,2] vector.
+    On feasible rows the secondary objective is the squared change in command (yaw
+    measured at the sole radius) plus centering_weight times the sum of squared
+    CoM-to-centroid distances. Zero weight restores the feasibility-only objective.
     An absolute monotonic deadline interrupts the next SQP rollout or reverse sweep.
     """
     _check_deadline(deadline)
@@ -200,6 +221,8 @@ def refine_gap(
         raise ValueError("Expected [particles,steps,3] commands")
     if margin_m < 0 or not math.isfinite(margin_m) or max_iterations < 0:
         raise ValueError("Invalid margin or iteration budget")
+    if not math.isfinite(centering_weight) or centering_weight < 0.0:
+        raise ValueError("Centering weight must be finite and nonnegative")
     if predictor is not None:
         if not isinstance(initial, LandingState):
             raise ValueError("Model-conditioned refinement requires the incoming physical state and history")
@@ -228,10 +251,18 @@ def refine_gap(
 
     u = commands.detach().clone()
     first_grad = torch.zeros_like(u)
+    first_center_grad = torch.zeros_like(u)
     iter_count = 0
     initial_margin = None
     initial_achieved = None
-    # A feasible iterate needs no further steps in a feasibility-first refinement.
+    first_distance = None
+    first_center = None
+    metric = u.new_tensor([1.0, 1.0, RHO]).repeat(len(order)).double()
+
+    def secondary(c, evaluation):
+        effort = ((c - commands).flatten(1) * metric).square().sum(-1)
+        return effort + centering_weight * evaluation.center.square().sum((1, 2))
+
     for i in range(max_iterations + 1):
         with torch.enable_grad():
             u = u.detach().requires_grad_(bool(order))
@@ -240,26 +271,37 @@ def refine_gap(
             if i == 0:
                 initial_margin = cur.ik.margin.detach()
                 initial_achieved = cur.ik.soles.detach()
+                first_center = cur.center[:, 0].detach()
+                first_distance = first_center.norm(dim=-1)
                 if order:
                     (first_grad,) = torch.autograd.grad(cur.ik.margin.sum(), u, retain_graph=True)
-            if cur.ok.all() or not order or i == max_iterations:
+                    (first_center_grad,) = torch.autograd.grad(cur.center.square().sum(), u, retain_graph=True)
+            if not order or i == max_iterations or (not centering_weight and cur.ok.all()):
                 break
             values = cur.matrix()
             jac = _jacobian(cur.rows, u, deadline)
+            if centering_weight:
+                center_jac = _jacobian({"centering": cur.center}, u, deadline)
         with torch.no_grad():
             width = len(order) * 3
             # The local QP targets a 0.2 mm margin buffer so a finite update can
             # clear the inclusive 5 cm requirement despite linearization error.
             g = cur.matrix(comfort_buffer=0.0002 / max(0.01, margin_m))
-            metric = u.new_tensor([1.0, 1.0, RHO]).repeat(len(order)).double()
             limit = u.new_tensor([0.018, 0.018, math.radians(2)]).repeat(len(order)).expand(b, -1).double()
             eye = torch.diag(metric)[None].expand(b, -1, -1)
             offset = ((u - commands).reshape(b, width) * metric).double()
-            d, _, _ = composite_step(g.double(), jac.double(), offset, eye, limit, metric)
+            effort_jac = eye
+            if centering_weight:
+                scale = math.sqrt(centering_weight)
+                offset = torch.cat((offset, scale * cur.center.flatten(1)), dim=1)
+                effort_jac = torch.cat((eye, scale * center_jac.double()), dim=1)
+            d, _, _ = composite_step(g.double(), jac.double(), offset, effort_jac, limit, metric)
             d = d.reshape_as(u).to(u)
             finite = torch.isfinite(d).all(-1).all(-1)
-            d = torch.where((finite & ~cur.ok)[:, None, None], d, 0)
+            eligible = finite & (~cur.ok | (centering_weight > 0))
+            d = torch.where(eligible[:, None, None], d, 0)
             score = values.detach().amax(-1).clamp_min(0)
+            current_objective = secondary(u, cur)
             if not (d.abs() > 1e-8).any():
                 break
             old = u.detach()
@@ -269,10 +311,12 @@ def refine_gap(
                 trial = old + scale * d
                 fresh = evaluate(trial)
                 merit = fresh.matrix().amax(-1).clamp_min(0)
-                better = ~moved & ~cur.ok & (fresh.ok | (merit < score - 1e-7))
+                restored = ~cur.ok & (fresh.ok | (merit < score - 1e-7))
+                centered = cur.ok & fresh.ok & (secondary(trial, fresh) < current_objective - 1e-10)
+                better = ~moved & eligible & (restored | centered)
                 chosen = torch.where(better[:, None, None], trial, chosen)
                 moved |= better
-                if (moved | cur.ok | ~finite).all():
+                if (moved | ~eligible).all():
                     break
             if not moved.any():
                 break
@@ -296,4 +340,8 @@ def refine_gap(
         fresh.ok,
         fresh.rows,
         iter_count,
+        first_distance,
+        fresh.center[:, 0].norm(dim=-1),
+        first_center_grad.detach(),
+        first_center,
     )

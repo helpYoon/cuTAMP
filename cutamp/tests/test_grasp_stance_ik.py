@@ -141,3 +141,19 @@ def test_expired_budget_interrupts_the_next_gap_evaluation(monkeypatch, one_cpu_
             None, soles, "", seed.new_empty(2, 0, 3), "left", wrist, seed, deadline=2.0, extra_rows=observed
         )
     assert len(calls) == (0 if expired_on_entry else 1)
+
+
+def test_zero_centering_weight_retains_the_feasible_command(one_cpu_thread):
+    from cutamp.step_refinement import refine_gap
+
+    wrist, seed = paired_inputs("cpu", torch.float32)
+    stance = seed.new_tensor([[[0.05220935, 0.10788354, -0.00239709], [0.04830433, -0.11117852, 0.0197674]]]).expand(
+        2, -1, -1
+    )
+    command = seed.new_tensor([[[0.12, 0.21, 0.0]]]).expand(2, -1, -1)
+    hard = refine_gap(None, stance, "L", command, "left", wrist, seed, max_iterations=4, centering_weight=0)
+    soft = refine_gap(None, stance, "L", command, "left", wrist, seed, max_iterations=4)
+    assert hard.ok.all() and soft.ok.all()
+    torch.testing.assert_close(hard.commands[0], command[0])
+    assert (soft.center_distance < hard.center_distance - 0.001).all()
+    assert (soft.margin >= 0.05).all()

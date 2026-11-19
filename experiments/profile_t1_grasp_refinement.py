@@ -7,7 +7,7 @@ measured history. The first and repeated measurements use identical targets.
 
 import argparse
 import json
-from contextlib import nullcontext
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -17,7 +17,7 @@ import torch
 
 from cutamp.landing_predictor import LandingPredictor, prediction_precision
 from cutamp.step_ik import solve_stance_ik
-from cutamp.step_refinement import refine_gap
+from cutamp.step_refinement import refine_gap, stance_center_residual
 from cutamp.tests.test_grasp_stance_ik import paired_inputs
 
 
@@ -65,6 +65,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=Path("data/t1-reachability/landing-accuracy/landing-seed3.pt"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--centering-weight",
+        type=float,
+        default=1.0,
+        help="Use 0 to reproduce the original feasibility-only comparison.",
+    )
     args = parser.parse_args()
     p = LandingPredictor(args.bundle)
     wrists, seeds = paired_inputs(p.device, torch.float32)
@@ -77,6 +83,7 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "torch": str(torch.__version__),
         "metadata": p.metadata,
+        "centering_weight": args.centering_weight,
         "order_profiles": {},
         "ablations": {},
     }
@@ -91,14 +98,17 @@ def main():
     report["no_step"] = {"margin_m": as_list(none.margin), "feasible": as_list(none.ok)}
     for name in ("full", "geometric_then_model_filter", "fixed_com_gradient"):
         geometric = name == "geometric_then_model_filter"
-        context = (
-            patch("cutamp.step_refinement.solve_stance_ik", hull_gradient_ik)
-            if name == "fixed_com_gradient"
-            else nullcontext()
-        )
         torch.cuda.reset_peak_memory_stats()
         t0 = now()
-        with context:
+        with ExitStack() as context:
+            if name == "fixed_com_gradient":
+                context.enter_context(patch("cutamp.step_refinement.solve_stance_ik", hull_gradient_ik))
+                context.enter_context(
+                    patch(
+                        "cutamp.step_refinement.stance_center_residual",
+                        lambda ik: stance_center_residual(replace(ik, com=ik.com.detach())),
+                    )
+                )
             r = refine_gap(
                 None if geometric else p,
                 standing if geometric else start,
@@ -108,6 +118,7 @@ def main():
                 wrists,
                 seeds,
                 max_iterations=4,
+                centering_weight=args.centering_weight,
             )
         elapsed = now() - t0
         peak = torch.cuda.max_memory_allocated() / 2**20
@@ -119,6 +130,9 @@ def main():
             "iterations": r.iterations,
             "commands": as_list(r.commands),
             "dmargin_du": as_list(r.initial_gradient),
+            "dsquared_center_distance_du": as_list(r.initial_center_gradient),
+            "initial_center_distance_m": as_list(r.initial_center_distance),
+            "fresh_model_center_distance_m": as_list(checked.center_distance),
             "optimized_margin_m": as_list(r.margin),
             "fresh_model_margin_m": as_list(checked.margin),
             "fresh_model_feasible": as_list(checked.ok),

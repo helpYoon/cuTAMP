@@ -13,7 +13,7 @@ from cutamp.tests.test_grasp_stance_ik import paired_inputs
 @needs_cuda
 def test_only_grasp_moves_the_optimized_model_command():
     from cutamp.landing_predictor import LandingPredictor
-    from cutamp.step_refinement import refine_gap
+    from cutamp.step_refinement import refine_gap, stance_center_residual
 
     data = Path(__file__).resolve().parents[2] / "data/t1-reachability"
     bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", data / "landing-accuracy/landing-seed3.pt"))
@@ -29,8 +29,11 @@ def test_only_grasp_moves_the_optimized_model_command():
     out = refine_gap(p, home, "L", u, "left", wrist, seed, max_iterations=4)
     assert out.ok.tolist() == [True, True], {k: v.tolist() for k, v in out.rows.items()}
     assert out.initial_margin[0] > 0.05 > out.initial_margin[1]
-    assert torch.equal(out.commands[0], u[0])
+    assert (out.commands[0] - u[0]).norm() > 0.002
     assert (out.commands[1] - u[1]).norm() > 0.002
+    assert (out.commands[1] - out.commands[0]).norm() > 0.001
+    assert torch.all(out.center_distance < out.initial_center_distance - 0.001)
+    assert (out.initial_center_gradient[0] - out.initial_center_gradient[1]).norm() > 0.003
     assert (out.achieved[1, 0, :2] - out.achieved[0, 0, :2]).norm() > 0.002
     assert (out.initial_gradient[0] - out.initial_gradient[1]).norm() > 0.01
     assert out.margin.min() >= 0.05 and out.prediction.tracking_ok.all()
@@ -52,6 +55,8 @@ def test_only_grasp_moves_the_optimized_model_command():
         upper = solve_stance_ik(hi.steps[0].achieved, wrist, seed, "left")
     fd = (upper.margin - lower.margin) / 0.0014
     torch.testing.assert_close(out.initial_gradient[:, 0, 0].double(), fd, atol=0.006, rtol=0.02)
+    center_fd = (stance_center_residual(upper).square().sum(1) - stance_center_residual(lower).square().sum(1)) / 0.0014
+    torch.testing.assert_close(out.initial_center_gradient[:, 0, 0].double(), center_fd, rtol=0.02, atol=0.0004)
     larger = u.clone()
     larger[:, :, 0] = 0.32
     with torch.no_grad():
@@ -87,7 +92,7 @@ def test_zero_step_places_grasp_selects_the_earlier_landing():
     """Both picks have the same already-comfortable wrist, only the downstream wrist differs."""
     from cutamp.landing_predictor import LandingPredictor
     from cutamp.step_ik import solve_stance_ik
-    from cutamp.step_refinement import refine_gap, stance_ik_rows
+    from cutamp.step_refinement import refine_gap, stance_center_residual, stance_ik_rows
 
     path = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
     bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", path))
@@ -103,17 +108,32 @@ def test_zero_step_places_grasp_selects_the_earlier_landing():
 
     def place_rows(pred, ik):
         future = solve_stance_ik(ik.soles, wrist, seed, "left")
-        return {"place_" + name: row for name, row in stance_ik_rows(future, 0.05).items()}
+        return {"place_" + name: row for name, row in stance_ik_rows(future, 0.05).items()}, [
+            stance_center_residual(future)
+        ]
 
     pick = refine_gap(
         p, start, "L", commands, "left", wrist[:1].expand_as(wrist), seed, max_iterations=4, extra_rows=place_rows
     )
     assert pick.ok.tolist() == [True, True], {n: r.tolist() for n, r in pick.rows.items()}
     torch.testing.assert_close(pick.initial_gradient[0], pick.initial_gradient[1])
-    assert (pick.commands[0] - commands[0]).abs().max() == 0
-    assert (pick.commands[1] - commands[1]).norm() > 0.002
+    assert (pick.commands - commands).norm(dim=-1).min() > 0.002
+    assert (pick.initial_center_gradient[1] - pick.initial_center_gradient[0]).norm() > 0.003
+    assert (pick.commands[1] - pick.commands[0]).norm() > 0.001
     after = solve_stance_ik(pick.achieved, wrist, seed, "left")
     assert (after.margin >= 0.05).all() and pick.prediction.tracking_ok.all()
+    with torch.no_grad():
+        delta = torch.zeros_like(commands)
+        delta[:, 0, 0] = 0.0007
+
+        def shared_stance_loss(u):
+            achieved = p.rollout(start, "L", u).steps[0].achieved
+            primary = solve_stance_ik(achieved, wrist[:1].expand_as(wrist), seed, "left")
+            place = solve_stance_ik(achieved, wrist, seed, "left")
+            return stance_center_residual(primary).square().sum(1) + stance_center_residual(place).square().sum(1)
+
+        fd = (shared_stance_loss(commands + delta) - shared_stance_loss(commands - delta)) / 0.0014
+    torch.testing.assert_close(pick.initial_center_gradient[:, 0, 0].double(), fd, rtol=0.02, atol=0.0008)
 
 
 @needs_cuda
