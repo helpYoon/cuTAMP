@@ -174,13 +174,17 @@ class ReachMap:
                 tmp.unlink(missing_ok=True)
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, *, nominal_only=False):
+        """Read the archive; nominal_only skips every non-home pose and witness array."""
         with np.load(path, allow_pickle=False) as data:
             info = json.loads(data["manifest"].item())
             if info["version"] != 1:
                 raise ValueError("unsupported reach map format")
             atlas = cls(info["voxel_size"], info["metadata"])
+            nominal = stance_key(atlas.metadata["home_soles"]) if nominal_only else None
             for i, desc in enumerate(info["stances"]):
+                if nominal_only and tuple(np.asarray(desc["soles"]).ravel()) != nominal:
+                    continue
                 layers = []
                 for j, (arm, posture) in enumerate(desc["layers"]):
                     arrays = {n: data[f"{i}_{j}_{n}"] for n in ("ijk", "points", "q", "margin")}

@@ -3,6 +3,7 @@
 From the worktree, with the cuTAMP environment active:
     python -m cutamp.scripts.t1_reachability build
     python -m cutamp.scripts.t1_reachability score --plot
+    python -m cutamp.scripts.t1_reachability search --lag 8
 
 The score command queries the saved map on CPU. Plotting uses the visual URDF
 to draw and independently verify the two stored fixed-foot configurations.
@@ -11,6 +12,8 @@ to draw and independently verify the two stored fixed-foot configurations.
 import argparse
 import json
 import time
+from dataclasses import asdict
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -20,18 +23,18 @@ from cutamp.reachability import ReachMap, canonical_stance, endpoint_orders, ran
 DEFAULT_DIR = Path("data/t1-reachability")
 
 
-def build_map(path, samples, seed, voxel_size, device):
+def build_map(path, samples, seed, voxel_size, device, *, nominal_only=False):
     from cutamp.reachability_fk import T1MapSampler
 
     sampler = T1MapSampler(samples=samples, seed=seed, device=device)
     home = np.asarray(sampler.home_soles)
     orders = endpoint_orders(home)
     stances = {}
-    for endpoints in orders.values():
+    for endpoints in ([orders["none"]] if nominal_only else orders.values()):
         for soles in endpoints:
             stances.setdefault(stance_key(soles), canonical_stance(soles)[0])
     metadata = dict(
-        sampler.metadata, home_soles=home.tolist(),
+        sampler.metadata, home_soles=home.tolist(), nominal_only=nominal_only,
         order_endpoints={order: [soles.tolist() for soles in endpoints] for order, endpoints in orders.items()},
     )
     atlas = ReachMap(voxel_size, metadata=metadata)
@@ -149,6 +152,7 @@ def main():
     build.add_argument("--samples", type=int, default=65536, help="Samples per arm, stance and posture")
     build.add_argument("--seed", type=int, default=7)
     build.add_argument("--voxel-size", type=float, default=0.015, help="Voxel edge in meters")
+    build.add_argument("--nominal-only", action="store_true", help="Build only the nominal sole pair for transported-map search")
     build.add_argument("--device", default="cuda", help="CUDA device for offline FK sampling")
     query = commands.add_parser("score", help="Rank no step, L, R, LR, RL for a world-frame pick box")
     query.add_argument("--arm", choices=("left", "right"), default="left")
@@ -157,11 +161,31 @@ def main():
     query.add_argument("--size", nargs=3, type=float, default=(0.05, 0.05, 0.05), metavar=("DX", "DY", "DZ"))
     query.add_argument("--output", type=Path, default=DEFAULT_DIR)
     query.add_argument("--plot", action="store_true", help="Draw the stored witnesses and write PNG and HTML")
-    for operation in (query, build):
+    search = commands.add_parser("search", help="Rank complete step schedules for ordered target regions on CPU")
+    search.add_argument("--targets", type=Path, help="JSON list of TargetRegion records; defaults to the 48 cm pick and place example")
+    search.add_argument("--lag", type=int, help="Use profiled landing accuracy at this actuator delay; omit for geometric scoring")
+    search.add_argument("--accuracy", type=Path, default=DEFAULT_DIR/"landing-accuracy/home-model.json")
+    search.add_argument("--limit", type=int, default=1, help="Maximum number of endpoint paths to print as JSON lines")
+    build.add_argument("--map", type=Path, help="Output NPZ (defaults to a separate t1-nominal-hand-map.npz with --nominal-only)")
+    for operation in (query, search):
         operation.add_argument("--map", type=Path, default=DEFAULT_DIR / "t1-hand-map.npz")
     args = parser.parse_args()
     if args.command == "build":
-        build_map(args.map, args.samples, args.seed, args.voxel_size, args.device)
+        path = args.map or DEFAULT_DIR / ("t1-nominal-hand-map.npz" if args.nominal_only else "t1-hand-map.npz")
+        build_map(path, args.samples, args.seed, args.voxel_size, args.device, nominal_only=args.nominal_only)
+    elif args.command == "search":
+        from cutamp.step_search import StepSearch, TargetRegion
+
+        if args.limit < 1:
+            parser.error("--limit must be positive")
+        tables = StepSearch.load(args.map, accuracy_path=args.accuracy if args.lag is not None else None, lag=args.lag)
+        if args.targets:
+            regions = [TargetRegion(**r) for r in json.loads(args.targets.read_text())]
+        else:
+            regions = [TargetRegion("left", (.48,.18,.025), (.05,)*3, solid_pick=True),
+                       TargetRegion("left", (.30,-.4,.65), (.05,)*3, loaded=True)]
+        for path in islice(tables.schedules(tables.home, regions), args.limit):
+            print(json.dumps(asdict(path), allow_nan=False))
     else:
         score(args.map, args.center, args.size, args.arm, args.output, args.plot)
 
