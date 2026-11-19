@@ -141,6 +141,10 @@ def entrypoint():
         help="Adam LR for Conf particle params (robot q).",
     )
     parser.add_argument(
+        "--com_comfort_margin_m", type=float, default=_defaults.com_comfort_margin_m,
+        help="Requested CoM clearance from the physical support polygon at pick and place, in meters.",
+    )
+    parser.add_argument(
         "--max_duration",
         type=float,
         default=_defaults.max_loop_dur,
@@ -199,6 +203,7 @@ def entrypoint():
         early_stop_patience=args.early_stop_patience,
         lr=args.lr,
         conf_lr=args.conf_lr,
+        com_comfort_margin_m=args.com_comfort_margin_m,
         max_loop_dur=args.max_duration,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,

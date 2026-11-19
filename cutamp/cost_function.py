@@ -17,15 +17,16 @@ from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo.types import JointState
 
-from cutamp.com_polygon_cost import compute_com_polygon_penalties
+from cutamp.com_polygon_cost import compute_com_polygon_penalties, margin_from_support_planes, physical_support_planes
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
 from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
-from cutamp.rollout import Rollout, get_retract_parameters
+from cutamp.rollout import Rollout, get_retract_parameters, require_fixed_stance
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import (
     Collision,
+    ComComfort,
     ComPolygon,
     KinematicConstraint,
     Motion,
@@ -58,11 +59,18 @@ class CostFunction:
     """
 
     def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration):
+        require_fixed_stance(plan_skeleton)
         self.plan_skeleton = plan_skeleton
         self.world = world
         self.config = config
 
         self.retract_info = get_retract_parameters(plan_skeleton)
+        # The same target soles used for the wrist pose's sole-lock check.
+        # A drifting FK sole must not move the support region with the body.
+        soles = world.stance_soles
+        yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
+        soles_xyyaw = torch.cat((soles[..., :2, 3], yaw.unsqueeze(-1)), dim=-1)
+        self.support_planes = physical_support_planes(soles_xyyaw, world.model.sole_box)
 
         # Single self-collision cost over the whole robot — both arms in one
         # kinematic chain, so one cost per query covers both.
@@ -367,6 +375,10 @@ class CostFunction:
         # COM-over-base-polygon hard filter (mirrors Collision)
         com_polygon_cost = self.com_polygon_constraint()
         add_cost(ComPolygon.type, com_polygon_cost)
+
+        margin = margin_from_support_planes(rollout["com_xy"], *self.support_planes)
+        shortfall = (self.config.com_comfort_margin_m - margin).clamp_min(0)
+        add_cost(ComComfort.type, {"type": "constraint", "values": {"margin_shortfall_squared": shortfall.square()}})
 
         # Soft costs
         if self.config.soft_cost:

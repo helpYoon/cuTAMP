@@ -39,3 +39,28 @@ class ComPolygon(Constraint):
 
     def __init__(self):
         super().__init__()
+
+
+class ComComfort(Constraint):
+    """Minimum physical sole-hull clearance of the projected CoM at each pick and place."""
+
+
+class StepReach(Constraint):
+    """The relative landing command and swing travel must be legal."""
+
+    def __init__(self, sole_from, sole_planted, sole_to):
+        super().__init__(sole_from, sole_planted, sole_to)
+
+
+class StandOnStance(Constraint):
+    """The predicted whole-body landing is supported on the achieved pair of soles."""
+
+    def __init__(self, q_stand, q_land, sole_l, sole_r):
+        super().__init__(q_stand, q_land, sole_l, sole_r)
+
+
+class Footprint(Constraint):
+    """Check sole clearance against the other foot and the scene during the step."""
+
+    def __init__(self, sole_from, sole_planted, sole_to):
+        super().__init__(sole_from, sole_planted, sole_to)

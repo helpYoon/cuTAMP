@@ -11,6 +11,7 @@ import logging
 import sys
 
 from cutamp.task_planning.constraints import (
+    ComComfort,
     ComPolygon,
     KinematicConstraint,
     StablePlacement,
@@ -31,6 +32,7 @@ default_constraint_to_mult = {
     # pos_err (mult 1.0 × value O(1e-2)). "default" applies to every
     # per-conf name — relies on CostReducer's (type, "default") fallback.
     ComPolygon.type: {"default": 10.0},
+    ComComfort.type: {"margin_shortfall_squared": 10.0},
     "soft": {
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
@@ -73,6 +75,7 @@ default_constraint_to_tol = {
     # excursion past an edge fails. "default" applies to every per-conf name
     # (left_q0, right_q1, ...).
     ComPolygon.type: {"default": COM_TOL},
+    ComComfort.type: {"margin_shortfall_squared": 0.0},
 }
 
 

@@ -16,7 +16,7 @@ from typing import Callable, Generator, List, Optional, Sequence
 from .base_structs import Atom, GroundOperator, Operator, State
 
 # Maps parameter types to the base string used when sampling literal names (e.g. "q0", "left_q1").
-_BASE_NAMES = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp"}
+_BASE_NAMES = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp", "sole": "sole"}
 
 
 @dataclass(frozen=True)
@@ -175,7 +175,7 @@ def get_valid_ground_operators(
                 sampled_value = sample_param_type(param.type)
                 param_to_literals[param.name].add(sampled_value)
 
-        if len(param_to_literals) != len(operator.parameters):
+        if len(param_to_literals) != len(operator.parameters) + len(operator.context_defaults):
             raise RuntimeError(
                 f"Number of parameter bindings {len(param_to_literals)} "
                 f"does not match number of parameters in {operator}"
@@ -196,6 +196,11 @@ def get_valid_ground_operators(
         # Stable sort: equal-priority groundings preserve declaration order.
         ground_ops.sort(key=priority_fn)
     return ground_ops
+
+
+def _search_key(state: State) -> State:
+    """Ignore facts which only record a unique binding (for example the latest T1 rest posture)."""
+    return frozenset(atom for atom in state if atom.fluent.tells_states_apart)
 
 
 def breadth_first_search(
@@ -235,7 +240,7 @@ def breadth_first_search(
 
     initial_node = _Node(state=initial_state, parent=None, operator=None)
     frontier: deque[_Node] = deque([initial_node])
-    explored: set[State] = {initial_node.state}
+    explored: set[State] = {_search_key(initial_node.state)}
 
     while frontier:
         node = frontier.popleft()
@@ -253,7 +258,8 @@ def breadth_first_search(
 
             # If the successor state hasn't been explored, add it to the frontier.
             # Also if successor is a goal state (we want different ways of getting to the goal)
-            if successor_state not in explored or goal_state.issubset(successor_state):
+            key = _search_key(successor_state)
+            if key not in explored or goal_state.issubset(successor_state):
                 child = _Node(state=successor_state, parent=node, operator=ground_op)
                 frontier.append(child)
-                explored.add(successor_state)
+                explored.add(key)

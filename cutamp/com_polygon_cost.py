@@ -253,6 +253,56 @@ def com_margin_from_base(com_in_base: torch.Tensor, half_extents: Tuple[float, f
     return (half - com_in_base[..., :2].abs()).min(dim=-1).values
 
 
+def physical_support_planes(soles_xyyaw: torch.Tensor, sole_box: Tuple[float, float]):
+    """Return outward unit normals and offsets of the two-sole hull, for n·p <= b.
+
+    All directed corner pairs occupy fixed slots. Nonfacets have infinite
+    offsets so the same batched reduction works for any relative sole pose.
+    """
+    centre, yaw = soles_xyyaw[..., :2], soles_xyyaw[..., 2]
+    cosine, sine = yaw.cos(), yaw.sin()
+    forward = torch.stack((cosine, sine), -1) * (sole_box[0] / 2)
+    lateral = torch.stack((-sine, cosine), -1) * (sole_box[1] / 2)
+    corners = centre.unsqueeze(-2) + torch.stack(
+        (forward + lateral, -forward + lateral, -forward - lateral, forward - lateral), dim=-2
+    )
+    corners = corners.flatten(-3, -2)
+
+    # For each directed corner pair (i, j), its left normal is an inward
+    # facet normal exactly when all eight corners lie on or left of its line.
+    # Testing fixed-size tensors keeps the CUDA path batched and capture-safe.
+    offsets = corners.unsqueeze(-3) - corners.unsqueeze(-2)
+    length = offsets.norm(dim=-1)
+    tolerance = 8 * torch.finfo(length.dtype).eps * length.amax(dim=(-2, -1), keepdim=True)
+    safe_length = torch.where(length > tolerance, length, 1.0)
+    inward = torch.stack((-offsets[..., 1], offsets[..., 0]), dim=-1) / safe_length.unsqueeze(-1)
+    corner_clearance = (inward.unsqueeze(-2) * offsets.unsqueeze(-3)).sum(dim=-1)
+    is_edge = (length > tolerance) & (corner_clearance.amin(dim=-1) >= -tolerance)
+    normals = -inward
+    bounds = (normals * corners.unsqueeze(-2)).sum(-1).masked_fill(~is_edge, torch.inf)
+    bounds = bounds.masked_fill(~is_edge.any(dim=(-2, -1), keepdim=True), torch.nan)
+    return normals.flatten(-3, -2), bounds.flatten(-2, -1)
+
+
+def margin_from_support_planes(com_xy: torch.Tensor, normals: torch.Tensor, bounds: torch.Tensor):
+    """Signed clearance in metres. A single fixed stance broadcasts over many CoM positions."""
+    return (bounds - (normals * com_xy.unsqueeze(-2)).sum(-1)).amin(dim=-1)
+
+
+def physical_support_margin(com_xy: torch.Tensor, soles_xyyaw: torch.Tensor,
+                            sole_box: Tuple[float, float]) -> torch.Tensor:
+    """Minimum signed clearance from the physical two-sole hull, in metres.
+
+    `com_xy` and `soles_xyyaw` share world coordinates and batch dimensions,
+    with trailing shapes [2] and [2, 3]. `sole_box` is the full sole length
+    and width. The active edge and the CoM both carry derivatives. Facet
+    choices are discrete at changes of hull topology or closest-edge ties.
+    """
+    if com_xy.shape[-1:] != (2,) or soles_xyyaw.shape != (*com_xy.shape[:-1], 2, 3):
+        raise ValueError("Expected matching batches of CoM [..., 2] and sole poses [..., 2, 3]")
+    return margin_from_support_planes(com_xy, *physical_support_planes(soles_xyyaw, sole_box))
+
+
 def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     """``[B]`` stability margins for full-cspace configs via FK, against the keyframes' rectangle
     (``world.model.support.keyframe_half``).

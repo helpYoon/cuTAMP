@@ -23,11 +23,13 @@ class OperatorMetadata:
         arm: Which arm this operator uses ("left", "right", or None).
         action_type: The type of action ("pick", "place"); for motion ops it is
                      "retract" (Retract*) or None (plain MoveFree/MoveHolding).
+        foot: Swing foot for a step.
     """
     is_actionable: bool = False
     is_motion: bool = False
     arm: Optional[Literal["left", "right"]] = None
-    action_type: Optional[Literal["pick", "place", "retract"]] = None
+    action_type: Optional[Literal["pick", "place", "retract", "step"]] = None
+    foot: Optional[Literal["left", "right"]] = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,9 @@ class Fluent:
     name: str
     parameters: Sequence[Parameter] = field(default_factory=list)
 
+    # A unique bookkeeping fact can bind an action without distinguishing BFS states.
+    tells_states_apart: bool = True
+
     def __call__(self, *parameters: Parameter) -> "Fluent":
         """Create a new Fluent with the given parameters. Makes sure the types match."""
         if len(parameters) != len(self.parameters):
@@ -58,7 +63,7 @@ class Fluent:
             if param.type != new_param.type:
                 raise ValueError(f"Expected type {param.type}, got {new_param.type}")
 
-        return Fluent(self.name, parameters)
+        return Fluent(self.name, parameters, self.tells_states_apart)
 
     def ground(self, *values: str) -> "Atom":
         """Ground a fluent by providing values for its parameters. We're only assume boolean atoms."""
@@ -135,14 +140,22 @@ class Operator:
     del_effects: Sequence[Fluent] = field(default_factory=list)
     metadata: OperatorMetadata = field(default_factory=OperatorMetadata)
 
+    # Context is bound by preconditions, separately from the action's positional
+    # arguments. Defaults support callers constructing a standing operator by hand.
+    context_defaults: dict[str, str] = field(default_factory=dict, kw_only=True)
+
     def ground(self, substitutions: dict[str, str]) -> "GroundOperator":
         """Ground this operator using the given values for the parameters."""
         # Order substitutions by parameter name
-        substitutions = {param.name: substitutions[param.name] for param in self.parameters}
-        ground_name = f"{self.name}({', '.join(substitutions.values())})"
+        values = [substitutions[param.name] for param in self.parameters]
+        context = {name: substitutions.get(name, default) for name, default in self.context_defaults.items()}
+        if context:
+            substitutions = {**substitutions, **context}
+        ground_name = f"{self.name}({', '.join(values)})"
         return GroundOperator(
             name=ground_name,
-            values=list(substitutions.values()),
+            values=values,
+            context=context,
             operator=self,
             preconditions=_ground_fluents(self.preconditions, substitutions),
             add_effects=_ground_fluents(self.add_effects, substitutions),
@@ -167,6 +180,17 @@ class GroundOperator:
     preconditions: set[Atom]
     add_effects: set[Atom]
     del_effects: set[Atom]
+
+    context: dict[str, str] = field(default_factory=dict, kw_only=True)
+
+    def arg(self, name: str) -> str:
+        """Look up a positional argument or a precondition-bound stance reference by name."""
+        if name in self.context:
+            return self.context[name]
+        for parameter, value in zip(self.operator.parameters, self.values):
+            if parameter.name == name:
+                return value
+        raise KeyError(f"{self.operator.name} has no argument {name!r}")
 
     def apply(self, state: State) -> State:
         """Apply this ground operator to a state."""

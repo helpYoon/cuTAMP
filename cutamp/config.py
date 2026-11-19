@@ -7,6 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -89,6 +90,9 @@ class TAMPConfiguration:
     # Root directory for logging experiments
     experiment_root: str = "/tmp/cutamp-experiments"
 
+    # Minimum projected CoM clearance from the physical sole hull at each pick and place.
+    com_comfort_margin_m: float = 0.05
+
     def __post_init__(self):
         if self.soft_cost is None:
             default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
@@ -121,3 +125,5 @@ def validate_tamp_config(config: TAMPConfiguration):
     # Task Planning and subgraph caching
     if config.num_initial_plans <= 0:
         raise ValueError(f"num_initial_plans must be positive, not {config.num_initial_plans}")
+    if not math.isfinite(config.com_comfort_margin_m) or config.com_comfort_margin_m < 0:
+        raise ValueError(f"com_comfort_margin_m must be finite and >= 0, got {config.com_comfort_margin_m}")

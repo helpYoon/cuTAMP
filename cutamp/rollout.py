@@ -31,6 +31,12 @@ from cutamp.utils.common import (
 )
 
 
+def require_fixed_stance(plan_skeleton: PlanSkeleton) -> None:
+    for op in plan_skeleton:
+        if op.operator.metadata.action_type == "step":
+            raise NotImplementedError(f"{op.operator.name} requires achieved sole poses in particle refinement")
+
+
 def get_conf_parameters(plan_skeleton: PlanSkeleton) -> List[str]:
     """Configuration parameter names appearing in actionable operators."""
     conf_params = []
@@ -109,6 +115,7 @@ class Rollout(TypedDict):
     robot_spheres: torch.Tensor  # [num_particles, *h, n, 4]
     world_from_ee: torch.Tensor  # [num_particles, *h, 4, 4]
     world_from_soles: torch.Tensor  # [num_particles, *h, 2, 4, 4]
+    com_xy: torch.Tensor  # [num_particles, *h, 2], world-frame CoM at each wrist keyframe
     world_from_ee_desired: torch.Tensor  # [num_particles, *h, 4, 4]
     gripper_close: List[bool]
     action_params: List[str]
@@ -125,6 +132,7 @@ class RolloutFunction:
     """
 
     def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld):
+        require_fixed_stance(plan_skeleton)
         self.plan_skeleton = plan_skeleton
         self.world = world
         self.conf_params = get_conf_parameters(plan_skeleton)
@@ -253,6 +261,7 @@ class RolloutFunction:
             robot_spheres=robot_spheres,
             world_from_ee=world_from_ee,
             world_from_soles=world_from_soles,
+            com_xy=kin_state.robot_com[..., :2].reshape(*confs.shape[:2], 2),
             world_from_ee_desired=world_from_ee_desired,
             gripper_close=gripper_close,
             action_params=action_params,

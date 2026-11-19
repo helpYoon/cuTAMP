@@ -20,8 +20,8 @@ One factory builds each arm's fluents and one its operators, so the two sides st
 from typing import Sequence
 
 from cutamp.task_planning import Fluent, OperatorMetadata, Parameter, TAMPOperator, State
-from cutamp.task_planning.constraints import KinematicConstraint, Motion, StablePlacement
-from cutamp.task_planning.costs import TrajectoryLength
+from cutamp.task_planning.constraints import Footprint, KinematicConstraint, Motion, StablePlacement, StandOnStance, StepReach
+from cutamp.task_planning.costs import StepTaken, TrajectoryLength
 
 # Types
 Conf = "conf"
@@ -31,6 +31,7 @@ Grasp = "grasp"
 
 Movable = "movable"
 Surface = "surface"
+Sole = "sole"
 
 
 # Fluents (aka predicates)
@@ -59,12 +60,23 @@ IsSurface = Fluent("IsSurface", [Parameter("surface", Surface)])
 HasNotPickedUp = Fluent("HasNotPickedUp", [Parameter("obj", Movable)])
 On = Fluent("On", [Parameter("obj", Movable), Parameter("surface", Surface)])
 
+LeftSoleAt = Fluent("LeftSoleAt", [Parameter("sole", Sole)])
+RightSoleAt = Fluent("RightSoleAt", [Parameter("sole", Sole)])
+LeftFootFresh = Fluent("LeftFootFresh")
+RightFootFresh = Fluent("RightFootFresh")
+StandingAt = Fluent("StandingAt", [Parameter("q", Conf)], tells_states_apart=False)
+
 # LeftAt, RightAt, LeftHandEmpty, RightHandEmpty, ..., then the arm-free fluents
 all_t1_fluents = [f for pair in zip(_LEFT.values(), _RIGHT.values()) for f in pair] + [
     IsMovable,
     IsSurface,
     HasNotPickedUp,
     On,
+    LeftSoleAt,
+    RightSoleAt,
+    StandingAt,
+    LeftFootFresh,
+    RightFootFresh,
 ]
 
 
@@ -82,7 +94,19 @@ grasp = Parameter("grasp", Grasp)
 placement = Parameter("placement", Pose)
 
 
-# Operators - this is the important part!
+sole_l = Parameter("sole_l", Sole)
+sole_r = Parameter("sole_r", Sole)
+q_stand = Parameter("q_stand", Conf)
+q_land = Parameter("q_land", Conf)
+sole_from = Parameter("sole_from", Sole)
+sole_planted = Parameter("sole_planted", Sole)
+sole_to = Parameter("sole_to", Sole)
+q_left_at = Parameter("q_left_at", Conf)
+q_right_at = Parameter("q_right_at", Conf)
+_STANCE = [LeftSoleAt(sole_l), RightSoleAt(sole_r), StandingAt(q_stand)]
+_HOME_STANCE = {"sole_l": "sole0", "sole_r": "sole1", "q_stand": "left_q0"}
+
+
 def _arm_operators(arm: str) -> list[TAMPOperator]:
     """One arm's six operators, named <Arm><op>: MoveFree, MoveHolding, Pick, Place, RetractHolding, RetractFree.
 
@@ -99,41 +123,45 @@ def _arm_operators(arm: str) -> list[TAMPOperator]:
     move_free = TAMPOperator(
         f"{s}MoveFree",
         [q_start, traj, q_end],
-        preconditions=[at(q_start), empty(), can_move(), other_can_move()],
+        preconditions=[at(q_start), empty(), can_move(), other_can_move()] + _STANCE,
         add_effects=[at(q_end), just_moved()],
         del_effects=[at(q_start), can_move(), other_can_move()],
         constraints=[Motion(q_start, traj, q_end)],
         costs=[TrajectoryLength(q_start, traj, q_end)],
+        context_defaults=_HOME_STANCE,
         metadata=OperatorMetadata(is_motion=True, arm=arm),
     )
     move_holding = TAMPOperator(
         f"{s}MoveHolding",
         [obj, grasp, q_start, traj, q_end],
-        preconditions=[at(q_start), holding(obj), holding_grasp(obj, grasp), can_move(), other_can_move()],
+        preconditions=[at(q_start), holding(obj), holding_grasp(obj, grasp), can_move(), other_can_move()] + _STANCE,
         add_effects=[at(q_end), just_moved()],
         del_effects=[at(q_start), can_move(), other_can_move()],
         constraints=[Motion(q_start, traj, q_end)],
         costs=[TrajectoryLength(q_start, traj, q_end)],
+        context_defaults=_HOME_STANCE,
         metadata=OperatorMetadata(is_motion=True, arm=arm),
     )
     pick = TAMPOperator(
         f"{s}Pick",
         [obj, grasp, q],
-        preconditions=[at(q), empty(), IsMovable(obj), just_moved(), HasNotPickedUp(obj)],
-        add_effects=[holding(obj), holding_grasp(obj, grasp), just_picked()],  # JustPicked triggers the retract
+        preconditions=[at(q), empty(), IsMovable(obj), just_moved(), HasNotPickedUp(obj)] + _STANCE,
+        add_effects=[holding(obj), holding_grasp(obj, grasp), just_picked(), LeftFootFresh(), RightFootFresh()],  # JustPicked triggers the retract
         del_effects=[empty(), just_moved(), HasNotPickedUp(obj)],
         constraints=[KinematicConstraint(q, grasp)],
         costs=[],
+        context_defaults=_HOME_STANCE,
         metadata=OperatorMetadata(is_actionable=True, action_type="pick", arm=arm),
     )
     place = TAMPOperator(
         f"{s}Place",
         [obj, grasp, placement, surface, q],
-        preconditions=[at(q), holding(obj), holding_grasp(obj, grasp), IsSurface(surface), just_moved()],
-        add_effects=[empty(), just_placed(), On(obj, surface)],  # JustPlaced triggers the retract
+        preconditions=[at(q), holding(obj), holding_grasp(obj, grasp), IsSurface(surface), just_moved()] + _STANCE,
+        add_effects=[empty(), just_placed(), On(obj, surface), LeftFootFresh(), RightFootFresh()],  # JustPlaced triggers the retract
         del_effects=[holding(obj), holding_grasp(obj, grasp), just_moved()],
         constraints=[KinematicConstraint(q, placement), StablePlacement(obj, grasp, placement, surface)],
         costs=[],
+        context_defaults=_HOME_STANCE,
         metadata=OperatorMetadata(is_actionable=True, action_type="place", arm=arm),
     )
     # Retracts move the arm back towards home after a pick or place; the optimizer's soft costs pick the closest
@@ -141,21 +169,23 @@ def _arm_operators(arm: str) -> list[TAMPOperator]:
     retract_holding = TAMPOperator(
         f"{s}RetractHolding",
         [obj, grasp, q_start, traj, q_retract],
-        preconditions=[at(q_start), holding(obj), holding_grasp(obj, grasp), just_picked()],
-        add_effects=[at(q_retract), can_move(), other_can_move()],
-        del_effects=[at(q_start), just_picked()],
+        preconditions=[at(q_start), holding(obj), holding_grasp(obj, grasp), just_picked()] + _STANCE,
+        add_effects=[at(q_retract), can_move(), other_can_move(), StandingAt(q_retract)],
+        del_effects=[at(q_start), just_picked(), StandingAt(q_stand)],
         constraints=[Motion(q_start, traj, q_retract)],
         costs=[],
+        context_defaults=_HOME_STANCE,
         metadata=OperatorMetadata(is_motion=True, action_type="retract", arm=arm),
     )
     retract_free = TAMPOperator(
         f"{s}RetractFree",
         [q_start, traj, q_retract],
-        preconditions=[at(q_start), empty(), just_placed()],
-        add_effects=[at(q_retract), can_move(), other_can_move()],
-        del_effects=[at(q_start), just_placed()],
+        preconditions=[at(q_start), empty(), just_placed()] + _STANCE,
+        add_effects=[at(q_retract), can_move(), other_can_move(), StandingAt(q_retract)],
+        del_effects=[at(q_start), just_placed(), StandingAt(q_stand)],
         constraints=[Motion(q_start, traj, q_retract)],
         costs=[],
+        context_defaults=_HOME_STANCE,
         metadata=OperatorMetadata(is_motion=True, action_type="retract", arm=arm),
     )
     return [move_free, move_holding, pick, place, retract_holding, retract_free]
@@ -174,6 +204,39 @@ all_t1_operators = [
 ]
 
 
+def _step_operator(foot: str) -> TAMPOperator:
+    """<Foot>Step: the ``foot`` sole moves from ``sole_from`` to ``sole_to`` while the other stays at
+    ``sole_planted``, and the robot goes from ``q_stand`` to ``q_land``, which stands on the landed stance.
+
+    Both hands' arms must be free to move (both CanMove: no arm is between its move and its retract), and the foot must
+    not have stepped since the last pick or place (<Foot>FootFresh). A step moves the whole robot, so both arms' "at"
+    literals (``q_left_at``, ``q_right_at``) move to ``q_land`` with it: the next move starts on the landed stance."""
+    mine, other = (LeftSoleAt, RightSoleAt) if foot == "left" else (RightSoleAt, LeftSoleAt)
+    fresh = LeftFootFresh if foot == "left" else RightFootFresh
+    left_at, right_at = _LEFT["At"], _RIGHT["At"]
+    landed = (sole_to, sole_planted) if foot == "left" else (sole_planted, sole_to)  # (left, right) after landing
+    return TAMPOperator(
+        f"{foot.capitalize()}Step",
+        [sole_from, sole_planted, sole_to, q_stand, q_land, q_left_at, q_right_at],
+        preconditions=[mine(sole_from), other(sole_planted), StandingAt(q_stand), _LEFT["CanMove"](),
+                       _RIGHT["CanMove"](), fresh(), left_at(q_left_at), right_at(q_right_at)],
+        add_effects=[mine(sole_to), StandingAt(q_land), left_at(q_land), right_at(q_land)],
+        del_effects=[mine(sole_from), StandingAt(q_stand), fresh(), left_at(q_left_at), right_at(q_right_at)],
+        constraints=[
+            StepReach(sole_from, sole_planted, sole_to),
+            StandOnStance(q_stand, q_land, *landed),
+            Footprint(sole_from, sole_planted, sole_to),
+        ],
+        costs=[StepTaken()],
+        metadata=OperatorMetadata(action_type="step", foot=foot),
+    )
+
+
+LeftStep, RightStep = _step_operator("left"), _step_operator("right")
+#: Not searched: step skeletons are built by task_planning.insert_steps.with_steps.
+all_t1_step_operators = [LeftStep, RightStep]
+
+
 def get_initial_state(movables: Sequence[str] = (), surfaces: Sequence[str] = ()) -> State:
     """Ground the initial state of the T1 TAMP domain.
     
@@ -187,6 +250,11 @@ def get_initial_state(movables: Sequence[str] = (), surfaces: Sequence[str] = ()
         _RIGHT["HandEmpty"].ground(),
         _LEFT["CanMove"].ground(),
         _RIGHT["CanMove"].ground(),
+        LeftSoleAt.ground("sole0"),
+        RightSoleAt.ground("sole1"),
+        StandingAt.ground("left_q0"),
+        LeftFootFresh.ground(),
+        RightFootFresh.ground(),
     }
     for movable in movables:
         initial_state.add(IsMovable.ground(movable))

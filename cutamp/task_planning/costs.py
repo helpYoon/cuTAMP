@@ -13,3 +13,7 @@ from .tamp_structs import Cost
 class TrajectoryLength(Cost):
     def __init__(self, q_start, traj, q_end):
         super().__init__(q_start, traj, q_end)
+
+
+class StepTaken(Cost):
+    """One discrete footstep in the plan's step-count preference."""

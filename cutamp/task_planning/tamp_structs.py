@@ -22,6 +22,8 @@ class TAMPOperator(Operator):
 
     def ground(self, substitutions: dict[str, str]) -> "GroundTAMPOperator":
         ground_operator: GroundOperator = super().ground(substitutions)
+        if ground_operator.context:
+            substitutions = {**substitutions, **ground_operator.context}
         # Ground constraints and costs
         ground_constraints = [con.ground(substitutions) for con in self.constraints]
         ground_costs = [cost.ground(substitutions) for cost in self.costs]

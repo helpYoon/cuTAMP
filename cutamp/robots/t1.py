@@ -96,6 +96,7 @@ class T1Model:
     home: Tuple[float, ...]
     support: Support
     sole_frames: Tuple[str, str]         # ("left_sole_link", "right_sole_link")
+    sole_box: Tuple[float, float]        # full physical length and width in the sole frame, metres
     envelope: Envelope                   # what the policy may be sent (design 7.10, call 22); its limits are cut to it
 
 
@@ -137,6 +138,7 @@ def _load_real_legs() -> T1Model:
         # The stance link sits at the home mid-sole, on the floor: the rectangle is centred on it.
         support=Support("stance", gate_half, keyframe_half),
         sole_frames=("left_sole_link", "right_sole_link"),
+        sole_box=tuple(block["sole_box"]),
         envelope=load_envelope("route_a_start"),  # by name: route A has no checkpoint to pick it by (design 7.10)
     )
 
