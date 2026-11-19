@@ -1,0 +1,101 @@
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+from cutamp.landing_predictor import LandingPredictor, prediction_precision
+from cutamp.tests.conftest import needs_cuda
+
+
+@pytest.fixture(scope="module")
+def predictor():
+    default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default))
+    if not bundle.is_file() and "CUTAMP_LANDING_BUNDLE" not in os.environ:
+        pytest.skip("Export the real seed-3 checkpoint with experiments/export_t1_landing.py")
+    return LandingPredictor(bundle)
+
+
+@needs_cuda
+def test_reference_single_step_and_nonsettled_precision_pass(predictor):
+    context = torch.zeros(1, 38, device="cuda")
+    context[:, 0] = (1.0 - 0.75) / 0.45
+    context[:, -5:] = -1.0  # two actuator-lag substeps
+    start = predictor.standing_start(context)
+    commands = torch.tensor([[[0.12, 0.21, 0]]], device="cuda", requires_grad=True)
+    out = predictor.rollout(start, "L", commands)
+    step = out.steps[0]
+    assert out.tracking_ok.tolist() == [True]
+    assert step.near_rest.tolist() == [False]
+    assert step.clock.tolist() == [46]
+    # Independent eager bfm_wm/Python 3.13 evaluation of this fixture in paired-model.json.
+    expected = commands.new_tensor([[[0.1539695, 0.0938335, 0.0220075], [0.0423440, -0.1177292, 0.0288627]]])
+    torch.testing.assert_close(step.achieved, expected, rtol=0, atol=2e-5)
+    assert abs(step.max_joint_rms.item() - 0.0127628) < 5e-5
+    (grad,) = torch.autograd.grad(step.achieved[0, 0, 0], commands)
+    torch.testing.assert_close(grad[0, 0], commands.new_tensor([0.899625, -0.016141, 0.011681]), rtol=0.006, atol=3e-4)
+    assert all(not p.requires_grad for p in predictor.model.parameters())
+
+
+@needs_cuda
+@pytest.mark.parametrize("order", ["LR", "RL"])
+def test_chain_uses_terminal_histories_and_correct_row_clocks(order, predictor):
+    context = torch.zeros(2, 38, device="cuda")
+    context[:, 0] = (1.0 - 0.75) / 0.45
+    context[:, -5:] = -1.0
+    start = predictor.standing_start(context)
+    sign = 1 if order == "LR" else -1
+    cmd = torch.tensor(
+        [[[0.12, 0.21 * sign, 0], [0.10, -0.21 * sign, 0]], [[0.24, 0.21 * sign, 0], [0.06, -0.21 * sign, 0]]],
+        dtype=torch.float32,
+        device="cuda",
+        requires_grad=True,
+    )
+    planner_precision = torch.backends.cuda.matmul.allow_tf32
+    pred = predictor.rollout(start, order, cmd)
+    assert torch.backends.cuda.matmul.allow_tf32 == planner_precision
+    a, b = pred.steps
+    assert a.clock[0] != a.clock[1]
+    torch.testing.assert_close(a.valid_ticks.sum(1), a.clock + 75)
+    support = "LR".index(order[0])
+    torch.testing.assert_close(b.reference[:, support], a.achieved[:, support])
+    with prediction_precision():
+        (terminal_grad,) = torch.autograd.grad(b.achieved[:, 1 - support, 0].sum(), cmd)
+    assert torch.isfinite(terminal_grad).all() and (terminal_grad[:, 0, :].abs().sum(1) > 0.01).all()
+    with torch.no_grad():
+        single = predictor.rollout(a.terminal, order[1], cmd[:, 1:])
+        # Perturb only the first command. Recompute complete closed-loop predictions for both sides.
+        delta = torch.zeros_like(cmd)
+        delta[:, 0, 0] = 0.001
+        minus = predictor.rollout(start, order, cmd - delta)
+        plus = predictor.rollout(start, order, cmd + delta)
+        for step, lower, upper in zip(pred.steps, minus.steps, plus.steps):
+            assert torch.equal(step.clock, lower.clock) and torch.equal(step.clock, upper.clock)
+        fd = (plus.steps[-1].achieved[:, 1 - support, 0] - minus.steps[-1].achieved[:, 1 - support, 0]) / 0.002
+        torch.testing.assert_close(terminal_grad[:, 0, 0], fd, atol=0.02, rtol=0.03)
+    torch.testing.assert_close(single.steps[0].achieved, b.achieved)
+    empty = predictor.rollout(start, "", cmd[:, :0])
+    assert empty.terminal is start and empty.tracking_ok.all()
+
+
+@needs_cuda
+def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
+    from cutamp.step_search import StepSearch, TargetRegion
+
+    data = Path(__file__).resolve().parents[2] / "data/t1-reachability"
+    if not (data / "t1-hand-map.npz").exists() or not (data / "landing-accuracy/home-model.json").exists():
+        pytest.skip("Requires the offline T1 hand map and accuracy table")
+    search = StepSearch.load(data / "t1-hand-map.npz", accuracy_path=data / "landing-accuracy/home-model.json", lag=8)
+    target = TargetRegion("left", (0.48, 0.18, 0.025), (0.05,) * 3, solid_pick=True)
+    edge = next(search.schedules(search.home, [target])).edges[0]
+    assert edge.order == "L" and edge.commands == ((0.24, 0.21, 0.0),)
+    dynamics = torch.zeros(1, 38, device=predictor.device)
+    dynamics[:, 0] = (1.0 - 0.75) / 0.45
+    dynamics[:, -5:] = 1.0  # 8 physics ticks of actuator lag
+    with torch.no_grad():
+        start = predictor.standing_start(dynamics)
+        commands = torch.tensor([edge.commands], device=predictor.device)
+        prediction = predictor.rollout(start, edge.order, commands)
+        assert prediction.tracking_ok.item()
+        assert predictor.rollout(start, "none", commands[:, :0]).terminal is start
