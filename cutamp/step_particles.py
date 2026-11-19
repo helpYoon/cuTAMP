@@ -8,8 +8,9 @@ import roma
 import torch
 
 from cutamp.cost_function import CostFunction
+from cutamp.grasps import GRASP_SCORE_CUTOFF
 from cutamp.landing_predictor import LandingState, prediction_precision
-from cutamp.particle_initialization import ParticleInitializer, _draw_placements
+from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
 from cutamp.rollout import RolloutFunction
 from cutamp.sole_collision import geometric_sweep_rows
 from cutamp.stance import abs_pose
@@ -29,37 +30,28 @@ def _batch(value, first, stop, tail, like):
     return x.expand(stop - first, *tail) if len(x) == 1 else x[first:stop]
 
 
-def _take(value, i, *, cpu=False):
+def _take(value, i, device):
     """Detach a selected trajectory, retaining its batch axis and metadata."""
     if torch.is_tensor(value):
-        tensor = value[i : i + 1].detach()
-        return tensor.cpu() if cpu else tensor
+        return value[i : i + 1].detach().to(device)
     if is_dataclass(value):
-        return type(value)(**{f.name: _take(getattr(value, f.name), i, cpu=cpu) for f in fields(value)})
+        return type(value)(**{f.name: _take(getattr(value, f.name), i, device) for f in fields(value)})
     if isinstance(value, tuple):
-        return tuple(_take(v, i, cpu=cpu) for v in value)
+        return tuple(_take(v, i, device) for v in value)
     return value
 
 
-def _evidence(adapter, predictions, i):
+def _evidence(adapter, predictions):
     from cutamp.step_validation import model_step_record
 
-    gaps = {}
-    for j, (initial, commands, pred, preparation) in predictions.items():
-        steps = []
-        for k, step in enumerate(pred.steps):
-            steps.append((_take(initial, i, cpu=True), _take(step, i, cpu=True), commands[i : i + 1, k].detach().cpu()))
-            initial = step.terminal
-        gaps[j] = (steps, _take(preparation, i, cpu=True))
-
     def render():
-        return {
-            str(j): [
-                model_step_record(adapter, start, step, cmd, preparation=preparation if k == 0 else None)
-                for k, (start, step, cmd) in enumerate(steps)
-            ]
-            for j, (steps, preparation) in gaps.items()
-        }
+        gaps = {}
+        for j, (start, commands, pred, preparation) in predictions.items():
+            gaps[str(j)] = []
+            for k, step in enumerate(pred.steps):
+                gaps[str(j)].append(model_step_record(adapter, start, step, commands[:, k], preparation=preparation))
+                start, preparation = step.terminal, None
+        return gaps
 
     return render
 
@@ -297,7 +289,7 @@ def _summary(result, commands, order, initial, validation, i):
 
 
 def _refine_batch(
-    proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop, timer, visualizer, deadline
+    proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop, motion_inputs, deadline
 ):
     groups = _groups(proposal.skeleton)
     arm_skeleton = [op for op in proposal.skeleton if op.operator.metadata.action_type != "step"]
@@ -587,37 +579,60 @@ def _refine_batch(
                 normalized_dynamics=_list(d[i]),
                 step_lag=config.step_lag,
             )
-        motion = None
+        evidence = None
+        if model_feasible:
+            saved = {gap: _take(trace, i, "cpu") for gap, trace in predictions.items()}
+            evidence = _evidence(adapter, saved)
+            if config.curobo_plan and inputs.transition_validator is not None:
+                motion_inputs[first + i] = (adapter, saved)
         if config.curobo_plan:
-            if model_feasible and inputs.transition_validator is not None:
-                from cutamp.motion_solver import plan_validated_step_motion
-                from cutamp.particle_initialization import IKTol
-
-                motion, motion_info = plan_validated_step_motion(
-                    proposal.skeleton,
-                    particle,
-                    {k: _take(p, i) for k, p in predictions.items()},
-                    adapter,
-                    world,
-                    config,
-                    inputs.transition_validator,
-                    timer=timer,
-                    visualizer=visualizer,
-                    ik_tol=IKTol.from_checker(checker),
-                )
-                report.update(motion_info)
+            if first + i in motion_inputs:
+                report["motion_validation"] = "unattempted"
             else:
-                report.update(
-                    motion_validation="unavailable", motion_reason="independent transition validator required"
-                )
-        evidence = _evidence(adapter, predictions, i) if model_feasible else None
-        rows.append(StepRow(first + i, particle, float(effort[i]), report, motion, evidence))
+                report.update(motion_validation="unavailable", motion_reason="independent transition validator required")
+        rows.append(StepRow(first + i, particle, float(effort[i]), report, evidence=evidence))
     # Keep same-row details for a failed ablation or an exhausted search.
     best = int((ep.sum(1) * -1e6 + hard.nan_to_num(1e6)).argmin())
     failures = [f"{kind}.{key}" for kind, items in masks.items() for key, mask in items.items() if not mask[best].all()]
     diagnostics = {"row": first + best, "gaps": records[best], "failed_constraints": failures}
     status = ("model_feasible" if predictor is not None else "kinematic_candidate") if rows else "unresolved"
     return StepResult(rows, ep, status, None if rows else "no particle met all applicable constraints", diagnostics)
+
+
+def _validate_motion_rows(rows, pools, skeleton, world, config, attempt, *, deadline):
+    """Spend one retry budget across all particle chunks of this grounded schedule."""
+    from cutamp.algorithm import grasp_group_order
+
+    diagnostics = {"motion_plan_attempts": 0, "motion_plan_failures": []}
+    if not rows or (deadline is not None and monotonic() >= deadline):
+        return diagnostics
+    if pools:
+        indices = torch.stack([torch.stack([r.particle[name + "_idx"] for name in pools]) for r in rows])
+        hi = torch.stack([
+            scores.to(indices.device)[indices[:, j]] >= GRASP_SCORE_CUTOFF for j, (_, scores) in enumerate(pools.values())
+        ]).all(0)
+    else:
+        indices = torch.empty(len(rows), 0, dtype=torch.long)
+        hi = torch.ones(len(rows), dtype=torch.bool)
+    soft = torch.tensor([r.soft_cost for r in rows], dtype=torch.float64)
+    margin = torch.tensor([r.metrics["best_com_margin"] for r in rows], dtype=torch.float64)
+    confs = [torch.stack([r.particle[q] for r in rows]) for q in pick_place_confs(skeleton)]
+    tilt, travel, _ = worst_posture(world, confs)
+    order = grasp_group_order(
+        indices, soft, hi, tilt, travel, margin, config.motion_plan_max_retries, rank_by_soft=config.com_center_weight > 0
+    )
+    for rank, pos in enumerate(order):
+        if deadline is not None and monotonic() >= deadline:
+            break
+        row = rows[pos]
+        row.motion_plan, info = attempt(row)
+        row.metrics.update(info)
+        diagnostics["motion_plan_attempts"] += 1
+        if row.motion_plan is not None:
+            row.metrics["motion_plan_rank"] = rank
+            break
+        diagnostics["motion_plan_failures"].append(info.get("reason", info["motion_validation"]))
+    return diagnostics
 
 
 @prediction_precision()
@@ -636,7 +651,7 @@ def refine_step_particles(
         seeds.extend(islice(proposal.alternative_seeds, n - 1))
     rows, feedback, diagnostic = [], [], {}
     status, reason = "unresolved", "no particle met all applicable constraints"
-    attempted_seeds = []
+    attempted_seeds, motion_inputs = [], {}
     groups = _groups(proposal.skeleton)
     for first in range(0, n, config.step_particle_batch_size):
         stop = min(first + config.step_particle_batch_size, n)
@@ -660,8 +675,7 @@ def refine_step_particles(
                 batch_seeds,
                 first,
                 stop,
-                timer,
-                visualizer,
+                motion_inputs,
                 deadline,
             )
         except TimeoutError as exc:
@@ -677,5 +691,20 @@ def refine_step_particles(
             status, reason = batch.status, batch.reason
         if deadline is not None and monotonic() >= deadline:
             break
+    if motion_inputs:
+        from cutamp.motion_solver import plan_validated_step_motion
+
+        def attempt(row):
+            adapter, saved = motion_inputs[row.index]
+            traces = {gap: _take(trace, 0, world.q_init.device) for gap, trace in saved.items()}
+            return plan_validated_step_motion(
+                proposal.skeleton, row.particle, traces, adapter, world, config, inputs.transition_validator,
+                timer=timer, visualizer=visualizer, ik_tol=IKTol.from_checker(constraint_checker),
+            )
+
+        eligible = [row for row in rows if row.index in motion_inputs]
+        diagnostic.update(
+            _validate_motion_rows(eligible, pools, proposal.skeleton, world, config, attempt, deadline=deadline)
+        )
     diagnostic["attempted_seed_commands"] = attempted_seeds
     return StepResult(rows, torch.cat(feedback) if feedback else None, status, reason, diagnostic)

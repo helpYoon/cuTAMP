@@ -217,6 +217,96 @@ def test_default_centroid_preference_and_zero_weight_ablation():
             validate_tamp_config(replace(cfg, com_center_weight=invalid))
 
 
+@pytest.mark.parametrize("limit,expire,expected", [(1, False, [5]), (5, False, [5, 2]), (5, True, [5])])
+def test_stepped_motion_honors_global_retry_order_and_deadline(monkeypatch, limit, expire, expected):
+    from cutamp import step_particles
+
+    # Row 5 is the best of three rows sharing a grasp, row 2 has a distinct grasp.
+    rows = [
+        StepRow(i, {"grasp1_idx": torch.tensor(grasp), "q1": torch.zeros(33)}, soft, {"best_com_margin": 0.06})
+        for i, grasp, soft in [(0, 0, 4.0), (1, 0, 0.3), (2, 1, 1.0), (5, 0, 0.1)]
+    ]
+    pools = {"grasp1": (torch.zeros(2, 7), torch.ones(2))}
+    calls = []
+    monkeypatch.setattr(step_particles, "monotonic", lambda: 1.0 if expire and calls else 0.0)
+    monkeypatch.setattr(step_particles, "worst_posture", lambda world, confs: (torch.zeros(4),) * 3)
+    op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="pick")), values=("q1",))
+
+    def attempt(row):
+        calls.append(row.index)
+        if row.index == 2:
+            return ["validated path"], {"motion_validation": "accepted"}
+        return None, {"motion_validation": "rejected", "reason": "connection failed"}
+
+    cfg = TAMPConfiguration(motion_plan_max_retries=limit)
+    report = step_particles._validate_motion_rows(rows, pools, [op], None, cfg, attempt, deadline=0.5)
+    assert calls == expected
+    assert report["motion_plan_attempts"] == len(calls)
+    assert report["motion_plan_failures"] == ["connection failed"]
+    winners = [r for r in rows if r.motion_plan is not None]
+    assert [r.index for r in winners] == ([2] if 2 in expected else [])
+    if winners:
+        assert winners[0].metrics["motion_plan_rank"] == 1 and winners[0].soft_cost == 1.0
+
+
+def test_stepped_motion_with_no_grasp_columns_uses_particle_cost(monkeypatch):
+    from cutamp import step_particles
+
+    op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="place")), values=("q1",))
+    rows = [StepRow(i, {"q1": torch.zeros(33)}, cost, {"best_com_margin": 0.08}) for i, cost in enumerate((2., 1.))]
+    monkeypatch.setattr(step_particles, "worst_posture", lambda w, qs: (torch.zeros(2),) * 3)
+    report = step_particles._validate_motion_rows(
+        rows, {}, [op], None, TAMPConfiguration(), lambda r: ([r.index], {"motion_validation": "accepted"}),
+        deadline=None,
+    )
+    assert report["motion_plan_attempts"] == 1 and rows[1].motion_plan == [1]
+
+
+def test_validator_uses_the_globally_ranked_particles_own_trace(monkeypatch):
+    from cutamp import motion_solver, step_particles
+
+    cfg = TAMPConfiguration(
+        step_mode="model", num_particles=4, step_particle_batch_size=2, motion_plan_max_retries=1, curobo_plan=True,
+    )
+    pools = {"grasp1": (torch.zeros(2, 7), torch.ones(2))}
+    op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="pick")), values=("q1",))
+    proposal = SimpleNamespace(skeleton=[op], seed=None)
+    world = SimpleNamespace(q_init=torch.zeros(33))
+    monkeypatch.setattr(step_particles, "ParticleInitializer", lambda *a: SimpleNamespace(_pick_pools=lambda p: pools))
+    monkeypatch.setattr(step_particles, "worst_posture", lambda w, qs: (torch.zeros(len(qs[0])),) * 3)
+    monkeypatch.setattr(step_particles.IKTol, "from_checker", lambda c: None)
+    chunks, attempted = [], []
+
+    def feasible_chunk(proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop,
+                       motion_inputs, deadline):
+        chunks.append(first)
+        rows = []
+        for i in range(first, stop):
+            if i != 2:
+                motion_inputs[i] = (predictor, {0: torch.tensor([[i]])})
+            particle = {"grasp1_idx": torch.tensor(i % 2), "q1": torch.full((33,), float(i))}
+            rows.append(StepRow(i, particle, 0. if i == 2 else 4 - i, {"best_com_margin": 0.06}))
+        return StepResult(rows, torch.ones(len(rows), 1, dtype=torch.bool), "model_feasible")
+
+    def validate(skeleton, particle, traces, adapter, world, config, validator, **kwargs):
+        assert validator is independent
+        i = int(particle["q1"][0])
+        assert traces[0].item() == i
+        attempted.append(i)
+        return ["path"], {"motion_validation": "accepted"}
+
+    independent = object()
+    monkeypatch.setattr(step_particles, "_refine_batch", feasible_chunk)
+    monkeypatch.setattr(motion_solver, "plan_validated_step_motion", validate)
+    result = step_particles.refine_step_particles(
+        proposal, world, cfg, None, None, inputs=StepInputs(transition_validator=independent), predictor=object(),
+        timer=None, visualizer=None, deadline=None,
+    )
+    assert chunks == [0, 2] and attempted == [3]
+    assert [row.index for row in result.rows if row.motion_plan] == [3]
+    assert result.diagnostics["motion_plan_attempts"] == 1 and result.diagnostics["motion_plan_failures"] == []
+
+
 def test_invalid_fixed_command_sequence_is_rejected():
     with pytest.raises(ValueError, match="one seed"):
         StepInputs(orders=("LR",), commands=(((0.1, 0.2, 0.0),),))

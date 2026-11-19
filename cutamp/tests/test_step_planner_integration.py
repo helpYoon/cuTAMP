@@ -11,8 +11,9 @@ from cutamp.tests.conftest import needs_cuda
 from cutamp.tests.paired_grasp_scene import ROOT, paired_setup
 
 
-def paired_case(label, output, *, place=False, motion=False):
+def paired_case(label, output, *, place=False, motion=False, validator=None):
     env, q, inp_args = paired_setup(label, place=place)
+    inp_args.transition_validator = validator
     bundle = ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
     cfg = TAMPConfiguration(
         step_mode="model",
@@ -72,3 +73,20 @@ def test_shared_grasp_and_achieved_stance_at_pick_and_place(tmp_path):
         assert pick["achieved"] == place["achieved"]
         assert min(pick["margin_m"], place["margin_m"]) >= 0.05
         assert max(pick["final_xy_error_m"]) < 0.02 and max(pick["final_yaw_error_deg"]) < 1.0
+
+
+@needs_cuda
+def test_public_validated_motion_receives_optimized_winning_trace(tmp_path):
+    requests = []
+
+    def inspect_request(request):
+        requests.append((request.foot, request.command.detach().cpu().tolist(), request.predicted.clock.item()))
+        return None  # This source has no independent execution evidence.
+
+    metrics = paired_case("near", tmp_path, motion=True, validator=inspect_request)
+    attempt = metrics["step_attempts"][0]
+    row = attempt["particle_candidate"]
+    assert attempt["status"] == "model_feasible" and not metrics["found_solution"]
+    assert metrics["motion_plan_attempts"] == 1 and "no transition" in metrics["motion_plan_failures"][0]
+    gap = row["gaps"][0]
+    assert requests == [("L", gap["commands"][0], gap["steps"][0]["clock"])]
