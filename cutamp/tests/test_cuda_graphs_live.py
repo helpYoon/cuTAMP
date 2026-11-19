@@ -4,6 +4,7 @@ Slow: runs only with CUTAMP_SLOW=1."""
 
 import json
 import os
+import threading
 
 import pytest
 
@@ -16,11 +17,35 @@ needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="sl
 def _run_demo(tmp_path, monkeypatch, n) -> list:
     import cutamp.algorithm
     from cutamp.envs.utils import get_env_dir, load_env
+    from cutamp.optimize_plan import _BestSnapshot
     from cutamp.scripts.run_cutamp import cutamp_demo
 
     monkeypatch.setattr(cutamp.algorithm, "Visualizer", lambda config, q_init: SpyVis(config))  # the vis block runs
-    # The run plans motions, so each optimize call captures beside the planner-build thread.
-    config = TAMPConfiguration(num_particles=n, cuda_graphs=True,
+    # Let step zero exercise the real overlap, then give replay comparisons a fixed window
+    # independent of how long the cuRobo build takes or when the objective plateaus.
+    builder = cutamp.algorithm.build_motion_planner
+    started = threading.Event()
+    build_thread = None
+
+    def build(world):
+        nonlocal build_thread
+        build_thread = threading.current_thread()
+        started.set()
+        return builder(world)
+
+    update = _BestSnapshot.update
+
+    def finish_warmup_after_first_step(self, step, *args):
+        result = update(self, step, *args)
+        if step == 0:
+            assert started.wait(timeout=120), "the real planner builder never started"
+            build_thread.join(timeout=120)
+            assert not build_thread.is_alive(), "the real planner builder did not finish"
+        return result
+
+    monkeypatch.setattr(cutamp.algorithm, "build_motion_planner", build)
+    monkeypatch.setattr(_BestSnapshot, "update", finish_warmup_after_first_step)
+    config = TAMPConfiguration(num_particles=n, cuda_graphs=True, num_opt_steps=26, early_stop_patience=0,
                                soft_cost=["joint_limit_margin", "minimize_body_movement"],
                                enable_visualizer=False, curobo_plan=True, experiment_root=str(tmp_path))
     cutamp_demo(load_env(os.path.join(get_env_dir(), "blocks_t1.yml")), config)
@@ -59,10 +84,8 @@ def test_live_capture_waits_for_the_planner_thread(tmp_path, monkeypatch):
     # The build waits until call 1 has run a step, so the real build thread is alive at call 1's
     # first capture checks and planner_busy must defer the capture. An event, not a sleep: the
     # build's lead over call 1 moves with plan sampling.
-    import threading
-
     import cutamp.algorithm
-    import cutamp.optimize_plan as optimize_plan
+    from cutamp import optimize_plan
 
     stepped, builds = threading.Event(), []
     build, update = cutamp.algorithm.build_motion_planner, optimize_plan._BestSnapshot.update
