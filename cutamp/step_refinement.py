@@ -193,6 +193,7 @@ def refine_gap(
     posture_seed,
     *,
     margin_m=0.05,
+    trust_scale=1.0,
     max_iterations=6,
     extra_rows=None,
     anchor=None,
@@ -224,6 +225,8 @@ def refine_gap(
         raise ValueError("Expected [particles,steps,3] commands")
     if margin_m < 0 or not math.isfinite(margin_m) or max_iterations < 0:
         raise ValueError("Invalid margin or iteration budget")
+    if not math.isfinite(trust_scale) or trust_scale <= 0:
+        raise ValueError("trust_scale must be finite and positive")
     if not math.isfinite(centering_weight) or centering_weight < 0.0:
         raise ValueError("Centering weight must be finite and nonnegative")
     if predictor is not None:
@@ -290,7 +293,7 @@ def refine_gap(
             # The local QP targets a 0.2 mm margin buffer so a finite update can
             # clear the inclusive 5 cm requirement despite linearization error.
             g = cur.matrix(comfort_buffer=0.0002 / max(0.01, margin_m))
-            limit = u.new_tensor([0.018, 0.018, math.radians(2)]).repeat(len(order)).expand(b, -1).double()
+            limit = u.new_tensor([0.018, 0.018, math.radians(2)]).repeat(len(order)).expand(b, -1).double() * trust_scale
             eye = torch.diag(metric)[None].expand(b, -1, -1)
             offset = ((u - commands).reshape(b, width) * metric).double()
             effort_jac = eye

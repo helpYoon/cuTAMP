@@ -105,7 +105,7 @@ def measure(directory, name, cfg, seed):
         "num_particles": cfg.num_particles,
         "num_initial_plans": cfg.num_initial_plans,
         "schedule_cap": cfg.max_step_schedules,
-        "centroid_weight": cfg.com_center_weight,
+        "centroid_weight": cfg.for_refinement(stepped=False).com_center_weight,
         "com_margin_m": cfg.com_comfort_margin_m,
         "wall_s": end - start,
         **observations,

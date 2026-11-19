@@ -209,12 +209,37 @@ def test_default_centroid_preference_and_zero_weight_ablation():
     from cutamp.scripts.utils import default_constraint_to_mult
 
     cfg = TAMPConfiguration()
-    assert cfg.com_center_weight > 0
+    assert cfg.for_refinement(stepped=False).com_center_weight == 1
     assert default_constraint_to_mult["soft"]["com_center_distance_squared"] == 1
     validate_tamp_config(replace(cfg, com_center_weight=0))
     for invalid in (-1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="com_center_weight"):
             validate_tamp_config(replace(cfg, com_center_weight=invalid))
+
+
+def test_fast_refinement_defaults_follow_the_selected_schedule_and_preserve_overrides():
+    from dataclasses import replace
+
+    from cutamp.config import validate_tamp_config
+
+    model = TAMPConfiguration(step_mode="model")
+
+    def settings(cfg, stepped):
+        resolved = cfg.for_refinement(stepped=stepped)
+        return resolved.step_refine_iterations, resolved.step_trust_scale, resolved.com_center_weight
+
+    assert settings(model, True) == (2, 2.0, 4.0)
+    assert settings(model, False) == (4, 1.0, 1.0)
+    assert settings(replace(model, step_mode="geometric"), True) == (4, 1.0, 1.0)
+    assert settings(replace(model, step_derivative_method="autodiff"), True) == (4, 1.0, 1.0)
+    for weight in (0.0, 1.0, 3.0):
+        custom = replace(model, step_refine_iterations=0, step_trust_scale=1.5, com_center_weight=weight)
+        assert settings(custom, True) == settings(custom, False) == (0, 1.5, weight)
+    for scale in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="step_trust_scale"):
+            validate_tamp_config(replace(model, step_trust_scale=scale))
+    with pytest.raises(ValueError, match="step_derivative_method"):
+        validate_tamp_config(replace(model, step_derivative_method="unknown"))
 
 
 @pytest.mark.parametrize("limit,expire,expected", [(1, False, [5]), (5, False, [5, 2]), (5, True, [5])])

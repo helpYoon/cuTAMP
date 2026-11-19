@@ -711,7 +711,7 @@ def _load_predictor(config):
     path = Path(config.landing_bundle or _STEP_DATA / "landing-accuracy/landing-seed3.pt")
     if not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
-    return LandingPredictor(path)
+    return LandingPredictor(path, derivative_method=config.step_derivative_method)
 
 
 def _refine_step_schedule(*args, **kwargs):

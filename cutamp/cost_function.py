@@ -65,7 +65,7 @@ class CostFunction:
         require_fixed_stance(plan_skeleton)
         self.plan_skeleton = plan_skeleton
         self.world = world
-        self.config = config
+        self.config = config.for_refinement(stepped=False)
 
         self.retract_info = get_retract_parameters(plan_skeleton)
         # The same target soles used for the wrist pose's sole-lock check.

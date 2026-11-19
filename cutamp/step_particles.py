@@ -446,6 +446,7 @@ def _refine_batch(
             margin_m=margin,
             centering_weight=config.com_center_weight,
             max_iterations=config.step_refine_iterations,
+            trust_scale=config.step_trust_scale,
             deadline=deadline,
             extra_rows=coupled_rows,
             geometry_rows=geometric_sweep_rows(world, objects[j], held) if steps and predictor is None else None,
@@ -576,6 +577,9 @@ def _refine_batch(
             report.update(
                 deployment_sha256=predictor.metadata["deployment_sha256"],
                 checkpoint_sha256=predictor.metadata["checkpoint_sha256"],
+                step_derivative_method=config.step_derivative_method,
+                step_refine_iterations=config.step_refine_iterations,
+                step_trust_scale=config.step_trust_scale,
                 normalized_dynamics=_list(d[i]),
                 step_lag=config.step_lag,
             )
@@ -619,7 +623,7 @@ def _validate_motion_rows(rows, pools, skeleton, world, config, attempt, *, dead
     confs = [torch.stack([r.particle[q] for r in rows]) for q in pick_place_confs(skeleton)]
     tilt, travel, _ = worst_posture(world, confs)
     order = grasp_group_order(
-        indices, soft, hi, tilt, travel, margin, config.motion_plan_max_retries, rank_by_soft=config.com_center_weight > 0
+        indices, soft, hi, tilt, travel, margin, config.motion_plan_max_retries, rank_by_soft=config.com_center_weight != 0
     )
     for rank, pos in enumerate(order):
         if deadline is not None and monotonic() >= deadline:
@@ -641,6 +645,7 @@ def refine_step_particles(
 ):
     if config.step_mode == "model" and predictor is None:
         return StepResult([], None, "unavailable", "missing trained landing predictor")
+    config = config.for_refinement(stepped=True)
     try:
         pools = ParticleInitializer(world, config, constraint_checker)._pick_pools(proposal.skeleton)
     except ValueError as e:

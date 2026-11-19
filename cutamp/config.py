@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 
@@ -74,7 +74,10 @@ class TAMPConfiguration:
     landing_bundle: str | None = None
     step_reach_map: str | None = None
     step_accuracy_table: str | None = None
-    step_refine_iterations: int = 4
+    step_derivative_method: str = "finite_difference"
+    # None selects the solver settings for the actual schedule (see for_refinement).
+    step_refine_iterations: int | None = None
+    step_trust_scale: float | None = None
     step_particle_batch_size: int = 4
     require_modeled_load: bool = False
 
@@ -103,12 +106,23 @@ class TAMPConfiguration:
     # Minimum projected CoM clearance from the physical sole hull at each pick and place.
     com_comfort_margin_m: float = 0.05
     # Weight on squared horizontal CoM distance to the support polygon area centroid.
-    com_center_weight: float = 1.0
+    com_center_weight: float | None = None
 
     def __post_init__(self):
         if self.soft_cost is None:
             default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
             object.__setattr__(self, "soft_cost", default)
+
+    def for_refinement(self, *, stepped: bool) -> "TAMPConfiguration":
+        """Resolve optional overrides once a candidate's actual footstep count is known."""
+        fast = stepped and self.step_mode == "model" and self.step_derivative_method == "finite_difference"
+        updates, trust_scale, weight = (2, 2.0, 4.0) if fast else (4, 1.0, 1.0)
+        return replace(
+            self,
+            step_refine_iterations=updates if self.step_refine_iterations is None else self.step_refine_iterations,
+            step_trust_scale=trust_scale if self.step_trust_scale is None else self.step_trust_scale,
+            com_center_weight=weight if self.com_center_weight is None else self.com_center_weight,
+        )
 
 
 def validate_tamp_config(config: TAMPConfiguration):
@@ -140,7 +154,8 @@ def validate_tamp_config(config: TAMPConfiguration):
     if not math.isfinite(config.com_comfort_margin_m) or config.com_comfort_margin_m < 0:
         raise ValueError(f"com_comfort_margin_m must be finite and >= 0, got {config.com_comfort_margin_m}")
 
-    if not math.isfinite(config.com_center_weight) or config.com_center_weight < 0:
+    weight = config.com_center_weight
+    if weight is not None and (not math.isfinite(weight) or weight < 0):
         raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
     if config.step_mode not in ("off", "rank", "model", "geometric"):
         raise ValueError("step_mode must be off, rank, model or geometric")
@@ -148,7 +163,13 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError("step_search_order must be astar or count")
     if config.max_step_schedules is not None and config.max_step_schedules <= 0:
         raise ValueError("max_step_schedules must be positive when specified")
-    if config.step_refine_iterations < 0 or config.step_particle_batch_size < 1:
+    if config.step_derivative_method not in ("finite_difference", "autodiff"):
+        raise ValueError("step_derivative_method must be finite_difference or autodiff")
+    scale = config.step_trust_scale
+    if scale is not None and (not math.isfinite(scale) or scale <= 0):
+        raise ValueError("step_trust_scale must be finite and positive")
+    updates = config.step_refine_iterations
+    if (updates is not None and (type(updates) is not int or updates < 0)) or config.step_particle_batch_size < 1:
         raise ValueError("Invalid step refinement iteration or batch count")
     if type(config.step_lag) is not int or config.step_lag < 0:
         raise ValueError("step_lag must be a nonnegative integer physics-step count")
