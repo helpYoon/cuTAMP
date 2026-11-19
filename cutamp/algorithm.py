@@ -518,26 +518,34 @@ def run_cutamp(
     # Sample initial plans and particles
     found_solution_initially = False
     num_skipped_plans = 0
-    with timer.time("sample_initial_plans", log_callback=_log.info):
-        plan_queue: List[dict] = []
-        plan_count = 0
+    plan_count = 0
+
+    def initialized_skeletons():
+        nonlocal num_skipped_plans, plan_count
         for idx in range(config.num_initial_plans):
+            if (config.max_loop_dur is not None and timer.has_timer("start_optimization")
+                    and timer.elapsed("start_optimization") >= config.max_loop_dur):
+                return
             try:
                 plan_info, has_solution = sample_plan_skeleton(
                     plan_gen, world, config, timer, idx, constraint_checker, particle_initializer
                 )
-                if plan_info is None:
-                    _log.debug("failed subgraph, skipping...")
-                    num_skipped_plans += 1
-                    continue
             except StopIteration:
-                _log.info("Ran out of plans to sample")
-                break
+                return
+            plan_count += 1
+            if plan_info is None:
+                num_skipped_plans += 1
+                continue
+            yield plan_info, has_solution
+
+    pending_plans = initialized_skeletons()
+    with timer.time("sample_initial_plans", log_callback=_log.info):
+        plan_queue: List[dict] = []
+        for plan_info, has_solution in pending_plans:
             plan_queue.append(plan_info)
             if has_solution:
                 found_solution_initially = True
                 break
-            plan_count += 1
 
     with timer.time("sort_plans"):
         plan_queue.sort(key=lambda x: x["heuristic"])
@@ -564,12 +572,23 @@ def run_cutamp(
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker, planner_busy=planner_busy)
     timer.start("first_solution")
     if found_solution_initially:
-        found_solution = True
+        found_solution = not config.curobo_plan
         timer.stop("first_solution")
+
+    def motion_candidates():
+        yield from plan_queue
+        if config.curobo_plan:
+            # Completing the first kinematic initialization can leave unused skeleton
+            # budget. Resume lazily when every motion on the prefetched candidates failed.
+            for plan_info, _ in pending_plans:
+                yield plan_info
 
     # Optimization loop for each skeleton and its particles
     timer.start("start_optimization")
-    for idx, plan_info in enumerate(plan_queue):
+    deadline = None if config.max_loop_dur is None else monotonic() + config.max_loop_dur
+    for idx, plan_info in enumerate(motion_candidates()):
+        if deadline is not None and monotonic() >= deadline:
+            break
         opt_iter = idx + 1
         should_break = False
         plan_skeleton = plan_info["plan_skeleton"]
@@ -597,7 +616,7 @@ def run_cutamp(
                 )
                 curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, visualizer,
-                    get_planner=get_planner, ik_tol=particle_initializer.ik_tol,
+                    get_planner=get_planner, ik_tol=particle_initializer.ik_tol, deadline=deadline,
                 )
                 overall_metrics["motion_plan_success"] = bool(curobo_plan)
                 # Over the skeletons planned, like the failures; absent until a skeleton is motion-planned.
@@ -623,6 +642,8 @@ def run_cutamp(
     _log.debug(f"Best cost: {overall_metrics['best_cost']:.4f}, soft cost: {overall_metrics['best_soft_cost']:.4f}")
 
     # Dump metrics out
+    overall_metrics["num_initial_plans"] = plan_count
+    overall_metrics["num_skipped_plans"] = num_skipped_plans
     overall_metrics["found_solution"] = found_solution
     exp_logger.log_dict("overall_metrics", overall_metrics)
     exp_logger.log_dict("timer_metrics", timer.get_summaries())
@@ -704,7 +725,7 @@ def _refine_standing_schedule(
     proposal, world, config, reducer, checker, timer, visualizer, initializer, optimizer, get_planner, *, deadline=None
 ):
     from cutamp.com_polygon_cost import margin_from_support_planes
-    from cutamp.step_planner import StepResult, StepRow
+    from cutamp.step_planner import StepResult, StepRow, standing_endpoint_flags
 
     plan = proposal.skeleton
     try:
@@ -724,9 +745,7 @@ def _refine_standing_schedule(
         masks = checker.get_full_mask(costs)
         margin = margin_from_support_planes(rollout["com_xy"], *cost_fn.support_planes)
         center_distances = torch.linalg.vector_norm(rollout["com_xy"] - cost_fn.support_centroid, dim=-1)
-        endpoint = masks["ComComfort"]["margin_shortfall_squared"].clone()
-        for mask in masks["KinematicConstraint"].values():
-            endpoint &= mask.reshape(*endpoint.shape, -1).all(-1)
+        endpoint = standing_endpoint_flags(masks, rollout, plan, cost_fn)
         good = checker.get_mask(costs, verbose=False)
         if not good.any():
             return StepResult([], endpoint, "unresolved")

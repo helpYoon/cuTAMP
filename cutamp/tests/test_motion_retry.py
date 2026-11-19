@@ -53,7 +53,7 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch):
     assert failures == ["pick failed", "place failed"]
 
 
-def _run_skeletons(monkeypatch, results) -> dict:
+def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budget=30) -> dict:
     """run_cutamp's overall_metrics, on the CPU, over one skeleton per entry of ``results``, in order: ``None`` where
     no particle satisfies, else ``(planned, attempts)``: its motion plan tries ``attempts`` candidates, each failing
     but the last if ``planned``. Everything else run_cutamp calls is a stand-in."""
@@ -66,7 +66,7 @@ def _run_skeletons(monkeypatch, results) -> dict:
             raise StopIteration
         choice = PickChoice(f"block{idx}", "grasp1", torch.zeros(1, 7), torch.ones(1), torch.ones(1, dtype=torch.bool),
                             torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1, dtype=torch.long))
-        return {"idx": idx, "plan_skeleton": [], "heuristic": float(idx), "grasp_choice": [choice]}, False
+        return {"idx": idx, "plan_skeleton": [], "heuristic": float(idx), "grasp_choice": [choice]}, initial_witness
 
     def optimize(plan_info, timer, visualizer):
         satisfying = results[plan_info["idx"]] is not None
@@ -89,9 +89,16 @@ def _run_skeletons(monkeypatch, results) -> dict:
     monkeypatch.setattr(alg, "get_top_satisfying_particles", lambda *args, **kwargs: [])
     monkeypatch.setattr(alg, "_motion_plan_with_retries", plan)
     monkeypatch.setattr(alg, "_planned_metrics", lambda *args: {})
-    config = TAMPConfiguration(curobo_plan=True, enable_visualizer=False)
+    config = TAMPConfiguration(curobo_plan=True, enable_visualizer=False, num_initial_plans=skeleton_budget)
     return alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
                           experiment_id="fake")[2]
+
+
+@pytest.mark.parametrize("budget, solved", [(1, False), (2, True)])
+def test_failed_motion_resumes_skeletons_after_early_kinematic_hit(monkeypatch, budget, solved):
+    metrics = _run_skeletons(monkeypatch, [(False, 2), (True, 1)], initial_witness=True, skeleton_budget=budget)
+    assert metrics["found_solution"] is solved and metrics["motion_plan_success"] is solved
+    assert metrics["num_initial_plans"] == metrics["num_optimized_plans"] == budget
 
 
 @pytest.mark.parametrize("results, attempts", [
