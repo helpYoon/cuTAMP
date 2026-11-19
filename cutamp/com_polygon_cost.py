@@ -177,6 +177,27 @@ class ComOverBasePolygonCost(BaseCost):
 ComOverBasePolygonCostCfg.class_type = ComOverBasePolygonCost
 
 
+class ComOverAchievedStanceCost(ComOverBasePolygonCost):
+    """cuRobo trajopt cost with device buffers that can follow each validated landing."""
+
+    def __init__(self, cfg, initial_soles, sole_box):
+        super().__init__(cfg)
+        self.sole_box = sole_box
+        self.normals, self.bounds = support_region_planes(initial_soles, sole_box, keyframe=True)
+
+    def set_stance(self, soles):
+        normals, bounds = support_region_planes(soles.to(self.normals), self.sole_box, keyframe=True)
+        # An already captured cuRobo CUDA graph reads these same tensor addresses.
+        self.normals.copy_(normals)
+        self.bounds.copy_(bounds)
+
+    def forward(self, state):
+        xy = state.cuda_robot_model_state.robot_com[..., :2]
+        outside = (xy @ self.normals.T - self.bounds).amax(-1)
+        cost = outside.clamp_min(0).square() + COM_INSIDE_WEIGHT * (outside + COM_INSIDE_MARGIN).clamp_min(0).square()
+        return cost.unsqueeze(-1) * self._weight
+
+
 def _fk_state(world, q_batch: torch.Tensor, kin=None):
     """FK ``q_batch`` (``[B, full_dof]`` or ``[full_dof]``) through ``kin`` (default ``world.kinematics``);
     return its kinematics state. Differentiable through cuRobo's FK chain."""

@@ -280,6 +280,7 @@ def get_t1_motion_planner(
     *,
     use_cuda_graph: bool = True,
     device_cfg: DeviceCfg = None,
+    initial_soles: torch.Tensor = None,
 ) -> MotionPlanner:
     """Single MotionPlanner for the T1, with every joint free, the base included.
 
@@ -361,7 +362,14 @@ def get_t1_motion_planner(
         half_extents=torch.tensor(model.support.keyframe_half),
         base_link_name=model.support.link,
     )
-    add_extra_cost(planner, "com_polygon", ComOverBasePolygonCost(cost_cfg))
+    if initial_soles is None:
+        cost = ComOverBasePolygonCost(cost_cfg)
+    else:
+        from cutamp.com_polygon_cost import ComOverAchievedStanceCost
+
+        cost = ComOverAchievedStanceCost(cost_cfg, initial_soles, model.sole_box)
+        planner.set_support_stance = cost.set_stance
+    add_extra_cost(planner, "com_polygon", cost)
     return planner
 
 

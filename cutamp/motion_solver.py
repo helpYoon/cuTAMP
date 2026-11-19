@@ -368,7 +368,7 @@ def _held_obj_poses(world: TAMPWorld, planner, held: dict, plan: JointState) -> 
     return out
 
 
-def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> MotionPlanner:
+def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True, *, initial_soles=None) -> MotionPlanner:
     """Build the trajopt planner on ``world.model``, colliding with the world's Scene with the movables included
     (so attached objects are part of the collision world during planning). Safe to run on a background
     thread concurrently with the Adam loop because it runs no solves.
@@ -387,6 +387,7 @@ def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True) -> Motio
         get_world_cfg(world.env, include_movables=True),
         use_cuda_graph=use_cuda_graph,
         device_cfg=world.device_cfg,
+        initial_soles=initial_soles,
     )
 
 
@@ -401,6 +402,7 @@ def solve_curobo(
     *,
     ik_tol: IKTol,
     max_attempts: int = 20,
+    step_motion=None,
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
@@ -415,7 +417,15 @@ def solve_curobo(
     plan_skeleton = plan_info["plan_skeleton"]
 
     with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
-        planner = get_planner() if get_planner is not None else build_motion_planner(world)
+        if get_planner is not None:
+            planner = get_planner()
+        elif step_motion is not None:
+            soles = step_motion.adapter.predictor.model.feet(step_motion.adapter.physical(world.q_init[None]))[0][0]
+            planner = build_motion_planner(world, initial_soles=soles)
+        else:
+            planner = build_motion_planner(world)
+        if step_motion is not None and not hasattr(planner, "set_support_stance"):
+            raise ValueError("A stepped motion planner must track the achieved support in trajopt")
 
     # Defensive reset in case a prior solve_curobo aborted mid-plan and left the
     # planner with stale attached objects, disabled world obstacles, or placed
@@ -427,11 +437,14 @@ def solve_curobo(
 
     # Every pick's and place's pre and post confs, in one GN call before the first segment.
     with timer.time("approach_ik"):
-        approach = _approach_confs(world, best_particle, plan_skeleton, ik_tol)
+        approach = _approach_confs(world, best_particle, plan_skeleton, ik_tol) if step_motion is None else {}
 
     # The initial state: particles are in the planner's joint order (the module docstring).
     last_js = JointState.from_position(best_particle["left_q0"].clone().reshape(1, -1),
                                        joint_names=list(planner.kinematics.joint_names))
+    if step_motion is not None and 0 in step_motion.inputs:
+        # The first gap may start from measured nonzero rates.
+        last_js.velocity = step_motion.initial_velocity()
     held = {}  # {arm: (obj_name, grasp_from_obj)}
     q_init = best_particle["left_q0"]
 
@@ -458,7 +471,15 @@ def solve_curobo(
         try:
             plan, dt = _interp_plan(result), _plan_dt(planner)
             entry = {"dt": dt, "arm": arm, "op_idx": idx, "phase": phase, "gripper": gripper}
-            plan, stats, fast = _balance_gate(world, plan, dt)
+            stance = step_motion.stance if step_motion is not None else None
+            plan, stats, fast = (_supported_segment_gate(world, plan, dt, stance) if stance is not None
+                                 else _balance_gate(world, plan, dt))
+            if step_motion is not None:
+                from cutamp.step_validation import boundary_errors, compatible_boundary
+                start = _model_frames(world, plan)
+                if not compatible_boundary(boundary_errors(start.position[0], start.velocity[0],
+                            last_js.position.reshape(-1), last_js.velocity.reshape(-1))).all():
+                    raise RuntimeError("cuRobo trajectory cannot connect to the arriving state and velocity")
             gate_stats.append(stats)
             if fast is not None:
                 entry["planner_timing"] = {"plan": fast, "held_objs": _held_obj_poses(world, planner, held, fast)}
@@ -471,6 +492,8 @@ def solve_curobo(
             e.args = (f"{what}: {e}",)  # the same error object, so a gate error keeps its `check`
             raise
         last_js = _last_timestep_js(plan, planner)
+        if step_motion is not None:
+            last_js.velocity = _model_frames(world, plan).velocity[-1:].clone()
 
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
 
@@ -488,7 +511,19 @@ def solve_curobo(
         # Both arms stay in the collision checks, except against the obstacle a pick or place segment disables for
         # the whole robot (the grasped block, or the support surface; _plan_arm_to_conf).
         try:
-            if metadata.is_motion and metadata.action_type is None:
+            if step_motion is not None and metadata.action_type in ("pick", "place"):
+                approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
+            if metadata.action_type == "step":
+                if step_motion is None:
+                    raise RuntimeError("A stepped motion requires independent transition evidence")
+                for plan, record in step_motion.step_segments(idx, last_js, obj_to_current_pose, held):
+                    accum_plans.append({"arm": None, "dt": record["dt"], "op_idx": idx, "phase": record["phase"],
+                                        "gripper": None, "plan": plan, "step": record,
+                                        "held_objs": _held_obj_poses(world, planner, held, plan)})
+                planner.set_support_stance(step_motion.stance)
+                last_js = JointState(position=plan.position[-1:], velocity=plan.velocity[-1:],
+                                     acceleration=plan.acceleration[-1:], joint_names=plan.joint_names)
+            elif metadata.is_motion and metadata.action_type is None:
                 # MoveFree / MoveHolding — no trajectory; pick/place chain
                 # from the previous trajectory's terminal state via last_js.
                 pass
@@ -879,3 +914,93 @@ def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
     stats = {"retime": s_eff, "binding": binding, "com_min_margin": min(com_m, com_planner),
              "zmp_min_margin": min(zmp_m, zmp_planner)}
     return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)
+
+
+def _supported_segment_gate(world, plan, dt, stance):
+    """Check the actual achieved support hull, whole trajectory speeds and RNEA, including any retiming."""
+    from cutamp.com_polygon_cost import _fk_state, com_zmp_in_support, margin_from_support_planes, support_region_planes
+    from cutamp.costs import curobo_pose_error
+
+    s = stance.reshape(2, 3)
+    normals, offsets = support_region_planes(s, world.model.sole_box, False)
+    xy_to_world = (
+        _fk_state(world, world.q_init)
+        .tool_poses.get_link_pose(world.model.support.link, make_contiguous=True)
+        .get_matrix()
+        .reshape(4, 4)
+    )
+    origin = xy_to_world[:2, 3]
+    goal = torch.eye(4, device=s.device, dtype=s.dtype).expand(2, -1, -1).clone()
+    c, sin = s[:, 2].cos(), s[:, 2].sin()
+    goal[:, 0, 0], goal[:, 0, 1], goal[:, 1, 0], goal[:, 1, 1] = c, -sin, sin, c
+    goal[:, :2, 3] = s[:, :2]
+
+    def verify(path):
+        model = _model_frames(world, path)
+        ks = _fk_state(world, model.position)
+        soles = torch.stack(
+            [
+                ks.tool_poses.get_link_pose(f, make_contiguous=True).get_matrix().reshape(-1, 4, 4)
+                for f in world.model.sole_frames
+            ],
+            dim=1,
+        )
+        if not soles_planted(*curobo_pose_error(soles, goal.expand_as(soles))).all():
+            raise _gate_error("soles", "Supported motion leaves the independently achieved stance")
+        com, zmp = com_zmp_in_support(world, model)
+
+        def margin(xy):
+            return margin_from_support_planes(xy @ xy_to_world[:2, :2].T + origin, normals, offsets).amin()
+
+        cm, zm = margin(com), margin(zmp)
+        if not cm >= 0:
+            raise _gate_error("com", "Supported motion leaves the actual CoM support region")
+        if not zm >= 0:
+            raise _gate_error("zmp", "Supported motion leaves the actual ZMP support region")
+        _check_torques(world, path)
+        _check_velocity(world, model)
+        return float(cm), float(zm)
+
+    # The existing cuRobo solver keeps its own pose-tracked sols and dynamics; each
+    # tested timing is independently rechecked on the measured support hull.
+    for scale in (1.0, 1.25, 1.5, 2.0, 3.0, RETIME_MAX):
+        path = plan if scale == 1.0 else _retime(plan, scale, dt)
+        try:
+            cm, zm = verify(path)
+            return (
+                path,
+                {"com_min_margin": cm, "zmp_min_margin": zm, "binding": "achieved_stance", "retime": scale},
+                plan if scale != 1.0 else None,
+            )
+        except RuntimeError as exc:
+            reason = str(getattr(exc, "check", "")).split(" ")[0]
+            if reason not in ("zmp", "torque", "velocity") or scale == RETIME_MAX:
+                raise
+
+
+def plan_validated_step_motion(
+    skeleton, particle, predictions, adapter, world, config, validator, *, timer, visualizer, ik_tol, get_planner=None
+):
+    """Join independently validated landing paths to cuRobo supported manipulation segments."""
+    from cutamp.step_validation import SteppedMotion, TransitionUnavailable
+
+    if validator is None:
+        return None, {"motion_validation": "unavailable", "reason": "Missing independent step transition validator"}
+    motion = SteppedMotion(skeleton, predictions, adapter, world, validator)
+    try:
+        plan, metrics = solve_curobo(
+            {"plan_skeleton": skeleton},
+            dict(particle),
+            world,
+            config,
+            timer,
+            visualizer,
+            get_planner=get_planner,
+            ik_tol=ik_tol,
+            step_motion=motion,
+        )
+    except TransitionUnavailable as exc:
+        return None, {"motion_validation": "unavailable", "reason": str(exc)}
+    except (ValueError, RuntimeError) as exc:
+        return None, {"motion_validation": "rejected", "reason": str(exc)}
+    return plan, {**metrics, "motion_validation": "accepted", "validated_steps": motion.records}
