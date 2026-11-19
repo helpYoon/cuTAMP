@@ -12,6 +12,30 @@ from cutamp.config import TAMPConfiguration
 from cutamp.step_planner import StepInputs, StepResult, StepRow, furthest_endpoint
 
 
+def test_standing_feedback_locates_scene_and_placement_failures_at_their_actions():
+    from cutamp.step_planner import standing_endpoint_flags
+    from cutamp.task_planning import task_plan_generator
+
+    init = t1_domain.get_initial_state(["block"], ["table"])
+    goal = frozenset([t1_domain.On.ground("block", "table")])
+    plan = next(task_plan_generator(init, goal, t1_domain.all_t1_operators))
+    ops = [op for op in plan if op.operator.metadata.is_actionable]
+    placement = ops[1].arg("placement")
+    mask = torch.ones(2, 2, dtype=torch.bool)
+    masks = {
+        "ComComfort": {"margin_shortfall_squared": mask},
+        "KinematicConstraint": {"sole_pos_err": mask.repeat_interleave(2, dim=1)},
+        "Motion": {"joint_limit": mask, "self_collision": mask},
+        "Collision": {"robot_to_world": torch.tensor([[True, True], [False, True]])},
+        "StablePlacement": {"table_support": torch.tensor([[False], [True]]), "table_in_xy": mask[:, :1]},
+    }
+    rollout = {"ts_to_pose_ts": {0: 0, 1: 1}}
+    cost = SimpleNamespace(retract_info=[], surface_to_placements={"table": [("block", placement)]})
+    ep = standing_endpoint_flags(masks, rollout, plan, cost)
+    assert ep.tolist() == [[True, False], [False, True]]
+    assert furthest_endpoint(ep) == 1
+
+
 def test_endpoint_prefix_belongs_to_one_row():
     assert furthest_endpoint(torch.tensor([[True, False], [False, True]])) == 1
     assert furthest_endpoint(torch.tensor([[False, False]])) == 0

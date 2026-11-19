@@ -103,6 +103,50 @@ def furthest_endpoint(endpoint_ok):
     return int(flags.long().cumprod(dim=1).sum(dim=1).amax())
 
 
+def standing_endpoint_flags(masks, rollout, plan, costs):
+    """Associate each fixed-stance hard check with the manipulation that owns it."""
+    flags = masks["ComComfort"]["margin_shortfall_squared"].clone()
+    for mask in masks["KinematicConstraint"].values():
+        flags &= mask.reshape(*flags.shape, -1).all(-1)
+
+    gap = -1
+    conf_gaps, placement_gaps = {}, {}
+    for op in plan:
+        kind = op.operator.metadata.action_type
+        if kind in ("pick", "place"):
+            gap += 1
+            conf_gaps[op.arg("q")] = gap
+            if kind == "place":
+                placement_gaps[op.arg("placement")] = gap
+        elif kind == "retract":
+            conf_gaps[op.arg("q_retract")] = gap
+
+    for conf, mask in masks.get("ComPolygon", {}).items():
+        flags[:, conf_gaps.get(conf, 0)] &= mask  # q0 belongs to the initial gap
+    motion = masks["Motion"]
+    flags &= motion["joint_limit"] & motion["self_collision"]
+    collision = masks["Collision"]
+    object_pose_times = list(rollout["ts_to_pose_ts"].values())
+    retract_checks = set()
+    for t, (conf, _, _) in enumerate(costs.retract_info):
+        column = conf_gaps[conf]
+        flags[:, column] &= motion["retract_joint_limit"][:, t] & motion["retract_self_collision"][:, t]
+        for key in (f"{conf}_world", f"{conf}_movables"):
+            flags[:, column] &= collision[key].flatten(1).all(1)
+            retract_checks.add(key)
+    for key, value in collision.items():
+        if key in ("robot_to_world", "robot_to_movables"):
+            flags &= value
+        elif key not in retract_checks:
+            flags &= value[:, object_pose_times]
+    placement = masks.get("StablePlacement", {})
+    for surface, group in costs.surface_to_placements.items():
+        supported = placement[f"{surface}_support"] & placement[f"{surface}_in_xy"]
+        for t, (_, name) in enumerate(group):
+            flags[:, placement_gaps[name]] &= supported[:, t]
+    return flags
+
+
 def manipulation_regions(skeleton, world):
     regions = []
     for op in skeleton:
