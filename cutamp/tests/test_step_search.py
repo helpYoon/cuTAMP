@@ -105,6 +105,13 @@ def test_missing_map_or_region_is_finite_and_floor_collision_excludes_endpoint()
     assert goal.cost == (0, 0) and goal.edges == ()
 
 
+def test_only_objects_that_intersect_the_sole_height_band_block_a_landing():
+    search = StepSearch(atlas(), commands=())
+    for bottom, expected in ((0.006, ("L",)), (0.05, ()), (-0.08, ())):
+        cube = TargetRegion("left", (0.0, 0.1, bottom + 0.025), (0.05,) * 3, solid_pick=True)
+        assert search.blocked_feet(HOME, cube) == expected
+
+
 def test_matching_signed_commands_only_and_transferred_prior():
     records = profile("L", [{"lag": 8, "stages": [stage("L")], "all_handoffs_pass": True}])
     search = StepSearch(atlas(), accuracy=records, lag=8, commands=(FWD,))

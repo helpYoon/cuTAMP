@@ -145,6 +145,23 @@ def entrypoint():
         help="Requested CoM clearance from the physical support polygon at pick and place, in meters.",
     )
     parser.add_argument(
+        "--com_center_weight", type=float, default=_defaults.com_center_weight,
+        help="Weight for squared CoM distance to the support area's centroid at picks and places. Zero disables it.",
+    )
+    parser.add_argument("--step_mode", choices=("off", "rank", "geometric", "model"), default=_defaults.step_mode,
+                        help="Rank foot schedules, refine a geometric ablation, or use the frozen T1 landing model.")
+    parser.add_argument("--step_search_order", choices=("astar", "count"), default=_defaults.step_search_order)
+    parser.add_argument("--max_step_schedules", type=int, default=None,
+                        help="Maximum distinct grounded schedules attempted across all arm assignments.")
+    parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
+    parser.add_argument("--landing_bundle", help="Path to the exported seed-3 CUDA bundle.")
+    parser.add_argument("--step_reach_map", help="Path to the T1 nominal hand reach map.")
+    parser.add_argument("--step_accuracy_table", help="Path to the measured landing precision profile.")
+    parser.add_argument("--step_refine_iterations", type=int, default=_defaults.step_refine_iterations)
+    parser.add_argument("--step_particle_batch_size", type=int, default=_defaults.step_particle_batch_size)
+    parser.add_argument("--require_modeled_load", action="store_true",
+                        help="Only accept loaded steps with an applicable payload model.")
+    parser.add_argument(
         "--max_duration",
         type=float,
         default=_defaults.max_loop_dur,
@@ -204,7 +221,13 @@ def entrypoint():
         lr=args.lr,
         conf_lr=args.conf_lr,
         com_comfort_margin_m=args.com_comfort_margin_m,
+        com_center_weight=args.com_center_weight,
         max_loop_dur=args.max_duration,
+        step_mode=args.step_mode, step_search_order=args.step_search_order,
+        max_step_schedules=args.max_step_schedules, step_lag=args.step_lag,
+        landing_bundle=args.landing_bundle, step_reach_map=args.step_reach_map,
+        step_accuracy_table=args.step_accuracy_table, step_refine_iterations=args.step_refine_iterations,
+        step_particle_batch_size=args.step_particle_batch_size, require_modeled_load=args.require_modeled_load,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,

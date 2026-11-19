@@ -165,6 +165,26 @@ def test_top_particles_go_round_the_grasps(monkeypatch):
     assert [int(t["left_q1"][5]) for t in alg.get_top_satisfying_particles(*inputs, n=4)] == [2, 1, 3, 4]
 
 
+def test_standing_motion_uses_centroid_cost_across_feasible_grasp_groups(monkeypatch):
+    from cutamp.cost_reduction import CostReducer
+    from cutamp.scripts.utils import default_constraint_to_mult
+
+    monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: torch.full((len(q),), 0.06))
+    plan, checker, _ = _ranking_inputs([0, 1], [0.3, 0.0], [True, True], [0.0, 0.0])
+    distance_sq = torch.tensor([[0.01, 0.01], [0.08, 0.07]]).square()
+
+    def cost_fn(rollout, particles):
+        return {"soft": {"type": "cost", "values": {"com_center_distance_squared": distance_sq}}}
+
+    cost_fn.config = SimpleNamespace(com_center_weight=1.0)
+    plan["cost_fn"] = cost_fn
+    candidates, ids = alg.get_top_satisfying_particles(
+        plan, checker, CostReducer(default_constraint_to_mult), n=2, return_indices=True
+    )
+    assert ids == [0, 1]
+    assert candidates[0]["left_q1"][3] == pytest.approx(0.3)
+
+
 def test_ranking_rejects_a_grasp_outside_the_pool(monkeypatch):
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: torch.full((len(q),), 0.05))
     plan_info, checker, reducer = _ranking_inputs([0, 1], [0.0, 0.0], [True, True], [0.0, 0.0])

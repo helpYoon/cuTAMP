@@ -14,6 +14,7 @@ from functools import lru_cache
 from itertools import count, product
 from math import inf
 from pathlib import Path
+from time import monotonic
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -184,17 +185,22 @@ class _HandIndex:
 class StepSearch:
     """One immutable map/menu/accuracy profile shared by all queries in a planning run."""
 
-    def __init__(self, atlas, *, accuracy=None, lag=None, commands=COMMANDS):
+    def __init__(self, atlas, *, accuracy=None, lag=None, commands=COMMANDS, postures=None):
         self.lag = lag
         meta = atlas.metadata if atlas is not None else {}
         self.home = _tuples(meta["home_soles"]) if "home_soles" in meta else None
         self.sole_half = np.asarray(meta.get("sole_box_m", (0.224868, 0.10)), dtype=float) / 2
+        # Older T1 maps record only the planar footprint. Their URDF foot box is 43.66 mm tall.
+        self.foot_height = float(meta.get("foot_height_m", 0.04366))
         self.hands = {}
         if atlas is not None:
             if self.home is None:
                 raise ValueError("a transported map requires the nominal home_soles in its metadata")
             for arm in ("left", "right"):
-                self.hands[arm] = _HandIndex(atlas.layers(self.home, arm), atlas.voxel_size)
+                layers = atlas.layers(self.home, arm)
+                if postures is not None:
+                    layers = [layer for layer in layers if layer["posture"] in postures]
+                self.hands[arm] = _HandIndex(layers, atlas.voxel_size)
         if self.sole_half.shape != (2,) or not np.isfinite(self.sole_half).all() or (self.sole_half <= 0).any():
             raise ValueError("invalid sole footprint")
         template = _tuples(commands)
@@ -244,11 +250,11 @@ class StepSearch:
         return self._cached_edges(_tuples(_soles_array(incoming_soles)), target)
 
     def blocked_feet(self, soles, target):
-        """Soles known to overlap a solid object's interior at a floor pick."""
+        """Soles known to overlap a solid pick object within the physical sole height band."""
         if not target.solid_pick or target.center is None or target.size is None:
             return ()
         half = np.asarray(target.size) / 2
-        if abs(target.center[2] - half[2]) > 1e-9:
+        if target.center[2] - half[2] >= self.foot_height or target.center[2] + half[2] <= 0:
             return ()
         poses = np.asarray(soles)
         xy = (poses[:, :2] - target.center[:2]) @ _rot(-target.yaw)
@@ -291,7 +297,7 @@ class StepSearch:
             candidates.append(LandingEdge(order, commands, feet, steps, gap, posture, q, *evidence))
         return tuple(candidates)
 
-    def schedules(self, incoming_soles, targets, *, orders=None):
+    def schedules(self, incoming_soles, targets, *, orders=None, deadline=None, step_count=None):
         """Yield complete endpoint paths in lexicographic A* order, preserving alternatives.
 
         Defer one-action lookahead until a partial path reaches the top of the
@@ -304,6 +310,8 @@ class StepSearch:
             orders = tuple(orders)
             if len(orders) != len(targets) or any(order not in ORDERS for order in orders):
                 raise ValueError("supply one exact foot order per manipulation")
+        if step_count is not None and not 0 <= step_count <= 2 * len(targets):
+            raise ValueError("Step count is outside the capacity of the manipulation gaps")
         start = _tuples(_soles_array(incoming_soles))
         queue = []
         serial = count()
@@ -314,7 +322,7 @@ class StepSearch:
             heapq.heappush(queue, (f, gap, next(serial), path, cost, children))
 
         push((), (0, 0), 0.0)
-        while queue:
+        while queue and (deadline is None or monotonic() < deadline):
             _, gap, _, path, cost, children = heapq.heappop(queue)
             if len(path) == len(targets):
                 yield Schedule(path, cost)
@@ -322,6 +330,9 @@ class StepSearch:
                 edges = self.edges(path[-1].soles if path else start, targets[len(path)])
                 if orders is not None:
                     edges = tuple(e for e in edges if e.order == orders[len(path)])
+                if step_count is not None:
+                    later_capacity = 2 * (len(targets) - len(path) - 1)
+                    edges = tuple(e for e in edges if 0 <= step_count - cost[1] - e.cost[1] <= later_capacity)
                 if edges:
                     push(path, cost, gap, edges)
             else:

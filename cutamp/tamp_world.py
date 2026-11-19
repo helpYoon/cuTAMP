@@ -111,10 +111,9 @@ class TAMPWorld:
             ).position.flatten().detach().cpu(),
         }
 
-        # The planted soles' world poses at the model's home: every action stands on this one stance.
+        # A fixed-feet action locks both planted soles to the supplied initial configuration.
         stance_sole_poses: Dict[str, Pose] = {}
-        stance_js = JointState.from_position(device_cfg.to_device(self.model.home).unsqueeze(0))
-        stance_ks = self.kinematics.compute_kinematics(stance_js)
+        stance_ks = home_ks
         for frame in self.model.sole_frames:
             pose = stance_ks.tool_poses.get_link_pose(frame, make_contiguous=True)
             # Copies: a single conf's pose is a view of cuRobo's FK buffers, which the next FK call rewrites.
@@ -187,7 +186,7 @@ class TAMPWorld:
 
     @property
     def stance_soles(self) -> torch.Tensor:
-        """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``model.home`` (made once, at construction)."""
+        """``[2, 4, 4]`` world poses of ``model.sole_frames`` at ``world.q_init`` (made once, at construction)."""
         return self._stance_soles
 
     # ---- Movables and indexing ---------------------------------------------

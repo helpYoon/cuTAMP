@@ -34,6 +34,7 @@ default_constraint_to_mult = {
     ComPolygon.type: {"default": 10.0},
     ComComfort.type: {"margin_shortfall_squared": 10.0},
     "soft": {
+        "com_center_distance_squared": 1.0,  # CostFunction applies the configured coefficient.
         "retract_close_to_home": 1e-1,
         "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
         # Tuned on the simplified model's 0.1 rad margin band (branch

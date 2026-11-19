@@ -490,7 +490,19 @@ class ParticleOptimizer:
             val.requires_grad = True
 
         if not pairs:
-            raise RuntimeError(f"No parameters to optimize! For plan skeleton: {plan_skeleton}")
+            # A pick-only skeleton can bind every configuration through grasp IK. Its
+            # initialized poses still require the same fresh whole-particle checks.
+            timer.stop("setup_optimizer")
+            with torch.no_grad():
+                costs = cost_fn(rollout_fn(particles), particles)
+                passing = self.get_satisfying_mask(costs, verbose=False)
+                n = int(passing.sum())
+                total = self.cost_reducer(costs, consider_types=ADAM_CONSIDER_TYPES)
+                soft = self.cost_reducer.soft_costs(costs)
+                opt_metrics.update(num_steps=0, num_satisfying_final=n,
+                                   best_cost=float(total[passing].min()) if n else None,
+                                   best_soft_cost=float(soft[passing].min()) if n else None)
+            return n > 0, opt_metrics, False
 
         optimizer = Adam(params=_adam_param_groups(pairs, self.config.conf_lr), lr=self.config.lr)
 

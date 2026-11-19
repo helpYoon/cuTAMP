@@ -11,6 +11,7 @@ import re
 import itertools
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from time import monotonic
 from typing import Callable, Generator, List, Optional, Sequence
 
 from .base_structs import Atom, GroundOperator, Operator, State
@@ -70,6 +71,8 @@ def get_valid_ground_operators(
     node: _Node,
     operators: Sequence[Operator],
     priority_fn: Optional["Callable[[GroundOperator], float]"] = None,
+    *,
+    deadline: float | None = None,
 ) -> list[GroundOperator]:
     """
     Get all valid ground operators by testing the operators, binding samples for the unspecified variables, and
@@ -183,8 +186,9 @@ def get_valid_ground_operators(
 
         # 3. Generate all combinations of the parameter bindings, so we ground the operator
         param_names = list(param_to_literals.keys())
-        combinations = list(itertools.product(*param_to_literals.values()))
-        for combo in combinations:
+        for combo in itertools.product(*param_to_literals.values()):
+            if deadline is not None and monotonic() >= deadline:
+                return []
             substitutions = dict(zip(param_names, combo))
             ground_op = operator.ground(substitutions)
 
@@ -208,6 +212,8 @@ def breadth_first_search(
     goal_state: State,
     operators: Sequence[Operator],
     ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
+    *,
+    deadline: float | None = None,
 ) -> Generator[List[GroundOperator], None, None]:
     """
     Performs a breadth-first search to find a solution to the given planning problem.
@@ -242,7 +248,7 @@ def breadth_first_search(
     frontier: deque[_Node] = deque([initial_node])
     explored: set[State] = {_search_key(initial_node.state)}
 
-    while frontier:
+    while frontier and (deadline is None or monotonic() < deadline):
         node = frontier.popleft()
 
         # Check if goal is satisfied
@@ -252,7 +258,7 @@ def breadth_first_search(
             continue  # stop exploring this branch as we already satisfied the goal
 
         # Get successor and add to frontier
-        ground_ops = get_valid_ground_operators(node, operators, priority_fn=ground_op_priority_fn)
+        ground_ops = get_valid_ground_operators(node, operators, priority_fn=ground_op_priority_fn, deadline=deadline)
         for ground_op in ground_ops:
             successor_state = ground_op.apply(node.state)
 

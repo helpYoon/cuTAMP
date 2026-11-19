@@ -67,6 +67,16 @@ class TAMPConfiguration:
     ## Task Planning
     # Number of initial plans to sample
     num_initial_plans: int = 30
+    step_mode: str = "off"  # off, rank only, geometric ablation, or frozen model
+    step_search_order: str = "astar"
+    max_step_schedules: int | None = None
+    step_lag: int = 2  # actuator delay in physics substeps
+    landing_bundle: str | None = None
+    step_reach_map: str | None = None
+    step_accuracy_table: str | None = None
+    step_refine_iterations: int = 4
+    step_particle_batch_size: int = 4
+    require_modeled_load: bool = False
 
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
@@ -92,6 +102,8 @@ class TAMPConfiguration:
 
     # Minimum projected CoM clearance from the physical sole hull at each pick and place.
     com_comfort_margin_m: float = 0.05
+    # Weight on squared horizontal CoM distance to the support polygon area centroid.
+    com_center_weight: float = 1.0
 
     def __post_init__(self):
         if self.soft_cost is None:
@@ -127,3 +139,16 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"num_initial_plans must be positive, not {config.num_initial_plans}")
     if not math.isfinite(config.com_comfort_margin_m) or config.com_comfort_margin_m < 0:
         raise ValueError(f"com_comfort_margin_m must be finite and >= 0, got {config.com_comfort_margin_m}")
+
+    if not math.isfinite(config.com_center_weight) or config.com_center_weight < 0:
+        raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
+    if config.step_mode not in ("off", "rank", "model", "geometric"):
+        raise ValueError("step_mode must be off, rank, model or geometric")
+    if config.step_search_order not in ("astar", "count"):
+        raise ValueError("step_search_order must be astar or count")
+    if config.max_step_schedules is not None and config.max_step_schedules <= 0:
+        raise ValueError("max_step_schedules must be positive when specified")
+    if config.step_refine_iterations < 0 or config.step_particle_batch_size < 1:
+        raise ValueError("Invalid step refinement iteration or batch count")
+    if type(config.step_lag) is not int or config.step_lag < 0:
+        raise ValueError("step_lag must be a nonnegative integer physics-step count")

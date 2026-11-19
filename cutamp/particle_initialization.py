@@ -419,6 +419,10 @@ def _draw_placements(
     return candidates[torch.arange(n, device=candidates.device), collision.argmin(-1)]
 
 
+class NoGraspCandidates(ValueError):
+    """The geometric gripper filters removed every grasp of the assigned hand."""
+
+
 class ParticleInitializer:
     def __init__(self, world: TAMPWorld, config: TAMPConfiguration, constraint_checker: ConstraintChecker):
         self.world = world
@@ -481,7 +485,7 @@ class ParticleInitializer:
                 raise ValueError(f"{obj=} not found in world")
             candidates = world.grasp_candidates(obj, arm)
             if not len(candidates.grasps):
-                raise ValueError(f"{idx + 1}. {ground_op}: none of {obj}'s {len(world.grasps[obj].grasps)} grasps is "
+                raise NoGraspCandidates(f"{idx + 1}. {ground_op}: none of {obj}'s {len(world.grasps[obj].grasps)} grasps is "
                                  f"left for the {arm} hand: each reaches below its bottom face or touches it")
             pools[grasp] = candidates.grasps, candidates.scores
         return pools

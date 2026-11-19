@@ -126,7 +126,9 @@ class T1MapSampler:
         hulls, mesh_assets = _gripper_hulls(self.model, locked)
         self.gripper_hulls = {arm: torch.as_tensor(points, device=self.device) for arm, points in hulls.items()}
         self.waist_index = self.joint_names.index("Waist")
-        waist = ET.parse(self.model.asset_root / "t1_planner.urdf").find("joint[@name='Waist']")
+        urdf = ET.parse(self.model.asset_root / "t1_planner.urdf")
+        waist = urdf.find("joint[@name='Waist']")
+        foot_box = urdf.find("link[@name='left_foot_link']/collision/geometry/box")
         self.waist_origin = self.cfg.to_device(np.fromstring(waist.find("origin").get("xyz"), sep=" "))
         asset = load_sweep_volume()
         self.contact_offset = self.cfg.to_device((np.array(asset["base_from_G"]) @ [*asset["offset_mid"], 1.0])[:3])
@@ -141,6 +143,7 @@ class T1MapSampler:
             "gripper_floor_check": "both locked grippers, minimum URDF palm/finger mesh vertex z >= 0 m",
             "gripper_hull_vertices": {arm: len(points) for arm, points in hulls.items()},
             "physical_margin_m": COM_MARGIN_M, "sole_box_m": self.sole_box,
+            "foot_height_m": float(foot_box.get("size").split()[2]),
             "sole_position_tolerance_m": SOLE_POS_TOL_M, "sole_angle_tolerance_rad": SOLE_ANGLE_TOL_RAD,
             "asset_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in assets},
         }

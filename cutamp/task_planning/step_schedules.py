@@ -2,6 +2,8 @@
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
+from math import comb
+from time import monotonic
 
 from cutamp.reachability import ORDERS
 from cutamp.step_search import Schedule, StepSearch, TargetRegion
@@ -39,9 +41,9 @@ def _bound_seed(schedule, soles):
     return GroundedStepSeed(schedule, dict(zip(soles, commands, strict=True)))
 
 
-def _alternatives(search, incoming, targets, orders, primary_commands, soles):
+def _alternatives(search, incoming, targets, orders, primary_commands, soles, options):
     seen = {primary_commands}
-    for path in search.schedules(incoming, targets, orders=orders):
+    for path in search.schedules(incoming, targets, orders=orders, **options):
         seed = _bound_seed(path, soles)
         commands = tuple(seed.commands.values())
         if commands not in seen:
@@ -83,6 +85,10 @@ def ranked_step_skeletons(
     initial: State,
     goal: State,
     incoming_soles,
+    *,
+    orders=None,
+    deadline=None,
+    step_count=None,
 ) -> Iterator[RankedStepSkeleton]:
     """Yield each sampled order schedule once, ranked by its best compatible endpoint path.
 
@@ -93,8 +99,20 @@ def ranked_step_skeletons(
     targets = _targets(skeleton, regions, initial)
     incoming = tuple(tuple(row) for row in incoming_soles)
     seen_orders = set()
-    max_orders = len(ORDERS) ** len(targets)
-    for path in search.schedules(incoming, targets):
+    max_orders = len(ORDERS) ** len(targets) if orders is None else 1
+    options = {} if deadline is None else {"deadline": deadline}
+    if step_count is not None:
+        options["step_count"] = step_count
+        n = len(targets)
+        if orders is None:
+            # Choose the gaps containing two and one steps, then their first feet.
+            max_orders = sum(
+                comb(n, two) * comb(n - two, one) * 2 ** (two + one)
+                for two in range(step_count // 2 + 1)
+                if 0 <= (one := step_count - 2 * two) <= n - two
+            )
+    fixed = {} if orders is None else {"orders": orders}
+    for path in search.schedules(incoming, targets, **fixed, **options):
         orders = tuple(edge.order for edge in path.edges)
         if orders in seen_orders:
             continue
@@ -102,7 +120,9 @@ def ranked_step_skeletons(
         grounded = _ground(skeleton, orders, initial, goal)
         soles = [op.arg("sole_to") for op in grounded if op.operator.metadata.action_type == "step"]
         primary = _bound_seed(path, soles)
-        alternatives = _alternatives(search, incoming, targets, orders, tuple(primary.commands.values()), soles)
+        alternatives = _alternatives(
+            search, incoming, targets, orders, tuple(primary.commands.values()), soles, options
+        )
         yield RankedStepSkeleton(grounded, orders, primary, alternatives)
         if len(seen_orders) == max_orders:
             return
@@ -117,6 +137,10 @@ def unseeded_step_skeletons(
     incoming_soles,
     *,
     tried_orders=(),
+    fixed=None,
+    max_steps=None,
+    min_steps=0,
+    deadline=None,
 ) -> Iterator[RankedStepSkeleton]:
     """Yield remaining symbolic schedules in increasing step count for refinement.
 
@@ -129,18 +153,27 @@ def unseeded_step_skeletons(
     tried = {tuple(orders) for orders in tried_orders}
 
     def paths(prefix, moved, remaining):
+        if deadline is not None and monotonic() >= deadline:
+            return
         if len(prefix) == len(targets):
             if remaining == 0 and prefix not in tried:
                 yield prefix
             return
         capacity_after = 2 * (len(targets) - len(prefix) - 1)
-        for order in ORDERS:
+        for order in ORDERS if fixed is None else (fixed[len(prefix)],):
             sides = set() if order == "none" else set(order)
             steps_left = remaining - len(sides)
             after = moved | sides
             if 0 <= steps_left <= capacity_after and blocked[len(prefix)] <= after:
                 yield from paths((*prefix, order), after, steps_left)
 
-    for count in range(2 * len(targets) + 1):
+    limit = 2 * len(targets)
+    if fixed is not None:
+        if len(fixed) != len(targets) or any(order not in ORDERS for order in fixed):
+            raise ValueError("Supply one legal foot order per manipulation")
+        counts = [sum(len(o) for o in fixed if o != "none")]
+    else:
+        counts = range(min_steps, min(limit, max_steps if max_steps is not None else limit) + 1)
+    for count in counts:
         for orders in paths((), set(), count):
             yield RankedStepSkeleton(_ground(skeleton, orders, initial, goal), orders, None, iter(()))

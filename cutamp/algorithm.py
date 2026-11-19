@@ -11,7 +11,12 @@
 
 import atexit
 import gc
+import json
 import logging
+from collections import deque
+from functools import lru_cache
+from pathlib import Path
+from time import monotonic
 from typing import Callable, List, Union, Optional, Tuple
 
 import numpy as np
@@ -29,7 +34,7 @@ from cutamp.grasps import GRASP_SCORE_CUTOFF, grasp_sets, start_sampler_load, wa
 from cutamp.motion_solver import build_motion_planner, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import (
-    IKTol, ParticleInitializer, choice_stats, pick_place_confs, worst_posture,
+    IKTol, NoGraspCandidates, ParticleInitializer, choice_stats, pick_place_confs, worst_posture,
 )
 from cutamp.robots import REAL_LEGS, load_t1_container
 from cutamp.rollout import RolloutFunction
@@ -109,7 +114,7 @@ def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
     return priority
 
 
-def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int) -> List[int]:
+def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int, *, rank_by_soft=False) -> List[int]:
     """Try order, as positions into the ``s`` satisfying particles, of ``pool_idx`` ``[s, P]`` (each particle's pool
     row per pick); ``soft``, ``all_hi``, ``tilt``, ``travel`` and ``margin`` are ``[s]``. A group is the particles with
     equal ``pool_idx`` rows, ordered inside by ``(soft, position)``. Groups go by their first particle's
@@ -123,7 +128,9 @@ def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int) -> L
     for row, members in groups.items():
         members.sort(key=lambda i: (soft[i], i))
         f = members[0]
-        ranked.append(((not hi[f], tilt[f], travel[f], -margin[f]), row, members))
+        # With the centroid objective active, compare the full weighted preference across grasp groups.
+        objective = soft[f] if rank_by_soft else 0.0
+        ranked.append(((not hi[f], objective, tilt[f], travel[f], -margin[f]), row, members))
     ranked.sort(key=lambda g: g[:2])
     rounds = max(len(g[2]) for g in ranked)
     return [g[2][r] for r in range(rounds) for g in ranked if r < len(g[2])][:n]
@@ -134,6 +141,7 @@ def get_top_satisfying_particles(
     constraint_checker: ConstraintChecker,
     cost_reducer: CostReducer,
     n: int,
+    *, return_indices: bool = False,
 ) -> List[dict]:
     """Up to ``n`` satisfying particles in motion-plan try order: grouped by grasp and taken round the groups, each
     group's particles by ascending soft cost (``grasp_group_order``). The posture measures are the particle's after
@@ -165,8 +173,14 @@ def get_top_satisfying_particles(
             tilt, travel, margin = worst_posture(plan_info["rollout_fn"].world, [sat[name] for name in confs])
         else:
             tilt = travel = margin = torch.zeros(s)
-        order = grasp_group_order(pool_idx, soft_costs[satisfying_mask], all_hi, tilt, travel, margin, n)
-    return [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
+        rank_by_soft = ("com_center_distance_squared" in cost_dict.get("soft", {}).get("values", {})
+                        and getattr(getattr(plan_info["cost_fn"], "config", None), "com_center_weight", 1.0) > 0)
+        order = grasp_group_order(pool_idx, soft_costs[satisfying_mask], all_hi, tilt, travel, margin, n,
+                                 rank_by_soft=rank_by_soft)
+    candidates = [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
+    if return_indices:
+        return candidates, satisfying_mask.nonzero(as_tuple=True)[0][order].tolist()
+    return candidates
 
 
 def sample_plan_skeleton(
@@ -239,6 +253,7 @@ def _motion_plan_with_retries(
     get_planner=None,
     *,
     ik_tol: IKTol,
+    deadline: float | None = None,
 ) -> Tuple[Optional[dict], Optional[dict], int, Optional[int], List[str]]:
     """Run ``solve_curobo`` on the top-N satisfying candidates; return on first success. ``get_planner`` and
     ``ik_tol`` (the run's IK tolerances, ``ParticleInitializer.ik_tol``) go to ``solve_curobo``.
@@ -280,6 +295,8 @@ def _motion_plan_with_retries(
     for max_attempts in _PLAN_ATTEMPTS:
         failed = list(rejected)
         for rank, particle in enumerate(candidates):
+            if deadline is not None and monotonic() >= deadline:
+                return None, None, tried, None, failures
             if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed):
                 _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
                 continue
@@ -409,8 +426,14 @@ def run_cutamp(
     q_init: Optional[List[float]] = None,
     *,
     experiment_id: str,
+    step_inputs=None,
 ):
     """Overall cuTAMP algorithm implementation."""
+    if config.step_mode != "off":
+        return _run_step_planner(env, config, cost_reducer, constraint_checker, q_init, experiment_id, step_inputs)
+    if step_inputs is not None:
+        raise ValueError("Explicit step inputs require step_mode rank, geometric or model")
+
     # GraspGenX's model loads on a background thread while the robot and the world load and the task planner runs.
     start_sampler_load()
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
@@ -608,3 +631,412 @@ def run_cutamp(
     exp_logger.log_dict("multipliers", cost_reducer.cost_config)
     exp_logger.log_dict("tolerances", constraint_checker.constraint_config)
     return curobo_plan, overall_metrics["num_satisfying_final"], overall_metrics
+
+
+_STEP_DATA = Path(__file__).resolve().parents[1] / "data/t1-reachability"
+
+
+def _load_step_search(config, *, applicable=True):
+    path = Path(config.step_reach_map) if config.step_reach_map else _STEP_DATA / "t1-nominal-hand-map.npz"
+    if not path.exists() and not config.step_reach_map:
+        path = _STEP_DATA / "t1-hand-map.npz"
+    lag = None if config.step_mode == "geometric" else config.step_lag
+    accuracy = Path(config.step_accuracy_table or _STEP_DATA / "landing-accuracy/home-model.json")
+
+    def identity(source):
+        try:
+            stat = source.stat()
+        except FileNotFoundError:
+            return (str(source.resolve()), None)
+        return (str(source.resolve()), (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size))
+
+    tables, notes = _step_tables(identity(path), identity(accuracy) if lag is not None and applicable else None, lag)
+    return tables, (
+        dict(notes) if applicable else dict(notes, accuracy_status="dynamics outside the profiled condition")
+    )
+
+
+@lru_cache(maxsize=4)
+def _step_tables(map_version, accuracy_version, lag):
+    from cutamp.reachability import ReachMap
+    from cutamp.step_search import StepSearch
+
+    path = Path(map_version[0])
+    accuracy = Path(accuracy_version[0]) if accuracy_version else None
+    notes = {"map": str(path), "accuracy": str(accuracy) if accuracy is not None else None}
+    atlas = None
+    if map_version[1] is not None:
+        try:
+            atlas = ReachMap.load(path, nominal_only=True)
+        except (ValueError, KeyError, OSError) as e:
+            notes["map_status"] = str(e)
+    if atlas is None:
+        notes.setdefault("map_status", "unavailable")
+    records = None
+    if accuracy is not None and accuracy.is_file():
+        try:
+            records = json.loads(accuracy.read_text())
+            return StepSearch(atlas, accuracy=records, lag=lag), notes
+        except (ValueError, KeyError) as e:
+            notes["accuracy_status"] = str(e)
+    elif lag is not None:
+        notes["accuracy_status"] = "unavailable"
+    return StepSearch(atlas, lag=lag), notes
+
+
+def _load_predictor(config):
+    from cutamp.landing_predictor import LandingPredictor
+
+    path = Path(config.landing_bundle or _STEP_DATA / "landing-accuracy/landing-seed3.pt")
+    if not path.is_file():
+        raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
+    return LandingPredictor(path)
+
+
+def _refine_step_schedule(*args, **kwargs):
+    # The model and its CUDA deployment are optional for fixed-feet runs.
+    from cutamp.step_particles import refine_step_particles
+
+    return refine_step_particles(*args, **kwargs)
+
+
+def _refine_standing_schedule(
+    proposal, world, config, reducer, checker, timer, visualizer, initializer, optimizer, get_planner, *, deadline=None
+):
+    from cutamp.com_polygon_cost import margin_from_support_planes
+    from cutamp.step_planner import StepResult, StepRow
+
+    plan = proposal.skeleton
+    try:
+        info, _ = sample_plan_skeleton(iter((plan,)), world, config, timer, 0, checker, initializer)
+    except NoGraspCandidates as e:
+        return StepResult([], None, "initialization_failed", str(e))
+    if info is None:
+        return StepResult([], None, "initialization_failed")
+    if deadline is not None and monotonic() >= deadline:
+        return StepResult([], None, "budget_exhausted", "standing initialization reached the time limit")
+    optimizer(info, timer, visualizer)
+    particles = info["particles"]
+    with torch.no_grad():
+        rollout = info["rollout_fn"](particles)
+        cost_fn = info["cost_fn"]
+        costs = cost_fn(rollout, particles)
+        masks = checker.get_full_mask(costs)
+        margin = margin_from_support_planes(rollout["com_xy"], *cost_fn.support_planes)
+        center_distances = torch.linalg.vector_norm(rollout["com_xy"] - cost_fn.support_centroid, dim=-1)
+        endpoint = masks["ComComfort"]["margin_shortfall_squared"].clone()
+        for mask in masks["KinematicConstraint"].values():
+            endpoint &= mask.reshape(*endpoint.shape, -1).all(-1)
+        good = checker.get_mask(costs, verbose=False)
+        if not good.any():
+            return StepResult([], endpoint, "unresolved")
+        soft = reducer.soft_costs(costs)
+        total = reducer(costs)
+        indices = good.nonzero(as_tuple=True)[0].tolist()
+        rows = [
+            StepRow(
+                i,
+                {name: v[i].detach().clone() for name, v in particles.items()},
+                float(soft[i]),
+                {
+                    "com_margins_m": margin[i].tolist(),
+                    "com_center_distances_m": center_distances[i].tolist(),
+                    "support_centroid_xy_m": cost_fn.support_centroid.tolist(),
+                    "min_com_margin_m": float(margin[i].min()),
+                    "cost": float(total[i]),
+                },
+            )
+            for i in indices
+        ]
+    diagnostics = {}
+    if config.curobo_plan:
+        candidates, row_ids = get_top_satisfying_particles(
+            info, checker, reducer, config.motion_plan_max_retries, return_indices=True
+        )
+        motion, traj, tries, rank, failed = _motion_plan_with_retries(
+            info,
+            candidates,
+            world,
+            config,
+            timer,
+            visualizer,
+            get_planner=get_planner,
+            ik_tol=initializer.ik_tol,
+            deadline=deadline,
+        )
+        diagnostics = {"motion_plan_attempts": tries, "motion_plan_failures": failed}
+        if motion is not None:
+            winning = next(row for row in rows if row.index == row_ids[rank])
+            winning.motion_plan = motion
+            winning.metrics.update(traj or {}, **_planned_metrics(world, plan, candidates, rank))
+    return StepResult(rows, endpoint, "standing_feasible", diagnostics=diagnostics)
+
+
+def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inputs):
+    from cutamp.step_planner import ScheduleSearch, StepInputs, StepResult, furthest_endpoint, manipulation_regions
+
+    validate_tamp_config(config)
+    inputs = inputs if inputs is not None else StepInputs()
+    logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
+    world.grasps.update(inputs.grasps)
+    start = monotonic()
+    deadline = start + config.max_loop_dur if config.max_loop_dur is not None else None
+    timer.start("start_optimization")
+    search, cache_info = _load_step_search(config, applicable=inputs.matches_accuracy_context(config.step_lag))
+    cache_info["load_seconds"] = monotonic() - start
+    soles = world.stance_soles
+    yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
+    incoming = torch.cat((soles[..., :2, 3], yaw[:, None]), -1).detach().cpu().tolist()
+
+    base_plans = task_plan_generator(
+        world.initial_state,
+        world.goal_state,
+        operators=all_t1_operators,
+        ground_op_priority_fn=make_arm_affinity_priority_fn(world),
+        deadline=deadline,
+    )
+
+    def streams():
+        seen = set()
+        for skeleton in base_plans:
+            if deadline is not None and monotonic() >= deadline:
+                break
+            arms = tuple(op.operator.metadata.arm for op in skeleton if op.operator.metadata.is_actionable)
+            if inputs.arms is not None and tuple(inputs.arms) != arms:
+                continue
+            if inputs.orders is not None and len(arms) != len(inputs.orders):
+                continue
+            identity = tuple(op.name for op in skeleton)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            metrics["num_symbolic_skeletons"] += 1
+            regions = manipulation_regions(skeleton, world)
+            yield ScheduleSearch(
+                search,
+                skeleton,
+                regions,
+                world,
+                incoming,
+                fixed=inputs.orders,
+                strategy=config.step_search_order,
+                deadline=deadline,
+            )
+            if len(seen) >= config.num_initial_plans:
+                break
+
+    metrics = {
+        "found_solution": False,
+        "status": "unresolved",
+        "num_satisfying_final": 0,
+        "num_particles": config.num_particles,
+        "num_optimized_plans": 0,
+        "num_symbolic_skeletons": 0,
+        "step_attempts": [],
+        "step_search": cache_info,
+        "grasp_generation_calls": 0,
+        "best_cost": None,
+        "best_soft_cost": None,
+        "time_to_first_accepted_s": None,
+    }
+    if config.curobo_plan:
+        metrics.update(motion_plan_success=False, motion_plan_failures=[], motion_plan_attempts=0)
+    incumbent = None
+    winning_motion = None
+    winning_evidence = None
+    selected_metrics = {}
+    predictor = initializer = optimizer = planner = None
+    unavailable = None
+
+    def get_planner():
+        nonlocal planner
+        if planner is None:
+            planner = build_motion_planner(world)
+        return planner
+
+    def make_grasps(skeleton):
+        objs = ungrasped(world, skeleton)
+        if objs:
+            # A caller can supply every grasp. Start GraspGenX lazily, after scheduling.
+            start_sampler_load()
+            try:
+                with timer.time("generate_grasps"):
+                    world.grasps.update(grasp_sets(objs, world.device))
+                metrics["grasp_generation_calls"] += 1
+            finally:
+                wait_for_sampler_load()  # no background CUDA work when the selected solve captures graphs
+            gc.collect()
+            gc.freeze()
+        else:
+            wait_for_sampler_load()  # a caller may have already started a process-wide preload
+
+    base_iter = iter(streams())
+    active = deque()
+    while config.max_step_schedules is None or len(metrics["step_attempts"]) < config.max_step_schedules:
+        if deadline is not None and monotonic() >= deadline:
+            break
+        # Each arm/object skeleton gets its first proposal before one skeleton consumes the whole budget.
+        stream = next(base_iter, None)
+        if stream is None:
+            if not active:
+                break
+            stream = active.popleft()
+        rank_start = monotonic()
+        proposal = stream.next(incumbent[0] if incumbent else None)
+        if proposal is None:
+            continue
+        active.append(stream)
+        if deadline is not None and monotonic() >= deadline:
+            break
+        attempt = {
+            "skeleton": [op.name for op in proposal.skeleton],
+            "orders": list(proposal.orders),
+            "step_count": proposal.step_count,
+            "heuristic_cost": proposal.cost,
+            "rank_seconds": monotonic() - rank_start,
+        }
+        if proposal.seed:
+            attempt["gaps"] = [
+                {
+                    "incoming_soles": incoming if i == 0 else proposal.seed.schedule.edges[i - 1].soles,
+                    "commands": e.commands,
+                    "outgoing_soles": e.soles,
+                    "posture": e.posture,
+                    "distance_m": e.distance_m,
+                    "accuracy": e.accuracy,
+                    "passes": e.passes,
+                    "trials": e.trials,
+                    "cost": e.cost,
+                }
+                for i, e in enumerate(proposal.seed.schedule.edges)
+            ]
+        if inputs.commands is not None:
+            attempt["supplied_command_seeds"] = inputs.commands
+        metrics["step_attempts"].append(attempt)
+        if config.step_mode == "rank":
+            attempt["status"] = "ranked"
+            metrics["status"] = "ranked"
+            continue
+        if proposal.step_count and config.step_mode == "model" and predictor is None and unavailable is None:
+            try:
+                predictor = _load_predictor(config)
+            except (FileNotFoundError, RuntimeError, ValueError, KeyError, OSError) as e:
+                unavailable = str(e)
+        if proposal.step_count and unavailable is not None:
+            result = StepResult([], None, "unavailable", unavailable)
+        else:
+            make_grasps(proposal.skeleton)
+            if deadline is not None and monotonic() >= deadline:
+                attempt["status"] = "budget_exhausted"
+                break
+            metrics["num_optimized_plans"] += 1
+            if proposal.step_count:
+                try:
+                    result = _refine_step_schedule(
+                        proposal,
+                        world,
+                        config,
+                        reducer,
+                        checker,
+                        inputs=inputs,
+                        predictor=predictor,
+                        timer=timer,
+                        visualizer=visualizer,
+                        deadline=deadline,
+                    )
+                except NoGraspCandidates as e:
+                    result = StepResult([], None, "initialization_failed", str(e))
+            else:
+                if initializer is None:
+                    initializer = ParticleInitializer(world, config, checker)
+                    optimizer = ParticleOptimizer(config, reducer, checker)
+                result = _refine_standing_schedule(
+                    proposal,
+                    world,
+                    config,
+                    reducer,
+                    checker,
+                    timer,
+                    visualizer,
+                    initializer,
+                    optimizer,
+                    get_planner,
+                    deadline=deadline,
+                )
+        attempt.update(
+            status=result.status,
+            reason=result.reason,
+            diagnostics=result.diagnostics,
+            furthest_endpoint=furthest_endpoint(result.endpoint_ok),
+            particle_rows=len(result.rows),
+        )
+        if config.curobo_plan:
+            metrics["motion_plan_attempts"] += result.diagnostics.get("motion_plan_attempts", 0)
+            metrics["motion_plan_failures"] += result.diagnostics.get("motion_plan_failures", [])
+        required_level = (
+            "standing_feasible"
+            if not proposal.step_count
+            else "model_feasible"
+            if config.step_mode == "model"
+            else "kinematic_candidate"
+        )
+        accepted = [
+            row
+            for row in result.rows
+            if result.status == required_level and (not config.curobo_plan or row.motion_plan is not None)
+        ]
+        attempt["accepted_rows"] = len(accepted)
+        if not accepted:
+            if result.rows:
+                # Keep evidence for a feasible model prediction whose subsequent motion was unavailable.
+                best_model = min(result.rows, key=lambda row: row.soft_cost)
+                attempt["particle_candidate"] = dict(
+                    best_model.metrics, row_index=best_model.index, soft_cost=best_model.soft_cost
+                )
+            stream.feedback(proposal.orders, result.endpoint_ok)
+            continue
+        row = min(accepted, key=lambda r: r.soft_cost)
+        key = (proposal.step_count, row.soft_cost)
+        if incumbent is None or key < incumbent:
+            if incumbent is None:
+                metrics["time_to_first_accepted_s"] = monotonic() - start
+            incumbent = key
+            winning_motion = row.motion_plan
+            winning_evidence = row.evidence
+            selected = {
+                name: value.detach().cpu().tolist() if torch.is_tensor(value) else value
+                for name, value in row.particle.items()
+            }
+            selected_metrics = dict(row.metrics)
+            if "best_com_margin" in selected_metrics:
+                selected_metrics.setdefault("min_com_margin_m", selected_metrics["best_com_margin"])
+            selected_metrics.update(
+                found_solution=True,
+                status="motion_feasible" if config.curobo_plan else result.status,
+                row_index=row.index,
+                best_cost=row.metrics.get("cost", row.soft_cost),
+                best_soft_cost=row.soft_cost,
+                num_satisfying_final=len(accepted),
+                gap_schedule=list(proposal.orders),
+                total_steps=proposal.step_count,
+                final_plan_skeleton=attempt["skeleton"],
+                selected_particle=selected,
+            )
+            if config.curobo_plan:
+                metrics["motion_plan_success"] = True
+    timer.stop("start_optimization")
+    metrics.update(selected_metrics)
+    if winning_evidence is not None:
+        artifact = logger.log_dict("model_evidence", winning_evidence())
+        metrics["model_evidence_path"] = str(artifact.resolve())
+        del winning_evidence
+    if metrics["step_attempts"] and all(a["status"] == "unavailable" for a in metrics["step_attempts"]):
+        metrics["status"] = "unavailable"
+    metrics["elapsed_s"] = monotonic() - start
+    metrics["schedule_limit_reached"] = (
+        config.max_step_schedules is not None and len(metrics["step_attempts"]) >= config.max_step_schedules
+    )
+    metrics["time_limit_reached"] = deadline is not None and monotonic() >= deadline
+    logger.log_dict("overall_metrics", metrics)
+    logger.log_dict("timer_metrics", timer.get_summaries())
+    return winning_motion, metrics["num_satisfying_final"], metrics
