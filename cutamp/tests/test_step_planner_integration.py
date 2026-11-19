@@ -19,9 +19,9 @@ def paired_case(label, output, *, place=False, motion=False):
         num_particles=1,
         enable_visualizer=False,
         curobo_plan=motion,
+        # Match the amount of refinement across grasps even on a shared GPU.
         step_refine_iterations=4,
         max_step_schedules=1,
-        max_loop_dur=180,
         experiment_root=str(output),
         landing_bundle=str(bundle),
     )
