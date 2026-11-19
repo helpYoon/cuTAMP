@@ -7,6 +7,7 @@ wrist/sole IK on the resulting stance. Returned masks describe individual rows.
 
 import math
 from dataclasses import dataclass
+from time import monotonic
 
 import torch
 
@@ -140,7 +141,12 @@ def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, 
     return _Evaluation(pred, ik, rows, hard)
 
 
-def _jacobian(rows, u):
+def _check_deadline(deadline):
+    if deadline is not None and monotonic() >= deadline:
+        raise TimeoutError("T1 step refinement exceeded the planner deadline")
+
+
+def _jacobian(rows, u, deadline):
     """One reverse sweep per constraint, reusing each particle's realized trajectory.
 
     Differentiate each original tensor separately. A VJP of a concatenated tensor
@@ -150,6 +156,7 @@ def _jacobian(rows, u):
     jac = []
     for row in rows.values():
         for component in row.reshape(b, -1).unbind(1):
+            _check_deadline(deadline)
             grad = None
             if component.requires_grad:
                 (grad,) = torch.autograd.grad(component.sum(), u, retain_graph=True, allow_unused=True)
@@ -172,6 +179,7 @@ def refine_gap(
     extra_rows=None,
     anchor=None,
     geometry_rows=None,
+    deadline=None,
 ):
     """Optimize K commanded soles from a common actual state with one bound wrist per row.
 
@@ -180,7 +188,9 @@ def refine_gap(
     model-world planar soles into the planner world. With predictor=None, initial is
     a [B,2,3] planar stance and outputs describe a geometric ablation. The
     geometric sweep can append constraints with `geometry_rows(incoming, order, commands)`.
+    An absolute monotonic deadline interrupts the next SQP rollout or reverse sweep.
     """
+    _check_deadline(deadline)
     if order == "none":
         order = ""
     if order not in ("", "L", "R", "LR", "RL"):
@@ -200,6 +210,7 @@ def refine_gap(
         raise ValueError("Expected one actual incoming sole pair per particle")
 
     def evaluate(c):
+        _check_deadline(deadline)
         return _evaluate(
             predictor,
             initial,
@@ -225,6 +236,7 @@ def refine_gap(
         with torch.enable_grad():
             u = u.detach().requires_grad_(bool(order))
             cur = evaluate(u)
+            _check_deadline(deadline)
             if i == 0:
                 initial_margin = cur.ik.margin.detach()
                 initial_achieved = cur.ik.soles.detach()
@@ -233,7 +245,7 @@ def refine_gap(
             if cur.ok.all() or not order or i == max_iterations:
                 break
             values = cur.matrix()
-            jac = _jacobian(cur.rows, u)
+            jac = _jacobian(cur.rows, u, deadline)
         with torch.no_grad():
             width = len(order) * 3
             # The local QP targets a 0.2 mm margin buffer so a finite update can
@@ -270,6 +282,7 @@ def refine_gap(
         u = u.detach()
         fresh = evaluate(u)
     k = fresh.ik
+    _check_deadline(deadline)
     return GapRefinement(
         u,
         first_grad.detach(),

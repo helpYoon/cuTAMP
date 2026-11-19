@@ -119,3 +119,25 @@ def test_posture_reference_gradient_on_free_and_joint_limited_branches(one_cpu_t
         high = solve_stance_ik(soles, wrists, seeds + delta, "left")
     assert torch.equal(active(ik.q), active(low.q)) and torch.equal(active(ik.q), active(high.q))
     torch.testing.assert_close(g[:, 1], (high.margin - low.margin) / 0.0002, rtol=0.02, atol=0.001)
+
+
+@pytest.mark.parametrize("expired_on_entry", [False, True])
+def test_expired_budget_interrupts_the_next_gap_evaluation(monkeypatch, one_cpu_thread, expired_on_entry):
+    from cutamp import step_refinement
+
+    now = [3.0 if expired_on_entry else 1.0]
+    monkeypatch.setattr(step_refinement, "monotonic", lambda: now[0])
+    wrist, seed = paired_inputs("cpu", torch.float32)
+    soles = seed.new_tensor([[[0.154, 0.094, 0.022], [0.042, -0.118, 0.029]]]).repeat(2, 1, 1)
+    calls = []
+
+    def observed(prediction, ik):
+        calls.append(1)
+        now[0] = 3.0
+        return {}
+
+    with pytest.raises(TimeoutError, match="refinement"):
+        step_refinement.refine_gap(
+            None, soles, "", seed.new_empty(2, 0, 3), "left", wrist, seed, deadline=2.0, extra_rows=observed
+        )
+    assert len(calls) == (0 if expired_on_entry else 1)
