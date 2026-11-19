@@ -346,7 +346,10 @@ def test_rebind_grasp_and_approach_to_independently_achieved_soles(rollout_scene
     with torch.no_grad():
         step = predictor.rollout(start, "L", command).steps[0]
     motion = SteppedMotion([], {}, adapter, world, None)
-    motion.stance = step.achieved[0]
+    # The observed swing sole lands 1 cm ahead of its model prediction. Keep
+    # the world wrist target and the planted sole fixed when replanning.
+    motion.stance = step.achieved[0].clone()
+    motion.stance[0, 0] += 0.01
     q = adapter.planner(step.terminal.tensors[:6])[0]
     tool = world.tool_from_ee[world.tool_frame_for_arm("left")]
     wrist = _hand_poses(world, q, "left")[0]
@@ -369,7 +372,7 @@ def test_rebind_grasp_and_approach_to_independently_achieved_soles(rollout_scene
 @needs_cuda
 def test_selected_model_evidence_replays_synthetic_preparation_from_its_true_first_frame(rollout_scene):
     from cutamp.landing_predictor import prediction_precision
-    from cutamp.step_particles import _evidence
+    from cutamp.step_particles import _evidence, _take
 
     predictor, adapter, world, context, _, command = rollout_scene
     q = world.q_init.repeat(2, 1)
@@ -379,7 +382,8 @@ def test_selected_model_evidence_replays_synthetic_preparation_from_its_true_fir
         start = adapter.initialize(q, dynamics, world=world)
         cmds = command.expand(2, -1, -1)
         result = predictor.rollout(start.state, "L", cmds)
-        record = _evidence(adapter, {1: (start.state, cmds, result, start.preparation)}, 1)()["1"][0]
+        selected = _take((start.state, cmds, result, start.preparation), 1, "cpu")
+        record = _evidence(adapter, {1: selected})()["1"][0]
         prep = record["preparation"]
         assert prep["history_source"] == "synthetic_hold_issue"
         assert prep["hold_ticks"] == 50 and len(prep["actions"]) == 50 and len(prep["sole_trace"]) == 51
