@@ -9,6 +9,19 @@ from cutamp.landing_predictor import LandingPredictor, prediction_precision
 from cutamp.tests.conftest import needs_cuda
 
 
+def assert_same_prediction(a, b):
+    if is_dataclass(a):
+        for f in fields(a):
+            assert_same_prediction(getattr(a, f.name), getattr(b, f.name))
+    elif isinstance(a, tuple):
+        for x, y in zip(a, b, strict=True):
+            assert_same_prediction(x, y)
+    elif torch.is_tensor(a):
+        assert torch.equal(a, b)
+    else:
+        assert a == b
+
+
 @pytest.fixture(scope="module")
 def predictor():
     default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
@@ -168,18 +181,6 @@ def test_cached_command_jacobian_matches_the_deployment_and_reverse_mode(order, 
     c[-1, 0, 0] += 0.03
     c.requires_grad_()
 
-    def same_value(a, b):
-        if is_dataclass(a):
-            for f in fields(a):
-                same_value(getattr(a, f.name), getattr(b, f.name))
-        elif isinstance(a, tuple):
-            for x, y in zip(a, b, strict=True):
-                same_value(x, y)
-        elif torch.is_tensor(a):
-            assert torch.equal(a, b)
-        else:
-            assert a == b
-
     def diagnostic(p):
         s = p.steps[-1]
         # Terminal FK, trajectory, phase gates, pending commands and the second issue frame.
@@ -198,11 +199,48 @@ def test_cached_command_jacobian_matches_the_deployment_and_reverse_mode(order, 
 
     with prediction_precision():
         a = predictor.rollout(initial, order, c)
-        b = predictor.linearize(initial, order, c)
-        same_value(a, b)
+        b = predictor.linearize_autodiff(initial, order, c)
+        assert_same_prediction(a, b)
         assert all(type(s.actions.grad_fn).__name__ == "_CommandJacobianBackward" for s in b.steps)
         ea, eb = diagnostic(a), diagnostic(b)
         for k in range(ea.shape[1]):
             (ga,) = torch.autograd.grad(ea[:, k].sum(), c, retain_graph=True)
             (gb,) = torch.autograd.grad(eb[:, k].sum(), c, retain_graph=True)
             torch.testing.assert_close(gb, ga, rtol=7e-4, atol=1.5e-4)
+
+
+@pytest.mark.parametrize("order", ["L", "R", "LR", "RL"])
+@needs_cuda
+def test_finite_difference_linearization_follows_each_particles_rollout(order, predictor, monkeypatch):
+    # Distinct commands and actuator lags expose cross-particle mixing. The first
+    # command of the alternating pair must also affect the other foot's landing.
+    context = torch.zeros(2, 38, device=predictor.device)
+    context[:, 0] = 0.25 / 0.45
+    context[:, -5:] = context.new_tensor([[-1.0], [1.0]])
+    initial = predictor.standing_start(context)
+    c = context.new_tensor([[0.12, 0.21 if foot == "L" else -0.21, 0.0] for foot in order])[None].repeat(2, 1, 1)
+    c[1, 0, 0] = 0.15
+    c.requires_grad_()
+    native = predictor.rollout(initial, order, c)
+    calls = []
+    rollout = predictor.rollout
+
+    def observe(state, sequence, targets):
+        result = rollout(state, sequence, targets)
+        calls.append(len(targets))
+        return result
+
+    monkeypatch.setattr(predictor, "rollout", observe)
+    approximate = predictor.linearize(initial, order, c)
+    assert calls == [2, 2 * 2 * c.shape[1] * 3], "This fixture must exercise batched FD on stable clocks"
+    assert_same_prediction(approximate, native)
+    with prediction_precision():
+        for get in (
+            lambda p: p.steps[-1].achieved[:, "LR".index(order[-1]), :2].sum(-1),
+            lambda p: p.steps[-1].achieved[:, "LR".index(order[-1]), 2],
+            lambda p: p.steps[-1].actions[:, :12, 2].mean(-1),
+            lambda p: p.steps[-1].terminal.tensors[7][:, -1, 5],
+        ):
+            (exact,) = torch.autograd.grad(get(native).sum(), c, retain_graph=True)
+            (fd,) = torch.autograd.grad(get(approximate).sum(), c, retain_graph=True)
+            torch.testing.assert_close(fd, exact, rtol=0.04, atol=0.015)

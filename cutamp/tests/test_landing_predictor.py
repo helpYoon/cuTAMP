@@ -79,14 +79,58 @@ def test_packed_clock_change_keeps_the_original_derivative():
     from cutamp.landing_predictor import LandingPredictor, LandingState
 
     # Simulate two batched kernels rounding to opposite sides of an issue tick.
-    class ClockBoundary:
+    class ClockBoundary(LandingPredictor):
+        def __init__(self):
+            pass  # This fixture supplies a synthetic CPU tick.
+
         def rollout(self, state, order, u):
             clock = torch.full((len(u),), 45 if len(u) == 1 else 46)
             return SimpleNamespace(steps=(SimpleNamespace(clock=clock),), value=u.square().sum(-1))
 
     u = torch.tensor([[[0.12, 0.21, 0.0]]], requires_grad=True)
     state = LandingState((torch.zeros(1, 3),), torch.zeros(1, 38), "boundary fixture")
-    result = LandingPredictor.linearize(ClockBoundary(), state, "L", u)
+    result = ClockBoundary().linearize_autodiff(state, "L", u)
     assert result.steps[0].clock.item() == 45
     (grad,) = torch.autograd.grad(result.value.sum(), u)
     torch.testing.assert_close(grad, 2 * u)
+
+
+def test_finite_difference_probe_crossing_second_clock_uses_nominal_derivatives():
+    from types import SimpleNamespace
+
+    from cutamp.landing_predictor import LandingPredictor, LandingState
+
+    class Branch(LandingPredictor):
+        def __init__(self):
+            self.derivative_method = "finite_difference"
+            self.batches = []
+
+        def rollout(self, state, order, u):
+            self.batches.append(len(u))
+            # The second issue duration depends on the first step's terminal state.
+            first = torch.full((len(u),), 45)
+            second = first + (u[:, 0, 0] < 0).long()
+            if len(u) == 12:  # Likewise exercise the original-batch reverse fallback.
+                second += 1
+            steps = tuple(SimpleNamespace(clock=c) for c in (first, second))
+            val = u.square().sum((1, 2)) + (second - first).float()
+            return SimpleNamespace(steps=steps, value=val)
+
+    p = Branch()
+    state = LandingState((torch.zeros(2, 3),), torch.zeros(2, 38), "fixed clock-boundary fixture")
+    c = torch.full((2, 2, 3), 0.1)
+    c[1, 0, 0] = 0
+    c.requires_grad_()
+    out = p.linearize(state, "LR", c)
+    assert p.batches[:2] == [2, 24]  # Two particles, six +/- coordinate pairs each.
+    (g,) = torch.autograd.grad(out.value.sum(), c)
+    torch.testing.assert_close(g, 2 * c)
+
+
+def test_central_difference_wraps_sole_yaw_before_dividing():
+    from cutamp.landing_predictor import _central_difference
+
+    h = torch.tensor([0.001], dtype=torch.float64)
+    poses = torch.tensor([[[1.0, 0.0, -math.pi + 0.001], [0.996, 0.0, math.pi - 0.001]]], dtype=h.dtype)
+    jac = _central_difference(poses, h, 2)
+    torch.testing.assert_close(jac, h.new_tensor([[[2.0, 0.0, 1.0]]]))
