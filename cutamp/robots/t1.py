@@ -231,7 +231,9 @@ def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None) -> Kinematic
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg = t1_curobo_cfg(model)
+    # The cuRobo loader replaces each extra-link dictionary with a LinkParams
+    # in place. Other consumers use the original YAML units and field names.
+    cfg = copy.deepcopy(t1_curobo_cfg(model))
     kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg)
     kin = Kinematics(kin_cfg, compute_com=True)
     _check_joint_order(model, kin.joint_names)

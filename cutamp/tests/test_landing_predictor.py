@@ -37,3 +37,37 @@ def test_phase_checks_use_each_rows_deadline_and_ignore_padded_ticks():
     assert checks.support_ok.tolist() == [False, True, True]
     assert checks.hold_ok.tolist() == [True, False, True]
     assert checks.hold_xy.shape == (3, 2)
+
+
+def test_two_locally_accurate_issues_can_miss_the_intended_world_stance():
+    from types import SimpleNamespace
+
+    from cutamp.landing_predictor import LandingPredictor, LandingState, _intended_pair
+
+    # Introduce 1.2 cm forward error on each swinging sole. R's second command
+    # uses the achieved L foot, so the final world error accumulates to 2.4 cm.
+    class Predictor:
+        device = torch.device("cpu")
+        model = SimpleNamespace(feet=lambda x: (x[0],))
+
+        def _step(self, state, side, command):
+            issued = _intended_pair(state.tensors[0], side, command)
+            achieved = issued.clone()
+            achieved[:, side, 0] += 0.012
+            xy, yaw, good = landing_errors(achieved, issued)
+            return SimpleNamespace(
+                reference=issued,
+                achieved=achieved,
+                xy_error=xy,
+                yaw_error=yaw,
+                tracking_ok=good,
+                terminal=LandingState((achieved,) * 9, state.dynamics, state.history_source),
+            )
+
+    standing = torch.tensor([[[0.0, 0.105, 0.0], [0.0, -0.105, 0.0]]])
+    start = LandingState((standing,) * 9, torch.zeros(1, 38), "analytic regression")
+    c = torch.tensor([[[0.12, 0.21, 0.0], [0.12, -0.21, 0.0]]])
+    out = LandingPredictor.rollout(Predictor(), start, "LR", c)
+    assert all(step.tracking_ok.item() for step in out.steps)
+    assert not out.tracking_ok.item()
+    torch.testing.assert_close(out.final_xy_error, torch.tensor([[0.012, 0.024]]))

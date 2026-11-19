@@ -280,8 +280,15 @@ class LandingPredictor:
         )
 
     @prediction_precision()
+    @torch.jit.optimized_execution(False)
     def rollout(self, initial: LandingState, order: str, commands: Tensor) -> LandingPrediction:
-        """Evaluate one exact gap order in parallel across all rows, with a fresh clock on each call."""
+        """Evaluate one exact gap order in parallel across all rows, with a fresh clock on each call.
+
+        Use normal ATen autograd for the deployed tick. Torch 2.9's profiling
+        executor can specialize the recurrent backward incorrectly when a fresh
+        module's first invocation consumes an externally supplied state and a
+        differentiable command. Its forward values then still match deployment.
+        """
         if order == "none":  # exact-order name emitted by the search
             order = ""
         if order not in ("", "L", "R", "LR", "RL"):

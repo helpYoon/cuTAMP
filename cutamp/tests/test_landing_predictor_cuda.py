@@ -99,3 +99,55 @@ def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
         prediction = predictor.rollout(start, edge.order, commands)
         assert prediction.tracking_ok.item()
         assert predictor.rollout(start, "none", commands[:, :0]).terminal is start
+
+
+@needs_cuda
+def test_importing_external_history_into_fresh_module_preserves_command_jacobian(predictor):
+    """A public planner run may construct its own predictor after an observation packet was prepared."""
+    default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
+    independent = LandingPredictor(Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default)))
+    context = torch.zeros(1, 38, device=predictor.device)
+    context[:, 0] = 0.25 / 0.45
+    context[:, -5:] = -1.0
+    observed = predictor.standing_start(context)
+    u = context.new_tensor([[[0.12, 0.21, 0.0]]]).requires_grad_()
+    with prediction_precision():
+        out = independent.rollout(observed, "L", u)
+        (derivative,) = torch.autograd.grad(out.steps[0].achieved[0, 0, 0], u)
+    delta = torch.zeros_like(u)
+    delta[:, :, 0] = 0.001
+    with torch.no_grad():
+        left = independent.rollout(observed, "L", u - delta)
+        right = independent.rollout(observed, "L", u + delta)
+    fd = (right.steps[0].achieved[0, 0, 0] - left.steps[0].achieved[0, 0, 0]) / 0.002
+    torch.testing.assert_close(derivative[0, 0, 0], fd, atol=0.004, rtol=0.008)
+    torch.testing.assert_close(derivative[0, 0], u.new_tensor([0.899625, -0.016141, 0.011681]), rtol=0.006, atol=0.0003)
+
+
+@needs_cuda
+@pytest.mark.parametrize("side", ["L", "R"])
+def test_command_grid_directional_derivative_on_smooth_clocks(side, predictor):
+    c = torch.tensor(
+        [[-0.12, 0.20, 0.03], [0.08, 0.23, -0.04], [0.15, 0.24, 0.02], [0.22, 0.26, 0.06]], device=predictor.device
+    )
+    sign = 1 if side == "L" else -1
+    c = (c * c.new_tensor([1.0, sign, sign]))[:, None].requires_grad_()
+    d = c.new_zeros(len(c), 38)
+    d[:, 0] = 0.25 / 0.45
+    d[:, -5:] = -1
+    state = predictor.standing_start(d)
+    v = c.new_tensor([0.8, -0.35 * sign, 0.2 * sign])
+
+    def score(u):
+        step = predictor.rollout(state, side, u).steps[0]
+        return step.achieved[:, "LR".index(side), 0], step.clock
+
+    with prediction_precision():
+        value, clock = score(c)
+        (jac,) = torch.autograd.grad(value.sum(), c)
+        with torch.no_grad():
+            lo, lc = score(c - 0.0007 * v)
+            hi, hc = score(c + 0.0007 * v)
+    smooth = (lc == clock) & (hc == clock)
+    assert smooth.sum() >= 2
+    torch.testing.assert_close((jac[:, 0] * v).sum(1)[smooth], ((hi - lo) / 0.0014)[smooth], rtol=0.035, atol=0.015)
