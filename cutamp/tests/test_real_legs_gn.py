@@ -10,8 +10,8 @@
 - level 1's collision row is positive exactly where the scene's collision_fn or cuRobo's self-collision kernel is,
   and it clears contact holding the hand; GN IK accepts only confs that pass the checks on their own, and the
   movables it checks sit where the rollout puts them.
-The GPU tests share conftest's module-scoped ``real_world`` and ``real_plan``: one world per module, and each test
-takes its confs from ``real_plan``."""
+The GPU tests share conftest's module-scoped ``real_world``. Most draw their confs from ``real_plan``;
+the centering comparison fixes the pick and place to pair the two IK solves."""
 
 import math
 
@@ -203,7 +203,7 @@ def test_gn_ik_centres_the_com(real_world, monkeypatch):
     ]
     with torch.random.fork_rng(devices=[real_world.device]):
         torch.manual_seed(0)
-        init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())
+        init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64, step_mode="off"), default_checker())
         particles = init(skeleton)
         for dep in _build_ik_deps(skeleton, real_world):
             args = (real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles), init.ik_tol)
