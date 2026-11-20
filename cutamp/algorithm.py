@@ -903,7 +903,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 incoming,
                 fixed=inputs.orders,
                 strategy=config.step_search_order,
-                prefer_reach=screened and inputs.orders is None,
+                prefer_reach=inputs.orders is None,
                 deadline=deadline,
             )
             if len(seen) >= config.num_initial_plans:

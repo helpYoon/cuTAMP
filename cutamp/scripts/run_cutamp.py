@@ -182,6 +182,7 @@ def entrypoint():
     parser.add_argument("--step_derivative_method", choices=("finite_difference", "autodiff"),
                         default=_defaults.step_derivative_method,
                         help="Learned-step solver. Batched finite differences use two wider updates; autodiff uses the four-update reference.")
+    parser.add_argument("--step_optimizer", choices=["adam"], help="Experimental joint closed-loop Adam refinement.")
     parser.add_argument("--step_proposal_count", type=int, default=_defaults.step_proposal_count,
                         help="Commands to screen per learned-step batch (default 192 for pick, 128 for place). Use 0 for the historical SQP route. "
                              "Positive counts default to forward-only checking; use --step_refine_iterations to add SQP.")
@@ -258,7 +259,7 @@ def entrypoint():
         max_step_schedules=args.max_step_schedules, step_lag=args.step_lag,
         landing_bundle=args.landing_bundle, step_reach_map=args.step_reach_map,
         step_accuracy_table=args.step_accuracy_table, step_proposal_count=args.step_proposal_count,
-        step_refine_iterations=args.step_refine_iterations,
+        step_refine_iterations=args.step_refine_iterations, step_optimizer=args.step_optimizer,
         step_derivative_method=args.step_derivative_method, step_trust_scale=args.step_trust_scale,
         step_particle_batch_size=args.step_particle_batch_size, require_modeled_load=args.require_modeled_load,
         reik_interval=args.reik_interval,

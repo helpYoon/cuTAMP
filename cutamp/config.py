@@ -76,6 +76,7 @@ class TAMPConfiguration:
     step_reach_map: str | None = None
     step_accuracy_table: str | None = None
     step_derivative_method: str | None = None
+    step_optimizer: str | None = None  # opt-in experimental joint Adam
     # None selects the solver settings for the actual schedule (see for_refinement).
     step_refine_iterations: int | None = None
     step_trust_scale: float | None = None
@@ -125,6 +126,8 @@ class TAMPConfiguration:
             object.__setattr__(self, "soft_cost", default)
 
     def _model_proposal_count(self):
+        if self.step_optimizer == "adam":
+            return 0
         if self.step_proposal_count is not None:
             return self.step_proposal_count
         if self.step_derivative_method is not None or self.step_refine_iterations is not None or self.step_trust_scale is not None:
@@ -133,7 +136,7 @@ class TAMPConfiguration:
 
     def for_refinement(self, *, stepped: bool) -> "TAMPConfiguration":
         """Resolve optional overrides once a candidate's actual footstep count is known."""
-        derivative = self.step_derivative_method or "finite_difference"
+        derivative = "autodiff" if self.step_optimizer == "adam" else self.step_derivative_method or "finite_difference"
         proposals = self._model_proposal_count() if stepped and self.step_mode == "model" else 0
         fast = stepped and self.step_mode == "model" and derivative == "finite_difference"
         updates, trust_scale, weight = (2, 2.0, 4.0) if fast else (4, 1.0, 1.0)
@@ -210,6 +213,11 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError("step_place_proposal_count must be a nonnegative integer")
     if config.step_proposal_count and config.step_mode != "model":
         raise ValueError("Forward command proposals require step_mode=model")
+    if config.step_optimizer == "adam" and (
+        config.step_mode != "model" or config.step_proposal_count or config.step_place_proposal_count
+        or config.step_derivative_method == "finite_difference"
+    ):
+        raise ValueError("The experimental Adam route uses model autodiff and zero screening proposals")
     updates = config.step_refine_iterations
     if (updates is not None and (type(updates) is not int or updates < 0)) or config.step_particle_batch_size < 1:
         raise ValueError("Invalid step refinement iteration or batch count")

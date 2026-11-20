@@ -182,7 +182,7 @@ def _generated_grasp_indices(pool, scores, objects, tool, arm, seeds, gap, ranks
     return choice
 
 
-def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds):
+def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds, bindings=None, grasp_indices=None):
     n = stop - first
     like = world.q_init
     particles = {k: like.expand(n, -1).clone() for k in ("left_q0", "right_q0")}
@@ -196,7 +196,9 @@ def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds):
         if op.operator.metadata.action_type == "pick":
             pool, scores = pools[grasp]
             idx = torch.arange(first, stop, device=like.device) % len(pool)
-            if obj in inputs.grasps:
+            if grasp_indices is not None:
+                choice = grasp_indices[grasp + "_idx"]
+            elif obj in inputs.grasps:
                 choice = torch.argsort(scores, descending=True, stable=True)[idx]
             else:
                 tool = world.tool_from_ee[world.tool_frame_for_arm(arm)]
@@ -206,10 +208,13 @@ def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds):
         if op.operator.metadata.action_type == "place":
             key = op.arg("placement")
             fixed = inputs.placements or {}
-            particles[key] = (
-                _batch(fixed[key], first, stop, (4,), like).clone()
-                if key in fixed
-                else _draw_placements(
+            if bindings is not None and key in bindings:
+                particles[key] = project_supported_placement(bindings[key], world.get_collision_spheres(obj),
+                                                            world.get_aabb(op.arg("surface")))
+            elif key in fixed:
+                particles[key] = _batch(fixed[key], first, stop, (4,), like).clone()
+            else:
+                particles[key] = _draw_placements(
                     world,
                     world.get_object(obj),
                     world.get_collision_spheres(obj),
@@ -217,7 +222,6 @@ def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds):
                     g,
                     surface_bounds=world.get_aabb(op.arg("surface")),
                 )
-            )
             objects[obj] = action_4dof_to_mat4x4(particles[key])
         tool = g @ world.tool_from_ee[world.tool_frame_for_arm(arm)]
         wrists.append(objects[obj] @ tool)
@@ -350,19 +354,60 @@ def _summary(result, commands, order, initial, validation, i, *, incoming, wrist
 
 
 def _refine_batch(
-    proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop, motion_inputs, deadline
+    proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop, motion_inputs, deadline,
+    *, bindings=None, grasp_indices=None, objective=False,
 ):
     groups = _groups(proposal.skeleton)
     arm_skeleton = [op for op in proposal.skeleton if op.operator.metadata.action_type != "step"]
     cost_function = CostFunction(arm_skeleton, world, config)
     n = stop - first
     like = world.q_init
-    particles, objects, wrists, held_before = _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds)
+    particles, objects, wrists, held_before = _placements_and_grasps(
+        groups, world, pools, inputs, first, stop, seeds, bindings, grasp_indices
+    )
     placement_seeds = {
         op.arg("placement"): particles[op.arg("placement")].clone()
         for _, op in groups
         if op.operator.metadata.action_type == "place"
     }
+    if config.step_optimizer == "adam" and bindings is None:
+        from cutamp.step_adam import optimize_particles
+
+        initial = {key: value for key, value in placement_seeds.items() if key not in (inputs.placements or {})}
+        bound_grasps = {key: value for key, value in particles.items() if key.endswith("_idx")}
+        for j, (steps, _) in enumerate(groups):
+            if steps:
+                initial[f"foot{j}"] = _command_inputs(inputs, seeds, j, steps, like)
+
+        def evaluate(values, objective=True):
+            return _refine_batch(proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first,
+                                 stop, motion_inputs, deadline, bindings=values, grasp_indices=bound_grasps,
+                                 objective=objective)
+
+        best, report = optimize_particles(initial, evaluate, config.step_refine_iterations, config.lr)
+        with torch.no_grad():
+            verified = evaluate(best, objective=False)
+        for row in verified.rows:
+            idx = row.index - first
+            row.metrics["step_optimizer"] = "adam"
+            row.metrics["selected_adam_iteration"] = int(report["iteration"][idx])
+            for j, gap in enumerate(row.metrics["gaps"]):
+                key = f"foot{j}"
+                if key in initial:
+                    gap["adam_seed_commands"] = _list(initial[key][idx])
+                    grad = report.get("initial_gradient", {}).get(key)
+                    gap["initial_adam_loss_gradient"] = _list(grad[idx]) if grad is not None else None
+        verified.diagnostics["adam"] = {
+            "first_index": first, "iterations": config.step_refine_iterations,
+            "selected_iteration": _list(report["iteration"]), "violation": _list(report["violation"]),
+            "initial_violation": _list(report["initial_violation"]),
+            "invalid_gradients": _list(report["invalid_gradients"]),
+            "initial_gradient": {key: _list(value) for key, value in report.get("initial_gradient", {}).items()},
+            "initial": {key: _list(value) for key, value in initial.items()},
+            "selected": {key: _list(value) for key, value in best.items()},
+        }
+        return verified
+    penalties, center_costs = [], []
     rest = particles["left_q0"]
     incoming = _planar(world.stance_soles).expand(n, -1, -1)
     d = nominal_landing_dynamics(like, n, config.step_lag)
@@ -429,7 +474,8 @@ def _refine_batch(
         if deadline is not None and monotonic() >= deadline:
             return StepResult([], None, "budget_exhausted", "continuous refinement time budget expired")
         order = proposal.orders[j]
-        cmds = _command_inputs(inputs, seeds, j, steps, like)
+        cmds = (bindings[f"foot{j}"] if bindings is not None and steps
+                else _command_inputs(inputs, seeds, j, steps, like))
         seed = _inputs_for_gap(inputs, seeds, j, op, incoming, cmds, rest, first, stop)
         arm = op.operator.metadata.arm
         held = held_before[j]
@@ -448,7 +494,7 @@ def _refine_batch(
                 qd = torch.zeros_like(rest)
             init = adapter.initialize(rest, d, qd, observed=obs, world=world, object_poses=objects[j], held=held)
             start, usable = init.state, init.compatible
-            if not usable.any():
+            if not usable.any() and not objective:
                 return StepResult(
                     [],
                     None,
@@ -463,7 +509,7 @@ def _refine_batch(
         if steps and held and config.require_modeled_load:
             return StepResult([], None, "unavailable", "seed-3 dynamics have no payload model")
         eligible_sources = None
-        if config.step_mode == "model" and inputs.orders is None and config.step_refine_iterations == 0 and endpoints:
+        if bindings is None and config.step_mode == "model" and inputs.orders is None and config.step_refine_iterations == 0 and endpoints:
             prefix = torch.stack(endpoints, dim=1)
             eligible_sources = usable & prefix.all(1)
             if not eligible_sources.any():
@@ -480,7 +526,7 @@ def _refine_batch(
             if place.operator.metadata.action_type != "place" or k in prepared_places:
                 continue
             key = place.arg("placement")
-            if key not in (inputs.placements or {}):
+            if bindings is None and key not in (inputs.placements or {}):
                 nominal = _nominal(incoming, order, cmds)
                 place_seed = (
                     seed
@@ -549,6 +595,25 @@ def _refine_batch(
                     rows.update(sweep_constraint_rows(world, adapter, pred, objects[j], held))
             return rows, centers
 
+        if objective:
+            from cutamp.step_refinement import _evaluate
+
+            # Each replay starts from the shared initial state. The next gap includes
+            # the retraction and controller history prepared from this gap's prediction.
+            forward_only = False
+            prediction = active_predictor.rollout(start, order, cmds) if active_predictor is not None else None
+            ev = _evaluate(active_predictor, start, incoming, order.replace("none", ""), cmds, arm, wrists[j],
+                           seed, margin, coupled_rows, None, None, solve_ik=endpoint_solver(j, rest, seed),
+                           prediction=prediction)
+            penalties.append(ev.matrix().relu().square().sum(-1))
+            center_costs.append(ev.worst_center_squared())
+            incoming = ev.ik.soles
+            if prediction is not None:
+                rest = adapter.planner(prediction.terminal.tensors[:6])[0]
+            if j in retracted and j + 1 < len(groups):
+                rest = _retract_on_stance(incoming, rest, arm, world.joint_limits, other_arm_reference=other).q
+            continue
+
         screened = None
         proposal_seed = cmds
         proposal_count = config.step_place_proposal_count if op.operator.metadata.action_type == "place" else config.step_proposal_count
@@ -569,7 +634,7 @@ def _refine_batch(
             )
             cmds = cmds.clone()
             cmds[screened.particle_indices] = screened.commands
-        forward_only = screened is not None and config.step_refine_iterations == 0
+        forward_only = bindings is not None or (screened is not None and config.step_refine_iterations == 0)
         result = refine_gap(
             active_predictor,
             start,
@@ -580,10 +645,10 @@ def _refine_batch(
             seed,
             margin_m=margin,
             forward_only=forward_only,
-            screened_prediction=screened.batch_prediction if forward_only else None,
+            screened_prediction=screened.batch_prediction if screened is not None and forward_only else None,
             solve_ik=endpoint_solver(j, rest, seed),
             centering_weight=config.com_center_weight,
-            max_iterations=config.step_refine_iterations,
+            max_iterations=0 if bindings is not None else config.step_refine_iterations,
             trust_scale=config.step_trust_scale,
             deadline=deadline,
             extra_rows=coupled_rows,
@@ -640,7 +705,7 @@ def _refine_batch(
                                  screened_indices=None if screened is None else screened.particle_indices,
                                  proposal_seed=proposal_seed, placement_seed=placement_seeds.get(place_key),
                                  placement=particles.get(place_key)))
-        if forward_only and inputs.orders is None and j + 1 < len(groups):
+        if bindings is None and forward_only and inputs.orders is None and j + 1 < len(groups):
             prefix = torch.stack(endpoints, dim=1)
             if not prefix.all(1).any():
                 # Every complete particle must pass *all* its handoffs. A later solve
@@ -651,6 +716,9 @@ def _refine_batch(
                 return StepResult([], flags, "unresolved", "all particles failed a manipulation prefix",
                                   {"row": first + best, "gaps": records(best)})
         incoming = final
+
+    if objective:
+        return torch.stack(penalties).sum(0), config.com_center_weight * torch.stack(center_costs).amax(0)
 
     j = -1
     for op in arm_skeleton:
@@ -802,7 +870,7 @@ def refine_step_particles(
         seeds.extend(islice(proposal.alternative_seeds, n - 1))
     rows, feedback, diagnostic = [], [], {}
     status, reason = "unresolved", "no particle met all applicable constraints"
-    attempted_seeds, motion_inputs = [], {}
+    attempted_seeds, motion_inputs, adam_batches = [], {}, []
     groups = _groups(proposal.skeleton)
     for first in range(0, n, config.step_particle_batch_size):
         stop = min(first + config.step_particle_batch_size, n)
@@ -834,6 +902,8 @@ def refine_step_particles(
                 status, reason = "budget_exhausted", str(exc)
             break
         rows.extend(batch.rows)
+        if "adam" in batch.diagnostics:
+            adam_batches.append(batch.diagnostics.pop("adam"))
         if batch.endpoint_ok is not None:
             feedback.append(batch.endpoint_ok)
         if not diagnostic or batch.rows:
@@ -865,4 +935,6 @@ def refine_step_particles(
             _validate_motion_rows(eligible, pools, proposal.skeleton, world, config, attempt, deadline=deadline)
         )
     diagnostic["attempted_seed_commands"] = attempted_seeds
+    if adam_batches:
+        diagnostic["adam_batches"] = adam_batches
     return StepResult(rows, torch.cat(feedback) if feedback else None, status, reason, diagnostic)
