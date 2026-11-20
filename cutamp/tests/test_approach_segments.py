@@ -141,6 +141,33 @@ def test_line_motion_restores_the_row(planner):
 
 
 @needs_cuda
+def test_retimed_retract_rejects_self_collision_between_clear_endpoints(real_world, planner, monkeypatch):
+    from types import SimpleNamespace
+
+    from curobo.types import JointState
+
+    import cutamp.motion_solver as ms
+    from cutamp.tests.test_t1_real_legs_model import hips_crossed
+    from cutamp.utils.timer import TorchTimer
+
+    home = real_world.q_init.flatten()
+    names = list(planner.kinematics.joint_names)
+    original = JointState.from_position(torch.stack([home, home]), joint_names=names)
+    retimed = JointState.from_position(torch.stack([home, hips_crossed(real_world), home]), joint_names=names)
+    # Supply the two consecutive solver outputs so the final gate must inspect the resampled frame.
+    result = SimpleNamespace(get_interpolated_plan=lambda: original)
+    monkeypatch.setattr(ms, "_plan_arm_to_conf", lambda *a, **kw: result)
+    stats = {"retime": 2.0, "binding": "torque", "com_min_margin": 0.05, "zmp_min_margin": 0.05}
+    monkeypatch.setattr(ms, "_balance_gate", lambda *a: (retimed, stats, original))
+    meta = SimpleNamespace(action_type="retract", arm="left", is_motion=True)
+    op = SimpleNamespace(operator=SimpleNamespace(metadata=meta), name="Retract", values=("q_ret",))
+    with pytest.raises(RuntimeError, match=r"self.collision.*frame 1") as err:
+        ms.solve_curobo({"plan_skeleton": [op]}, {"left_q0": home, "q_ret": home}, real_world,
+                        None, TorchTimer(), None, get_planner=lambda: planner, ik_tol=None)
+    assert err.value.check == "self_collision" and err.value.op_idx == 0
+
+
+@needs_cuda
 def test_attached_block_clears_the_floor(real_world, real_plan, planner):
     # blocks_t1 on the floor (h 0.0): with the first pick's block attached at its grasp conf, where the lift starts,
     # the RRT's feasibility check (on the planner's spheres) passes. The same spheres moved just into the floor fail

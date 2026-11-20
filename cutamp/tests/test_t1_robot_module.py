@@ -33,6 +33,30 @@ def test_t1_has_two_tool_frames(t1_container):
     assert RIGHT_TOOL_FRAME in t1_container.gripper_spheres
 
 
+def test_nominal_kinematics_reuses_parser_but_owns_spheres(monkeypatch, request):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from curobo.types import DeviceCfg
+    from cutamp.robots import t1
+
+    t1._nominal_kinematics_cfg.cache_clear()
+    request.addfinalizer(t1._nominal_kinematics_cfg.cache_clear)
+    model = replace(t1.REAL_LEGS)
+    parses = []
+    def parse(cfg, *, device_cfg):
+        parses.append(cfg)
+        return SimpleNamespace(spheres=torch.ones(1, 4))
+    monkeypatch.setattr(t1.KinematicsCfg, "from_robot_yaml_file", parse)
+    monkeypatch.setattr(t1, "Kinematics", lambda cfg, **kw: SimpleNamespace(config=cfg, joint_names=model.joint_names))
+    device = DeviceCfg(device="cpu")
+    first = t1.get_t1_kinematics(model, device)
+    first.config.spheres.zero_()
+    second = t1.get_t1_kinematics(model, device)
+    assert len(parses) == 1 and torch.all(second.config.spheres == 1)
+    t1.get_t1_kinematics(model, device, robot_cfg=t1.t1_curobo_cfg(model))
+    assert len(parses) == 2
+
+
 def _raw_plan_input():
     """A two-segment plan as solve_curobo returns one, every value distinct: each JointState a batch of one, in the
     real legs' joint order reversed plus the head's two locked joints. The balance gate slowed the second segment."""

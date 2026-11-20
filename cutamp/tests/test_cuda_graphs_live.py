@@ -45,7 +45,7 @@ def _run_demo(tmp_path, monkeypatch, n) -> list:
 
     monkeypatch.setattr(cutamp.algorithm, "build_motion_planner", build)
     monkeypatch.setattr(_BestSnapshot, "update", finish_warmup_after_first_step)
-    config = TAMPConfiguration(num_particles=n, cuda_graphs=True, num_opt_steps=26, early_stop_patience=0,
+    config = TAMPConfiguration(step_mode="off", num_particles=n, cuda_graphs=True, num_opt_steps=26, early_stop_patience=0,
                                soft_cost=["joint_limit_margin", "minimize_body_movement"],
                                enable_visualizer=False, curobo_plan=True, experiment_root=str(tmp_path))
     cutamp_demo(load_env(os.path.join(get_env_dir(), "blocks_t1.yml")), config)

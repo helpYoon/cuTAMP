@@ -29,6 +29,7 @@ class Timings:
         self.stack = []
         self.seconds = Counter()
         self.calls = Counter()
+        self.samples = defaultdict(list)
         self.vjps = defaultdict(list)
 
     @contextmanager
@@ -42,6 +43,7 @@ class Timings:
             name, start, children = self.stack.pop()
             duration = perf_counter() - start
             self.seconds[name] += duration - children
+            self.samples[name].append(duration - children)
             self.calls[name] += 1
             if self.stack:
                 self.stack[-1][2] += duration

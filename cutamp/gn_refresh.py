@@ -36,6 +36,8 @@ import torch
 
 from curobo.types import JointState, Pose
 
+from cutamp._curobo_internals import sphere_position_vjp
+
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
 # refresh records' gn_fail counts (opt_metrics["reik_refresh"]) show a fat
 # non-converged band.
@@ -77,6 +79,13 @@ def _self_pairs(kin):
     return pairs[:, 0].contiguous(), pairs[:, 1].contiguous(), pad
 
 
+def self_sphere_overlaps(kin, spheres):
+    """Signed overlap in metres per active cuRobo pair; negative values give separation."""
+    i, j, pad = _self_pairs(kin)
+    centers, radii = spheres[..., :3], spheres[..., 3] + pad
+    return radii[..., i] + radii[..., j] - (centers[..., i, :] - centers[..., j, :]).norm(dim=-1)
+
+
 def collision_penetration(world, spheres: torch.Tensor, movables: Optional[torch.Tensor] = None) -> torch.Tensor:
     """``[N]``: the summed linear penetration depth (m) of the robot's ``spheres`` ``[N, S, 4]`` (an FK of
     ``world.kinematics`` or one of its sites; differentiable) with the static scene (``world.collision_fn``),
@@ -90,10 +99,7 @@ def collision_penetration(world, spheres: torch.Tensor, movables: Optional[torch
     if movables is not None:
         from cutamp.costs import sphere_to_sphere_overlap
         pen = pen + sphere_to_sphere_overlap(spheres, movables, activation_distance=0.0)
-    i, j, pad = _self_pairs(world.kinematics)
-    c, r = spheres[..., :3], spheres[..., 3] + pad
-    d = (c[:, i] - c[:, j]).norm(dim=-1)
-    return pen + torch.relu(r[:, i] + r[:, j] - d).sum(-1)
+    return pen + self_sphere_overlaps(world.kinematics, spheres).relu().sum(-1)
 
 
 @lru_cache(maxsize=None)
@@ -628,7 +634,8 @@ def gn_project_balanced(
             jcy = torch.autograd.grad(com_g[:, 1].sum(), q_g, retain_graph=collision)[0].clone()
             if collision:
                 pen_g = collision_penetration(world, state.robot_spheres, movables)
-                jpen = torch.autograd.grad(pen_g.sum(), q_g)[0]
+                forces = torch.autograd.grad(pen_g.sum(), state.robot_spheres)[0]
+                jpen = sphere_position_vjp(kin, forces).reshape_as(q_g)
         with torch.no_grad():
             jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
             com = com_g.detach()

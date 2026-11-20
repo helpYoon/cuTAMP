@@ -8,7 +8,8 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from cutamp.com_polygon_cost import physical_support_margin
+from cutamp.com_polygon_cost import physical_support_centroid, physical_support_margin
+from cutamp.stance import stance_joint_limits
 from cutamp.robots.t1 import REAL_LEGS, t1_curobo_cfg
 
 
@@ -38,9 +39,10 @@ class _Kinematics:
     of the *full* Hessian of the pose and posture residual objective on its active branch.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, cfg=None):
         model = REAL_LEGS
-        cfg = t1_curobo_cfg(model)["robot_cfg"]["kinematics"]
+        if cfg is None:
+            cfg = t1_curobo_cfg(model)["robot_cfg"]["kinematics"]
         tree = ET.parse(cfg["urdf_path"]).getroot()
         names = model.joint_names
         self.n = len(names)
@@ -57,7 +59,6 @@ class _Kinematics:
         upper = np.zeros(self.n)
         for i, sub in enumerate(("x", "y", "z", "pitch", "roll", "yaw")):
             lower[i], upper[i] = cfg["extra_links"]["base_link_" + sub]["joint_limits"]
-        self.base_axes = tensor(np.eye(3)[[1, 0, 2]])
         self.eye = torch.eye(3, device=device, dtype=torch.float64)
         children = {}
         for joint in tree.findall("joint"):
@@ -65,6 +66,7 @@ class _Kinematics:
                 continue
             children.setdefault(joint.find("parent").get("link"), []).append(joint)
         self.levels = []
+        origin_frames, joint_axes, angle_columns = [], [], []
         links = ["Trunk"]
         parents = links.copy()
         ancestors = {"Trunk": [3, 4, 5]}
@@ -93,14 +95,35 @@ class _Kinematics:
                     level.append((i, max(j, 0), _xyz(origin.get("xyz")), r, a if j >= 0 else np.zeros(3)))
             if level:
                 ix, jx, p, r, a = zip(*level)
-                self.levels.append((indices(ix), indices(jx), tensor(p), tensor(r), tensor(a)))
+                first = len(origin_frames)
+                for offset, rotation in zip(p, r):
+                    frame = np.eye(4)
+                    frame[:3, :3], frame[:3, 3] = rotation, offset
+                    origin_frames.append(frame)
+                joint_axes.extend(a)
+                angle_columns.extend(jx)
+                self.levels.append((indices(ix), slice(first, len(origin_frames))))
             links.extend(limb)
             parents = limb
+        # Constant Rodrigues coefficients let every local joint transform be evaluated
+        # in one batch. Only the parent/child products depend on the tree level.
+        origins = np.stack(origin_frames)
+        axes = np.array(joint_axes)
+        skew = np.zeros_like(origins)
+        skew[:, 0, 1], skew[:, 1, 0] = -axes[:, 2], axes[:, 2]
+        skew[:, 2, 0], skew[:, 0, 2] = -axes[:, 1], axes[:, 1]
+        skew[:, 1, 2], skew[:, 2, 1] = -axes[:, 0], axes[:, 0]
+        self.origins = tensor(origins)
+        self.sin_coeff = tensor(origins @ skew)
+        self.cos_coeff = tensor(origins @ skew @ skew)
+        self.angle_columns = indices(angle_columns)
+        self.axes = tensor(axes[np.array(joint_links[6:]) - 1])
         clip = dict(zip(cfg["cspace"]["joint_names"], cfg["cspace"]["position_limit_clip"]))
         widths = np.array([clip[name] for name in names])
         self.lower, self.upper = tensor(lower + widths), tensor(upper - widths)
         self.prior = tensor([0.035] * 3 + [0.008] * (self.n - 3))
         self.joint_links = indices(joint_links[6:])
+        self.links = tuple(links)
         self.end = {}
         for arm in ("left", "right"):
             tools = ("left_foot_link", "right_foot_link", f"{arm}_base_link")
@@ -118,37 +141,40 @@ class _Kinematics:
             centers.append(_xyz(inert.find("origin").get("xyz")) if inert is not None else np.zeros(3))
         self.centers = tensor(centers)
         self.mass_fraction = tensor(masses) / sum(masses)
+        descendant = [[j in ancestors[name] for name in links] for j in range(self.n)]
+        self.descendant_mass = tensor(descendant) * self.mass_fraction
+        self.subtree_mass = self.descendant_mass.sum(-1, keepdim=True)
 
-    def _rot(self, axis, angle):
-        x, y, z = axis.unbind(-1)
-        o = torch.zeros_like(x)
-        K = torch.stack((o, -z, y, z, o, -x, -y, x, o), -1).reshape(*x.shape, 3, 3)
-        return self.eye + angle.sin()[..., None, None] * K + (1 - angle.cos())[..., None, None] * (K @ K)
-
-    def fk(self, q, arm, jacobian=True):
+    def link_frames(self, q, jacobian=False):
         b = len(q)
-        # Map constants into the arithmetic type when a complex-step evaluation is requested.
-        base_axes = self.base_axes.to(q.dtype)
-        R = self.eye.to(q.dtype).expand(b, -1, -1)
-        axes = []
-        for i in range(3):
-            a = base_axes[i]
-            axes.append(R @ a)
-            R = R @ self._rot(a, q[:, 3 + i])
-        rotations = [R[:, None]]
-        positions = [q[:, None, :3]]
-        link_axes = [torch.zeros_like(positions[0])]
-        for parents, joints, offset, rot, axis in self.levels:
-            Rp = rotations[-1][:, parents]
-            p = positions[-1][:, parents] + (Rp @ offset.to(q.dtype)[..., None]).squeeze(-1)
-            R0 = Rp @ rot.to(q.dtype)
-            a = axis.to(q.dtype)
-            rotations.append(R0 @ self._rot(a, q[:, joints]))
-            positions.append(p)
-            if jacobian:
-                link_axes.append((R0 @ a[..., None]).squeeze(-1))
-        ps = torch.cat(positions, dim=1)
-        rs = torch.cat(rotations, dim=1)
+        sy, sx, sz = q[:, 3:6].sin().unbind(-1)
+        cy, cx, cz = q[:, 3:6].cos().unbind(-1)
+        # The floating base uses intrinsic Y-X-Z rotations.
+        rotation = torch.stack((
+            cy * cz + sy * sx * sz, -cy * sz + sy * sx * cz, sy * cx,
+            cx * sz, cx * cz, -sx,
+            -sy * cz + cy * sx * sz, sy * sz + cy * sx * cz, cy * cx,
+        ), -1).reshape(b, 3, 3)
+        base = q.new_zeros((b, 1, 4, 4))
+        base[:, 0, :3, :3], base[:, 0, :3, 3], base[:, 0, 3, 3] = rotation, q[:, :3], 1
+        angles = q[:, self.angle_columns, None, None]
+        local = self.origins + angles.sin() * self.sin_coeff + (1 - angles.cos()) * self.cos_coeff
+        chain = [base]
+        for parents, level in self.levels:
+            chain.append(chain[-1].index_select(1, parents) @ local[:, level])
+        frames = torch.cat(chain, dim=1)
+        rs = frames[:, :, :3, :3]
+        axes = link_axes = None
+        if jacobian:
+            zero = torch.zeros_like(cy)
+            axes = torch.stack((zero, torch.ones_like(cy), zero, cy, zero, -sy, sy * cx, -sx, cy * cx), -1)
+            axes = axes.reshape(b, 3, 3)
+            link_axes = (rs.index_select(1, self.joint_links) @ self.axes.to(q.dtype)[..., None]).squeeze(-1)
+        return frames[:, :, :3, 3], rs, axes, link_axes
+
+    def fk(self, q, arm, jacobian=True, *, frames=None, com_jacobian=False):
+        b = len(q)
+        ps, rs, axes, link_axes = self.link_frames(q, jacobian) if frames is None else frames
         end, mask = self.end[arm]
         er = rs[:, end]
         ep = ps[:, end] + (er @ self.offsets.to(q.dtype)[..., None]).squeeze(-1)
@@ -160,8 +186,8 @@ class _Kinematics:
         directions = torch.cat(
             (
                 torch.zeros_like(q[:, :3, None]).expand(-1, -1, 3),
-                torch.stack(axes, dim=1),
-                torch.cat(link_axes, dim=1)[:, self.joint_links],
+                axes,
+                link_axes,
             ),
             dim=1,
         )
@@ -171,22 +197,35 @@ class _Kinematics:
         dp = torch.cat((self.eye.to(q.dtype).expand(b, 3, 3, 3), dp[:, :, 3:]), dim=2)
         dr = torch.linalg.cross(angular[:, :, :, None], er.transpose(-1, -2)[:, :, None]).reshape(b, 3, self.n, 9)
         J = torch.cat((dp, 0.2 * dr), -1).transpose(-1, -2).reshape(b, -1, self.n)
+        if com_jacobian:
+            # The derivative of each moving mass is axis × (mass center - joint origin).
+            # Sum over descendants before taking the cross product for each joint.
+            moment = self.descendant_mass @ pcom - self.subtree_mass * origins
+            angular_com = torch.linalg.cross(directions[:, 3:], moment[:, 3:])
+            Jcom = torch.cat((self.eye.expand(b, -1, -1), angular_com.mT), dim=-1)
+            return pose, J, com, Jcom
         return pose, J, com
 
-    def fitted(self, q, target, seed, arm):
-        pose, J, _ = self.fk(q, arm)
+    def fitted(self, q, target, seed, arm, center_weight=0.0):
+        if center_weight:
+            pose, J, com, Jcom = self.fk(q, arm, com_jacobian=True)
+            pose = torch.cat((pose, center_weight * com[:, :2]), -1)
+            J = torch.cat((J, center_weight * Jcom[:, :2]), 1)
+        else:
+            pose, J, _ = self.fk(q, arm)
         gradient = (J.mT @ (pose - target)[..., None]).squeeze(-1) + self.prior.square() * (q - seed)
         return pose, J, gradient
 
     @torch.no_grad()
-    def solve(self, target, seed, arm):
-        q = seed.clamp(self.lower, self.upper)
+    def solve(self, target, seed, arm, *, bounds=None, center_weight=0.0, iterations=100):
+        lower, upper = (self.lower, self.upper) if bounds is None else bounds
+        q = seed.clamp(lower, upper)
         damping = q.new_full((len(q), 1), 1e-4)
         eye = torch.eye(self.n, device=q.device, dtype=q.dtype)
-        for _ in range(100):
-            pose, J, g = self.fitted(q, target, seed, arm)
-            low = q <= self.lower + 1e-8
-            high = q >= self.upper - 1e-8
+        for _ in range(iterations):
+            pose, J, g = self.fitted(q, target, seed, arm, center_weight)
+            low = q <= lower + 1e-8
+            high = q >= upper - 1e-8
             active = (low & (g >= 0)) | (high & (g <= 0))
             optimality = g.masked_fill(active, 0).abs().amax(-1)
             if (optimality < 2e-9).all():
@@ -203,15 +242,17 @@ class _Kinematics:
                     break
                 active |= outward
             change = step * (0.4 / step.abs().amax(-1, keepdim=True).clamp_min(0.4))
-            candidate = (q + change).clamp(self.lower, self.upper)
-            other, _ = self.fk(candidate, arm, False)
+            candidate = (q + change).clamp(lower, upper)
+            other, com = self.fk(candidate, arm, False)
+            if center_weight:
+                other = torch.cat((other, center_weight * com[:, :2]), -1)
             cost = (pose - target).square().sum(-1) + ((q - seed) * self.prior).square().sum(-1)
             trial = (other - target).square().sum(-1) + ((candidate - seed) * self.prior).square().sum(-1)
             better = (trial < cost)[:, None]
             q = torch.where(better, candidate, q)
             damping = torch.where(better, damping * 0.35, damping * 5).clamp(1e-9, 100.0)
-        _, j, g = self.fitted(q, target, seed, arm)
-        active = ((q <= self.lower + 5e-7) & (g >= 0)) | ((q >= self.upper - 5e-7) & (g <= 0))
+        _, j, g = self.fitted(q, target, seed, arm, center_weight)
+        active = ((q <= lower + 5e-7) & (g >= 0)) | ((q >= upper - 5e-7) & (g <= 0))
         return q, j, active, g.masked_fill(active, 0).abs().amax(-1)
 
     @torch.no_grad()
@@ -239,11 +280,31 @@ def _targets(soles, wrist):
     return torch.cat((p, 0.2 * end_r.transpose(-1, -2).reshape(b, 3, 9)), -1).reshape(b, -1)
 
 
-def solve_stance_ik(soles, wrist, posture_seed, arm):
+@torch.no_grad()
+def centered_stance_witnesses(soles, wrist, seeds, arm, other, weight):
+    """Initialize all particles' wrist, sole and projected-CoM residuals in one bounded solve."""
+    kin = _kinematics(soles.device)
+    soles = soles.double()
+    seed = seeds.double().clone()
+    idle = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
+    nominal = seed.new_tensor(REAL_LEGS.home[idle]) if other is None else other
+    seed[:, idle] = nominal.to(seed)
+    lower, upper = stance_joint_limits(soles, kin.lower, kin.upper)
+    lower[:, idle] = upper[:, idle] = seed[:, idle]
+    # As in fit_centered_posture, the wrist and sole residuals have weight 50.
+    center_weight = weight / 50.0
+    center = physical_support_centroid(soles, kin.box)
+    target = torch.cat((_targets(soles, wrist.double()), center_weight * center), -1)
+    q = kin.solve(target, seed, arm, bounds=(lower, upper), center_weight=center_weight, iterations=30)[0]
+    return torch.where(q.isfinite().all(-1, keepdim=True), q, seed).to(seeds)
+
+
+def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None, collides=None, kinematics=None):
     """Fit both horizontal soles and the full bound wrist pose, with box-constrained T1 joints.
 
-    The rank-restoring posture reference is an explicit input. Implicit gradients propagate
-    into all three inputs, including a reference derived from a preceding gap.
+    The other arm uses its nominal joint posture, or the reference of an occupied hand.
+    If nominal collides, try progressively larger excursions toward the supplied witness.
+    Both arms contribute their actual mass and pose to the resulting CoM.
     """
     b = len(soles)
     if (
@@ -254,17 +315,26 @@ def solve_stance_ik(soles, wrist, posture_seed, arm):
         or posture_seed.shape != (b, 33)
     ):
         raise ValueError("Expected a left/right T1 wrist, [B,2,3] soles, [B,4,4] wrist and [B,33] posture")
-    kin = _kinematics(soles.device)
+    kin = _kinematics(soles.device) if kinematics is None else kinematics
     seed = posture_seed.to(soles.device, dtype=torch.float64)
+    other = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
+    alternate = seed[:, other]
+    reference = REAL_LEGS.home[other] if other_arm_reference is None else other_arm_reference
+    reference = torch.as_tensor(reference, device=seed.device, dtype=seed.dtype).expand_as(alternate)
+    seed = seed.clone()
+    seed[:, other] = reference
     wrist = wrist.to(soles.device, dtype=torch.float64)
     valid = soles.isfinite().all(dim=(1, 2)) & wrist.isfinite().all(dim=(1, 2)) & seed.isfinite().all(dim=1)
+    valid &= alternate.isfinite().all(dim=1)
+    valid &= (reference >= kin.lower[other]).all(dim=1) & (reference <= kin.upper[other]).all(dim=1)
     # LAPACK/cuSOLVER may fail an entire batch on a single NaN. Substitute a
     # finite problem before the linear algebra and retain the row's failed certificate.
     soles = torch.where(valid[:, None, None], soles, 0)
     wrist = torch.where(valid[:, None, None], wrist, 0)
     seed = torch.where(valid[:, None], seed, 0)
     target = _targets(soles.double(), wrist)
-    q, j, active, optimality = kin.solve(target, seed, arm)
+    bounds = stance_joint_limits(soles.double(), kin.lower, kin.upper) if kinematics is None else None
+    q, j, active, optimality = kin.solve(target, seed, arm, bounds=bounds)
     optimality = torch.where(valid, optimality, torch.inf)
     conditioning_ok = torch.ones_like(optimality, dtype=torch.bool)
     if torch.is_grad_enabled() and (target.requires_grad or seed.requires_grad):
@@ -277,6 +347,26 @@ def solve_stance_ik(soles, wrist, posture_seed, arm):
         H = torch.where(conditioning_ok[:, None, None], H, I)
         rhs = (j.mT @ (target - target.detach())[..., None]).squeeze(-1) + kin.prior.square() * (seed - seed.detach())
         q = q + torch.linalg.solve(H, (rhs * free)[..., None]).squeeze(-1) * conditioning_ok[:, None]
+    if collides is not None:
+        def blocked(candidate):
+            with torch.no_grad():
+                return collides(candidate.to(posture_seed.dtype))
+
+        collision = blocked(q)
+        if other_arm_reference is None and collision.any():
+            # None of the two sole or active-wrist poses depends on the idle arm.
+            # Its alternate can be checked on the fitted torso without another IK solve.
+            alternate = torch.where(valid[:, None], alternate, 0).clamp(kin.lower[other], kin.upper[other])
+            reference = torch.where(valid[:, None], reference, 0)
+            for fraction in (0.25, 0.5, 1.0):
+                candidate = q.clone()
+                candidate[:, other] = torch.lerp(reference, alternate, fraction)
+                cleared = collision & ~blocked(candidate)
+                q = torch.where(cleared[:, None], candidate, q)
+                collision = collision & ~cleared
+                if not collision.any():
+                    break
+        valid = valid & ~collision
     pose, com = kin.fk(q, arm, False)
     residual = (pose - target).reshape(b, 3, 12)
     pos = residual[..., :3].norm(dim=-1)
@@ -285,5 +375,5 @@ def solve_stance_ik(soles, wrist, posture_seed, arm):
     fixed = physical_support_margin(com[:, :2].detach(), soles.double(), kin.box)
     wp, wr = pos[:, 2], angle[:, 2]
     sp, sr = pos[:, :2].amax(-1), angle[:, :2].amax(-1)
-    ok = conditioning_ok & (optimality < 2e-6) & (wp < 0.005) & (wr < 0.05) & (sp < 0.001) & (sr < 0.01)
+    ok = valid & conditioning_ok & (optimality < 2e-6) & (wp < 0.005) & (wr < 0.05) & (sp < 0.001) & (sr < 0.01)
     return StanceIK(q.to(posture_seed.dtype), margin, fixed, com, wp, wr, sp, sr, optimality, ok, soles)

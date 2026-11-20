@@ -40,6 +40,48 @@ def test_below_cutoff_fills_by_score_then_posture():
     assert _choose(rows, 3) == [0, 2, 1]
 
 
+def test_generated_grasps_match_the_witness_orientation_and_keep_the_pool():
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_ik import _kinematics
+    from cutamp.step_particles import _generated_grasp_indices
+
+    posture = torch.tensor(REAL_LEGS.home, dtype=torch.double)
+    hand = _kinematics(posture.device).fk(posture[None], "left", False)[0][0, -12:]
+    obj = torch.eye(4, dtype=posture.dtype)
+    obj[:3, 3] = hand[:3]
+    obj[:3, :3] = hand[3:].reshape(3, 3).T / 0.2
+    seed = SimpleNamespace(schedule=SimpleNamespace(edges=[
+        SimpleNamespace(soles=[[0, .1, 0], [0, -.1, 0]], witness=posture.tolist())
+    ]))
+    # The highest score points backward. The two other grasps match the witness, one below cutoff.
+    pool = torch.tensor([[0, 0, 0, 0, 0, 0, 1], [0, 0, 0, 1, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]], dtype=obj.dtype)
+    scores = pool.new_tensor([.98, .8, .5])
+    indices = _generated_grasp_indices(pool, scores, obj.expand(4, 4, 4), torch.eye(4, dtype=obj.dtype),
+                                       "left", [seed, seed, seed, None], 0, torch.tensor([0, 1, 2, 0]))
+    assert indices.tolist() == [1, 0, 2, 0]
+
+
+def test_free_placement_projection_matches_the_final_rotated_footprint_and_support_checks():
+    from cutamp.cost_function import CostFunction
+    from cutamp.samplers import PLACEMENT_SUPPORT_GAP_M, project_supported_placement
+    from cutamp.utils.common import action_4dof_to_mat4x4, transform_spheres
+
+    spheres = torch.tensor([[-.13, 0, .02, .05], [.07, 0, .08, .02]])
+    bounds = torch.tensor([[.5, -.06, .05], [.9, .06, .1]])
+    poses = torch.tensor([[.45, .1, .15, 0.], [.9, .1, .17, math.pi], [.72, .15, .25, math.pi / 2]])
+    projected = project_supported_placement(poses, spheres, bounds)
+    moved = transform_spheres(spheres, action_4dof_to_mat4x4(projected))
+    cost = SimpleNamespace(surface_to_placements={"pad": [("part", "p")]},
+                           surface_to_aabb={"pad": bounds[:, :2]}, surface_to_target_z={"pad": .1 + PLACEMENT_SUPPORT_GAP_M},
+                           surface_to_sphere_counts={"pad": (2,)}, surface_to_sphere_idx_map={"pad": torch.zeros(2, dtype=torch.long)})
+    rollout = {"num_particles": 3, "action_to_pose_ts": {"p": 0}}
+    checked = CostFunction.stable_placement_costs(cost, rollout, {"part": moved[:, None]})["values"]
+    assert checked["pad_in_xy"][:2].max() < 1e-6
+    assert checked["pad_in_xy"][2] > .07  # rotating the long axis onto the narrow side cannot fit
+    assert checked["pad_support"].max() < 1e-6
+    torch.testing.assert_close(projected[:, 3], poses[:, 3])
+
+
 def test_unbalanced_never_chosen():
     rows = [(False, 0.99, 0.0, 0.0, 0.087), (True, 0.71, 0.6, 0.2, 0.01)]
     assert _choose(rows, 10) == [1]  # fewer balanced than k: every balanced grasp
@@ -165,24 +207,30 @@ def test_top_particles_go_round_the_grasps(monkeypatch):
     assert [int(t["left_q1"][5]) for t in alg.get_top_satisfying_particles(*inputs, n=4)] == [2, 1, 3, 4]
 
 
-def test_standing_motion_uses_centroid_cost_across_feasible_grasp_groups(monkeypatch):
+def test_standing_motion_uses_worst_centroid_error_then_effort_across_feasible_grasps(monkeypatch):
     from cutamp.cost_reduction import CostReducer
     from cutamp.scripts.utils import default_constraint_to_mult
 
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: torch.full((len(q),), 0.06))
-    plan, checker, _ = _ranking_inputs([0, 1], [0.3, 0.0], [True, True], [0.0, 0.0])
-    distance_sq = torch.tensor([[0.01, 0.01], [0.08, 0.07]]).square()
+    plan, checker, _ = _ranking_inputs([0, 2, 2, 1, 0], [0.3, 0.1, 0.2, 0.0, 0.0],
+                                       [True, True, True, True, False], [0.0] * 5)
+    # Rows 1 and 2 share a low-confidence grasp. Both have a better worst endpoint than
+    # row 0 and lower effort than row 3, whose other endpoint is almost perfectly centered.
+    distance_sq = torch.tensor([[.01, .081], [.07, .07], [.07, .065], [.0001, .07], [0., 0.]]).square()
 
     def cost_fn(rollout, particles):
-        return {"soft": {"type": "cost", "values": {"com_center_distance_squared": distance_sq}}}
+        return {"soft": {"type": "cost", "max_center_distance_m": distance_sq.amax(-1).sqrt(), "values": {
+            "com_center_distance_squared": distance_sq * 1e-44,
+            "place_close_to_base": torch.tensor([0., 5., 5., 5.001, 0.]),
+        }}}
 
-    cost_fn.config = SimpleNamespace(com_center_weight=1.0)
+    cost_fn.config = SimpleNamespace(com_center_weight=1e-44)
     plan["cost_fn"] = cost_fn
     candidates, ids = alg.get_top_satisfying_particles(
-        plan, checker, CostReducer(default_constraint_to_mult), n=2, return_indices=True
+        plan, checker, CostReducer(default_constraint_to_mult), n=4, return_indices=True
     )
-    assert ids == [0, 1]
-    assert candidates[0]["left_q1"][3] == pytest.approx(0.3)
+    assert ids == [1, 2, 3, 0]
+    assert [int(c["left_q1"][5]) for c in candidates] == ids
 
 
 def test_ranking_rejects_a_grasp_outside_the_pool(monkeypatch):

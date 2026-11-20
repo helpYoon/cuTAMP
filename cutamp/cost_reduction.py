@@ -42,7 +42,9 @@ class CostReducer:
         # "no multiplier, pass value through" (no implicit default-for-all).
         return self.cost_to_multiplier.get((cost_type, "default"))
 
-    def get_cost(self, cost_dict: Dict[str, dict], consider_types: Set[str]) -> torch.Tensor:
+    def get_cost(
+        self, cost_dict: Dict[str, dict], consider_types: Set[str], *, include_centering: bool = True
+    ) -> torch.Tensor:
         """Returns total cost per particle by taking weighted sum of considered cost types."""
         cost = None
         for cost_type, entry in cost_dict.items():
@@ -52,15 +54,22 @@ class CostReducer:
             for name, values in entry["values"].items():
                 if values.ndim == 2:
                     values = values.sum(dim=1)  # Sum over time
-                multiplier = self._get_multiplier(cost_type, name)
-                if multiplier is not None:
-                    values = values * multiplier
+                if not include_centering and (cost_type, name) == ("soft", "com_center_distance_squared"):
+                    values = torch.zeros_like(values)
+                else:
+                    multiplier = self._get_multiplier(cost_type, name)
+                    if multiplier is not None:
+                        values = values * multiplier
                 cost = values if cost is None else cost + values
         return cost
 
     def soft_costs(self, cost_dict: Dict[str, dict]) -> torch.Tensor:
         """Reduce only the soft costs."""
         return self.get_cost(cost_dict, consider_types={"cost"})
+
+    def secondary_effort(self, cost_dict: dict[str, dict]) -> torch.Tensor:
+        """Effort tie-breaker after comparing the worst physical centroid distance."""
+        return self.get_cost(cost_dict, consider_types={"cost"}, include_centering=False)
 
     def __call__(
         self, cost_dict: Dict[str, dict], consider_types: Set[str] = frozenset(("constraint", "cost"))

@@ -22,7 +22,8 @@ from cutamp.tests.conftest import needs_cuda
 T1_29DOF = Path(__file__).resolve().parents[1] / "robots" / "assets" / "t1_29dof"
 REPO = T1_29DOF.parents[3]
 BFM_WM = Path("/home/yoonwoo/bfm_wm")
-OUTPUTS = ("t1_planner.urdf", "t1_29dof.yml", "t1_29dof_spheres.yml")
+OUTPUTS = ("t1_planner.urdf", "t1_29dof.yml", "t1_29dof_spheres.yml",
+           "visuals/left_wrist_mount.stl", "visuals/right_wrist_mount.stl")
 HEAD = ("AAHead_yaw", "Head_pitch")
 WXYZ_TO_XYZW = [1, 2, 3, 0]
 
@@ -175,7 +176,7 @@ def test_base_limits_are_the_legs_reach():
     assert bowed > 0, bowed  # deep bows, past horizontal, stay inside the box
 
 
-def test_planner_urdf_adds_only_world_and_gripper():
+def test_planner_urdf_adds_world_and_articulated_grippers():
     build = _build_module()
     vendor = ET.parse(T1_29DOF / "urdf" / "T1_29dof.urdf").getroot()
     planner = ET.parse(T1_29DOF / "t1_planner.urdf").getroot()
@@ -192,6 +193,9 @@ def test_planner_urdf_adds_only_world_and_gripper():
     assert set(p_links) == set(v_links) | {"world"} | gripper_links
     assert set(p_joints) == set(v_joints) | {"world_joint"} | gripper_joints and len(gripper_joints) == 10
     for name, link in v_links.items():  # origins, axes, limits, inertials, visuals and collisions
+        if name in ("left_hand_link", "right_hand_link"):
+            side = name.split("_")[0]
+            link.find("visual/geometry/mesh").set("filename", f"visuals/{side}_wrist_mount.stl")
         assert _canon(p_links[name]) == _canon(link), name
     for name, joint in v_joints.items():
         assert _canon(p_joints[name]) == _canon(joint), name

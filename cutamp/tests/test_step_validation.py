@@ -70,6 +70,16 @@ def test_source_sole_frames_and_observed_handoffs():
     drifting[0, 0] += 0.25
     assert not adapter.initialize(start_q, ctx, drifting, observed=state).compatible[0]
 
+    # The measured head is present in the controller state and history, even though cuRobo locks it.
+    from dataclasses import replace
+
+    raw = [x.clone() for x in state.tensors]
+    head = adapter.names.index("Head_pitch")
+    raw[4][1, head] = 1.5
+    raw[7][1, -1, head] = raw[4][1, head] - pred.model.home_joints.reshape(-1)[head]
+    measured = replace(state, tensors=tuple(raw))
+    assert adapter.initialize(start_q, ctx, start_qd, observed=measured).compatible.tolist() == [True, False, True]
+
 
 @pytest.fixture(scope="module")
 def rollout_scene():
@@ -166,6 +176,11 @@ def test_independent_timeline_must_match_issued_command_and_velocity(rollout_sce
     assert record["source"] == ev.source and record["foot"] == "L"
     torch.testing.assert_close(js.velocity[-1], v[-1])
     torch.testing.assert_close(soles, s.achieved[0], atol=0.0001, rtol=0.0)
+    # Moving an arm mid-step leaves both sole traces and the terminal observation intact.
+    bad = q.clone()
+    bad[len(q) // 2, REAL_LEGS.joint_names.index("Left_Elbow_Pitch")] = 2.5
+    with pytest.raises(ValueError, match="joint limit"):
+        verify_transition(req, replace(ev, position=bad), adapter)
     with pytest.raises(TransitionUnavailable):
         verify_transition(req, None, adapter)
     with pytest.raises(ValueError, match="carried-object"):
@@ -231,6 +246,12 @@ def test_step_record_and_supported_motion_handoff_in_solver(rollout_scene, monke
             q[-1:].repeat(2, 1), v[-1:].repeat(2, 1), acc[-1:].repeat(2, 1), joint_names=list(world.model.joint_names)
         )
 
+    # This test supplies the supported segment itself to isolate the measured boundary. The
+    # planner double has no obstacle database and the measured terminal can be outside the
+    # standing IK envelope. Real-scene tests exercise the replacement trajectory's geometry.
+    monkeypatch.setattr(ms, "_direct_supported_path",
+                        lambda last, conf, model, dt, arm: plan_segment(planner, conf, last))
+    monkeypatch.setattr(ms, "_check_supported_path_geometry", lambda *args: None)
     monkeypatch.setattr(ms, "_plan_arm_to_conf", plan_segment)
     monkeypatch.setattr(ms, "_interp_plan", lambda js: js)
     monkeypatch.setattr(ms, "_plan_dt", lambda _: 0.02)
@@ -270,6 +291,53 @@ def test_step_record_and_supported_motion_handoff_in_solver(rollout_scene, monke
     torch.testing.assert_close(result.steps[0].achieved, state.achieved)
     assert len(replay["actions"]) == replay["step_ticks"] + replay["hold_ticks"]
     assert raw[0]["step"]["measured_terminal"]["tensors"][-1] == state.terminal.tensors[-1][0].tolist()
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    ("first_hold", "left_target", "right_target"),
+    [(0, (0.12, 0.21, 0.0), (0.0, -0.19, 0.0)), (75, (0.05, 0.19, 0.0), (0.10, -0.24, 0.0))],
+)
+@torch.no_grad()
+def test_independent_pair_replays_recorded_dwell_and_measured_handoff(rollout_scene, first_hold, left_target, right_target):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from curobo.types import JointState
+
+    from cutamp.step_validation import SteppedMotion, TransitionEvidence
+    from cutamp.t1_domain import LeftStep, RightStep
+
+    predictor, adapter, world, _, start, _ = rollout_scene
+    commands = world.q_init.new_tensor([[left_target, right_target]])
+    # A saved pair can also come from an older planner that held after both feet.
+    first = predictor.rollout(start, "L", commands[:, :1], final_hold_ticks=first_hold).steps[0]
+    last = predictor.rollout(first.terminal, "R", commands[:, 1:]).steps[0]
+    predictions = {0: (start, commands, SimpleNamespace(steps=(first, last)))}
+    ops = [op.ground({p.name: p.name for p in op.parameters}) for op in (LeftStep, RightStep)]
+    terminals = []
+
+    def supply_trace(request):
+        if terminals:
+            assert request.initial is terminals[-1]
+        q0, v0 = adapter.planner(request.initial.tensors[:6])
+        q, v = adapter.planner(request.predicted.trajectory)
+        q, v = torch.cat((q0, q[0])), torch.cat((v0, v[0]))
+        measured = replace(request.predicted.terminal, history_source="controlled_measurement")
+        terminals.append(measured)
+        return TransitionEvidence("controlled_trace", q, v, torch.zeros_like(v), 0.02, True, True, False, measured)
+
+    motion = SteppedMotion(ops, predictions, adapter, world, supply_trace)
+    q0, v0 = adapter.planner(start.tensors[:6])
+    handoff = JointState(position=q0, velocity=v0, joint_names=list(world.model.joint_names))
+    for idx, hold in enumerate((first_hold, 75)):
+        [(plan, record)] = motion.step_segments(idx, handoff, {}, {})
+        expected_ticks = int(predictions[0][2].steps[idx].clock[0]) + hold
+        assert record["hold_ticks"] == record["model_prediction"]["hold_ticks"] == hold
+        assert len(plan.position) == expected_ticks + 1
+        assert len(record["model_prediction"]["actions"]) == expected_ticks
+        torch.testing.assert_close(plan.velocity[:1], handoff.velocity)
+        handoff = JointState(position=plan.position[-1:], velocity=plan.velocity[-1:], joint_names=plan.joint_names)
 
 
 @needs_cuda

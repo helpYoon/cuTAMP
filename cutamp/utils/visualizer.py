@@ -47,6 +47,7 @@ class Visualizer:
         timeline: str,
         start_time: float,
         dt: float,
+        *, head=None,
     ):
         pass
 
@@ -103,13 +104,15 @@ class RerunVisualizer(Visualizer):
         timeline: str,
         start_time: float,
         dt: float,
+        *, head=None,
     ):
+        """Log each native motion frame and return the time of the shared segment endpoint."""
         for key, mat in mat4x4s.items():
             if traj.shape[0] != mat.shape[0]:
                 raise ValueError(f"Trajectory and mat4x4 for {key} must have the same length.")
-        end_time = start_time + len(traj) * dt
-        times = [rr.TimeColumn(timeline, duration=np.linspace(start_time, end_time, len(traj)))]
-        key_to_columns = self.robot.get_rr_columns(traj)
+        frame_times = start_time + np.arange(len(traj)) * dt
+        times = [rr.TimeColumn(timeline, duration=frame_times)]
+        key_to_columns = self.robot.get_rr_columns(traj, head=head) if head is not None else self.robot.get_rr_columns(traj)
 
         for mat4x4_key, mat in mat4x4s.items():
             if mat4x4_key in key_to_columns:
@@ -120,8 +123,8 @@ class RerunVisualizer(Visualizer):
             )
 
         for key, columns in key_to_columns.items():
-            rr.send_columns(key, indexes=times * len(columns), columns=columns)
-        return end_time
+            rr.send_columns(key, indexes=times, columns=columns)
+        return float(frame_times[-1]) if len(frame_times) else start_time
 
     def log_tamp_world(self, world: TAMPWorld):
         rr_log_tamp_world(world)

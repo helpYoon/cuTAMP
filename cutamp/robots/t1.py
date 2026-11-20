@@ -222,7 +222,16 @@ def _check_joint_order(model: T1Model, joint_names) -> None:
 # Kinematics and MotionPlanner factories
 # =============================================================================
 
-def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None) -> Kinematics:
+@lru_cache(maxsize=4)
+def _nominal_kinematics_cfg(config_json, device_cfg, _asset_versions):
+    """Parsed nominal robot tensors. Callers copy them before changing a chart or attaching geometry."""
+    cfg = KinematicsCfg.from_robot_yaml_file(json.loads(config_json), device_cfg=device_cfg)
+    if device_cfg.device.type == "cuda":
+        torch.cuda.current_stream(device_cfg.device).synchronize()  # publish a complete template to other workers
+    return cfg
+
+
+def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None, *, robot_cfg=None) -> Kinematics:
     """``model``'s Kinematics over its whole cspace (both arms and the base, which nothing here locks).
 
     Always built with ``compute_com=True`` so ``KinematicsState.robot_com``
@@ -233,8 +242,16 @@ def get_t1_kinematics(model: T1Model, device_cfg: DeviceCfg = None) -> Kinematic
         device_cfg = DeviceCfg()
     # The cuRobo loader replaces each extra-link dictionary with a LinkParams
     # in place. Other consumers use the original YAML units and field names.
-    cfg = copy.deepcopy(t1_curobo_cfg(model))
-    kin_cfg = KinematicsCfg.from_robot_yaml_file(cfg, device_cfg=device_cfg)
+    if robot_cfg is None and device_cfg.device != torch.device("cuda"):
+        cfg = t1_curobo_cfg(model)
+        parameters = cfg["robot_cfg"]["kinematics"]
+        paths = (parameters["urdf_path"], parameters.get("collision_spheres"))
+        stats = [Path(p).stat() for p in paths if isinstance(p, str)]
+        versions = tuple((s.st_dev, s.st_ino, s.st_mtime_ns, s.st_size) for s in stats)
+        kin_cfg = copy.deepcopy(_nominal_kinematics_cfg(json.dumps(cfg), device_cfg, versions))
+    else:
+        cfg = robot_cfg if robot_cfg is not None else t1_curobo_cfg(model)
+        kin_cfg = KinematicsCfg.from_robot_yaml_file(copy.deepcopy(cfg), device_cfg=device_cfg)
     kin = Kinematics(kin_cfg, compute_com=True)
     _check_joint_order(model, kin.joint_names)
     return kin
@@ -249,6 +266,10 @@ cases planned, 15 of 15 at 1e6 (2026-11-06)."""
 TRAJOPT_INITIAL_ITERS = 100
 """L-BFGS iterations in trajopt's first solve: cuRobo v0.8's budget (v0.9.0's is 50). On the five blocks_t1 cases
 v0.9.0 planned worst (timeopt off), 50 planned 4 of 5 and 100 all 5, with 16 candidates for 19 (2026-11-06)."""
+
+
+MOTION_INTERPOLATION_DT = 0.025
+"""Seconds per supported motion frame, shared by the direct path and cuRobo trajectory interpolation."""
 
 
 def _trajopt_optimizer_dict() -> dict:
@@ -281,6 +302,7 @@ def get_t1_motion_planner(
     use_cuda_graph: bool = True,
     device_cfg: DeviceCfg = None,
     initial_soles: torch.Tensor = None,
+    robot_cfg=None,
 ) -> MotionPlanner:
     """Single MotionPlanner for the T1, with every joint free, the base included.
 
@@ -307,11 +329,12 @@ def get_t1_motion_planner(
     """
     if device_cfg is None:
         device_cfg = DeviceCfg()
-    cfg_dict = copy.deepcopy(t1_curobo_cfg(model))
+    cfg_dict = copy.deepcopy(t1_curobo_cfg(model) if robot_cfg is None else robot_cfg)
     cfg_dict["robot_cfg"]["load_dynamics"] = True
     cfg = MotionPlannerCfg.create(
         robot=cfg_dict,
         scene_model=scene,
+        interpolation_dt=MOTION_INTERPOLATION_DT,
         use_cuda_graph=use_cuda_graph,
         # 2.5 mm, the trajopt margin in cuRobo's lbfgs_bspline_trajopt.yml (MotionPlannerCfg.create's default, 0.01,
         # is untested here). It only shapes the optimizers' collision cost: cuRobo still judges success at 0
@@ -526,7 +549,7 @@ class T1RerunRobot:
         self.urdf.update_cfg(self._real_legs_urdf_cfg(q))
         log_scene(scene=self.urdf.scene, node=self.urdf.base_link, path=self.name, static=False, add_mesh=False)
 
-    def get_rr_columns(self, joint_positions: torch.Tensor) -> Dict[str, rr.Transform3D.columns]:
+    def get_rr_columns(self, joint_positions: torch.Tensor, *, head=None) -> Dict[str, rr.Transform3D.columns]:
         """
         Gets the Rerun columns for a batch of joint positions for use in columnar logging. This is especially helpful
         for logging joint trajectories, as it's much faster than individual row-oriented logging.
@@ -551,6 +574,11 @@ class T1RerunRobot:
         base_columns = rr.Transform3D.columns(mat3x3=base_mats[:, :3, :3], translation=base_mats[:, :3, 3])
         joint_positions = torch.tensor([self._real_legs_urdf_cfg(q) for q in confs], dtype=torch.float64)
 
+        if head is not None:
+            if head.shape != (len(confs), 2):
+                raise ValueError("Expected one head yaw and pitch for each motion frame")
+            cols = [self.urdf.actuated_joint_names.index(n) for n in ("AAHead_yaw", "Head_pitch")]
+            joint_positions[:, cols] = torch.as_tensor(head, dtype=joint_positions.dtype, device="cpu")
         path_to_tforms = {}  # map of path to list of transforms
 
         # Update the URDF with joint position and get the transformations

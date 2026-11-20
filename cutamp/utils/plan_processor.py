@@ -38,12 +38,13 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
                 # the same segment at the motion planner's own timing, as the same three arrays ([T', n] at the
                 # same dt); else None.
                 "planner_timing": {"position", "velocity", "acceleration"} | None,
-                # Step entries carry the validator's source and issued/achieved soles.
+                # Step entries carry the prediction or independent validator source.
                 # A swing record also carries its learned prediction and the incoming controller history.
             }],
         }
 
-    The joint values are the planner's own; the joints it locks (the head, the fingers) are left out. A segment
+    The joint positions use the planner's columns. Predicted trajectories also preserve the two head angles
+    in a separate per-frame array. Their motion_validation is model_predicted. A segment
     without native velocities or accelerations raises rather than having them fabricated."""
     names = list(model.joint_names)
 
@@ -66,10 +67,17 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
         segments.append({"arm": entry.get("arm"), "dt": float(entry["dt"]), "op_idx": entry["op_idx"],
                          "phase": entry["phase"], "gripper": entry["gripper"], **frames(entry["plan"]),
                          "planner_timing": None if fast is None else frames(fast["plan"])})
+        if "motion_source" in entry:
+            segments[-1]["motion_source"] = entry["motion_source"]
+        if "head" in entry:
+            segments[-1]["head"] = entry["head"].detach().cpu().numpy().copy()
         if "step" in entry:
             # Preserve the exact command, issued/achieved soles and independent validator provenance.
             segments[-1]["step"] = {
                 key: value.detach().cpu().numpy().copy() if torch.is_tensor(value) else value
                 for key, value in entry["step"].items()
             }
-    return {"schema_version": RAW_SCHEMA_VERSION, "model": model.name, "joint_names": names, "segments": segments}
+    result = {"schema_version": RAW_SCHEMA_VERSION, "model": model.name, "joint_names": names, "segments": segments}
+    if any(s.get("step", {}).get("source") == "frozen_policy_world_model" for s in segments):
+        result.update(motion_validation="model_predicted", head_joint_names=["AAHead_yaw", "Head_pitch"])
+    return result

@@ -79,6 +79,17 @@ class StepRow:
     motion_plan: object | None = None
     evidence: Callable[[], dict] | None = None
 
+    @property
+    def max_center_distance_m(self) -> float:
+        """Worst planned pick/place CoM distance to the physical support centroid, in meters."""
+        if "com_center_distances_m" in self.metrics:
+            return max(self.metrics["com_center_distances_m"])
+        return max(gap["center_distance_m"] for gap in self.metrics["gaps"])
+
+    @property
+    def effort(self) -> float:
+        return self.metrics["secondary_effort"]
+
 
 @dataclass
 class StepResult:
@@ -163,7 +174,7 @@ def manipulation_regions(skeleton, world):
 class ScheduleSearch:
     """Rank and retry foot orders for one fixed arm/object skeleton."""
 
-    def __init__(self, search, skeleton, regions, world, incoming, *, fixed=None, strategy="astar", deadline=None):
+    def __init__(self, search, skeleton, regions, world, incoming, *, fixed=None, strategy="astar", deadline=None, prefer_reach=False):
         self.args = (search, skeleton, regions, world.initial_state, world.goal_state, incoming)
         self.seen = set()
         self.targeted = deque()
@@ -175,12 +186,13 @@ class ScheduleSearch:
             or not search.hands
             or any(target is None or target.center is None for target in regions)
         )
-        self.ranked = ranked_step_skeletons(*self.args, deadline=deadline)
+        self.prefer_reach = prefer_reach and not self.count_first
+        self.ranked = ranked_step_skeletons(*self.args, deadline=deadline, prefer_reach=self.prefer_reach)
         self.fallback = None
         self.cap = None
 
     def _exact(self, orders, fallback=None):
-        proposal = next(ranked_step_skeletons(*self.args, orders=orders, deadline=self.deadline), None)
+        proposal = next(ranked_step_skeletons(*self.args, orders=orders, deadline=self.deadline, prefer_reach=self.prefer_reach), None)
         if proposal is None and fallback is None:
             fallback = next(unseeded_step_skeletons(*self.args, fixed=orders), None)
         return proposal if proposal is not None else fallback
@@ -230,6 +242,10 @@ class ScheduleSearch:
 
     def feedback(self, orders, endpoint_ok):
         if self.fixed is not None:
+            return
+        # Screened search already has ranked geometric alternatives for both arms.
+        # Keep them ahead of the count-only enumeration when a particle fails.
+        if self.prefer_reach:
             return
         self.count_first = True
         prefix = furthest_endpoint(endpoint_ok)

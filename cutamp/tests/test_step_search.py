@@ -14,6 +14,27 @@ FWD = (0.12, 0.20, 0.0)
 DATA = Path(__file__).resolve().parents[2] / "data/t1-reachability"
 
 
+def test_stances_with_identical_frames_reuse_the_same_hand_map_query(monkeypatch):
+    from cutamp import step_search
+
+    calls = []
+    box_gaps = step_search._box_gaps
+    def measured(*args):
+        calls.append(1)
+        return box_gaps(*args)
+    monkeypatch.setattr(step_search, "_box_gaps", measured)
+    search = StepSearch(atlas(), commands=())
+    region = target(0.005)
+    (home,) = search.edges(HOME, region)
+    initial_count = len(calls)
+    widened = ((0.0, 0.12, 0.0), (0.0, -0.12, 0.0))
+    (wide,) = search.edges(widened, region)
+    assert home.soles != wide.soles and home.witness == wide.witness
+    assert len(calls) == initial_count > 0
+    search.edges(widened, target(0.065))
+    assert len(calls) > initial_count
+
+
 def atlas(points=((0.005, 0.005, 0.505),), arm="left"):
     m = ReachMap(0.01, {"home_soles": HOME, "sole_box_m": [0.20, 0.08]})
     m.add_stance(
@@ -54,6 +75,7 @@ def profile(order, trials):
         "control_hz": 50,
         "warmup_ticks": 50,
         "hold_ticks": 75,
+        "inter_step_hold_ticks": 0,
         "xy_threshold_m": 0.02,
         "yaw_threshold_deg": 1.0,
         "source_sha256": SOURCE_SHA256.copy(),
@@ -127,6 +149,18 @@ def test_matching_signed_commands_only_and_transferred_prior():
     assert StepSearch(atlas(), commands=(FWD,), lag=8).edges(HOME, query)[1].cost == (1, 1)
 
 
+def test_screened_search_prefers_loaded_reach_over_a_known_miss():
+    search = StepSearch(atlas(), commands=(FWD,), lag=2)
+    # From the starting feet the grasp-independent place query misses by 6 cm.
+    # A step overlaps the reach map but has no controller prior with this payload.
+    region = target(0.065, loaded=True)
+    reference = list(search.schedules(HOME, [region]))
+    screened = list(search.schedules(HOME, [region], prefer_reach=True))
+    assert reference[0].edges[0].order == "none"
+    assert screened[0].edges[0].distance_m == 0 and screened[0].edges[0].accuracy == "unknown"
+    assert {plan.edges[0] for plan in reference} == {plan.edges[0] for plan in screened}
+
+
 def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():
     trials = [{"lag": 8, "stages": [stage("L"), stage("R")], "all_handoffs_pass": True} for _ in range(6)]
     trials[0]["stages"][0]["handoff"]["issued_xy_error_m"][1] = 0.020  # planted foot, strict boundary
@@ -138,6 +172,16 @@ def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():
     seen = StepSearch(atlas(), accuracy=profile("LR", trials), lag=8, commands=(FWD,))
     edge = next(e for e in seen.edges(HOME, target(0.065)) if e.order == "LR")
     assert (edge.passes, edge.trials) == (1, 4)
+
+
+def test_legacy_hold_profile_keeps_single_step_evidence_only():
+    records = profile("LR", [{"lag": 8, "stages": [stage("L"), stage("R")]}])
+    del records["provenance"]["inter_step_hold_ticks"]
+    records["schedules"] += profile("L", [{"lag": 8, "stages": [stage("L")]}])["schedules"]
+    search = StepSearch(atlas(), accuracy=records, lag=8, commands=(FWD,))
+    edges = {e.order: e for e in search.edges(HOME, target(0.065))}
+    assert (edges["L"].passes, edges["L"].trials) == (1, 1)
+    assert (edges["LR"].accuracy, edges["LR"].trials) == ("unknown", 0)
 
 
 @pytest.mark.parametrize("field", ["source_sha256", "checkpoint_sha256", "hold_ticks"])
@@ -163,24 +207,22 @@ def test_yawed_voxels_keep_pose_and_do_not_fill_sampling_gaps():
     assert search.edges(HOME, target(0.08))[0].cost == (1, 0)
 
 
-@pytest.mark.skipif(
-    not all((DATA / p).exists() for p in ("t1-hand-map.npz", "landing-accuracy/home-model.json")),
-    reason="requires the generated reach map and scored home pilot",
-)
 def test_saved_low_pick_matches_geometric_and_lag8_contributor_counts():
-    search = StepSearch.load(DATA / "t1-hand-map.npz", accuracy_path=DATA / "landing-accuracy/home-model.json", lag=8)
+    search = StepSearch.load(
+        DATA / "t1-nominal-hand-map.npz", accuracy_path=DATA / "landing-accuracy/home-model.json", lag=8
+    )
     pick = TargetRegion("left", (0.48, 0.18, 0.025), (0.05, 0.05, 0.05), solid_pick=True)
     place = TargetRegion("left", (0.30, -0.40, 0.65), (0.05, 0.05, 0.05), loaded=True)
     edges = search.edges(search.home, pick)
-    assert [sum(e.order == o and e.distance_m == 0 for e in edges) for o in ORDERS] == [0, 4, 4, 28, 22]
-    assert [sum(e.order == o and e.cost[0] == 0 for e in edges) for o in ORDERS] == [0, 1, 0, 4, 0]
+    assert [sum(e.order == o and e.distance_m == 0 for e in edges) for o in ORDERS] == [0, 4, 4, 25, 22]
+    assert [sum(e.order == o and e.cost[0] == 0 for e in edges) for o in ORDERS] == [0, 1, 0, 0, 0]
     assert next(e for e in edges if e.cost == (0, 1)).commands == ((0.24, 0.21, 0.0),)
     best = next(search.schedules(search.home, (pick, place)))
     assert [e.order for e in best.edges] == ["L", "none"] and best.cost == (1, 1)
     assert best.edges[0].commands == ((0.12, 0.21, 0.0),)
     unloaded = TargetRegion("left", place.center, place.size)
     alternative = next(search.schedules(search.home, (pick, unloaded)))
-    assert [e.order for e in alternative.edges] == ["LR", "L"] and alternative.cost == (0, 3)
+    assert [e.order for e in alternative.edges] == ["L", "none"] and alternative.cost == (1, 1)
 
 
 def test_scene_pick_and_place_geometry_use_each_pose_once():

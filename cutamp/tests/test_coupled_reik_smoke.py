@@ -33,6 +33,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     spy("_refresh_balanced", 2)  # (particles, ik_deps, world, gate, step)
 
     config = TAMPConfiguration(
+        step_mode="off",  # Exercise the fixed-feet Adam loop that owns coupled re-IK.
         num_particles=8,
         num_opt_steps=5,
         reik_interval=2,

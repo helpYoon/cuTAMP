@@ -144,8 +144,8 @@ class GraspSet(NamedTuple):
     """``[K]`` float32 in [0, 1]: GraspGenX's discriminator scores."""
 
 
-_SETS: Dict[str, GraspSet] = {}
-"""Each shape's grasps by ``mesh_sha256``, kept for the life of the process."""
+_SETS: dict[tuple, tuple[GraspSet, int, int]] = {}
+"""Per shape, checkpoint, device and budget: the grasp pool and its learned and box counts."""
 
 
 def mesh_sha256(obj: Obstacle) -> str:
@@ -268,14 +268,29 @@ def _z_offsets_cm(mesh: trimesh.Trimesh) -> Tuple[int, ...]:
     return tuple(range(0, -m - 1, -1))
 
 
-def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Dict[str, GraspSet]:
+def _bounded_grasp_proposals(points, sampler, budget):
+    """Budget both source generators before the discriminator scores their outputs."""
+    from graspgenx.samplers.planner import run_planner_on_batch
+
+    # Five OBB face centers, one depth, evenly spaced wrist rotations. Other proposals
+    # come from one diffusion pass. The scalar API retries up to a minimum of 40.
+    yaws = budget // 8
+    return run_planner_on_batch(
+        [points], sampler, planner="graspmoe" if yaws else "diffusion",
+        num_grasps=budget - 5 * yaws, grasp_threshold=-1.0, topk_num_grasps=-1,
+        moe_obb_density="dense-topandside", moe_obb_position_spacing_cm=0.0,
+        moe_num_yaws=yaws, moe_z_offsets_cm=(0.0,),
+    )[0]
+
+
+def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str], *,
+               max_grasps: int | None = None, counts: dict | None = None) -> Dict[str, GraspSet]:
     """Each object's GraspGenX grasps, keyed by name, made in this process.
 
     Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process
-    (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame, and runs GraspGenX's
-    graspmoe planner on them: 500 diffusion grasps and the box grasps on the top and the four sides, all kept.
-    GraspGenX always runs on ``.cuda()``; ``device`` places a shape's tensors on its first call, and later calls
-    return them as they are.
+    (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame.
+    With max_grasps set, diffusion and geometric generation share that limit before scoring.
+    Without a limit the reference route draws 500 diffusion grasps and a dense five-face box sweep.
 
     The grasps repeat bit for bit across calls and processes: each run is seeded with ``GRASP_SEED`` and runs in FP32,
     with PTv3's segment reduction deterministic. The caller's random state (Python's, numpy's, torch's CPU and every
@@ -296,8 +311,10 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
             f"(cutamp/grasps.py). uv sync installs it on x86_64 only, and this machine is {platform.machine()}. "
             "See README.md, Installation, the GraspGenX paragraph."
         )
+    if max_grasps is not None and (type(max_grasps) is not int or max_grasps < 1):
+        raise ValueError("max_grasps must be a positive integer")
     ckpt = _checked_model_dir()
-    shape_of = {obj.name: mesh_sha256(obj) for obj in objs}
+    shape_of = {obj.name: (mesh_sha256(obj), ckpt, str(device), max_grasps) for obj in objs}
     new = {shape_of[obj.name]: obj for obj in objs if shape_of[obj.name] not in _SETS}
     if new:
         wait_for_sampler_load()  # before the random state is saved: a background load puts the CPU generator back
@@ -315,16 +332,22 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
                 random.seed(GRASP_SEED)
                 np.random.seed(GRASP_SEED)
                 torch.manual_seed(GRASP_SEED)  # and every CUDA generator
-                grasps, scores, tags, _ = run_planner_on_object(
-                    points, sampler, planner="graspmoe", num_grasps=500, grasp_threshold=-1.0, topk_num_grasps=-1,
-                    moe_obb_density="dense-topandside", moe_z_offsets_cm=_z_offsets_cm(mesh), moe_num_yaws=36,
-                    moe_obb_mode="advanced", moe_skip_obb_rule="auto", moe_obb_position_spacing_cm=1.0,
-                    moe_outlier_threshold=0.014, moe_outlier_k=20,
-                )
-                _SETS[shape] = GraspSet(
+                if max_grasps is None:
+                    grasps, scores, tags, _ = run_planner_on_object(
+                        points, sampler, planner="graspmoe", num_grasps=500, grasp_threshold=-1.0, topk_num_grasps=-1,
+                        moe_obb_density="dense-topandside", moe_z_offsets_cm=_z_offsets_cm(mesh), moe_num_yaws=36,
+                        moe_obb_mode="advanced", moe_skip_obb_rule="auto", moe_obb_position_spacing_cm=1.0,
+                        moe_outlier_threshold=0.014, moe_outlier_k=20,
+                    )
+                else:
+                    grasps, scores, tags, _ = _bounded_grasp_proposals(points, sampler, max_grasps)
+                    if len(grasps) > max_grasps:
+                        raise RuntimeError(f"GraspGenX returned {len(grasps)} poses for a budget of {max_grasps}")
+                candidates = GraspSet(
                     mat4x4_to_grasp_7dof(torch.from_numpy(grasps).to(device)), torch.from_numpy(scores).to(device)
                 )
                 n_box, names = tags.count("obb"), ", ".join(n for n, s in shape_of.items() if s == shape)
+                _SETS[shape] = candidates, len(tags) - n_box, n_box
                 _log.debug(f"GraspGenX: {len(tags)} grasps for {names}, {len(tags) - n_box} diffusion and {n_box} box")
         finally:
             random.setstate(rng[0])
@@ -332,4 +355,9 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str]) -> Di
             torch.set_rng_state(rng[2])
             torch.cuda.set_rng_state_all(rng[3])
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
-    return {name: _SETS[shape] for name, shape in shape_of.items()}
+    if counts is not None:
+        for name, shape in shape_of.items():
+            _, learned, geometric = _SETS[shape]
+            counts[name] = dict(requested=max_grasps, diffusion=learned, box=geometric,
+                                total=learned + geometric, cached=shape not in new)
+    return {name: _SETS[shape][0] for name, shape in shape_of.items()}

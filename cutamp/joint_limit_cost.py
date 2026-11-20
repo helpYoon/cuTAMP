@@ -15,6 +15,8 @@ from typing import Dict
 
 import torch
 
+from cutamp.stance import stance_joint_limits
+
 
 # Initial-state confs are frozen at the robot's actual current state: the
 # initial state must never acquire limit gradients.
@@ -28,6 +30,7 @@ def joint_limit_margin_soft_cost(
     joint_limits: torch.Tensor,
     num_particles: int,
     device: torch.device,
+    achieved_stances=None,
 ) -> torch.Tensor:
     """Per-particle limit penalty summed over Conf particles and DOFs: each conf's hinge², zero inside the limits
     and quadratic in the depth past them. Pure fixed-shape tensor ops — CUDA-graph capture-safe.
@@ -54,7 +57,10 @@ def joint_limit_margin_soft_cost(
     if not config_params:
         return torch.zeros(num_particles, device=device)
     qs = torch.stack([particles[name] for name in config_params], dim=1)  # [B, n_confs, dof]
-    lower, upper = joint_limits[0], joint_limits[1]
+    lower, upper = joint_limits
+    if achieved_stances is not None:
+        soles = torch.stack([achieved_stances[name] for name in config_params], dim=1)
+        lower, upper = stance_joint_limits(soles, lower, upper)
     return (torch.relu(lower - qs).square() + torch.relu(qs - upper).square()).sum(dim=(1, 2))
 
 

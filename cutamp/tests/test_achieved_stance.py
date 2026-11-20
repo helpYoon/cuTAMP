@@ -1,5 +1,37 @@
 import torch
 
+from cutamp.tests.conftest import needs_cuda
+
+
+@needs_cuda
+def test_stepped_pick_reports_signed_self_collision_and_its_gradient(real_world):
+    from cutamp.config import TAMPConfiguration
+    from cutamp.cost_function import CostFunction
+    from cutamp.t1_domain import LeftPick
+    from cutamp.tests.test_t1_real_legs_model import hips_crossed
+
+    obj = real_world.movables[0].name
+    pick = LeftPick.ground({"obj": obj, "grasp": "g", "q": "q"})
+    grasp = real_world.grasps[obj].grasps[:1]
+    costs = CostFunction([pick], real_world, TAMPConfiguration())
+    home, crossed = real_world.q_init.flatten(), hips_crossed(real_world)
+
+    def self_overlap(poses):
+        values = costs.stepped_scene_costs({"q": poses, "g": grasp.expand(len(poses), -1)}, [pick])["values"]
+        assert "self_collision" in values
+        return values["self_collision"][:, 0]
+
+    q = torch.stack([home, crossed]).requires_grad_()
+    overlap = self_overlap(q)
+    assert overlap[0] < 0 < overlap[1]
+    grad = torch.autograd.grad(overlap[1], q)[0][1]
+    joint = grad.abs().argmax()
+    assert abs(grad[joint]) > 1e-3
+    delta = torch.zeros_like(home)
+    delta[joint] = 1e-4
+    plus, minus = self_overlap(torch.stack([crossed + delta, crossed - delta]))
+    torch.testing.assert_close((plus - minus) / 2e-4, grad[joint], rtol=0.02, atol=2e-4)
+
 
 def test_guard_transports_physical_stance_and_matches_home_region():
     from cutamp.com_polygon_cost import margin_from_support_planes, support_rectangles, support_region_planes

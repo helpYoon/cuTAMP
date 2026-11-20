@@ -278,7 +278,9 @@ def score_batch(model, home, entries):
     measured = to_numpy(world(model.pose(traj[:6])))
     trials = [{"lag": lag, "start_soles": measured[i].tolist(), "stages": []} for i, (_, lag) in enumerate(entries)]
     expected = np.repeat(np.asarray(home)[None], count, axis=0)
-    for stage in range(len(entries[0][0]["order"])):
+    num_steps = len(entries[0][0]["order"])
+    for stage in range(num_steps):
+        hold_ticks = HOLD if stage == num_steps - 1 else 0
         foot = torch.as_tensor([int(e["order"][stage] == "R") for e, lag in entries], device=device)
         commands = tensor([e["commands"][stage] for e, lag in entries])
         before = world(model.pose(traj[:6]))
@@ -291,6 +293,7 @@ def score_batch(model, home, entries):
             trials[i]["stages"].append(
                 {
                     "foot": side,
+                    "hold_ticks": hold_ticks,
                     "issue_legal": apply_command(before[i], side, command) is not None,
                     "initial_soles": before[i].tolist(),
                     "nominal_soles": expected[i].tolist(),
@@ -308,12 +311,12 @@ def score_batch(model, home, entries):
             trials[i]["stages"][-1]["clock_ticks"] = int(c)
         handoff = tuple(torch.empty_like(x) for x in traj)
         foot_np = to_numpy(foot)
-        handoff_tick = torch.as_tensor(clocks + HOLD, device=device)
+        handoff_tick = torch.as_tensor(clocks + hold_ticks, device=device)
         max_root_speed = torch.zeros_like(foot, dtype=commands.dtype)
         max_joint_rms = torch.zeros_like(max_root_speed)
-        for t in range(2, int(clocks.max()) + HOLD + 1):
+        for t in range(2, int(clocks.max()) + hold_ticks + 1):
             traj = model.tick(traj, empty, context)
-            if t > int(clocks.min()) + HOLD - SETTLED_WINDOW:
+            if hold_ticks and t > int(clocks.min()) + hold_ticks - SETTLED_WINDOW:
                 final_window = (handoff_tick - SETTLED_WINDOW < t) & (t <= handoff_tick)
                 root_speed_now = traj[2].norm(dim=-1)
                 joint_rms_now = traj[5].square().mean(-1).sqrt()
@@ -321,7 +324,7 @@ def score_batch(model, home, entries):
                     final_window, torch.maximum(max_root_speed, root_speed_now), max_root_speed
                 )
                 max_joint_rms = torch.where(final_window, torch.maximum(max_joint_rms, joint_rms_now), max_joint_rms)
-            for name, times in (("deadline", clocks), ("handoff", clocks + HOLD)):
+            for name, times in (("deadline", clocks), ("handoff", clocks + hold_ticks)):
                 ids = np.flatnonzero(times == t)
                 if not len(ids):
                     continue
@@ -348,7 +351,7 @@ def score_batch(model, home, entries):
                 "max_root_speed_m_s": float(v),
                 "max_joint_speed_rms_rad_s": float(qd),
                 "settled": bool(v < 0.02 and qd < 0.01),
-            }
+            } if hold_ticks else None
         traj = handoff
     for tr, (entry, _) in zip(trials, entries):
         tr["final_stance_pass"] = tr["stages"][-1]["handoff"]["stance_pass"]
@@ -356,7 +359,7 @@ def score_batch(model, home, entries):
         if tr["all_handoffs_pass"] is None:
             raise ValueError(f"Incomplete or nonfinite handoff evidence for {entry['order']}")
         tr["all_swings_pass"] = all(s["issue_legal"] and s["handoff"]["swing_pass"] for s in tr["stages"])
-        tr["all_settled"] = all(s["settling"]["settled"] for s in tr["stages"])
+        tr["all_settled"] = tr["stages"][0]["settling"]["settled"] if num_steps == 1 else None
     return trials
 
 
@@ -439,6 +442,7 @@ def main():
         "context": "All five actuator groups use the reported constant delay in physics substeps. Friction 1.0, zero encoder and torso CoM offsets, zero sensor noise, no payload.",
         "warmup_ticks": WARMUP,
         "hold_ticks": HOLD,
+        "inter_step_hold_ticks": 0,
         "settled_window_ticks": SETTLED_WINDOW,
         "settling": "Separately scored: maximum joint-speed RMS < 0.01 rad/s and root speed < 0.02 m/s throughout the final 25 HOLD ticks.",
         "control_hz": 50,

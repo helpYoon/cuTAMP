@@ -49,8 +49,10 @@ def test_two_locally_accurate_issues_can_miss_the_intended_world_stance():
     class Predictor:
         device = torch.device("cpu")
         model = SimpleNamespace(feet=lambda x: (x[0],))
+        hold_ticks = 75
 
-        def _step(self, state, side, command):
+        def _step(self, state, side, command, hold_ticks):
+            assert hold_ticks == (0 if side == 0 else self.hold_ticks)
             issued = _intended_pair(state.tensors[0], side, command)
             achieved = issued.clone()
             achieved[:, side, 0] += 0.012

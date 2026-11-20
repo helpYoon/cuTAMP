@@ -58,3 +58,40 @@ def test_patience_zero_disables_early_stop():
     snap = _BestSnapshot()
     snap.update(0, 10, 5.0, _particles(0.0))
     assert not snap.should_stop(step=10_000, patience=0)
+
+
+def test_patience_extends_only_for_better_feasible_center():
+    from cutamp.optimize_plan import _FeasibleArchive
+
+    p = _particles(0.)
+    snap = _BestSnapshot()
+    feasible = torch.tensor([True, False, False, False])
+    center = torch.tensor([.09, .03, .02, .01])
+    effort = torch.zeros(4)
+    archive = _FeasibleArchive(p, center, effort)
+    for step, distance in [(0, .09), (1, .08), (2, .07), (3, .06)]:
+        center[0] = distance
+        archive.observe(p, feasible, center, effort)
+        snap.update(step, 1, 10., p)
+        assert not snap.should_stop(step, 2, archive)
+    # Count, weighted loss and feasible centering now plateau. Moving an infeasible
+    # row toward the centroid cannot extend the patience window again.
+    center[1] = 0.
+    archive.observe(p, feasible, center, effort)
+    assert snap.should_stop(6, 2, archive)
+    assert not snap.should_stop(6, 0, archive)
+
+
+def test_preserve_best_feasible_center_for_each_particle():
+    from cutamp.optimize_plan import _FeasibleArchive
+
+    p = {"q": torch.tensor([[1.], [2.], [3.]])}
+    archive = _FeasibleArchive(p, torch.zeros(3), torch.zeros(3))
+    archive.observe(p, torch.tensor([True, True, False]), torch.tensor([.1, .3, .0]), torch.tensor([8., 1., 0.]))
+    p["q"] += 10
+    archive.observe(p, torch.tensor([True, True, True]), torch.tensor([.2, .3, .6]), torch.tensor([0., .9, 10.]))
+    p["q"] += 10
+    # A failed constraint rules out even perfect centering. Recheck the last iterate before restoring.
+    restored = archive.restore(p, torch.tensor([False, True, True]), torch.tensor([0., .4, .5]), torch.zeros(3))
+    assert restored
+    assert p["q"].flatten().tolist() == [1., 12., 23.]

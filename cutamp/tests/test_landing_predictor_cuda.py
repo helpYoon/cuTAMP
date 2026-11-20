@@ -26,9 +26,29 @@ def assert_same_prediction(a, b):
 def predictor():
     default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
     bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default))
-    if not bundle.is_file() and "CUTAMP_LANDING_BUNDLE" not in os.environ:
-        pytest.skip("Export the real seed-3 checkpoint with experiments/export_t1_landing.py")
     return LandingPredictor(bundle)
+
+
+@needs_cuda
+@torch.no_grad()
+def test_captured_rollout_matches_eager_and_retains_prior_results(predictor):
+    default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default))
+    fast = LandingPredictor(bundle, use_cuda_graph=True)
+    ctx = torch.zeros(2, 38, device="cuda")
+    ctx[:, -5:] = -1
+    start = predictor.standing_start(ctx)
+    commands = ctx.new_tensor([[[.12,.21,0], [.10,-.21,0]], [[.24,.21,0], [.06,-.21,0]]])
+    expected = predictor.rollout(start, "LR", commands)
+    result = fast.rollout(start, "LR", commands)
+    assert expected.steps[0].clock.unique().numel() == 2
+    torch.cuda.empty_cache()  # any scratch tensor referenced by the graph must still be owned
+    changed = commands.clone()
+    changed[..., 0] += .01
+    ctx[:, 0] += .25
+    other = predictor.standing_start(ctx)
+    assert_same_prediction(fast.rollout(other, "LR", changed), predictor.rollout(other, "LR", changed))
+    assert_same_prediction(result, expected)
 
 
 @needs_cuda
@@ -71,13 +91,22 @@ def test_chain_uses_terminal_histories_and_correct_row_clocks(order, predictor):
     assert torch.backends.cuda.matmul.allow_tf32 == planner_precision
     a, b = pred.steps
     assert a.clock[0] != a.clock[1]
-    torch.testing.assert_close(a.valid_ticks.sum(1), a.clock + 75)
+    torch.testing.assert_close(a.valid_ticks.sum(1), a.clock)
+    torch.testing.assert_close(b.valid_ticks.sum(1), b.clock + predictor.hold_ticks)
+    rows = torch.arange(len(a.clock), device=a.clock.device)
+    torch.testing.assert_close(a.achieved, a.sole_trace[rows, a.clock - 1])
+    assert (a.terminal.tensors[-1][:, 4] == 1).all()  # The very next issue reads the deadline's foot anchors.
+    assert a.max_joint_rms is None and a.max_root_speed is None and a.near_rest is None
+    assert b.near_rest is not None
     support = "LR".index(order[0])
     torch.testing.assert_close(b.reference[:, support], a.achieved[:, support])
     with prediction_precision():
         (terminal_grad,) = torch.autograd.grad(b.achieved[:, 1 - support, 0].sum(), cmd)
     assert torch.isfinite(terminal_grad).all() and (terminal_grad[:, 0, :].abs().sum(1) > 0.01).all()
     with torch.no_grad():
+        first = predictor.rollout(start, order[0], cmd[:, :1], final_hold_ticks=0)
+        for actual, replayed in zip(a.terminal.tensors, first.terminal.tensors, strict=True):
+            torch.testing.assert_close(actual, replayed)
         single = predictor.rollout(a.terminal, order[1], cmd[:, 1:])
         # Perturb only the first command. Recompute complete closed-loop predictions for both sides.
         delta = torch.zeros_like(cmd)
@@ -98,9 +127,9 @@ def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
     from cutamp.step_search import StepSearch, TargetRegion
 
     data = Path(__file__).resolve().parents[2] / "data/t1-reachability"
-    if not (data / "t1-hand-map.npz").exists() or not (data / "landing-accuracy/home-model.json").exists():
-        pytest.skip("Requires the offline T1 hand map and accuracy table")
-    search = StepSearch.load(data / "t1-hand-map.npz", accuracy_path=data / "landing-accuracy/home-model.json", lag=8)
+    search = StepSearch.load(
+        data / "t1-nominal-hand-map.npz", accuracy_path=data / "landing-accuracy/home-model.json", lag=8
+    )
     target = TargetRegion("left", (0.48, 0.18, 0.025), (0.05,) * 3, solid_pick=True)
     edge = next(search.schedules(search.home, [target])).edges[0]
     assert edge.order == "L" and edge.commands == ((0.24, 0.21, 0.0),)

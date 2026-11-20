@@ -11,15 +11,17 @@ from cutamp.tests.conftest import needs_cuda
 from cutamp.tests.paired_grasp_scene import ROOT, paired_setup
 
 
-def paired_case(label, output, *, place=False, motion=False, validator=None):
+def paired_case(label, output, *, place=False, motion=False, validator=None, motion_validation="independent"):
     env, q, inp_args = paired_setup(label, place=place)
     inp_args.transition_validator = validator
     bundle = ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
     cfg = TAMPConfiguration(
         step_mode="model",
+        step_proposal_count=0,  # Exercise the differentiable SQP reference in these gradient tests.
         num_particles=1,
         enable_visualizer=False,
         curobo_plan=motion,
+        step_motion_validation=motion_validation,
         max_step_schedules=1,
         experiment_root=str(output),
         landing_bundle=str(bundle),

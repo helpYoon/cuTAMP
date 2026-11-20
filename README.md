@@ -70,6 +70,20 @@ Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
 `uv run pytest`) or after `source .venv/bin/activate`. Both put `.venv/bin`,
 which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
+The checkout includes the three T1 stepping inputs used by the default planner.
+The nominal hand reach map and landing-accuracy table guide task search. The
+frozen bfm_wm policy and world model in `landing-seed3.pt` evaluate candidate
+landings on logical CUDA device 0. To verify the exact files used in the
+four-step benchmark, run this from the repository root:
+
+```bash
+sha256sum -c <<'EOF'
+047174fe321ccdb3711dd88581a51142576b09a742b7a46f4c9784c4454d8bf7  data/t1-reachability/t1-nominal-hand-map.npz
+61413e2a0c8ecbbd398803a9466d3aafea2c66fe8f2acf404726a1af8ad5f686  data/t1-reachability/landing-accuracy/home-model.json
+2f8002e1dcf16957a7f64d37aacb89ca10e3a579cfc1c1756d154381b90f6c47  data/t1-reachability/landing-accuracy/landing-seed3.pt
+EOF
+```
+
 A clone made without `--recursive` gets both submodules with
 `GIT_LFS_SKIP_SMUDGE=1 git submodule update --init`, and so does a checkout
 that pulls or merges a commit adding a submodule: until then that submodule's
@@ -285,11 +299,13 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   model: a pinned copy of bfm_wm's T1 (`urdf/T1_29dof.urdf`, its `meshes/`,
   `t1_actuators.npz` and the licence; `PROVENANCE.yml` gives each file's
   source and sha1) and `build_planner_model.py`, which derives the planner's
-  `t1_planner.urdf` (the vendor URDF plus a `world` link and cuTAMP's gripper),
+  `t1_planner.urdf` (the vendor URDF plus a `world` link and cuTAMP's articulated gripper),
   `t1_29dof.yml` (the cuRobo robot config, with a `cutamp:` block cuRobo never
   reads) and `t1_29dof_spheres.yml` from it, cuTAMP's gripper and the
   hand-kept upper-body spheres (`upper_body_spheres.yml`, gripper links
-  included); a rerun reproduces all three byte for byte.
+  included). The generated wrist visuals keep the vendor wrist housing and
+  camera. The fingers follow the gripper joints. The generator reproduces the
+  URDF, both YAML files and the two wrist meshes byte for byte.
   `write_mujoco_fixture.py` writes `mujoco_fixture.npz` (MuJoCo's FK, masses,
   inertias and soft limits on bfm_wm's `t1.xml`), which the tests check the
   model against.
@@ -466,7 +482,7 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   `Right…` twins.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
-  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles=256`;
+  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles=64`;
   `soft_cost=["place_close_to_base", "joint_limit_margin",
   "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
   balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
@@ -611,7 +627,19 @@ live `--cuda_graphs` runs in
 
 ## Usage
 
-By default a run plans on bfm_wm's T1 on its home stance with 256 particles
+The T1 default runs `--step_mode model` and requests a complete motion. The public
+planner generates grasps for the scene, searches over the acting arm and footstep
+orders, and screens foot targets with the frozen landing policy and world model.
+It tries smooth, planted-foot manipulation paths with the inactive arm at nominal
+and uses cuRobo trajectory optimization when needed. A connected prediction carries
+the status `model_predicted_motion`. Independent transition validation is available
+through the Python API with `step_motion_validation="independent"` and an evidence
+provider. Both default full-motion deadlines start at planner entry. The planner
+allows 9.5 seconds to find a complete motion and, once one passes, compares alternatives
+until 4.4 seconds from entry. Use `--no-motion_plan` for an 8-second keyframe search
+or `--max_duration` to set one budget for the entire search.
+
+The fixed-feet route (`--step_mode off`) uses 64 particles by default
 and the soft costs `place_close_to_base`, `joint_limit_margin` and
 `minimize_body_movement`, optimized under re-IK-coupled Adam with the
 balance-first GN refresh replayed as CUDA graphs, and balance-first GN IK, so
@@ -624,32 +652,35 @@ each segment as needed, up to 4×, and a candidate that still fails is dropped
 (`motion_solver._balance_gate`).
 
 ```bash
-# Smoke test (no motion plan)
-uv run python -m cutamp.scripts.run_cutamp -n 16 --num_opt_steps 50
+# Recorded floor-transfer scene, generating the grasp and step order from its goal
+uv run python -m cutamp.scripts.run_cutamp --env two_steps_floor_transfer --save_plan
+
+# Fixed-feet smoke test (keyframes)
+uv run python -m cutamp.scripts.run_cutamp --step_mode off -n 16 --num_opt_steps 50
 
 # Full run with motion planning, no visualizer
-uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --disable_visualizer
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --disable_visualizer
 
 # With Rerun visualizer
-uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64
 
 # Save the raw plan (stage4-raw) next to the run's metrics
-uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --save_plan auto
 
 # Another scene: the shelf (at height 0), or the cylinder or the cup on a 0.5 m table top
-uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --env shelf_t1
-uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --env cylinder_t1 --surface_height 0.5
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --env shelf_t1
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --env cylinder_t1 --surface_height 0.5
 
 # Different soft costs (replaces the default list)
-uv run python -m cutamp.scripts.run_cutamp --motion_plan \
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan \
     --soft_cost retract_close_to_home minimize_body_movement
 
 # Eager Adam steps and refreshes (no CUDA graphs)
-uv run python -m cutamp.scripts.run_cutamp --motion_plan --no_cuda_graphs
+uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan --no_cuda_graphs
 
 # Several runs, each saving its plan, then the real-leg report over them
 for s in 0 1 2; do
-    uv run python -m cutamp.scripts.run_cutamp --motion_plan -n 64 --save_plan auto \
+    uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --save_plan auto \
         --disable_visualizer --seed $s --experiment_root /tmp/study --experiment_id run_s$s
 done
 uv run python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/real_legs
@@ -695,7 +726,7 @@ skips the robot's meshes; both cut bandwidth.
 ## Troubleshooting
 
 - **`torch.OutOfMemoryError: CUDA out of memory`** — use fewer particles
-  (default 256), e.g. `-n 64`.
+  (default 64), e.g. `-n 32`.
 
 ## Key Design Decisions
 
@@ -703,13 +734,13 @@ skips the robot's meshes; both cut bandwidth.
    GN refresh and the optimizer's gradient masks keep the inactive arm's
    joints fixed, so that hand rides with the trunk when they move the body,
    and `plan_cspace` holds nothing between confs.
-   Both arms are in GN's collision row, the optimizer's collision constraints
-   and the planner's collision checks, with two gaps: a pick's insert disables
-   its object, and a place's insert its support surface and its back-out the
-   released object, each for the whole robot; and a segment
-   the balance gate slows down is resampled through
-   the planner's frames (`_retime`) without new collision or joint-limit
-   checks on the in-between frames.
+   Both arms participate in GN, particle and motion-planning collision checks.
+   Every returned manipulation and retract frame, including samples introduced
+   by retiming, is checked for self-collision with the planner's active spheres
+   and any attached object. For scene collisions, a pick's insert disables its
+   object, a place's insert disables its support surface and its back-out
+   disables the released object, each for the whole robot. The resampling
+   stage still relies on cuRobo's original scene and joint-limit checks.
 
 2. **Retract after pick/place** — the per-arm `RetractHolding` (collision checks
    exclude held object) and `RetractFree` (empty gripper) operators move toward

@@ -113,6 +113,58 @@ def _adam_param_groups(params: List[Tuple[torch.Tensor, bool]], conf_lr: float) 
     return [g for g in ({"params": non_confs}, {"params": confs, "lr": conf_lr}) if g["params"]]
 
 
+class _FeasibleArchive:
+    """Keep each particle's best complete feasible state across fixed-stance Adam proposals."""
+
+    def __init__(self, particles, center, effort):
+        self.center = torch.full_like(center, float("inf"))
+        self.effort = torch.full_like(effort, float("inf"))
+        self.state = {name: value.detach().clone() for name, value in particles.items()}
+
+    @torch.no_grad()
+    def observe(self, particles, feasible, center, effort):
+        better = feasible & ((center < self.center) | ((center == self.center) & (effort < self.effort)))
+        self.center.copy_(torch.where(better, center, self.center))
+        self.effort.copy_(torch.where(better, effort, self.effort))
+        for name, saved in self.state.items():
+            mask = better.view((-1,) + (1,) * (saved.ndim - 1))
+            saved.copy_(torch.where(mask, particles[name], saved))
+
+    @torch.no_grad()
+    def restore(self, particles, feasible, center, effort):
+        better = self.center.isfinite() & (
+            ~feasible | (self.center < center) | ((self.center == center) & (self.effort < effort))
+        )
+        if not better.any():
+            return False
+        for name, saved in self.state.items():
+            mask = better.view((-1,) + (1,) * (saved.ndim - 1))
+            value = particles[name]
+            value.copy_(torch.where(mask, saved, value))
+        return True
+
+
+def _fixed_row_quality(info, cost_dict, total_cost, soft_cost, reducer):
+    """Scores of the same final rows for particle selection and later motion retries."""
+    quality = {"best_cost": total_cost, "best_soft_cost": soft_cost}
+    center = cost_dict.get("soft", {}).get("max_center_distance_m")
+    if center is not None:
+        quality.update(max_center_distance_m=center, secondary_effort=reducer.secondary_effort(cost_dict))
+    info["row_quality"] = quality
+    return quality
+
+
+def _best_fixed_row(quality, passing):
+    if "max_center_distance_m" in quality:
+        center = quality["max_center_distance_m"].masked_fill(~passing, float("inf"))
+        passing = passing & (center == center.min())
+        score = quality["secondary_effort"]
+    else:
+        score = quality["best_soft_cost"]
+    return int(score.masked_fill(~passing, float("inf")).argmin())
+
+
+
 @dataclass
 class _StepBody:
     """One Adam step's device work, run eagerly or captured as G_step: the forward, the per-step scalars
@@ -127,12 +179,16 @@ class _StepBody:
     params: List[torch.Tensor]
     grad_masks: Dict[int, torch.Tensor]
     keep_vis: bool
+    archive: _FeasibleArchive | None = None
 
     def __call__(self) -> Tuple[torch.Tensor, Optional[tuple]]:
         rollout = self.rollout_fn(self.particles)
         cost_dict = self.cost_fn(rollout, self.particles)
         costs = self.cost_reducer(cost_dict, consider_types=self.consider_types)
         satisfying_mask = self.get_mask(cost_dict, verbose=False)
+        if self.archive is not None:
+            centers = cost_dict["soft"]["max_center_distance_m"]
+            self.archive.observe(self.particles, satisfying_mask, centers, self.cost_reducer.secondary_effort(cost_dict))
         loss = costs.mean()
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
@@ -185,6 +241,7 @@ class _BestSnapshot:
         self.state = None
         self._patience_sat = -1
         self._best_min_loss = float("inf")
+        self._last_checked_center = float("inf")
 
     def update(self, step: int, num_satisfying: int, min_loss: float, particles: dict):
         if num_satisfying > self.best_sat:
@@ -201,8 +258,18 @@ class _BestSnapshot:
         if meaningful or loss_improved:
             self.last_improve_step = step
 
-    def should_stop(self, step: int, patience: int) -> bool:
-        return patience > 0 and (step - self.last_improve_step) > patience
+    def should_stop(self, step: int, patience: int, archive: _FeasibleArchive | None = None) -> bool:
+        if patience <= 0:
+            return False
+        expired = step - self.last_improve_step > patience
+        if archive is not None and (step == 0 or expired):
+            # Check the GPU archive only at the initial step and at a potential stop.
+            best_center = float(archive.center.min())
+            if best_center < self._last_checked_center:
+                self._last_checked_center = best_center
+                self.last_improve_step = step
+                return False
+        return expired
 
     def restore_if_better(self, particles: dict, current_num_satisfying: int) -> bool:
         """Copy the best-seen state back into ``particles`` (in place) if it
@@ -414,8 +481,13 @@ class ParticleOptimizer:
         rollout, cost_dict, costs, satisfying_mask = vis
         # Visualize satisfying particles if we have any. Otherwise, just show the best particle so far.
         if num_satisfying > 0:
-            best_satisfying_idx = costs[satisfying_mask].argmin()
-            best_idx = indices[satisfying_mask][best_satisfying_idx]
+            center = cost_dict.get("soft", {}).get("max_center_distance_m")
+            if center is None:
+                best_idx = indices[satisfying_mask][costs[satisfying_mask].argmin()]
+            else:
+                best_idx = _best_fixed_row({"max_center_distance_m": center,
+                                            "secondary_effort": self.cost_reducer.secondary_effort(cost_dict)},
+                                           satisfying_mask)
         else:
             best_idx = costs.argmin()
 
@@ -432,7 +504,9 @@ class ParticleOptimizer:
         visualizer.log_cost_dict(cost_dict)
         visualizer.log_scalar("loss", loss_val)
 
-    def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
+    def __call__(
+        self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer, *, deadline=None
+    ) -> Tuple[bool, dict, bool]:
         """Optimize particles for the plan skeleton.
 
         Returns ``(solution_found, opt_metrics, time_exceeded)``.
@@ -494,14 +568,18 @@ class ParticleOptimizer:
             # initialized poses still require the same fresh whole-particle checks.
             timer.stop("setup_optimizer")
             with torch.no_grad():
-                costs = cost_fn(rollout_fn(particles), particles)
+                rollout = rollout_fn(particles)
+                costs = cost_fn(rollout, particles)
                 passing = self.get_satisfying_mask(costs, verbose=False)
                 n = int(passing.sum())
                 total = self.cost_reducer(costs, consider_types=ADAM_CONSIDER_TYPES)
                 soft = self.cost_reducer.soft_costs(costs)
-                opt_metrics.update(num_steps=0, num_satisfying_final=n,
-                                   best_cost=float(total[passing].min()) if n else None,
-                                   best_soft_cost=float(soft[passing].min()) if n else None)
+                quality = _fixed_row_quality(plan_info, costs, total, soft, self.cost_reducer)
+                selected = _best_fixed_row(quality, passing) if n else None
+                opt_metrics.update(num_steps=0, num_satisfying_final=n)
+                opt_metrics.update({k: float(v[selected]) if n else None for k, v in quality.items()})
+                if n and "max_center_distance_m" not in quality:
+                    opt_metrics["best_cost"] = float(total[passing].min())
             return n > 0, opt_metrics, False
 
         optimizer = Adam(params=_adam_param_groups(pairs, self.config.conf_lr), lr=self.config.lr)
@@ -549,11 +627,18 @@ class ParticleOptimizer:
         start_time = time.perf_counter()
         time_exceeded = False
         best_snapshot = _BestSnapshot()
+        archive = None
+        if "max_center_distance_m" in init_cost_dict.get("soft", {}):
+            mutable = {k: v for k, v in particles.items() if v.requires_grad or k in dropped_conf_names}
+            archive = _FeasibleArchive(
+                mutable, init_cost_dict["soft"]["max_center_distance_m"],
+                self.cost_reducer.secondary_effort(init_cost_dict),
+            )
         body = _StepBody(
             particles, rollout_fn, cost_fn, self.cost_reducer, self.get_satisfying_mask, consider_types,
             params=[p for g in optimizer.param_groups for p in g["params"]], grad_masks=grad_masks,
             # The no-op Visualizer skips the vis block, and with it the block's syncs.
-            keep_vis=type(visualizer) is not Visualizer,
+            keep_vis=type(visualizer) is not Visualizer, archive=archive,
         )
         step_graph = refresh_graph = None
         use_graphs = self.config.cuda_graphs
@@ -561,6 +646,9 @@ class ParticleOptimizer:
             opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
         try:
             for step in pbar:
+                if deadline is not None and time.monotonic() >= deadline:
+                    time_exceeded = True
+                    break
                 if (self.config.max_loop_dur is not None
                         and timer.elapsed("start_optimization") >= self.config.max_loop_dur):
                     _log.warning(f"Optimization exceeded max time of {self.config.max_loop_dur:.2f}s")
@@ -600,7 +688,7 @@ class ParticleOptimizer:
                 # Best-seen snapshot + early-stop bookkeeping. Measured state is
                 # pre-step, so the clone is consistent with num_satisfying.
                 best_snapshot.update(step, num_satisfying, min_cost, particles)
-                if best_snapshot.should_stop(step, self.config.early_stop_patience):
+                if best_snapshot.should_stop(step, self.config.early_stop_patience, archive):
                     _log.info(
                         f"Early stop at step {step}: no meaningful progress for "
                         f"{self.config.early_stop_patience} steps (best "
@@ -645,15 +733,18 @@ class ParticleOptimizer:
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).
-        restored = best_snapshot.restore_if_better(
-            particles, opt_metrics["num_satisfying"][-1] if opt_metrics["num_satisfying"] else 0
-        )
-        if restored:
-            _log.info(
-                f"Restored best-seen particles: {best_snapshot.best_sat} satisfying "
-                f"(step {best_snapshot.best_step}) over final "
-                f"{opt_metrics['num_satisfying'][-1]}"
+        if archive is None:
+            restored = best_snapshot.restore_if_better(
+                particles, opt_metrics["num_satisfying"][-1] if opt_metrics["num_satisfying"] else 0
             )
+        else:
+            with torch.no_grad():
+                final_costs = cost_fn(rollout_fn(particles), particles)
+                restored = archive.restore(
+                    particles, self.get_satisfying_mask(final_costs, verbose=False),
+                    final_costs["soft"]["max_center_distance_m"],
+                    self.cost_reducer.secondary_effort(final_costs),
+                )
         opt_metrics["best_num_satisfying"] = best_snapshot.best_sat
         # What Adam added over step 0, which measures the untouched IK init (None if no step ran:
         # best_sat stays -1), and whether the reported particles are a restored snapshot.
@@ -684,27 +775,12 @@ class ParticleOptimizer:
         _log.info(f"{num_satisfying}/{self.config.num_particles} satisfying after optimization")
         opt_metrics["num_satisfying_final"] = num_satisfying
 
-        # Get the best costs from the satisfying particles. Note cost itself includes soft and hard (i.e., constraints)
-        # costs, as the Adam loss does (ADAM_CONSIDER_TYPES).
-        best_cost = costs[satisfying_mask].min().item() if num_satisfying > 0 else None
-        best_soft_cost = soft_costs[satisfying_mask].min().item() if num_satisfying > 0 else None
-        if best_cost is not None:
-            _log.info(f"Best particle cost: {best_cost:04f}, best soft cost: {best_soft_cost:04f}")
-        else:
-            _log.info("No satisfying particles found at end of optimization")
-        opt_metrics["best_cost"] = best_cost
-        opt_metrics["best_soft_cost"] = best_soft_cost
-
-        # Visualize rollout of the best particle in terms of soft costs, which is just trajectory length if no
-        # other soft costs are specified. If no satisfying particles, just visualize lowest overall cost particle.
-        if num_satisfying > 0:
-            best_satisfying_idx = soft_costs[satisfying_mask].argmin()
-            best_idx = indices[satisfying_mask][best_satisfying_idx]
-        else:
-            best_idx = costs.argmin()
-        best_idx_int = int(best_idx.item())
-        # Measure only: the selected best particle's CoM margin, the min over its confs.
-        opt_metrics["best_com_margin"] = particle_com_margin(world, {k: v[best_idx_int] for k, v in particles.items()})
+        quality = _fixed_row_quality(plan_info, cost_dict, costs, soft_costs, self.cost_reducer)
+        best_idx = _best_fixed_row(quality, satisfying_mask) if num_satisfying else int(costs.argmin())
+        opt_metrics.update({k: float(v[best_idx]) if num_satisfying else None for k, v in quality.items()})
+        if num_satisfying and "max_center_distance_m" not in quality:
+            opt_metrics["best_cost"] = float(costs[satisfying_mask].min())
+        opt_metrics["best_com_margin"] = particle_com_margin(world, {k: v[best_idx] for k, v in particles.items()})
 
         # Log initial state
         timer.start("visualize_rollout")

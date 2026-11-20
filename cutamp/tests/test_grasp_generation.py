@@ -10,6 +10,7 @@ import sys
 import threading
 from importlib.machinery import ModuleSpec
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +24,21 @@ from cutamp.utils.common import grasp_7dof_to_mat4x4
 
 DEVICE = torch.device("cuda", 0)
 README = "README.md, Installation, the GraspGenX paragraph"
+
+
+@pytest.mark.parametrize("budget", [1, 4, 8, 17, 63, 64])
+def test_learned_and_geometric_proposals_share_the_raw_generation_budget(monkeypatch, budget):
+    def run(clouds, sampler, *, planner, num_grasps, moe_num_yaws, moe_obb_position_spacing_cm, moe_z_offsets_cm, **kw):
+        assert len(clouds) == 1 and num_grasps >= 1
+        assert moe_obb_position_spacing_cm == 0 and moe_z_offsets_cm == (0.0,)
+        n_box = 5 * moe_num_yaws if planner == "graspmoe" else 0
+        assert num_grasps + n_box == budget
+        if budget == 64:
+            assert (num_grasps, n_box) == (24, 40)
+        return [(None, None, ["diff"] * num_grasps + ["obb"] * n_box, None)]
+    monkeypatch.setitem(sys.modules, "graspgenx.samplers.planner", SimpleNamespace(run_planner_on_batch=run))
+    _, _, tags, _ = g._bounded_grasp_proposals(np.zeros((10, 3)), object(), budget)
+    assert len(tags) == budget
 
 
 def _blocks():
@@ -112,7 +128,8 @@ def test_grasps_are_made_for_the_objects_a_skeleton_picks(monkeypatch):
         time.sleep(0.2)
         events.append("warmup ends")
 
-    def fake_grasp_sets(objs, device):
+    def fake_grasp_sets(objs, device, *, max_grasps, counts):
+        assert max_grasps == 64
         events.append(list(objs))
         return dict.fromkeys(objs, "grasps")
 
@@ -134,7 +151,7 @@ def test_grasps_are_made_for_the_objects_a_skeleton_picks(monkeypatch):
     monkeypatch.setattr(alg, "start_sampler_load", lambda: events.append("model load starts"))
     monkeypatch.setattr(alg, "wait_for_sampler_load", lambda: events.append("model load ended"))
     monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
-    config = TAMPConfiguration(curobo_plan=True, enable_visualizer=False)
+    config = TAMPConfiguration(step_mode="off", curobo_plan=True, enable_visualizer=False)
     alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
                    experiment_id="fake")
     assert events == ["model load starts", ["block2"], "model load ended", "warmup starts", "warmup ends", ["block3"]]

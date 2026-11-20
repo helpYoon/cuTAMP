@@ -151,6 +151,8 @@ class _HandIndex:
 
     def __init__(self, layers, voxel_size):
         self.voxel = voxel_size
+        # Distinct sole pairs can put the same target at exactly the same hand-map coordinates.
+        self.nearest = lru_cache(maxsize=2048)(self.nearest)
         self.layers = [layer for layer in layers if len(layer["ijk"])]
         if not self.layers:
             self.tree = None
@@ -220,6 +222,9 @@ class StepSearch:
             check_profile(self.provenance)
             self.profile_stance = _tuples(_soles_array(accuracy["home_soles"]))
             for schedule in accuracy["schedules"]:
+                # Older tables measured alternating pairs with a dwell after the first landing.
+                if len(schedule["order"]) > 1 and self.provenance.get("inter_step_hold_ticks") != 0:
+                    continue
                 key = (schedule["order"], _tuples(schedule["commands"]))
                 matched = [
                     handoff_precision(t.get("stages"), schedule["order"]) for t in schedule["trials"] if t["lag"] == lag
@@ -267,7 +272,7 @@ class StepSearch:
     def _edges(self, incoming, target):
         known = target.center is not None and target.size is not None
         if known:
-            center, half = np.asarray(target.center), np.asarray(target.size) / 2
+            center, half = np.asarray(target.center), tuple(np.asarray(target.size) / 2)
         arm_map = self.hands.get(target.arm)
         exact_start = self.profile_stance is not None and np.allclose(incoming, self.profile_stance, atol=1e-7, rtol=0)
         candidates = []
@@ -291,13 +296,13 @@ class StepSearch:
             gap, posture, q = None, None, None
             if known and arm_map is not None:
                 _, frame = canonical_stance(feet)
-                local = np.r_[(center[:2] - frame[:2]) @ _rot(-frame[2]), center[2]]
+                local = (*((center[:2] - frame[:2]) @ _rot(-frame[2])), center[2])
                 gap, posture, q = arm_map.nearest(local, half, target.yaw - frame[2])
             evidence = self._accuracy(order, commands, exact_start, target.loaded)
             candidates.append(LandingEdge(order, commands, feet, steps, gap, posture, q, *evidence))
         return tuple(candidates)
 
-    def schedules(self, incoming_soles, targets, *, orders=None, deadline=None, step_count=None):
+    def schedules(self, incoming_soles, targets, *, orders=None, deadline=None, step_count=None, prefer_reach=False):
         """Yield complete endpoint paths in lexicographic A* order, preserving alternatives.
 
         Defer one-action lookahead until a partial path reaches the top of the
@@ -319,7 +324,11 @@ class StepSearch:
         def push(path, cost, gap, children=None):
             h = min(e.cost for e in children) if children else (0, 0)
             f = (cost[0] + h[0], cost[1] + h[1])
-            heapq.heappush(queue, (f, gap, next(serial), path, cost, children))
+            # Screening will measure controller precision from the actual history. In this
+            # mode a missing load profile should not outrank a measured miss of the hand map.
+            # Worst reach miss is monotone along the path and lower-bounds the completed plan.
+            priority = (gap, *f) if prefer_reach else (*f, gap)
+            heapq.heappush(queue, (priority, gap, next(serial), path, cost, children))
 
         push((), (0, 0), 0.0)
         while queue and (deadline is None or monotonic() < deadline):

@@ -137,6 +137,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(dir=args.output)).resolve()
     base = TAMPConfiguration(
+        step_mode="off", curobo_plan=False,
         num_particles=args.particles,
         num_initial_plans=1,
         max_step_schedules=1,

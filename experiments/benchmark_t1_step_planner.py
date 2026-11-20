@@ -129,7 +129,7 @@ def run_case(directory, name, env, q, inputs, cfg):
         "mode": cfg.step_mode,
         "strategy": cfg.step_search_order,
         "budget": cfg.max_step_schedules,
-        "time_budget_s": cfg.max_loop_dur,
+        "time_budget_s": m.get("search_budget_s", cfg.max_loop_dur),
         "num_particles": cfg.num_particles,
         "step_refine_iterations": stepped.step_refine_iterations,
         **{
@@ -210,7 +210,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=args.section + "-", dir=args.output))
     cfg = TAMPConfiguration(
-        step_mode="model",
+        step_mode="model", curobo_plan=False,
         step_derivative_method="autodiff" if args.autodiff_reference else "finite_difference",
         com_center_weight=args.center_weight,
         enable_visualizer=False,

@@ -65,6 +65,7 @@ _PINNED_SOURCES = {
     "curobo._src.transition.robot_state_transition:RobotStateTransition.compute_augmented_state": "b850477475b9",
     "curobo._src.util.warp:get_warp_device_stream": "ba0736c58155",
     "curobo._src.robot.kinematics.kinematics:Kinematics._forward": "c77db1c18ed6",
+    "curobo._src.curobolib.backends.cuda_core_backend.kinematics:launch_kinematics_link_wrench_backward": "21403a994f1a",
     "curobo._src.robot.dynamics.dynamics:Dynamics.compute_inverse_dynamics": "88bc59d7b638",
     "curobo._src.solver.solver_trajopt:TrajOptSolver.get_all_rollout_instances": "284a926d8db7",
     "curobo._src.solver.solver_core:SolverCore.get_all_rollout_instances": "87a2594a222f",
@@ -76,6 +77,28 @@ _PINNED_SOURCES = {
 }
 
 _KERNEL_CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "cutamp", "nvrtc")
+
+
+def sphere_position_vjp(kin, grad_spheres: torch.Tensor) -> torch.Tensor:
+    """Map sphere forces from the latest default-environment FK to joint gradients with one warp per frame.
+
+    The default multi-warp kernel adds forces on each link with unordered float atomics.
+    A single warp gives GN the same collision row during eager execution and graph replay.
+    """
+    from curobo._src.curobolib.backends.cuda_core_backend.kinematics import launch_kinematics_link_wrench_backward
+
+    cfg, buf = kin.kinematics_config, kin._buffers
+    batch, horizon, num_spheres, _ = grad_spheres.shape
+    grad_q = torch.empty_like(buf["grad_out_q"])
+    # FK allocates the fallback pose and CoM cotangents once as zeros. Its backward only reads them.
+    launch_kinematics_link_wrench_backward(
+        grad_q, buf["grad_in_link_pos"], buf["grad_in_link_quat"], grad_spheres.contiguous(), buf["grad_in_com"],
+        buf["batch_com"], buf["batch_cumul_mat"], cfg.link_spheres, cfg.link_masses_com, cfg.joint_map_type,
+        cfg.joint_link_influence_words, cfg.joint_links_data, cfg.joint_links_offsets, cfg.joint_offset_map,
+        cfg.tool_frame_map, cfg.link_sphere_idx_map, buf["idxs_env"], batch * horizon, horizon, cfg.num_envs,
+        cfg.num_dof, num_spheres, compute_com=False, backward_threads=32,
+    )
+    return grad_q
 
 
 # TODO: file upstream issue against cuRobo. RobotCostManager.compute_costs (cost_manager_robot.py) evaluates only its

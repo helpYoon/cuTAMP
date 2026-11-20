@@ -220,18 +220,18 @@ class _Legs:
         rad = self.fk(self.home.unsqueeze(0)).robot_spheres.reshape(-1, 4)[:, 3] + sc.sphere_padding.to(d)
         pairs = sc.collision_pairs.long().to(d)
         pairs = pairs[(rad[pairs] >= 0).all(-1)]
+        # All collision links on either moving leg participate, including the hip motor housings.
+        self.left_leg, self.right_leg = (
+            torch.cat([idx for link, idx in links.items() if link.endswith("_" + side)
+                       or link == f"{side.lower()}_foot_link"])
+            for side in ("Left", "Right")
+        )
         leg = torch.zeros(rad.shape[0], dtype=torch.bool, device=d)
-        for link in ("Hip_Yaw_Left", "Shank_Left", "Hip_Yaw_Right", "Shank_Right"):
-            leg[links[link]] = True
-        arm = torch.zeros_like(leg)
-        for link, idx in links.items():
-            if link.startswith(("AL", "AR", "left_", "right_")):
-                arm[idx] = True
+        leg[self.left_leg] = True
+        leg[self.right_leg] = True
         keep = leg[pairs].any(-1)  # pairs with a leg sphere (the others never move here)
         self.pairs = pairs[keep]
         self.radius = rad
-        self.left_leg = torch.cat([links["Hip_Yaw_Left"], links["Shank_Left"]])
-        self.right_leg = torch.cat([links["Hip_Yaw_Right"], links["Shank_Right"]])
         fx, fy, fz = self.facts["foot_box"]  # the foot's collision box, its bottom face on the sole plane
         self.box_c = torch.tensor([0.0, 0.0, fz / 2], device=d)
         self.box_h = torch.tensor([fx / 2, fy / 2, fz / 2], device=d)
@@ -492,11 +492,15 @@ def _grid():
 
 
 def _search_set(
-    rb, cells, shape, use_com, lift, iters=40, chunk=30000, log=print, use_coll=True, lim=None, domain=None
+    rb, cells, shape, use_com, lift, iters=40, chunk=8192, log=print, use_coll=True, lim=None, domain=None
 ):
     """The cells of ``cells`` [M, 3] (the grid, flattened) that pass, from the 4 fixed starts and then by continuation: a
     failing cell next to a passing one is re-solved from that neighbour's solution, in each of the 6 grid directions,
     until nothing changes. Cells whose sole rectangles overlap are never searched."""
+    if use_coll:
+        # Autograd retains one 3-D offset per pose and active sphere pair. With the full T1
+        # geometry, 2,048 poses already give nearly seven million offsets per solver iteration.
+        chunk = min(chunk, 2048)
     gap = _rect_gap(cells, rb.facts["sole_box"])
     dom_idx = np.flatnonzero((gap > 0) if domain is None else ((gap > 0) & domain.ravel()))
     pos = -np.ones(len(cells), np.int64)

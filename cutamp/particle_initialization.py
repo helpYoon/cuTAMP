@@ -39,7 +39,7 @@ from cutamp.gn_refresh import (
 from cutamp.grasps import AZIMUTH_CONE, GRASP_REDRAW_ROUNDS, GRASP_SCORE_CUTOFF, near_vertical
 from cutamp.joint_limit_cost import trunk_tilt_cosine
 from cutamp.rollout import movable_spheres_fn
-from cutamp.samplers import place_4dof_sampler
+from cutamp.samplers import place_4dof_sampler, project_supported_placement
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.task_planning.constraints import KinematicConstraint
@@ -397,6 +397,7 @@ _PLACE_DRAWS = 4
 
 def _draw_placements(
     world: TAMPWorld, obj: Obstacle, obj_spheres: torch.Tensor, surface: Obstacle, held: torch.Tensor,
+    *, surface_bounds=None,
 ) -> torch.Tensor:
     """``[n, 4]``: a placement of ``obj`` on ``surface`` for each row of ``held`` ``[n, 4, 4]``, the row's grasp of
     ``obj`` (G in the object frame). Of ``_PLACE_DRAWS`` candidates whose xyz come from ``place_4dof_sampler``, the row
@@ -414,6 +415,8 @@ def _draw_placements(
     psi = phi_u - phi_g + (2 * torch.rand_like(phi_u) - 1) * AZIMUTH_CONE
     candidates[..., 3] = torch.where(near_vertical(approach)[:, None], candidates[..., 3],
                                      torch.remainder(psi, 2 * math.pi))
+    if surface_bounds is not None:
+        candidates = project_supported_placement(candidates, obj_spheres, surface_bounds)
     world_from_obj = action_4dof_to_mat4x4(candidates)  # [n, k, 4, 4]
     collision = world.collision_fn(transform_spheres(obj_spheres, world_from_obj).contiguous())  # [n, k]
     return candidates[torch.arange(n, device=candidates.device), collision.argmin(-1)]

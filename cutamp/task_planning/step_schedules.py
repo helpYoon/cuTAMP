@@ -89,6 +89,7 @@ def ranked_step_skeletons(
     orders=None,
     deadline=None,
     step_count=None,
+    prefer_reach=False,
 ) -> Iterator[RankedStepSkeleton]:
     """Yield each sampled order schedule once, ranked by its best compatible endpoint path.
 
@@ -101,6 +102,8 @@ def ranked_step_skeletons(
     seen_orders = set()
     max_orders = len(ORDERS) ** len(targets) if orders is None else 1
     options = {} if deadline is None else {"deadline": deadline}
+    if prefer_reach:
+        options["prefer_reach"] = True
     if step_count is not None:
         options["step_count"] = step_count
         n = len(targets)

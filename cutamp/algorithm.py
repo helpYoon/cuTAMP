@@ -16,6 +16,7 @@ import logging
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
+from threading import local
 from time import monotonic
 from typing import Callable, List, Union, Optional, Tuple
 
@@ -31,7 +32,7 @@ from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
 from cutamp.grasps import GRASP_SCORE_CUTOFF, grasp_sets, start_sampler_load, wait_for_sampler_load
-from cutamp.motion_solver import build_motion_planner, solve_curobo
+from cutamp.motion_solver import build_motion_planner, play_curobo_motion, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import (
     IKTol, NoGraspCandidates, ParticleInitializer, choice_stats, pick_place_confs, worst_posture,
@@ -128,7 +129,6 @@ def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int, *, r
     for row, members in groups.items():
         members.sort(key=lambda i: (soft[i], i))
         f = members[0]
-        # With the centroid objective active, compare the full weighted preference across grasp groups.
         objective = soft[f] if rank_by_soft else 0.0
         ranked.append(((not hi[f], objective, tilt[f], travel[f], -margin[f]), row, members))
     ranked.sort(key=lambda g: g[:2])
@@ -143,10 +143,9 @@ def get_top_satisfying_particles(
     n: int,
     *, return_indices: bool = False,
 ) -> List[dict]:
-    """Up to ``n`` satisfying particles in motion-plan try order: grouped by grasp and taken round the groups, each
-    group's particles by ascending soft cost (``grasp_group_order``). The posture measures are the particle's after
-    the optimizer. May return < n if fewer particles satisfy constraints. Used by the motion-plan retry loop: if
-    solve_curobo fails on a try, retry on the next.
+    """Order feasible motion candidates by worst manipulation CoM distance, then secondary effort.
+
+    Disabling centering selects the grasp-group retry order.
     """
     particles = plan_info["particles"]
     with torch.no_grad():
@@ -155,10 +154,9 @@ def get_top_satisfying_particles(
         satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
         if not satisfying_mask.any():
             raise RuntimeError("No satisfying particles found")
-        soft_costs = cost_reducer.soft_costs(cost_dict)
         sat = {k: v[satisfying_mask] for k, v in particles.items()}
         s = int(satisfying_mask.sum())
-        rows, all_hi = [], torch.ones(s, dtype=torch.bool, device=soft_costs.device)
+        rows, all_hi = [], torch.ones(s, dtype=torch.bool, device=satisfying_mask.device)
         for c in plan_info["grasp_choice"]:
             pool = c.grasps.to(sat[c.grasp])
             match = (sat[c.grasp][:, None, :] == pool[None]).all(-1)  # [s, m]
@@ -167,16 +165,21 @@ def get_top_satisfying_particles(
             row = match.long().argmax(-1)  # the first matching row
             rows.append(row)
             all_hi &= (c.scores.to(row.device)[row] >= GRASP_SCORE_CUTOFF).to(all_hi.device)
-        pool_idx = torch.stack(rows, -1) if rows else torch.zeros(s, 0, dtype=torch.long)
-        confs = pick_place_confs(plan_info["plan_skeleton"])
-        if confs:
-            tilt, travel, margin = worst_posture(plan_info["rollout_fn"].world, [sat[name] for name in confs])
+        center = cost_dict.get("soft", {}).get("max_center_distance_m")
+        if center is not None:
+            worst = center[satisfying_mask]
+            effort = cost_reducer.secondary_effort(cost_dict)[satisfying_mask]
+            by_effort = torch.argsort(effort, stable=True)
+            order = by_effort[torch.argsort(worst[by_effort], stable=True)[:n]].tolist()
         else:
-            tilt = travel = margin = torch.zeros(s)
-        rank_by_soft = ("com_center_distance_squared" in cost_dict.get("soft", {}).get("values", {})
-                        and getattr(getattr(plan_info["cost_fn"], "config", None), "com_center_weight", 1.0) > 0)
-        order = grasp_group_order(pool_idx, soft_costs[satisfying_mask], all_hi, tilt, travel, margin, n,
-                                 rank_by_soft=rank_by_soft)
+            pool_idx = torch.stack(rows, -1) if rows else torch.zeros(s, 0, dtype=torch.long)
+            confs = pick_place_confs(plan_info["plan_skeleton"])
+            if confs:
+                tilt, travel, margin = worst_posture(plan_info["rollout_fn"].world, [sat[name] for name in confs])
+            else:
+                tilt = travel = margin = torch.zeros(s)
+            soft = cost_reducer.soft_costs(cost_dict)[satisfying_mask]
+            order = grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n)
     candidates = [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
     if return_indices:
         return candidates, satisfying_mask.nonzero(as_tuple=True)[0][order].tolist()
@@ -237,9 +240,8 @@ def sample_plan_skeleton(
     return plan_info, num_satisfying > 0
 
 
-# plan_cspace attempts per segment, one pass over the candidates each. On blocks_t1 (2026-11-07, 13 problems) every
-# segment that planned did so on its first attempt (223 of 223), while each failing one spent all of cuRobo's 20 at
-# 1.1-4.0 s, against 0.06 s for a success. The 20 run only when no candidate plans on 2 (one of them graph-seeded).
+# Start plan_cspace with two attempts per segment. Allow twenty after a budget-limited failure.
+# With centering enabled each candidate gets both budgets before a lower-ranked candidate can win.
 _PLAN_ATTEMPTS = (2, 20)
 
 
@@ -267,10 +269,10 @@ def _motion_plan_with_retries(
     confs (on blocks_t1 seed 1, every satisfying particle had the same
     ``left_q1``).
 
-    The candidates get two passes (``_PLAN_ATTEMPTS``): each segment first with
-    2 plan_cspace attempts, then, only if no candidate planned, with cuRobo's
-    20 for the candidates whose plan_cspace ran out of attempts
-    (``e.out_of_attempts``). Any other failure (a balance-gate rejection, an
+    A candidate first gets 2 plan_cspace attempts per segment. If it runs out
+    (``e.out_of_attempts``), centering gives it the full budget of 20 before
+    trying the next candidate. Disabling centering gives all candidates their
+    cheap pass first. Any other failure (a balance-gate rejection, an
     approach-IK or line miss) is not planned again: plan_cspace returns its
     first success, so a bigger budget replans the same trajectory.
 
@@ -291,50 +293,40 @@ def _motion_plan_with_retries(
         ``overall_metrics["motion_plan_failures"]``.
     """
     skeleton = plan_info["plan_skeleton"]
-    last_err, tried, failures, rejected = None, 0, [], []
-    for max_attempts in _PLAN_ATTEMPTS:
-        failed = list(rejected)
-        for rank, particle in enumerate(candidates):
-            if deadline is not None and monotonic() >= deadline:
-                return None, None, tried, None, failures
-            if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed):
-                _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
-                continue
-            tried += 1
-            try:
-                curobo_plan, traj_metrics = solve_curobo(
-                    plan_info, particle, world, config, timer, visualizer,
-                    get_planner=get_planner, ik_tol=ik_tol, max_attempts=max_attempts,
-                )
-                if rank > 0:
-                    _log.warning(
-                        f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}"
-                    )
-                return curobo_plan, traj_metrics, tried, rank, failures
-            except RuntimeError as e:
-                _log.warning(
-                    f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}"
-                )
-                last_err = e
-                failures.append(str(e))
-                # ponytail: keys on every value read up to the failing op (all ops if untagged), so
-                # a candidate differing only in values that op never sees (a pick conf before a
-                # shared retract) still replans; key on the op's own start/goal/world if that matters.
-                ops = skeleton[: getattr(e, "op_idx", len(skeleton)) + 1]
-                used = {"left_q0"} | {v for op in ops for v in op.values if v in particle}
-                failed.append({k: particle[k] for k in used})
-                # No budget changes the rest (a gate rejection, an approach-IK or line miss): plan_cspace returns
-                # its first success, so more attempts replan the same trajectory.
-                # ponytail: trajopt's success test leaves torque to the gate (t1._trajopt_metrics_dict), so a path
-                # the gate can't slow enough (past RETIME_MAX for the ZMP or an effort) ends the candidate here,
-                # where cuRobo's torque bound used to send it on to graph-seeded attempts. Unseen on the 13
-                # 2026-11-09 checks (at most 3.45x); if studies show "slowdown cap" rejections, replan that segment
-                # once with graph seeds first (plan_cspace's enable_graph_attempt=0).
-                if not getattr(e, "out_of_attempts", False):
-                    rejected.append(failed[-1])
-        if max_attempts != _PLAN_ATTEMPTS[-1]:
-            _log.warning(f"No candidate planned with {max_attempts} plan_cspace attempts per segment; "
-                         f"retrying those that ran out with {_PLAN_ATTEMPTS[-1]}")
+    last_err, tried, failures = None, 0, []
+    ranks = range(len(candidates))
+    if getattr(config, "com_center_weight", 0) != 0:
+        checks = ((rank, budget) for rank in ranks for budget in _PLAN_ATTEMPTS)
+    else:
+        checks = ((rank, budget) for budget in _PLAN_ATTEMPTS for rank in ranks)
+    failed_prefixes = {budget: [] for budget in _PLAN_ATTEMPTS}
+    for rank, max_attempts in checks:
+        if deadline is not None and monotonic() >= deadline:
+            return None, None, tried, None, failures
+        particle = candidates[rank]
+        if any(all(torch.equal(particle[k], v) for k, v in f.items()) for f in failed_prefixes[max_attempts]):
+            _log.info(f"Skipping particle rank {rank}/{len(candidates) - 1}: repeats a failed plan")
+            continue
+        tried += 1
+        try:
+            curobo_plan, traj_metrics = solve_curobo(
+                plan_info, particle, world, config, timer, visualizer,
+                get_planner=get_planner, ik_tol=ik_tol, max_attempts=max_attempts,
+            )
+            if rank > 0:
+                _log.warning(f"Motion plan succeeded on retry rank {rank}/{len(candidates) - 1}")
+            return curobo_plan, traj_metrics, tried, rank, failures
+        except RuntimeError as e:
+            _log.warning(f"Motion plan failed on particle rank {rank}/{len(candidates) - 1}: {e}")
+            last_err = e
+            failures.append(str(e))
+            ops = skeleton[: getattr(e, "op_idx", len(skeleton)) + 1]
+            used = {"left_q0"} | {v for op in ops for v in op.values if v in particle}
+            prefix = {k: particle[k] for k in used}
+            # A matching prefix can benefit from a larger budget only after exhausting attempts.
+            for budget in _PLAN_ATTEMPTS:
+                if budget <= max_attempts or not getattr(e, "out_of_attempts", False):
+                    failed_prefixes[budget].append(prefix)
     _log.error(
         f"Exhausted {len(candidates)} particle retries ({tried} planned); giving up on this plan. "
         f"Last error: {last_err}"
@@ -345,8 +337,7 @@ def _motion_plan_with_retries(
 def _planned_metrics(world: TAMPWorld, plan_skeleton: PlanSkeleton, candidates: List[dict], rank: int) -> dict:
     """The planned particle's rank, CoM margin (over all its confs) and the Trunk's tilt (radians to degrees) and travel
     (metres), the worst over its pick and place confs (G7; left out when the skeleton has none). ``best_com_margin``
-    is the lowest-soft-cost satisfying particle's (optimize_plan), which need not be the planned one: the tries go
-    round the grasp groups, and a retry plans another particle (known-bugs N3)."""
+    describes the preferred kinematic candidate. A motion retry can succeed on a different particle."""
     particle = candidates[rank]
     metrics = {"motion_plan_rank": rank, "planned_com_margin": particle_com_margin(world, particle)}
     confs = pick_place_confs(plan_skeleton)
@@ -428,9 +419,18 @@ def run_cutamp(
     experiment_id: str,
     step_inputs=None,
 ):
-    """Overall cuTAMP algorithm implementation."""
+    """Return the best feasible plan found within the configured search budget."""
     if config.step_mode != "off":
-        return _run_step_planner(env, config, cost_reducer, constraint_checker, q_init, experiment_id, step_inputs)
+        preload = config.step_mode == "model" and config.curobo_plan and not (step_inputs and step_inputs.grasps)
+        if preload:
+            # Only sampler construction overlaps world setup and search. Grasp generation itself
+            # changes process-wide CUDA settings and runs synchronously for the selected objects.
+            start_sampler_load()
+        try:
+            return _run_step_planner(env, config, cost_reducer, constraint_checker, q_init, experiment_id, step_inputs)
+        finally:
+            if preload:
+                wait_for_sampler_load()  # also when no skeleton was reached or setup raised
     if step_inputs is not None:
         raise ValueError("Explicit step inputs require step_mode rank, geometric or model")
 
@@ -458,6 +458,7 @@ def run_cutamp(
     # turns process-wide settings on while it runs, so the first skeleton's grasps are made here, before the motion
     # planner's warmup thread starts, and a later skeleton's wait for that thread to end.
     planner_thread = None
+    grasp_counts = {}
 
     def make_grasps(plan_skeleton: PlanSkeleton) -> None:
         objs = ungrasped(world, plan_skeleton)
@@ -466,7 +467,8 @@ def run_cutamp(
         if planner_thread is not None:
             planner_thread.join()
         with timer.time("generate_grasps", log_callback=_log.info):
-            world.grasps.update(grasp_sets(objs, world.device))
+            world.grasps.update(grasp_sets(objs, world.device, max_grasps=min(64, config.num_particles),
+                                          counts=grasp_counts))
         gc.collect()
         gc.freeze()  # GraspGenX's import and the grasps (setup_cutamp), before the next graph capture
 
@@ -516,6 +518,7 @@ def run_cutamp(
             return planner_box["planner"]
 
     # Sample initial plans and particles
+    center_first = config.com_center_weight != 0
     found_solution_initially = False
     num_skipped_plans = 0
     plan_count = 0
@@ -551,6 +554,7 @@ def run_cutamp(
         plan_queue.sort(key=lambda x: x["heuristic"])
     _log.info(f"Num plans: {len(plan_queue)}, num skipped: {num_skipped_plans}")
     overall_metrics = {
+        "grasp_proposals_by_object": grasp_counts,
         "num_optimized_plans": 0,
         "num_initial_plans": plan_count,
         "num_skipped_plans": num_skipped_plans,
@@ -572,20 +576,21 @@ def run_cutamp(
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker, planner_busy=planner_busy)
     timer.start("first_solution")
     if found_solution_initially:
-        found_solution = not config.curobo_plan
+        found_solution = not (config.curobo_plan or center_first)
         timer.stop("first_solution")
 
     def motion_candidates():
         yield from plan_queue
-        if config.curobo_plan:
+        if config.curobo_plan or center_first:
             # Completing the first kinematic initialization can leave unused skeleton
-            # budget. Resume lazily when every motion on the prefetched candidates failed.
+            # budget. Resume lazily for centering comparisons or subsequent motion retries.
             for plan_info, _ in pending_plans:
                 yield plan_info
 
     # Optimization loop for each skeleton and its particles
     timer.start("start_optimization")
     deadline = None if config.max_loop_dur is None else monotonic() + config.max_loop_dur
+    incumbent = None
     for idx, plan_info in enumerate(motion_candidates()):
         if deadline is not None and monotonic() >= deadline:
             break
@@ -597,9 +602,9 @@ def run_cutamp(
             f"heuristic = {plan_info['heuristic']:.2f}"
         )
         has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
-        if metrics["best_cost"] is not None:
+        if not center_first and metrics["best_cost"] is not None:
             overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
-        if metrics["best_soft_cost"] is not None:
+        if not center_first and metrics["best_soft_cost"] is not None:
             overall_metrics["best_soft_cost"] = min(overall_metrics["best_soft_cost"], metrics["best_soft_cost"])
         if time_exceeded:
             _log.info(f"Max loop duration reached, stopping optimization")
@@ -607,30 +612,45 @@ def run_cutamp(
         exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
 
         overall_metrics["num_optimized_plans"] += 1
-        overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
+        if incumbent is None:
+            overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
         if has_satisfying:
+            selection = ({k: metrics[k] for k in ("best_cost", "best_soft_cost", "max_center_distance_m",
+                                                   "secondary_effort")} if center_first else {})
+            motion = None
             if config.curobo_plan:
-                candidates = get_top_satisfying_particles(
-                    plan_info, constraint_checker, cost_reducer,
-                    n=config.motion_plan_max_retries,
+                # Motion validation can only exclude rows from this kinematic ranking.
+                if center_first and incumbent is not None and (
+                    selection["max_center_distance_m"], selection["secondary_effort"]
+                ) >= incumbent:
+                    continue
+                candidates, indices = get_top_satisfying_particles(
+                    plan_info, constraint_checker, cost_reducer, n=config.motion_plan_max_retries, return_indices=True,
                 )
-                curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
-                    plan_info, candidates, world, config, timer, visualizer,
+                motion, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
+                    plan_info, candidates, world, config, timer, None if center_first else visualizer,
                     get_planner=get_planner, ik_tol=particle_initializer.ik_tol, deadline=deadline,
                 )
-                overall_metrics["motion_plan_success"] = bool(curobo_plan)
-                # Over the skeletons planned, like the failures; absent until a skeleton is motion-planned.
                 overall_metrics["motion_plan_attempts"] = overall_metrics.get("motion_plan_attempts", 0) + attempts
                 overall_metrics["motion_plan_failures"] += failures
-                if curobo_plan is None:
+                if motion is None:
                     continue
-                overall_metrics.update(traj_metrics)
-                overall_metrics.update(_planned_metrics(world, plan_skeleton, candidates, rank))
+                if center_first:
+                    # A retry can succeed on a different particle from the kinematic winner.
+                    selection = {k: float(v[indices[rank]]) for k, v in plan_info["row_quality"].items()}
+                selection.update(traj_metrics or {})
+                selection.update(_planned_metrics(world, plan_skeleton, candidates, rank))
+                overall_metrics["motion_plan_success"] = True
+            key = (selection["max_center_distance_m"], selection["secondary_effort"]) if center_first else ()
+            if incumbent is None or key < incumbent:
+                incumbent = key
+                curobo_plan = motion
+                overall_metrics.update(selection)
+                overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
+                overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
+                overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
             found_solution = True
-            overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
-            overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
-            _log.debug(f"Total num satisfying {metrics['num_satisfying_final']}")
-            should_break = True
+            should_break |= not center_first
 
         if should_break:
             break
@@ -651,10 +671,21 @@ def run_cutamp(
     # Log constraint and cost multipliers
     exp_logger.log_dict("multipliers", cost_reducer.cost_config)
     exp_logger.log_dict("tolerances", constraint_checker.constraint_config)
+    if center_first and curobo_plan is not None:
+        play_curobo_motion(world, curobo_plan, visualizer)
     return curobo_plan, overall_metrics["num_satisfying_final"], overall_metrics
 
 
 _STEP_DATA = Path(__file__).resolve().parents[1] / "data/t1-reachability"
+_PREDICTOR_CACHE = local()  # A captured graph's mutable replay buffers belong to its worker.
+
+
+def _file_version(path):
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (str(path.resolve()), None)
+    return (str(path.resolve()), (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size))
 
 
 def _load_step_search(config, *, applicable=True):
@@ -664,14 +695,7 @@ def _load_step_search(config, *, applicable=True):
     lag = None if config.step_mode == "geometric" else config.step_lag
     accuracy = Path(config.step_accuracy_table or _STEP_DATA / "landing-accuracy/home-model.json")
 
-    def identity(source):
-        try:
-            stat = source.stat()
-        except FileNotFoundError:
-            return (str(source.resolve()), None)
-        return (str(source.resolve()), (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size))
-
-    tables, notes = _step_tables(identity(path), identity(accuracy) if lag is not None and applicable else None, lag)
+    tables, notes = _step_tables(_file_version(path), _file_version(accuracy) if lag is not None and applicable else None, lag)
     return tables, (
         dict(notes) if applicable else dict(notes, accuracy_status="dynamics outside the profiled condition")
     )
@@ -709,9 +733,19 @@ def _load_predictor(config):
     from cutamp.landing_predictor import LandingPredictor
 
     path = Path(config.landing_bundle or _STEP_DATA / "landing-accuracy/landing-seed3.pt")
-    if not path.is_file():
+    version = _file_version(path)
+    if version[1] is None or not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
-    return LandingPredictor(path, derivative_method=config.step_derivative_method)
+    solver = config.for_refinement(stepped=True)
+    if not (config.cuda_graphs and solver.step_proposal_count and solver.step_refine_iterations == 0):
+        return LandingPredictor(path, derivative_method=solver.step_derivative_method)
+    stream = torch.cuda.current_stream()
+    key = (version, solver.step_derivative_method, stream.device, stream.cuda_stream)
+    if getattr(_PREDICTOR_CACHE, "key", None) != key:
+        predictor = LandingPredictor(path, derivative_method=solver.step_derivative_method, use_cuda_graph=True)
+        _PREDICTOR_CACHE.model = predictor
+        _PREDICTOR_CACHE.key = key
+    return _PREDICTOR_CACHE.model
 
 
 def _refine_step_schedule(*args, **kwargs):
@@ -736,7 +770,7 @@ def _refine_standing_schedule(
         return StepResult([], None, "initialization_failed")
     if deadline is not None and monotonic() >= deadline:
         return StepResult([], None, "budget_exhausted", "standing initialization reached the time limit")
-    optimizer(info, timer, visualizer)
+    optimizer(info, timer, visualizer, deadline=deadline)
     particles = info["particles"]
     with torch.no_grad():
         rollout = info["rollout_fn"](particles)
@@ -750,6 +784,7 @@ def _refine_standing_schedule(
         if not good.any():
             return StepResult([], endpoint, "unresolved")
         soft = reducer.soft_costs(costs)
+        effort = reducer.secondary_effort(costs)
         total = reducer(costs)
         indices = good.nonzero(as_tuple=True)[0].tolist()
         rows = [
@@ -762,6 +797,7 @@ def _refine_standing_schedule(
                     "com_center_distances_m": center_distances[i].tolist(),
                     "support_centroid_xy_m": cost_fn.support_centroid.tolist(),
                     "min_com_margin_m": float(margin[i].min()),
+                    "secondary_effort": float(effort[i]),
                     "cost": float(total[i]),
                 },
             )
@@ -778,7 +814,7 @@ def _refine_standing_schedule(
             world,
             config,
             timer,
-            visualizer,
+            None if config.com_center_weight != 0 else visualizer,
             get_planner=get_planner,
             ik_tol=initializer.ik_tol,
             deadline=deadline,
@@ -792,30 +828,42 @@ def _refine_standing_schedule(
 
 
 def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inputs):
+    request_start = monotonic()
     from cutamp.step_planner import ScheduleSearch, StepInputs, StepResult, furthest_endpoint, manipulation_regions
 
     validate_tamp_config(config)
     inputs = inputs if inputs is not None else StepInputs()
+    solver = config.for_refinement(stepped=True)
+    screened = solver.step_proposal_count > 0 and solver.step_refine_iterations == 0
+    budget = config.max_loop_dur
+    improvement_budget = None
+    if screened and budget is None:
+        budget = 9.5 if config.curobo_plan else 8.0
+        if config.curobo_plan:
+            # Leave room for an in-flight GPU stage and serializing the selected evidence.
+            improvement_budget = 4.4
     logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
     world.grasps.update(inputs.grasps)
-    start = monotonic()
-    deadline = start + config.max_loop_dur if config.max_loop_dur is not None else None
+    setup_end = monotonic()
+    start = request_start if screened else setup_end
+    deadline = start + budget if budget is not None else None
     timer.start("start_optimization")
-    search, cache_info = _load_step_search(config, applicable=inputs.matches_accuracy_context(config.step_lag))
-    cache_info["load_seconds"] = monotonic() - start
-    soles = world.stance_soles
-    yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
-    incoming = torch.cat((soles[..., :2, 3], yaw[:, None]), -1).detach().cpu().tolist()
-
-    base_plans = task_plan_generator(
-        world.initial_state,
-        world.goal_state,
-        operators=all_t1_operators,
-        ground_op_priority_fn=make_arm_affinity_priority_fn(world),
-        deadline=deadline,
-    )
+    incoming = None
 
     def streams():
+        nonlocal incoming
+        load_start = monotonic()
+        search, cache_info = _load_step_search(config, applicable=inputs.matches_accuracy_context(config.step_lag))
+        metrics["step_search"].update(cache_info, load_seconds=monotonic() - load_start)
+        if deadline is not None and monotonic() >= deadline:
+            return
+        soles = world.stance_soles
+        yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
+        incoming = torch.cat((soles[..., :2, 3], yaw[:, None]), -1).detach().cpu().tolist()
+        base_plans = task_plan_generator(
+            world.initial_state, world.goal_state, operators=all_t1_operators,
+            ground_op_priority_fn=make_arm_affinity_priority_fn(world), deadline=deadline,
+        )
         seen = set()
         for skeleton in base_plans:
             if deadline is not None and monotonic() >= deadline:
@@ -839,6 +887,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 incoming,
                 fixed=inputs.orders,
                 strategy=config.step_search_order,
+                prefer_reach=screened and inputs.orders is None,
                 deadline=deadline,
             )
             if len(seen) >= config.num_initial_plans:
@@ -852,8 +901,12 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         "num_optimized_plans": 0,
         "num_symbolic_skeletons": 0,
         "step_attempts": [],
-        "step_search": cache_info,
+        "step_search": {},
+        "search_budget_s": budget,
+        "improvement_budget_s": improvement_budget,
+        "search_budget_start": "planner_entry" if screened else "after_world_setup",
         "grasp_generation_calls": 0,
+        "grasp_proposals_by_object": {},
         "best_cost": None,
         "best_soft_cost": None,
         "time_to_first_accepted_s": None,
@@ -861,6 +914,13 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
     if config.curobo_plan:
         metrics.update(motion_plan_success=False, motion_plan_failures=[], motion_plan_attempts=0)
     incumbent = None
+    center_first = config.com_center_weight != 0
+
+    def plan_key(row, step_count):
+        if center_first:
+            return row.max_center_distance_m, step_count, row.effort
+        return 0.0, step_count, row.soft_cost
+
     winning_motion = None
     winning_evidence = None
     selected_metrics = {}
@@ -876,11 +936,10 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
     def make_grasps(skeleton):
         objs = ungrasped(world, skeleton)
         if objs:
-            # A caller can supply every grasp. Start GraspGenX lazily, after scheduling.
-            start_sampler_load()
             try:
                 with timer.time("generate_grasps"):
-                    world.grasps.update(grasp_sets(objs, world.device))
+                    world.grasps.update(grasp_sets(objs, world.device, max_grasps=min(64, config.num_particles),
+                                                  counts=metrics["grasp_proposals_by_object"]))
                 metrics["grasp_generation_calls"] += 1
             finally:
                 wait_for_sampler_load()  # no background CUDA work when the selected solve captures graphs
@@ -901,7 +960,9 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 break
             stream = active.popleft()
         rank_start = monotonic()
-        proposal = stream.next(incumbent[0] if incumbent else None)
+        # A shorter schedule can rule out longer ones only at the lower bound of the primary objective.
+        step_cap = incumbent[1] if incumbent is not None and incumbent[0] == 0 else None
+        proposal = stream.next(step_cap)
         if proposal is None:
             continue
         active.append(stream)
@@ -944,6 +1005,9 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         if proposal.step_count and unavailable is not None:
             result = StepResult([], None, "unavailable", unavailable)
         else:
+            if deadline is not None and monotonic() >= deadline:
+                attempt["status"] = "budget_exhausted"
+                break
             make_grasps(proposal.skeleton)
             if deadline is not None and monotonic() >= deadline:
                 attempt["status"] = "budget_exhausted"
@@ -960,7 +1024,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                         inputs=inputs,
                         predictor=predictor,
                         timer=timer,
-                        visualizer=visualizer,
+                        visualizer=None if center_first else visualizer,
                         deadline=deadline,
                     )
                 except NoGraspCandidates as e:
@@ -1008,17 +1072,19 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         if not accepted:
             if result.rows:
                 # Keep evidence for a feasible model prediction whose subsequent motion was unavailable.
-                best_model = min(result.rows, key=lambda row: row.soft_cost)
+                best_model = min(result.rows, key=lambda row: plan_key(row, proposal.step_count))
                 attempt["particle_candidate"] = dict(
                     best_model.metrics, row_index=best_model.index, soft_cost=best_model.soft_cost
                 )
             stream.feedback(proposal.orders, result.endpoint_ok)
             continue
-        row = min(accepted, key=lambda r: r.soft_cost)
-        key = (proposal.step_count, row.soft_cost)
+        row = min(accepted, key=lambda r: plan_key(r, proposal.step_count))
+        key = plan_key(row, proposal.step_count)
         if incumbent is None or key < incumbent:
             if incumbent is None:
                 metrics["time_to_first_accepted_s"] = monotonic() - start
+                if improvement_budget is not None:
+                    deadline = start + improvement_budget
             incumbent = key
             winning_motion = row.motion_plan
             winning_evidence = row.evidence
@@ -1027,11 +1093,16 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 for name, value in row.particle.items()
             }
             selected_metrics = dict(row.metrics)
+            if center_first:
+                selected_metrics["max_center_distance_m"] = row.max_center_distance_m
             if "best_com_margin" in selected_metrics:
                 selected_metrics.setdefault("min_com_margin_m", selected_metrics["best_com_margin"])
+            status = result.status
+            if config.curobo_plan:
+                status = "model_predicted_motion" if row.metrics.get("motion_validation") == "model_predicted" else "motion_feasible"
             selected_metrics.update(
                 found_solution=True,
-                status="motion_feasible" if config.curobo_plan else result.status,
+                status=status,
                 row_index=row.index,
                 best_cost=row.metrics.get("cost", row.soft_cost),
                 best_soft_cost=row.soft_cost,
@@ -1043,19 +1114,28 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             )
             if config.curobo_plan:
                 metrics["motion_plan_success"] = True
+    search_end = monotonic()
     timer.stop("start_optimization")
     metrics.update(selected_metrics)
     if winning_evidence is not None:
         artifact = logger.log_dict("model_evidence", winning_evidence())
         metrics["model_evidence_path"] = str(artifact.resolve())
         del winning_evidence
-    if metrics["step_attempts"] and all(a["status"] == "unavailable" for a in metrics["step_attempts"]):
+    metrics["time_limit_reached"] = deadline is not None and search_end >= deadline
+    metrics["effective_search_budget_s"] = (
+        improvement_budget if incumbent is not None and improvement_budget is not None else budget
+    )
+    if not metrics["time_limit_reached"] and metrics["step_attempts"] and all(
+        a["status"] == "unavailable" for a in metrics["step_attempts"]
+    ):
         metrics["status"] = "unavailable"
+    metrics["search_elapsed_s"] = search_end - start
     metrics["elapsed_s"] = monotonic() - start
     metrics["schedule_limit_reached"] = (
         config.max_step_schedules is not None and len(metrics["step_attempts"]) >= config.max_step_schedules
     )
-    metrics["time_limit_reached"] = deadline is not None and monotonic() >= deadline
     logger.log_dict("overall_metrics", metrics)
     logger.log_dict("timer_metrics", timer.get_summaries())
+    if center_first and winning_motion is not None:
+        play_curobo_motion(world, winning_motion, visualizer)
     return winning_motion, metrics["num_satisfying_final"], metrics

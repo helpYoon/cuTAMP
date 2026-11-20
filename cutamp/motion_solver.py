@@ -9,11 +9,9 @@
 
 """Motion-plan solver for cuTAMP under cuRobo's single MotionPlanner.
 
-Per plan-skeleton operator (T1), every segment a ``plan_cspace`` call to a conf (``_plan_arm_to_conf``) that the
-balance gate then checks and paces:
-  - Arm ops (Pick/Place/Retract): every joint is free, the base included, and
-    trajopt holds the soles on the stance (``get_t1_motion_planner``); nothing
-    holds the inactive hand between confs.
+Supported T1 motions connect full-body endpoint configurations. The balance gate checks and paces each segment:
+  - Arm ops after steps first try a direct, planted motion between the approved configurations.
+    On obstructed paths, cuRobo can route around the obstacle with both arms in collision checking.
   - Pick and place: three segments along the grasp's axis (design 7.8). An approach, everything enabled, to the
     pre conf; a straight insert to the gate-approved particle conf with the grasp object or the placement surface
     disabled; and a straight leave, a pick's lift or a place's back-out (the released object disabled), to the post
@@ -36,6 +34,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from curobo._src.cost.cost_self_collision import SelfCollisionCost
+from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo.motion_planner import MotionPlanner
 from curobo.scene import Mesh, Obstacle
 from curobo.sphere_fit import SphereFitType
@@ -368,7 +368,7 @@ def _held_obj_poses(world: TAMPWorld, planner, held: dict, plan: JointState) -> 
     return out
 
 
-def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True, *, initial_soles=None) -> MotionPlanner:
+def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True, *, initial_soles=None, robot_cfg=None) -> MotionPlanner:
     """Build the trajopt planner on ``world.model``, colliding with the world's Scene with the movables included
     (so attached objects are part of the collision world during planning). Safe to run on a background
     thread concurrently with the Adam loop because it runs no solves.
@@ -388,7 +388,172 @@ def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True, *, initi
         use_cuda_graph=use_cuda_graph,
         device_cfg=world.device_cfg,
         initial_soles=initial_soles,
+        **({"robot_cfg": robot_cfg} if robot_cfg is not None else {}),
     )
+
+
+def _arm_columns(plan, names):
+    return [plan.joint_names.index(name) for name in names]
+
+
+def _quintic_segment(q0, q1, v0, v1, a0, a1, count, dt):
+    """Minimum integrated squared jerk with the given endpoint positions, velocities and accelerations."""
+    duration = (count - 1) * dt
+    t = torch.linspace(0, 1, count, device=q0.device, dtype=torch.float64)[:, None]
+    p0, p1 = q0.double(), q1.double()
+    b = v0.double() * duration
+    c = a0.double() * (0.5 * duration**2)
+    dp = p1 - p0 - b - c
+    dv = v1.double() * duration - b - 2 * c
+    da = a1.double() * duration**2 - 2 * c
+    d, e, f = 10 * dp - 4 * dv + 0.5 * da, -15 * dp + 7 * dv - da, 6 * dp - 3 * dv + 0.5 * da
+    pos = p0 + t * (b + t * (c + t * (d + t * (e + t * f))))
+    vel = (b + t * (2 * c + t * (3 * d + t * (4 * e + 5 * t * f)))) / duration
+    acc = (2 * c + t * (6 * d + t * (12 * e + 20 * t * f))) / duration**2
+    jerk = (6 * d + t * (24 * e + 60 * t * f)) / duration**3
+    pos[0], pos[-1], vel[0], vel[-1], acc[0], acc[-1] = p0, p1, v0, v1, a0, a1
+    return tuple(x.to(q0) for x in (pos, vel, acc, jerk))
+
+
+def _smooth_arm_segment(plan, names, dt):
+    """Return a candidate preserving every other joint of the cuRobo path and both arm boundary states."""
+    cols = _arm_columns(plan, names)
+    q = plan.position.reshape(-1, len(plan.joint_names))[:, cols]
+    v = plan.velocity.reshape(-1, len(plan.joint_names))[:, cols]
+    a = plan.acceleration.reshape(-1, len(plan.joint_names))[:, cols]
+    if len(q) < 2:
+        return plan
+    samples = _quintic_segment(q[0], q[-1], v[0], v[-1], a[0], a[-1], len(q), dt)
+    result = plan.clone()
+    for field, x in zip(("position", "velocity", "acceleration", "jerk"), samples):
+        arr = getattr(result, field)
+        if arr is not None:
+            arr[..., cols] = x
+    return result
+
+
+def _select_idle_arm_route(path, names, dt, collides):
+    """Prefer the direct arm return. In an obstruction, retain only the needed part of cuRobo's detour."""
+    direct = _smooth_arm_segment(path, names, dt)
+    if not collides(direct):
+        return direct, "curobo_nominal_arm"
+    cols = _arm_columns(path, names)
+    for fraction in (0.25, 0.5, 0.75):
+        candidate = path.clone()
+        for field in ("position", "velocity", "acceleration", "jerk"):
+            original = getattr(path, field)
+            if original is not None:
+                getattr(candidate, field)[..., cols] = torch.lerp(
+                    getattr(direct, field)[..., cols], original[..., cols], fraction
+                )
+        if not collides(candidate):
+            return candidate, "curobo_collision_avoidance"
+    return path, "curobo_collision_avoidance"
+
+
+def _direct_supported_path(start, target, model, dt, arm):
+    """Try a direct joint-space motion with a planted-leg projection between the exact endpoint states."""
+    from cutamp.step_ik import _kinematics
+
+    q0 = start.position.reshape(-1)
+    v0 = torch.zeros_like(q0) if start.velocity is None else start.velocity.reshape(-1)
+    a0 = torch.zeros_like(q0) if start.acceleration is None else start.acceleration.reshape(-1)
+    zero = torch.zeros_like(q0)
+    # Unit peak joint speed for the proposal. The trajectory gate uses the actual per-joint limits and dynamics.
+    count = 1 + math.ceil(max(0.5, 1.875 * float((target - q0).abs().max())) / dt)
+    q, v, a, jerk = _quintic_segment(q0, target, v0, zero, a0, zero, count, dt)
+    kin = _kinematics(q.device)
+    curve = q.to(torch.float64, copy=True)
+    base_feet = kin.fk(curve, arm, False)[0][:, :24]
+    t = torch.linspace(0, 1, count, device=q.device, dtype=curve.dtype)[:, None]
+    s = t.pow(3) * (10 - 15 * t + 6 * t.square())
+    foot_target = torch.lerp(base_feet[:1], base_feet[-1:], s)
+    # Each six-joint leg can correct its sole without affecting the wrist or the other arm.
+    legs = [i for i, name in enumerate(model.joint_names) if any(k in name for k in ("_Hip_", "_Knee_", "_Ankle_"))]
+    cols = torch.tensor(legs, device=q.device)
+    identity = torch.eye(len(legs), dtype=curve.dtype, device=q.device)
+    for _ in range(5):
+        pose, jac, _ = kin.fk(curve, arm)
+        residual = foot_target - pose[:, :24]
+        if residual.abs().max() < 0.0001:
+            break
+        J = jac[:, :24, cols]
+        delta = torch.linalg.solve(J.mT @ J + 0.00005 * identity, J.mT @ residual.unsqueeze(-1)).squeeze(-1)
+        curve[:, cols] += delta.clamp(-0.18, 0.18)
+    # Taper the correction at each boundary so the polynomial's measured incoming velocity is preserved.
+    taper = (t / 0.08).clamp(max=1) * ((1 - t) / 0.08).clamp(max=1)
+    taper = taper.square() * (3 - 2 * taper)
+    delta = (curve - q.double()) * taper
+    dv = torch.gradient(delta, spacing=(dt,), dim=0, edge_order=2)[0]
+    da = torch.gradient(dv, spacing=(dt,), dim=0, edge_order=2)[0]
+    dj = torch.gradient(da, spacing=(dt,), dim=0, edge_order=2)[0]
+    dv[[0, -1]] = 0
+    da[[0, -1]] = 0
+    return JointState(
+        position=q + delta.to(q),
+        velocity=v + dv.to(q),
+        acceleration=a + da.to(q),
+        jerk=jerk + dj.to(q),
+        joint_names=list(model.joint_names),
+    )
+
+
+def _motion_collisions(planner, world, self_collision, q, dt=None):
+    """Collision of each candidate configuration or the swept trajectory with its actual attachments."""
+    from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+
+    spheres = planner.kinematics.compute_kinematics(JointState.from_position(q.contiguous())).robot_spheres
+    self_collision.setup_batch_tensors(*spheres.shape[:2])
+    robot = ~(self_collision.forward(spheres).reshape(-1) <= 0)
+    scene = planner.scene_collision_checker
+    if dt is None:
+        collided = scene.get_sphere_distance_raw(
+            spheres,
+            CollisionBuffer.from_shape(spheres.shape, world.device_cfg),
+            q.new_ones(1),
+            q.new_zeros(1),
+            return_loss=True,
+        )
+    else:
+        spheres = spheres.reshape(1, len(q), -1, 4).contiguous()
+        collided = scene.get_swept_sphere_distance_raw(
+            spheres,
+            CollisionBuffer.from_shape(spheres.shape, world.device_cfg),
+            q.new_ones(1),
+            q.new_zeros(1),
+            q.new_tensor([dt]),
+            return_loss=True,
+        )
+    return robot, ~(collided.reshape(len(q), -1) <= 0).all(1)
+
+
+def _check_supported_path_geometry(planner, world, self_collision, plan, dt):
+    """Check the limits and collisions again on the emitted, possibly retimed path."""
+    q = _full_positions(world, plan)
+    bounds = planner.kinematics.get_joint_limits().position
+    if not ((q >= bounds[0] - 1e-6) & (q <= bounds[1] + 1e-6)).all():
+        raise _gate_error("joint_limits", "Supported motion leaves the planner joint limits")
+    robot, scene = _motion_collisions(planner, world, self_collision, q, dt)
+    if robot.any():
+        raise _gate_error(
+            "self_collision", f"self-collision on the returned trajectory at frame {int(robot.nonzero()[0])}"
+        )
+    if scene.any():
+        raise _gate_error(
+            "scene_collision", f"Swept scene collision on the returned trajectory at frame {int(scene.nonzero()[0])}"
+        )
+
+
+def _check_path_rates(planner, plan):
+    limits = planner.kinematics.get_joint_limits()
+    cols = _arm_columns(plan, limits.joint_names)
+    for field in ("velocity", "acceleration", "jerk"):
+        bound = getattr(limits, field)
+        x = getattr(plan, field)
+        if x is not None:
+            x = x[..., cols]
+            if not ((x >= bound[0] - 1e-5) & (x <= bound[1] + 1e-5)).all():
+                raise _gate_error(field, f"Supported motion exceeds the planner's {field} limits")
 
 
 def solve_curobo(
@@ -434,6 +599,10 @@ def solve_curobo(
     # disabled movable, and blocks at its placements, all of which corrupt the
     # retry attempt.
     _reset_attachment_state(planner, world)
+    self_collision = SelfCollisionCost(SelfCollisionCostCfg(
+        weight=world.device_cfg.to_device([1.0]), device_cfg=world.device_cfg,
+        self_collision_kin_config=planner.kinematics.get_self_collision_config(),
+    ))
 
     # Every pick's and place's pre and post confs, in one GN call before the first segment.
     with timer.time("approach_ik"):
@@ -446,7 +615,6 @@ def solve_curobo(
         # The first gap may start from measured nonzero rates.
         last_js.velocity = step_motion.initial_velocity()
     held = {}  # {arm: (obj_name, grasp_from_obj)}
-    q_init = best_particle["left_q0"]
 
     accum_plans: List[dict] = []
     gate_stats: List[dict] = []
@@ -466,30 +634,70 @@ def solve_curobo(
         what = f"{ground_op} {phase}"
         if step_motion is not None:
             step_motion.check_supported_start()
-        with _line_motion(planner, arm, direction) if line else contextlib.nullcontext():
-            with timer.time("curobo_planning"):
-                result = _plan_arm_to_conf(planner, conf, last_js, disable_obstacle=disable, ground_op=what,
-                                           max_attempts=max_attempts)
-        try:
-            plan, dt = _interp_plan(result), _plan_dt(planner)
-            entry = {"dt": dt, "arm": arm, "op_idx": idx, "phase": phase, "gripper": gripper}
-            stance = step_motion.stance if step_motion is not None else None
-            plan, stats, fast = (_supported_segment_gate(world, plan, dt, stance) if stance is not None
-                                 else _balance_gate(world, plan, dt))
-            if step_motion is not None:
+        stance = step_motion.stance if step_motion is not None else None
+        dt = step_motion.direct_dt if hasattr(step_motion, "direct_dt") else _plan_dt(planner)
+
+        def checked(path):
+            if stance is None:
+                accepted, stats, fast = _balance_gate(world, path, dt)
+            else:
                 from cutamp.step_validation import boundary_errors, compatible_boundary
-                start = _model_frames(world, plan)
+
+                accepted, stats, fast = _supported_segment_gate(world, path, dt, stance)
+                start = _model_frames(world, accepted)
                 if not compatible_boundary(boundary_errors(start.position[0], start.velocity[0],
                             last_js.position.reshape(-1), last_js.velocity.reshape(-1))).all():
-                    raise RuntimeError("cuRobo trajectory cannot connect to the arriving state and velocity")
+                    raise _gate_error("handoff", "Supported trajectory cannot connect to the arriving state and velocity")
+            _check_supported_path_geometry(planner, world, self_collision, accepted, dt)
+            _check_path_rates(planner, accepted)
+            if line:
+                palm = _hand_poses(world, _full_positions(world, accepted), arm)[:, :3, 3]
+                check_line(palm, palm[0], _hand_poses(world, conf.reshape(1, -1), arm)[0, :3, 3])
+            return accepted, stats, fast
+
+        try:
+            solved = None
+            source = "curobo"
+            with _disabled_world_obstacle(planner, disable):
+                if stance is not None:
+                    path = _direct_supported_path(last_js, conf, world.model, dt, arm)
+                    try:
+                        solved = checked(path)
+                        source = "direct_supported"
+                    except RuntimeError as exc:
+                        if not hasattr(exc, "check") and not str(exc).startswith("palm "):
+                            raise
+                        _log.debug("Direct path for %s rejected: %s", what, exc)
+                if solved is None:
+                    fallback = planner
+                    if hasattr(step_motion, "fallback_planner"):
+                        fallback = step_motion.fallback_planner(obj_to_current_pose, held)
+                    contact = disable if fallback is not planner else None
+                    with _line_motion(fallback, arm, direction) if line else contextlib.nullcontext():
+                        with timer.time("curobo_planning"):
+                            result = _plan_arm_to_conf(
+                                fallback, conf, last_js, disable_obstacle=contact, ground_op=what,
+                                max_attempts=max_attempts,
+                            )
+                    path = _interp_plan(result)
+                    opposite = "right" if arm == "left" else "left"
+                    if opposite not in held:
+                        idle = getattr(world.model, opposite + "_arm")
+                        def collides(candidate):
+                            q = _full_positions(world, candidate)
+                            robot, scene = _motion_collisions(planner, world, self_collision, q, dt)
+                            return (robot | scene).any()
+
+                        path, source = _select_idle_arm_route(path, world.model.joint_names[idle], dt, collides)
+                    solved = checked(path)
+            plan, stats, fast = solved
+            entry = {"dt": dt, "arm": arm, "op_idx": idx, "phase": phase, "gripper": gripper,
+                     "motion_source": source}
             gate_stats.append(stats)
             if fast is not None:
                 entry["planner_timing"] = {"plan": fast, "held_objs": _held_obj_poses(world, planner, held, fast)}
             entry.update(plan=plan, held_objs=_held_obj_poses(world, planner, held, plan))
             accum_plans.append(entry)
-            if line:
-                palm = _hand_poses(world, _full_positions(world, plan), arm)[:, :3, 3]
-                check_line(palm, palm[0], _hand_poses(world, conf.reshape(1, -1), arm)[0, :3, 3])
         except RuntimeError as e:
             e.args = (f"{what}: {e}",)  # the same error object, so a gate error keeps its `check`
             raise
@@ -499,22 +707,24 @@ def solve_curobo(
 
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
 
-    ts = 0.0
-    visualizer.set_time_seconds("curobo", ts)
-    visualizer.set_joint_positions(q_init)
-    for obj, pose in obj_to_current_pose.items():
-        visualizer.log_mat4x4(f"world/{obj}", pose)
-
     for idx, ground_op in enumerate(plan_skeleton):
         metadata = ground_op.operator.metadata
         arm = metadata.arm
 
-        # plan_cspace holds nothing between endpoint confs, so the inactive hand is not held along the segment.
         # Both arms stay in the collision checks, except against the obstacle a pick or place segment disables for
         # the whole robot (the grasped block, or the support surface; _plan_arm_to_conf).
         try:
             if step_motion is not None and metadata.action_type in ("pick", "place"):
-                approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
+                opposite = "right" if arm == "left" else "left"
+                idle = getattr(world.model, opposite + "_arm")
+                step_motion.occupied_arm = last_js.position[..., idle] if opposite in held else None
+                def collides(q):
+                    robot, scene = _motion_collisions(planner, world, self_collision, q)
+                    return robot | scene
+                step_motion.endpoint_collides = collides
+                contact = ground_op.arg("obj" if metadata.action_type == "pick" else "surface")
+                with _disabled_world_obstacle(planner, contact):
+                    approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
             if metadata.action_type == "step":
                 if step_motion is None:
                     raise RuntimeError("A stepped motion requires independent transition evidence")
@@ -590,18 +800,42 @@ def solve_curobo(
 
         _log.info(f"{idx + 1}. {ground_op.name}")
 
-    # Play back the accumulated trajectories on the visualizer's "curobo" axis, frame by frame, in the model's full
-    # cspace (its 33 joints, the form T1RerunRobot takes: _full_positions), so Rerun shows the legs and arms animating.
+    play_curobo_motion(world, accum_plans, visualizer)
+    metrics = {"plan_duration_s": sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)}
+    metrics["supported_motion_sources"] = dict(collections.Counter(
+        entry["motion_source"] for entry in accum_plans if "motion_source" in entry
+    ))
+    if gate_stats:
+        metrics["retime_max"] = max(g["retime"] for g in gate_stats)
+        metrics["retime_min"] = min(g["retime"] for g in gate_stats)
+        metrics["retime_binding"] = dict(collections.Counter(g["binding"] for g in gate_stats))
+        metrics["traj_com_min_margin"] = min(g["com_min_margin"] for g in gate_stats)
+        metrics["traj_zmp_min_margin"] = min(g["zmp_min_margin"] for g in gate_stats)
+    return accum_plans, metrics
+
+
+def play_curobo_motion(world: TAMPWorld, accum_plans: list, visualizer: Visualizer | None) -> None:
+    """Publish the selected trajectory and its original scene on the curobo timeline."""
+    if visualizer is None or type(visualizer) is Visualizer or not accum_plans:
+        return
+    visualizer.set_time_seconds("curobo", 0.0)
     rr_robot = getattr(visualizer, "robot", None)
     grippers = {"left": list(GRIPPER_OPEN), "right": list(GRIPPER_OPEN)}
+    if rr_robot is not None and hasattr(rr_robot, "set_grippers"):
+        rr_robot.set_grippers(**grippers)
+    visualizer.set_joint_positions(_full_positions(world, accum_plans[0]["plan"])[0])
+    for obj in world.movables:
+        visualizer.log_mat4x4(f"world/{obj.name}", world.get_object_pose(obj))
 
+    # Play back the accumulated trajectories on the visualizer's "curobo" axis, frame by frame, in the model's full
+    # cspace (its 33 joints, the form T1RerunRobot takes: _full_positions), so Rerun shows the legs and arms animating.
     def _set_gripper(arm_name, closed):
         if rr_robot is None or not hasattr(rr_robot, "set_grippers"):
             return
         grippers[arm_name] = list(GRIPPER_CLOSED if closed else GRIPPER_OPEN)
         rr_robot.set_grippers(left=grippers["left"], right=grippers["right"])
 
-    cur_t = ts
+    cur_t = 0.0
     for entry in accum_plans:
         plan = entry["plan"]
         dt = entry.get("dt", 0.05)
@@ -613,25 +847,17 @@ def solve_curobo(
             _set_gripper(traj_arm, traj_arm in held_objs)
 
         mat4x4s = {f"world/{obj_name}": poses for obj_name, poses in held_objs.values()}
-        if mat4x4s:
+        head = entry.get("head")
+        if mat4x4s or head is not None:
             visualizer.log_joint_trajectory_with_mat4x4s(
                 traj=pos, mat4x4s=mat4x4s, timeline="curobo",
-                start_time=cur_t, dt=dt,
+                start_time=cur_t, dt=dt, **({"head": head} if head is not None else {}),
             )
         else:
             visualizer.log_joint_trajectory(
                 traj=pos, timeline="curobo", start_time=cur_t, dt=dt,
             )
-        cur_t += pos.shape[0] * dt
-
-    metrics = {"plan_duration_s": sum((e["plan"].position.shape[-2] - 1) * e["dt"] for e in accum_plans)}
-    if gate_stats:
-        metrics["retime_max"] = max(g["retime"] for g in gate_stats)
-        metrics["retime_min"] = min(g["retime"] for g in gate_stats)
-        metrics["retime_binding"] = dict(collections.Counter(g["binding"] for g in gate_stats))
-        metrics["traj_com_min_margin"] = min(g["com_min_margin"] for g in gate_stats)
-        metrics["traj_zmp_min_margin"] = min(g["zmp_min_margin"] for g in gate_stats)
-    return accum_plans, metrics
+        cur_t += (pos.shape[0] - 1) * dt
 
 
 def _full_positions(world: TAMPWorld, plan_js) -> torch.Tensor:
@@ -650,8 +876,7 @@ RETIME_RECHECK_STEP = 1.05
 
 
 def _gate_error(check: str, message: str) -> RuntimeError:
-    """The balance gate's RuntimeError, whose ``check`` names the check that failed: ``"soles"``, ``"com"``,
-    ``"zmp"``, ``"torque <joint>"`` or ``"velocity <joint>"``."""
+    """Trajectory rejection with its cause in ``check``: soles, com, zmp, torque or velocity of a joint, or self_collision."""
     error = RuntimeError(message)
     error.check = check
     return error

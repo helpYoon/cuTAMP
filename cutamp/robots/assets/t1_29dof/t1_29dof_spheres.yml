@@ -3,8 +3,24 @@ collision_spheres:
   Trunk:
   - center: [0.05773648526519537, -3.020884469151497e-05, 0.14906761050224304]
     radius: 0.14321203529834747
-  - center: [0.05250000022351742, 0.0, 0.02499999850988388]
-    radius: 0.11500002443790436
+  - center: [0.094, 0.0, -0.004]
+    radius: 0.0415
+  - center: [0.056, 0.0, 0.038]
+    radius: 0.088
+  - center: [0.014, -0.061, 0.026]
+    radius: 0.062
+  - center: [0.014, 0.061, 0.026]
+    radius: 0.062
+  - center: [0.085, -0.05, 0.017]
+    radius: 0.058
+  - center: [0.085, 0.05, 0.017]
+    radius: 0.058
+  - center: [0.052, -0.09, 0.229]
+    radius: 0.043
+  - center: [0.052, 0.09, 0.229]
+    radius: 0.043
+  - center: [-0.004, 0.0, 0.011]
+    radius: 0.035
   H1: []
   H2:
   - center: [-0.0005922466516494751, -0.0026749856770038605, 0.01010836660861969]
@@ -129,16 +145,66 @@ collision_spheres:
   right_Link22: []
   Waist:
   - center: [0.0, 0.0, 0.0]
-    radius: 0.0933
+    radius: 0.066
+  - center: [-0.039, -0.026, 0.047]
+    radius: 0.0255
+  - center: [-0.039, 0.026, 0.047]
+    radius: 0.0255
+  - center: [0.039, -0.026, 0.047]
+    radius: 0.0255
+  - center: [0.039, 0.026, 0.047]
+    radius: 0.0255
+  - center: [-0.022, -0.022, -0.02]
+    radius: 0.036
+  - center: [-0.022, 0.022, -0.02]
+    radius: 0.036
+  - center: [0.022, -0.022, -0.02]
+    radius: 0.036
+  - center: [0.022, 0.022, -0.02]
+    radius: 0.036
+  - center: [-0.027, 0.0, 0.025]
+    radius: 0.056
+  - center: [0.027, 0.0, 0.025]
+    radius: 0.056
+  - center: [0.0, -0.02, -0.025]
+    radius: 0.041
+  - center: [0.0, 0.02, -0.025]
+    radius: 0.041
+  Hip_Pitch_Left:
+  - center: [0.0, -0.005, -0.015]
+    radius: 0.044
+  Hip_Roll_Left:
+  - center: [-0.018, 0, -0.012]
+    radius: 0.038
+  - center: [0.018, 0, -0.012]
+    radius: 0.038
+  - center: [-0.018, -0.019, -0.066]
+    radius: 0.027
+  - center: [-0.018, 0.019, -0.066]
+    radius: 0.027
+  - center: [0.018, -0.019, -0.066]
+    radius: 0.027
+  - center: [0.018, 0.019, -0.066]
+    radius: 0.027
+  - center: [-0.033, 0, -0.062]
+    radius: 0.027
+  - center: [0.032, 0, -0.062]
+    radius: 0.024
   Hip_Yaw_Left:
-  - center: [0.0, 0.0, 0.101854]
-    radius: 0.055
-  - center: [-0.004666666666666666, 0.0, 0.023236000000000007]
-    radius: 0.055
-  - center: [-0.009333333333333332, 0.0, -0.05538199999999999]
-    radius: 0.055
-  - center: [-0.014, 0.0, -0.134]
-    radius: 0.055
+  - center: [0, 0, -0.046]
+    radius: 0.051
+  - center: [0, 0, -0.096]
+    radius: 0.054
+  - center: [-0.014, 0, -0.14]
+    radius: 0.06
+  - center: [-0.018, 0, -0.016]
+    radius: 0.03
+  - center: [0.018, 0, -0.016]
+    radius: 0.03
+  - center: [0, -0.022, -0.017]
+    radius: 0.028
+  - center: [0, 0.022, -0.017]
+    radius: 0.028
   Shank_Left:
   - center: [0.0, 0.0, 0.0]
     radius: 0.045
@@ -148,15 +214,41 @@ collision_spheres:
     radius: 0.045
   - center: [0.0, 0.0, -0.28]
     radius: 0.045
+  Hip_Pitch_Right:
+  - center: [0.0, 0.005, -0.015]
+    radius: 0.044
+  Hip_Roll_Right:
+  - center: [-0.018, 0, -0.012]
+    radius: 0.038
+  - center: [0.018, 0, -0.012]
+    radius: 0.038
+  - center: [-0.018, 0.019, -0.066]
+    radius: 0.027
+  - center: [-0.018, -0.019, -0.066]
+    radius: 0.027
+  - center: [0.018, 0.019, -0.066]
+    radius: 0.027
+  - center: [0.018, -0.019, -0.066]
+    radius: 0.027
+  - center: [-0.033, 0, -0.062]
+    radius: 0.027
+  - center: [0.032, 0, -0.062]
+    radius: 0.024
   Hip_Yaw_Right:
-  - center: [0.0, 0.0, 0.101854]
-    radius: 0.055
-  - center: [-0.004666666666666666, 0.0, 0.023236000000000007]
-    radius: 0.055
-  - center: [-0.009333333333333332, 0.0, -0.05538199999999999]
-    radius: 0.055
-  - center: [-0.014, 0.0, -0.134]
-    radius: 0.055
+  - center: [0, 0, -0.046]
+    radius: 0.051
+  - center: [0, 0, -0.096]
+    radius: 0.054
+  - center: [-0.014, 0, -0.14]
+    radius: 0.06
+  - center: [-0.018, 0, -0.016]
+    radius: 0.03
+  - center: [0.018, 0, -0.016]
+    radius: 0.03
+  - center: [0, 0.022, -0.017]
+    radius: 0.028
+  - center: [0, -0.022, -0.017]
+    radius: 0.028
   Shank_Right:
   - center: [0.0, 0.0, 0.0]
     radius: 0.045

@@ -266,7 +266,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="meshes/AL7.STL" />
+        <mesh filename="visuals/left_wrist_mount.stl" />
       </geometry>
       <material name="">
         <color rgba="0.4 0.4 0.4 0.3" />
@@ -451,7 +451,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="meshes/AR7.STL" />
+        <mesh filename="visuals/right_wrist_mount.stl" />
       </geometry>
       <material name="">
         <color rgba="0.4 0.4 0.4 0.3" />

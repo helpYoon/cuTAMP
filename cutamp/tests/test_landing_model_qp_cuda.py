@@ -130,7 +130,9 @@ def test_zero_step_places_grasp_selects_the_earlier_landing():
             achieved = p.rollout(start, "L", u).steps[0].achieved
             primary = solve_stance_ik(achieved, wrist[:1].expand_as(wrist), seed, "left")
             place = solve_stance_ik(achieved, wrist, seed, "left")
-            return stance_center_residual(primary).square().sum(1) + stance_center_residual(place).square().sum(1)
+            return torch.maximum(
+                stance_center_residual(primary).square().sum(1), stance_center_residual(place).square().sum(1)
+            )
 
         fd = (shared_stance_loss(commands + delta) - shared_stance_loss(commands - delta)) / 0.0014
     torch.testing.assert_close(pick.initial_center_gradient[:, 0, 0].double(), fd, rtol=0.02, atol=0.0008)

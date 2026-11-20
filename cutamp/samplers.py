@@ -10,7 +10,25 @@
 import torch
 from curobo.scene import Cuboid, Mesh, Obstacle
 
-from cutamp.utils.common import approximate_goal_aabb, pose_list_to_mat4x4, transform_points
+from cutamp.utils.common import (
+    action_4dof_to_mat4x4, approximate_goal_aabb, pose_list_to_mat4x4, transform_points, transform_spheres,
+)
+
+
+PLACEMENT_SUPPORT_GAP_M = 0.002
+
+
+def project_supported_placement(pose, obj_spheres, surface_bounds):
+    """Translate a yawed object onto the same sphere-center footprint and bottom used by StablePlacement."""
+    spheres = transform_spheres(obj_spheres, action_4dof_to_mat4x4(pose))
+    xy = spheres[..., :2]
+    lo = surface_bounds[0, :2] - xy.amin(dim=-2)
+    hi = surface_bounds[1, :2] - xy.amax(dim=-2)
+    # An oversized footprint is centered on that axis. StablePlacement still sees the overhang.
+    shift = torch.where(lo <= hi, torch.zeros_like(lo).clamp(min=lo, max=hi), (lo + hi) / 2)
+    bottom = (obj_spheres[:, 2] - obj_spheres[:, 3]).min()
+    height = (surface_bounds[1, 2] + PLACEMENT_SUPPORT_GAP_M - bottom).expand_as(pose[..., 2:3])
+    return torch.cat((pose[..., :2] + shift, height, pose[..., 3:4]), dim=-1)
 
 
 def sample_yaw(num_samples: int, device: torch.device) -> torch.Tensor:

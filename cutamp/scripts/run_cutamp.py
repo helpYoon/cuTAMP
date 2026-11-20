@@ -93,7 +93,7 @@ def entrypoint():
     )
 
     parser.add_argument(
-        "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of particles to use (i.e. batch size)"
+        "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of plan particles per skeleton."
     )
     parser.add_argument(
         "--surface_height", type=float, default=0.0,
@@ -146,10 +146,13 @@ def entrypoint():
     )
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
-        help="Squared CoM-to-centroid distance weight. Defaults to 4 for fast learned steps, 1 otherwise. Zero disables it.",
+        help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the squared "
+             "centering term (default 4 for fast learned steps, 1 otherwise). Zero disables centering.",
     )
     parser.add_argument("--step_mode", choices=("off", "rank", "geometric", "model"), default=_defaults.step_mode,
                         help="Rank foot schedules, refine a geometric ablation, or use the frozen T1 landing model.")
+    parser.add_argument("--step_motion_validation", choices=("model", "independent"), default=_defaults.step_motion_validation,
+                        help="Return a predicted motion, or require independent transition evidence.")
     parser.add_argument("--step_search_order", choices=("astar", "count"), default=_defaults.step_search_order)
     parser.add_argument("--max_step_schedules", type=int, default=None,
                         help="Maximum distinct grounded schedules attempted across all arm assignments.")
@@ -160,6 +163,9 @@ def entrypoint():
     parser.add_argument("--step_derivative_method", choices=("finite_difference", "autodiff"),
                         default=_defaults.step_derivative_method,
                         help="Learned-step solver. Batched finite differences use two wider updates; autodiff uses the four-update reference.")
+    parser.add_argument("--step_proposal_count", type=int, default=_defaults.step_proposal_count,
+                        help="Commands to screen per learned-step batch (default 192 for pick, 128 for place). Use 0 for the historical SQP route. "
+                             "Positive counts default to forward-only checking; use --step_refine_iterations to add SQP.")
     parser.add_argument("--step_refine_iterations", type=int, default=_defaults.step_refine_iterations,
                         help="Override the learned-step or geometric solver's maximum updates.")
     parser.add_argument("--step_trust_scale", type=float, default=_defaults.step_trust_scale,
@@ -171,12 +177,14 @@ def entrypoint():
         "--max_duration",
         type=float,
         default=_defaults.max_loop_dur,
-        help="Maximum duration for optimization in seconds. Overrides --num_opt_steps if set.",
+        help="Cooperative search budget from planner entry. By default forward-only search allows 9.5 s to find "
+             "a full motion, compares feasible motions up to 4.4 s from entry, and allows 8 s for keyframes. "
+             "An explicit duration controls the entire search.",
     )
     parser.add_argument(
         "--motion_plan",
-        action="store_true",
-        help="Whether to plan for full motions after using cuTAMP.",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="Generate a complete motion (default for model). Use --no-motion_plan for keyframes.",
     )
     parser.add_argument(
         "--env", type=str, default="blocks_t1",
@@ -232,13 +240,14 @@ def entrypoint():
         step_mode=args.step_mode, step_search_order=args.step_search_order,
         max_step_schedules=args.max_step_schedules, step_lag=args.step_lag,
         landing_bundle=args.landing_bundle, step_reach_map=args.step_reach_map,
-        step_accuracy_table=args.step_accuracy_table, step_refine_iterations=args.step_refine_iterations,
+        step_accuracy_table=args.step_accuracy_table, step_proposal_count=args.step_proposal_count,
+        step_refine_iterations=args.step_refine_iterations,
         step_derivative_method=args.step_derivative_method, step_trust_scale=args.step_trust_scale,
         step_particle_batch_size=args.step_particle_batch_size, require_modeled_load=args.require_modeled_load,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,
-        curobo_plan=args.motion_plan,
+        curobo_plan=args.motion_plan, step_motion_validation=args.step_motion_validation,
         enable_visualizer=not args.disable_visualizer,
         experiment_root=args.experiment_root,
     )

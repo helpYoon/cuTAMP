@@ -1,6 +1,8 @@
 """T1 sole command conventions and planar frame transforms, in meters and radians."""
 
+import json
 import math
+from functools import lru_cache
 
 import torch
 
@@ -36,3 +38,25 @@ def abs_pose(planted: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         ],
         -1,
     )
+
+@lru_cache(maxsize=8)
+def _base_reach(device, dtype):
+    from cutamp.robots.t1 import REAL_LEGS
+
+    data = json.loads((REAL_LEGS.asset_root / "sole_base_reach.json").read_text())
+    reach = torch.tensor(data["sole_base_xy"], device=device, dtype=dtype)
+    return reach.mean(-1), (reach[..., 1] - reach[..., 0]) * 0.5, data["base_margin"]
+
+
+def stance_joint_limits(soles, lower, upper):
+    """Transport both leg reach boxes into world XY and intersect them for each stance."""
+    center, radius, padding = _base_reach(soles.device, soles.dtype)
+    yaw = soles[..., 2]
+    c, s = yaw.cos(), yaw.sin()
+    rot = torch.stack((c, -s, s, c), -1).reshape(*yaw.shape, 2, 2)
+    xy = soles[..., :2] + (rot @ center.unsqueeze(-1)).squeeze(-1)
+    extents = (rot.abs() @ radius.unsqueeze(-1)).squeeze(-1)
+    lo = (1000 * ((xy - extents).amax(-2) - padding)).floor() / 1000
+    hi = (1000 * ((xy + extents).amin(-2) + padding)).ceil() / 1000
+    leading = soles.shape[:-2]
+    return torch.cat((lo, lower[2:].expand(*leading, -1)), -1), torch.cat((hi, upper[2:].expand(*leading, -1)), -1)

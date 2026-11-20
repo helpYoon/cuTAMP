@@ -22,7 +22,9 @@ from cutamp.com_polygon_cost import (
     physical_support_planes, physical_support_margin,
 )
 from cutamp.config import TAMPConfiguration
+from cutamp.samplers import PLACEMENT_SUPPORT_GAP_M
 from cutamp.costs import curobo_pose_error, dist_from_bounds_jit, sphere_to_sphere_overlap, trajectory_length
+from cutamp.stance import stance_joint_limits
 from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
 from cutamp.rollout import Rollout, get_retract_parameters, require_fixed_stance
 from cutamp.tamp_world import TAMPWorld
@@ -109,7 +111,7 @@ class CostFunction:
 
             # The target z: the surface's top plus a buffer (the world collision cost activates at 0)
             surface_z = aabb[1, 2]
-            target_z = surface_z + 2e-3
+            target_z = surface_z + PLACEMENT_SUPPORT_GAP_M
             self.surface_to_target_z[surface] = target_z
 
         self.surface_to_sphere_idx_map = {}
@@ -135,14 +137,17 @@ class CostFunction:
         values["sole_pos_err"], values["sole_rot_err"] = sole_pos.flatten(1), sole_rot.flatten(1)
         return {"type": "constraint", "values": values}
 
-    def motion_costs(self, rollout: Rollout) -> Union[dict, None]:
+    def motion_costs(self, rollout: Rollout, achieved_stances=None) -> Union[dict, None]:
         """Motion constraints — joint-limit violation + self-collision cost, of the rollout's confs and of the
         retract confs too (``retract_joint_limit``, ``retract_self_collision``)."""
         confs = rollout["confs"]
         robot_spheres = rollout["robot_spheres"]
 
         joint_limits = self.world.joint_limits
-        dist_from_joint_lims = dist_from_bounds_jit(confs, joint_limits[0], joint_limits[1])
+        if achieved_stances is not None:
+            soles = torch.stack([achieved_stances[name] for name in rollout["conf_params"]], dim=1)
+            joint_limits = stance_joint_limits(soles, *joint_limits)
+        dist_from_joint_lims = dist_from_bounds_jit(confs, *joint_limits)
 
         # Single self-collision cost: setup once per shape, then evaluate.
         b, h = robot_spheres.shape[0], robot_spheres.shape[1]
@@ -151,10 +156,10 @@ class CostFunction:
 
         values = {"joint_limit": dist_from_joint_lims, "self_collision": self_coll_vals}
         if self.retract_self_collision_cost_fn is not None:
-            values.update(self._retract_motion_values())
+            values.update(self._retract_motion_values(achieved_stances))
         return {"type": "constraint", "values": values}
 
-    def _retract_motion_values(self) -> Dict[str, torch.Tensor]:
+    def _retract_motion_values(self, achieved_stances=None) -> Dict[str, torch.Tensor]:
         """``retract_joint_limit`` and ``retract_self_collision``, each ``[N, R]`` over ``retract_info``'s confs,
         from one FK of every retract conf on its own site (TAMPWorld.site_kinematics)."""
         q = torch.stack([self._particles[name] for name, _, _ in self.retract_info], dim=1)  # [N, R, dof]
@@ -163,6 +168,9 @@ class CostFunction:
             JointState.from_position(q.view(n * r, -1))
         )
         joint_limits = self.world.joint_limits
+        if achieved_stances is not None:
+            soles = torch.stack([achieved_stances[name] for name, _, _ in self.retract_info], dim=1)
+            joint_limits = stance_joint_limits(soles, *joint_limits)
         self.retract_self_collision_cost_fn.setup_batch_tensors(n, r)
         return {
             "retract_joint_limit": dist_from_bounds_jit(q, joint_limits[0], joint_limits[1]),
@@ -270,8 +278,9 @@ class CostFunction:
 
         return {"type": "constraint", "values": coll_values}
 
-    def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None):
-        """Reconstruct the loose and held objects at each manipulation and retract."""
+    def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None, *, include_self=True):
+        """Check selected postures against the other links, loose objects and carried objects."""
+        from cutamp.gn_refresh import self_sphere_overlaps
         from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
         from cutamp.step_set import _facts
         from cutamp.step_validation import _obb_gap, _object_box
@@ -290,6 +299,8 @@ class CostFunction:
         fk = kin.compute_kinematics(JointState.from_position(q.flatten(0, 1).contiguous()))
         robot = fk.robot_spheres.reshape(b, h, -1, 4)
         values = {"robot_to_world": self.world.collision_fn(robot)}
+        if include_self:
+            values["self_collision"] = self_sphere_overlaps(self.world.kinematics, robot).amax(-1)
         kp = kin.kinematics_config
         held = dict(initial_held or {})
         loose = (dict(initial_loose) if initial_loose is not None else
@@ -353,17 +364,17 @@ class CostFunction:
             return None
         return {"type": "constraint", "values": pens}
 
-    def soft_costs(self, rollout: Rollout) -> dict:
+    def soft_costs(self, rollout: Rollout, achieved_stances=None) -> dict:
         """Soft costs defined on the goal state. Supports multiple soft costs."""
         values = {}
 
         for cost_name in self.config.soft_cost:
-            cost_value = self._compute_soft_cost(cost_name, rollout)
+            cost_value = self._compute_soft_cost(cost_name, rollout, achieved_stances)
             values[cost_name] = cost_value
 
         return {"type": "cost", "values": values}
 
-    def _compute_soft_cost(self, cost_name: str, rollout: Rollout) -> torch.Tensor:
+    def _compute_soft_cost(self, cost_name: str, rollout: Rollout, achieved_stances=None) -> torch.Tensor:
         """Compute a single soft cost by name."""
         device = self.world.device
         num_particles = rollout["num_particles"]
@@ -411,7 +422,7 @@ class CostFunction:
         # initial robot state must never acquire limit gradients.
         elif cost_name == "joint_limit_margin":
             limits = self.world.joint_limits  # [2, dof], row 0 = lower
-            return joint_limit_margin_soft_cost(self._particles, limits, num_particles, device)
+            return joint_limit_margin_soft_cost(self._particles, limits, num_particles, device, achieved_stances)
 
         else:
             raise ValueError(f"Unsupported soft cost: {cost_name}")
@@ -436,15 +447,16 @@ class CostFunction:
             obj_spheres = transform_spheres(self.world.get_collision_spheres(obj), obj_pose)
             obj_to_spheres[obj.name] = obj_spheres
 
+        # motion_costs below already checks robot self-collision for the final particle.
         collision_cost = (self.collision_costs(rollout, obj_to_spheres) if achieved_stances is None
-                          else self.stepped_scene_costs(particles))
+                          else self.stepped_scene_costs(particles, include_self=False))
         add_cost(Collision.type, collision_cost)
 
         stable_placement_cost = self.stable_placement_costs(rollout, obj_to_spheres)
         add_cost(StablePlacement.type, stable_placement_cost)
 
         # Valid motions don't exceed joint limits
-        motion_cost = self.motion_costs(rollout)
+        motion_cost = self.motion_costs(rollout, achieved_stances)
         add_cost(Motion.type, motion_cost)
 
         stances = None if achieved_stances is None else torch.stack(
@@ -466,10 +478,11 @@ class CostFunction:
 
         # Soft costs
         if self.config.soft_cost or self.config.com_center_weight:
-            soft_cost = self.soft_costs(rollout)
+            soft_cost = self.soft_costs(rollout, achieved_stances)
             if self.config.com_center_weight:
                 center = self.support_centroid if stances is None else physical_support_centroid(stances, self.world.model.sole_box)
                 distance_squared = (rollout["com_xy"] - center).square().sum(dim=-1)
+                soft_cost["max_center_distance_m"] = distance_squared.detach().amax(-1).sqrt()
                 soft_cost["values"]["com_center_distance_squared"] = self.config.com_center_weight * distance_squared
             add_cost("soft", soft_cost)
 

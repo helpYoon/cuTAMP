@@ -8,7 +8,7 @@ import roma
 import torch
 from torch import Tensor
 
-from cutamp.landing_predictor import LandingState, near_rest, prediction_precision
+from cutamp.landing_predictor import LandingState, _hold_trace, near_rest, prediction_precision
 from cutamp.robots.t1 import REAL_LEGS
 
 
@@ -149,25 +149,17 @@ class StepStateAdapter:
             hist = raw[:, None, :].repeat(1, self.predictor.metadata["history_ticks"], 1)
             full = (*physical, previous, hist, q.new_zeros(len(q), 8))
             initial = LandingState(full, dynamics, "synthetic_hold_issue")
-            speeds = []
-            states = [physical] if world is not None else []
-            actions = []
-            for t in range(50):
-                full = self.predictor.model(full, q.new_zeros(len(q), 5), dynamics)
-                if world is not None:
-                    states.append(full[:6])
-                    actions.append(full[6][:, : len(self.names)])
-                if t >= 25:
-                    speeds.append(torch.stack((full[5].square().mean(-1).sqrt(), full[2].norm(dim=-1)), -1))
+            ticks = torch.full((len(q),), 50, dtype=torch.long, device=q.device)
+            full, following, actions = _hold_trace(self.predictor, full, dynamics, ticks, 50)
             state = LandingState(full, dynamics, "synthetic_retract_50_hold")
             if world is not None:
                 # The planner may explicitly include the predicted preparation motion.
                 # Its first state is exactly the requested pose/rate and its final state
                 # is exactly the one used to issue the step. No pose or velocity reset.
                 state.history_source = "synthetic_supported_hold_50"
-                trajectory = tuple(torch.stack(series, dim=1) for series in zip(*states))
+                trajectory = tuple(torch.cat((start[:, None], tail), dim=1) for start, tail in zip(physical, following))
                 sole, height, tilt = self.predictor.model.feet(tuple(v.flatten(0, 1) for v in trajectory))
-                b, t = q.shape[0], len(states)
+                b, t = trajectory[0].shape[:2]
                 sole, height, tilt = sole.reshape(b, t, 2, 3), height.reshape(b, t, 2), tilt.reshape(b, t, 2)
                 xy = (sole[..., :2] - sole[:, :1, :, :2]).norm(dim=-1).amax((1, 2))
                 yaw_delta = sole[..., 2] - sole[:, :1, :, 2]
@@ -179,10 +171,11 @@ class StepStateAdapter:
                     tilt,
                     torch.ones((b, t), device=q.device, dtype=torch.bool),
                     (xy < 0.020) & (yaw < torch.pi / 180),
-                    torch.stack(actions, dim=1),
+                    actions,
                 )
                 preparation = HoldPrediction((prepared,), prepared.tracking_ok, initial)
-            peak = torch.stack(speeds, dim=1).amax(1)
+            peak = torch.stack((following[5][:, -25:].square().mean(-1).sqrt().amax(1),
+                                following[2][:, -25:].norm(dim=-1).amax(1)), dim=-1)
             diagnostics = {
                 "max_joint_rms": peak[:, 0],
                 "max_root_speed": peak[:, 1],
@@ -218,6 +211,7 @@ class StepStateAdapter:
         synchronized = (actual_obs - history[:, -1]).abs().amax(-1) < 1.0e-4
         synchronized &= torch.stack([v.reshape(len(q), -1).isfinite().all(-1) for v in state.tensors]).all(0)
         diagnostics["synchronized_history"] = synchronized
+        diagnostics["joint_hard_limit_rad"] = _physical_joint_excess(self.robot, self.names, joints)
         current, velocity = self.planner(state.tensors[:6])
         diagnostics.update(boundary_errors(current, velocity, q, qd))
         now, _, _ = self.predictor.model.feet(state.tensors[:6])
@@ -241,10 +235,10 @@ class StepStateAdapter:
             usable = geom["valid"] & applicable & (phase[:, 0] > 0.5) & (phase[:, 2:4] == 0).all(-1)
             diagnostics.update(
                 preparation_ok=geom["valid"],
-                preparation_frames=len(states),
+                preparation_frames=preparation.steps[0].valid_ticks.shape[1],
                 preparation_contact_and_drift=preparation.tracking_ok,
             )
-        usable &= synchronized
+        usable &= synchronized & (diagnostics["joint_hard_limit_rad"] <= 1.0e-6)
         diagnostics.update(history_source=state.history_source, encoder_context_supported=applicable)
         return StepStart(state, usable, diagnostics, preparation)
 
@@ -294,21 +288,14 @@ def _object_box(obj, world_from_obj):
     return transform, (b - a) / 2
 
 
-def _moving_head(world, spheres, physical, adapter):
+def _moving_head(spheres, p, R, joints, adapter, inds, offset):
     """Replace the head centers in cuRobo's locked-head sphere model by their measured FK."""
-    from cutamp.robots.t1 import t1_curobo_cfg
-
-    p, R, _, _, joints, _ = physical
-    cfg = t1_curobo_cfg(world.model)["robot_cfg"]["kinematics"]
-    if "H2" not in cfg["collision_link_names"]:
-        return spheres
-    inds = world.kinematics.kinematics_config.get_sphere_index_from_link_name("H2").long().to(p.device)
     # URDF Trunk -> H1 (yaw), H1 -> H2 (pitch). The head's two centers are taken
     # from the exact locked FK, so the collision sphere model stays identical at q_head=0.
     y = joints[..., adapter.names.index("AAHead_yaw")]
     pitch = joints[..., adapter.names.index("Head_pitch")]
     rot = roma.euler_to_rotmat("ZY", torch.stack((y, pitch), dim=-1))
-    origin = p + (R @ p.new_tensor([0.0625, 0, 0.243 + 0.06185]).reshape(3, 1)).squeeze(-1)
+    origin = p + (R @ offset).squeeze(-1)
     local = (spheres[:, inds, :3] - origin[:, None]) @ R
     moving = (local @ (R @ rot).transpose(-1, -2)) + origin[:, None]
     spheres = spheres.clone()
@@ -318,9 +305,15 @@ def _moving_head(world, spheres, physical, adapter):
 
 @lru_cache(maxsize=8)
 def _physical_joint_limits(robot, names):
+    """The source URDF preserves physical joint ranges before supported-posture limits are applied."""
     tree = ET.parse(robot.asset_root / "t1_planner.urdf")
     by_name = {j.get("name"): j.find("limit") for j in tree.getroot().findall("joint")}
     return tuple((float(by_name[n].get("lower")), float(by_name[n].get("upper"))) for n in names)
+
+
+def _physical_joint_excess(robot, names, positions):
+    limits = positions.new_tensor(_physical_joint_limits(robot, names))
+    return torch.maximum(limits[:, 0] - positions, positions - limits[:, 1]).amax(-1).clamp_min(0.0)
 
 
 @lru_cache(maxsize=8)
@@ -342,7 +335,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
 
     from cutamp.costs import sphere_to_sphere_overlap
     from cutamp.gn_refresh import collision_penetration
-    from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
+    from cutamp.robots.t1 import GRIPPER_JOINT_NAMES, t1_curobo_cfg
     from cutamp.utils.common import transform_spheres
 
     held = dict(held or {})
@@ -350,12 +343,38 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
     poses = {obj.name: world.get_object_pose(obj) for obj in world.movables + world.statics}
     poses.update(object_poses or {})
     B = len(prediction.tracking_ok)
+    kp = world.kinematics.kinematics_config
+
+    def excluding(names):
+        # Use the model's actual sphere-to-link map. Materialize the indices once;
+        # repeated nonzero/Boolean indexing would synchronize each trajectory chunk.
+        link_ids = kp.link_sphere_idx_map.flatten()
+        mask = torch.ones_like(link_ids, dtype=torch.bool)
+        for name in names:
+            if name in kp.link_name_to_idx_map:
+                mask &= link_ids != kp.link_name_to_idx_map[name]
+        return mask.nonzero().flatten()
+
+    foot_body_ids = {
+        arm: excluding((f"Shank_{arm.title()}", f"Ankle_Cross_{arm.title()}", f"{arm}_foot_link"))
+        for arm in ("left", "right")
+    }
+    payload_body_ids = {
+        arm: excluding((world.tool_frame_for_arm(arm), f"{arm}_hand_link", *GRIPPER_JOINT_NAMES[arm]))
+        for arm in held
+    }
+    head_ids = None
+    if "H2" in t1_curobo_cfg(world.model)["robot_cfg"]["kinematics"]["collision_link_names"]:
+        head_ids = kp.get_sphere_index_from_link_name("H2").long()
+    like = world.q_init
+    head_offset = like.new_tensor([0.0625, 0, 0.243 + 0.06185]).reshape(3, 1)
+    physical_limits = like.new_tensor(_physical_joint_limits(adapter.robot, adapter.names))
+    half = like.new_tensor(_foot_half_extents(world.model))
     totals = {}
     history = []
     for idx, step in enumerate(prediction.steps):
         q, qd = adapter.planner(step.trajectory)
         T = q.shape[1]
-        kp = world.kinematics.kinematics_config
 
         def at(poses, rows):
             poses = poses.reshape(-1, 4, 4)
@@ -363,6 +382,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
 
         peaks = {}
         held_world = {arm: [] for arm in held}
+        moments = []
         # A cuRobo instance owns writable FK buffers. Give each concurrently differentiated
         # step its own instance; run one FK per trace before its backward.
         if torch.is_grad_enabled():
@@ -373,27 +393,27 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
             kin = world.kinematics
         chunk_size = B * T if torch.is_grad_enabled() else 256
         for start in range(0, B * T, chunk_size):
-            frames = torch.arange(start, min(start + chunk_size, B * T), device=q.device)
-            rows = frames // T
+            stop = min(start + chunk_size, B * T)
+            rows = torch.arange(start, stop, device=q.device) // T
+            frames = slice(start, stop)
             valid = step.valid_ticks.flatten()[frames]
             qpart = q.flatten(0, 1)[frames].contiguous()
             fk = kin.compute_kinematics(JointState.from_position(qpart))
+            if step.side == "HOLD":
+                moments.append(fk.robot_com.reshape(-1, 4)[:, :2].clone())
 
             def link(name, state=fk):
                 return state.tool_poses.get_link_pose(name, make_contiguous=True).get_matrix().reshape(-1, 4, 4)
 
-            spheres = fk.robot_spheres.reshape(len(frames), -1, 4)
-            spheres = _moving_head(world, spheres, [v.flatten(0, 1)[frames] for v in step.trajectory], adapter)
+            spheres = fk.robot_spheres.reshape(len(qpart), -1, 4)
             sphere_poses, boxes = {}, {}
-            hard_limits = q.new_tensor(_physical_joint_limits(adapter.robot, adapter.names))
             actual_joints = step.trajectory[4].flatten(0, 1)[frames]
-            pen = {
-                "joint_hard_limit_rad": torch.maximum(
-                    hard_limits[:, 0] - actual_joints, actual_joints - hard_limits[:, 1]
-                )
-                .amax(-1)
-                .clamp_min(0.0)
-            }
+            if head_ids is not None:
+                p, R = (v.flatten(0, 1)[frames] for v in step.trajectory[:2])
+                spheres = _moving_head(spheres, p, R, actual_joints, adapter, head_ids, head_offset)
+            pen = {"joint_hard_limit_rad": torch.maximum(
+                physical_limits[:, 0] - actual_joints, actual_joints - physical_limits[:, 1]
+            ).amax(-1).clamp_min(0.)}
             for obj in world.movables + world.statics:
                 if obj.name in carried:
                     arm = carried[obj.name]
@@ -410,12 +430,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
             for name, arm in carried.items():
                 obj_s = sphere_poses[name]
                 # Only suppress the grasping hand, never the opposite arm or torso.
-                ignored = [world.tool_frame_for_arm(arm), f"{arm}_hand_link", *GRIPPER_JOINT_NAMES[arm]]
-                mask = torch.ones(spheres.shape[1], dtype=torch.bool, device=q.device)
-                for n in ignored:
-                    if n in kp.link_name_to_idx_map:
-                        mask[kp.get_sphere_index_from_link_name(n).long()] = False
-                pen["payload_robot_" + arm] = sphere_to_sphere_overlap(obj_s, spheres[:, mask], 0.0)
+                pen["payload_robot_" + arm] = sphere_to_sphere_overlap(obj_s, spheres.index_select(1, payload_body_ids[arm]), 0.0)
                 pen["payload_scene_" + arm] = world.collision_fn(obj_s[:, None].contiguous()).reshape(-1)
                 others = [sp for other, sp in sphere_poses.items() if other != name]
                 if others:
@@ -423,7 +438,6 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
                 pen["payload_floor_" + arm] = (obj_s[..., 3] - obj_s[..., 2]).amax(1).clamp_min(0)
             # The planner's collision spheres leave out the feet. Use both physical
             # URDF foot boxes at each tick, including the swing over floor objects.
-            half = q.new_tensor(_foot_half_extents(world.model))
             feet = []
             for instr in world.model.sole_frames:
                 foot = link(instr).clone()
@@ -442,14 +456,10 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
             for arm, box in zip(("left", "right"), feet):
                 # Mated ankle/leg is exempt; all upper body, opposite leg and arm
                 # poses use actual spheres. Transform those sphere centers into foot.
-                excluded = "Left" if arm == "left" else "Right"
-                mask = torch.ones(spheres.shape[1], dtype=torch.bool, device=q.device)
-                for link_name in (f"Shank_{excluded}", f"Ankle_Cross_{excluded}", f"{arm}_foot_link"):
-                    if link_name in kp.link_name_to_idx_map:
-                        mask[kp.get_sphere_index_from_link_name(link_name).long()] = False
-                rel = ((spheres[:, mask, :3] - box[:, None, :3, 3]) @ box[..., :3, :3]).abs() - half
+                body = spheres.index_select(1, foot_body_ids[arm])
+                rel = ((body[..., :3] - box[:, None, :3, 3]) @ box[..., :3, :3]).abs() - half
                 dist = rel.clamp_min(0.0).norm(dim=-1) + rel.amax(-1).clamp_max(0.0)
-                pen["foot_body_" + arm] = (spheres[:, mask, 3] - dist).clamp_min(0).amax(-1)
+                pen["foot_body_" + arm] = (body[..., 3] - dist).clamp_min(0).amax(-1)
             for name, value in pen.items():
                 if name not in peaks:
                     peaks[name] = q.new_zeros(B)
@@ -472,11 +482,6 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
             # Remain in double support during the preparatory HOLD.
             from cutamp.com_polygon_cost import margin_from_support_planes, support_region_planes
 
-            moments = []
-            for start in range(0, B * T, 256):
-                qhold = q.flatten(0, 1)[start : start + 256].contiguous()
-                fk = world.kinematics.compute_kinematics(JointState.from_position(qhold))
-                moments.append(fk.robot_com.reshape(-1, 4)[:, :2].clone())
             com = torch.cat(moments).reshape(B, T, 2)
             support = support_region_planes(step.sole_trace[:, 0], world.model.sole_box, False)
             ok &= (margin_from_support_planes(com, support[0][:, None], support[1][:, None]) >= 0).all(1)
@@ -517,6 +522,10 @@ def sweep_constraint_rows(world, adapter, prediction, object_poses=None, held=No
     if prediction is None or not prediction.steps:
         return {}
     peaks = _step_geometry(world, adapter, prediction, object_poses=object_poses, held=held)["penetration"]
+    return sweep_penetration_rows(peaks)
+
+
+def sweep_penetration_rows(peaks):
     # Each underlying gate must pass. The maximum gives the QP the active
     # constraint's gradient and keeps the number of full-dynamics VJPs bounded.
     limits = [(v - 1.0e-6) / (0.05 if k.endswith("_rad") else 0.02) for k, v in peaks.items()]
@@ -541,7 +550,8 @@ class TransitionRequest:
 class TransitionEvidence:
     """Independent validator's heard/executed trace in model joint order, including the issue state.
 
-    A step path contains `clock + hold_ticks + 1` frames at 50 Hz. A preparatory
+    A step path contains `clock + hold_ticks + 1` frames at 50 Hz, including the issue
+    state and the deadline. Consecutive alternating steps can join there with zero hold ticks. A preparatory
     HOLD contains its 51 consecutive frames, starting at the arriving state. A measured terminal
     state with actual observation/action histories is required before another step.
     The source must certify continuous swept clearance and contact on this scene.
@@ -590,7 +600,7 @@ def model_step_record(adapter, initial, step, command, row=0, *, preparation=Non
         "command": array(command[row]),
         "dt_s": 0.02,
         "step_ticks": int(step.clock[row]),
-        "hold_ticks": model.hold_ticks,
+        "hold_ticks": ticks - int(step.clock[row]),
         "joint_names": list(adapter.names),
         "checkpoint_sha256": model.metadata["checkpoint_sha256"],
         "deployment_sha256": model.metadata["deployment_sha256"],
@@ -652,6 +662,8 @@ def verify_transition(request, evidence, adapter, intended_final=None):
     q, qd, acc = [v.to(request.initial_position) for v in values]
     if not compatible_boundary(boundary_errors(q[0], qd[0], request.initial_position, request.initial_velocity)).all():
         raise ValueError("Independent step trace does not begin at the arriving state and velocity")
+    if (_physical_joint_excess(adapter.robot, adapter.robot.joint_names[6:], q[:, 6:]) > 1.0e-6).any():
+        raise ValueError("Independent step trace exceeds a physical URDF joint limit")
     trace, height, tilt = adapter.predictor.model.feet(adapter.physical(q, qd))
     js = JointState(position=q, velocity=qd, acceleration=acc, joint_names=list(adapter.robot.joint_names))
     if evidence.terminal is not None:
@@ -711,6 +723,7 @@ def verify_transition(request, evidence, adapter, intended_final=None):
             "yaw_error_rad": yaw[0].detach(),
             "tracking": True,
             "clock": int(step.clock[0]),
+            "hold_ticks": n - 1 - int(step.clock[0]),
             "history_source": request.initial.history_source,
             "load_validated": bool(request.held and evidence.load_ok),
             "dt": request.dt,
@@ -727,6 +740,10 @@ class SteppedMotion:
         self.last_state = None
         self.stance = None
         self.records = []
+        self.occupied_arm = None
+        self.supported_kinematics = None
+        self.planned_endpoints = {}
+        self.endpoint_collides = None
         gap, offset = 0, 0
         for idx, op in enumerate(skeleton):
             typ = op.operator.metadata.action_type
@@ -808,8 +825,11 @@ class SteppedMotion:
                 )
             start = self.last_state
         # Rerun from the actual issue state and the saved command.
-        foot = prediction.steps[j].side
-        result = self.adapter.predictor.rollout(start, foot, commands[:, j : j + 1])
+        saved = prediction.steps[j]
+        foot = saved.side
+        # Preserve the recorded dwell even if the measured state gives a different step clock.
+        hold_ticks = int(saved.valid_ticks[0].sum() - saved.clock[0])
+        result = self.adapter.predictor.rollout(start, foot, commands[:, j : j + 1], final_hold_ticks=hold_ticks)
         s = result.steps[0]
         if not self.adapter.initialize(incoming, start.dynamics, velocity, observed=start).compatible.all():
             raise ValueError("Previous motion cannot connect to the requested step state and velocity")
@@ -855,7 +875,8 @@ class SteppedMotion:
         if s is None:
             s = self.adapter.predictor.model.feet(self.adapter.physical(self.world.q_init.reshape(1, -1)))[0][0]
         s = s.reshape(1, 2, 3)
-        fitted = solve_stance_ik(s, wrist, seed, arm)
+        fitted = solve_stance_ik(s, wrist, seed, arm, other_arm_reference=self.occupied_arm,
+                                 collides=self.endpoint_collides, kinematics=self.supported_kinematics)
 
         def pose_ok(ik):
             return (
@@ -878,9 +899,12 @@ class SteppedMotion:
         ):
             raise ValueError("Actual landing cannot support the bound full wrist pose with the required margin")
         particle[op.arg("q")] = fitted.q[0].to(seed).detach()
+        self.planned_endpoints[idx] = fitted
         hand = _hand_poses(self.world, particle[op.arg("q")][None], arm)[0]
         targets = torch.stack(approach_targets(hand, kind))
-        linked = solve_stance_ik(s.expand(2, -1, -1), targets, particle[op.arg("q")][None].expand(2, -1), arm)
+        idle = self.world.model.right_arm if arm == "left" else self.world.model.left_arm
+        linked = solve_stance_ik(s.expand(2, -1, -1), targets, fitted.q.expand(2, -1), arm,
+                                 other_arm_reference=fitted.q[:, idle].expand(2, -1), kinematics=self.supported_kinematics)
         if not pose_ok(linked).all():
             raise ValueError("Actual stance cannot reach manipulation pre/post keyframes")
         return linked.q[0].to(seed).detach(), linked.q[1].to(seed).detach(), is_vertical(hand)

@@ -70,6 +70,21 @@ def _leg_gap(kin, q: torch.Tensor) -> float:
     return float((torch.cdist(a[:, :3], b[:, :3]) - a[:, 3:] - b[:, 3].unsqueeze(0)).min())
 
 
+@needs_cuda
+@pytest.mark.parametrize("side,angles", [
+    ("left", (-2.91495, 1.56804, 2.01149, 0.90438, -1.83141, -1.45416, -0.59429)),
+    ("right", (-2.92101, -1.56804, -1.14768, 0.88676, 1.04484, 0.08944, -0.45465)),
+])
+def test_forearm_cannot_pass_through_trunk(real_world, side, angles):
+    """STL intersections of the forearm and torso at in-range arm poses, with the other joints at home."""
+    q = _home(real_world)
+    arm = real_world.model.left_arm if side == "left" else real_world.model.right_arm
+    q[arm] = q.new_tensor(angles)
+    lo, hi = real_world.joint_limits
+    assert ((q[arm] >= lo[arm]) & (q[arm] <= hi[arm])).all()
+    assert _self_collision(real_world.kinematics, q) > 0
+
+
 def hips_crossed(world) -> torch.Tensor:
     """Home with both Hip_Roll joints at their inward soft limits, so the thighs cross: a self-colliding conf
     (test_real_legs_init's retract test reuses it)."""
@@ -115,6 +130,13 @@ def _cli_config(monkeypatch, *argv) -> TAMPConfiguration:
     monkeypatch.setattr(sys, "argv", ["run_cutamp", *argv])
     rc.entrypoint()
     return seen[-1]
+
+
+def test_cli_defaults_to_predicted_motion_and_allows_keyframes(monkeypatch):
+    cfg = _cli_config(monkeypatch)
+    assert cfg.step_mode == "model" and cfg.curobo_plan and cfg.step_motion_validation == "model"
+    assert not _cli_config(monkeypatch, "--no-motion_plan").curobo_plan
+    assert not _cli_config(monkeypatch, "--step_mode", "off").curobo_plan
 
 
 def test_soft_cost_default_and_choice(monkeypatch):
@@ -255,10 +277,11 @@ def test_home_com_over_the_mid_sole(real_world):
 @needs_cuda
 def test_home_clears_itself(real_world):
     kin, home = real_world.kinematics, _home(real_world)
-    assert _fk(kin, home).robot_spheres.shape[-2] == 79  # 67 link spheres and 6 slots per attach link
+    body = yaml.safe_load((T1_29DOF / "t1_29dof_spheres.yml").read_text())["collision_spheres"]
+    assert _fk(kin, home).robot_spheres.shape[-2] == sum(map(len, body.values())) + 12  # 6 slots per attached object
     assert _self_collision(kin, home) == 0.0  # the gripper clears the thighs (call 11)
     gap = _leg_gap(kin, home)
-    assert abs(gap - 0.102) <= 0.005, gap  # section 10: the shanks 0.102 m apart
+    assert abs(gap - 0.092) <= 0.005, gap  # gap between the facing thigh proxies at home
     crossed = hips_crossed(real_world)
     assert _leg_gap(kin, crossed) < gap and _self_collision(kin, crossed) > 0.0  # the check fires
     from cutamp.robots.t1 import t1_curobo_cfg
@@ -268,6 +291,57 @@ def test_home_clears_itself(real_world):
             pair = {link, other}
             assert not (pair & LEGS["left"] and pair & LEGS["right"]), pair       # left leg against right leg
             assert not (pair & (LEGS["left"] | LEGS["right"]) and pair & ARMS_AND_GRIPPERS), pair  # legs against arms
+
+
+@needs_cuda
+@pytest.mark.parametrize("side,reflect", [("Right", 1), ("Left", -1)])
+def test_torso_hip_collision_in_deep_place(real_world, side, reflect):
+    """The low pick and place in the two-step replay, reflected across the sagittal plane.
+
+    The CAD meshes clear at the pick. The place intersects the trunk with both the roll housing and the thigh,
+    and the waist with the roll housing. Only the waist and ipsilateral hip affect these relative transforms.
+    """
+    kin = real_world.kinematics
+    names = list(real_world.model.joint_names)
+    params = kin.config.kinematics_config
+    pairs = [("Trunk", f"Hip_Yaw_{side}"), ("Trunk", f"Hip_Roll_{side}"), ("Waist", f"Hip_Roll_{side}")]
+    sphere_links = params.link_sphere_idx_map
+    # Check the actual CUDA pair list as well as distances. A disabled pair can still geometrically overlap.
+    checked = sphere_links[kin.get_self_collision_config().collision_pairs.long()]
+    for a, b in pairs:
+        ia, ib = (params.link_name_to_idx_map[link] for link in (a, b))
+        assert ((checked.min(dim=1).values == min(ia, ib)) &
+                (checked.max(dim=1).values == max(ia, ib))).any(), (a, b)
+    for colliding, values in [(False, (0.91080, -2.28954, 0.07771, 0.20565)),
+                              (True, (0.91080, -2.46200, 0.26805, 0.25524))]:
+        q = _home(real_world)
+        for joint, angle, parity in zip(
+            ["Waist", f"{side}_Hip_Pitch", f"{side}_Hip_Roll", f"{side}_Hip_Yaw"], values,
+            [reflect, 1, reflect, reflect],
+        ):
+            q[names.index(joint)] = angle * parity
+        spheres = _fk(kin, q).robot_spheres.reshape(-1, 4)
+        for a, b in pairs:
+            s, t = (spheres[sphere_links == params.link_name_to_idx_map[link]] for link in (a, b))
+            assert len(s) and len(t), (a, b)
+            gap = (torch.cdist(s[:, :3], t[:, :3]) - s[:, 3:] - t[:, 3]).min().item()
+            assert (gap < 0.0) == colliding, (a, b, gap)
+        assert (_self_collision(kin, q) > 0) == colliding
+
+
+@needs_cuda
+def test_step_set_checks_each_moving_hip_sphere(real_world):
+    from cutamp.step_set import _Legs
+
+    kin = real_world.kinematics
+    legs = _Legs(real_world.model, kin)
+    params = kin.kinematics_config
+    for side, body in (("Left", legs.left_leg), ("Right", legs.right_leg)):
+        roll = params.get_sphere_index_from_link_name(f"Hip_Roll_{side}").long()
+        trunk = params.get_sphere_index_from_link_name("Trunk").long()
+        assert torch.isin(roll, body).all()
+        endpoints = legs.pairs
+        assert (torch.isin(endpoints, roll).any(-1) & torch.isin(endpoints, trunk).any(-1)).any()
 
 
 @needs_cuda

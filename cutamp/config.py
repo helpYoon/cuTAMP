@@ -23,7 +23,7 @@ SUPPORTED_SOFT_COSTS = (
 @dataclass(frozen=True)
 class TAMPConfiguration:
     # Number of particles to initialize and optimize over; pass -n for larger sweeps.
-    num_particles: int = 256
+    num_particles: int = 64
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
@@ -67,23 +67,26 @@ class TAMPConfiguration:
     ## Task Planning
     # Number of initial plans to sample
     num_initial_plans: int = 30
-    step_mode: str = "off"  # off, rank only, geometric ablation, or frozen model
+    step_mode: str = "model"  # off, rank only, geometric ablation, or frozen model
     step_search_order: str = "astar"
     max_step_schedules: int | None = None
     step_lag: int = 2  # actuator delay in physics substeps
     landing_bundle: str | None = None
     step_reach_map: str | None = None
     step_accuracy_table: str | None = None
-    step_derivative_method: str = "finite_difference"
+    step_derivative_method: str | None = None
     # None selects the solver settings for the actual schedule (see for_refinement).
     step_refine_iterations: int | None = None
     step_trust_scale: float | None = None
-    step_particle_batch_size: int = 4
+    step_proposal_count: int | None = None  # Explicit counts apply to both pick and place.
+    step_place_proposal_count: int | None = None
+    step_particle_batch_size: int = 64
     require_modeled_load: bool = False
 
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
-    curobo_plan: bool = False
+    curobo_plan: bool | None = None
+    step_motion_validation: str = "model"  # independent mode requires a transition evidence provider
     # On RuntimeError from solve_curobo, retry on the next satisfying particle, going round the grasp groups,
     # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
@@ -105,20 +108,42 @@ class TAMPConfiguration:
 
     # Minimum projected CoM clearance from the physical sole hull at each pick and place.
     com_comfort_margin_m: float = 0.05
-    # Weight on squared horizontal CoM distance to the support polygon area centroid.
+    # Positive values enable center-first plan selection and weight the Adam centering term.
+    # Zero restores step-count/effort selection.
     com_center_weight: float | None = None
 
     def __post_init__(self):
+        if self.curobo_plan is None:
+            object.__setattr__(self, "curobo_plan", self.step_mode == "model")
         if self.soft_cost is None:
             default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
             object.__setattr__(self, "soft_cost", default)
 
+    def _model_proposal_count(self):
+        if self.step_proposal_count is not None:
+            return self.step_proposal_count
+        if self.step_derivative_method is not None or self.step_refine_iterations is not None or self.step_trust_scale is not None:
+            return 0
+        return 192
+
     def for_refinement(self, *, stepped: bool) -> "TAMPConfiguration":
         """Resolve optional overrides once a candidate's actual footstep count is known."""
-        fast = stepped and self.step_mode == "model" and self.step_derivative_method == "finite_difference"
+        derivative = self.step_derivative_method or "finite_difference"
+        proposals = self._model_proposal_count() if stepped and self.step_mode == "model" else 0
+        fast = stepped and self.step_mode == "model" and derivative == "finite_difference"
         updates, trust_scale, weight = (2, 2.0, 4.0) if fast else (4, 1.0, 1.0)
+        place_proposals = proposals
+        if proposals:
+            updates = 0
+            if self.step_place_proposal_count is not None:
+                place_proposals = self.step_place_proposal_count
+            elif self.step_proposal_count is None:
+                place_proposals = 128
         return replace(
             self,
+            step_proposal_count=proposals,
+            step_place_proposal_count=place_proposals,
+            step_derivative_method=derivative,
             step_refine_iterations=updates if self.step_refine_iterations is None else self.step_refine_iterations,
             step_trust_scale=trust_scale if self.step_trust_scale is None else self.step_trust_scale,
             com_center_weight=weight if self.com_center_weight is None else self.com_center_weight,
@@ -159,15 +184,25 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
     if config.step_mode not in ("off", "rank", "model", "geometric"):
         raise ValueError("step_mode must be off, rank, model or geometric")
+    if config.step_motion_validation not in ("model", "independent"):
+        raise ValueError("step_motion_validation must be model or independent")
     if config.step_search_order not in ("astar", "count"):
         raise ValueError("step_search_order must be astar or count")
     if config.max_step_schedules is not None and config.max_step_schedules <= 0:
         raise ValueError("max_step_schedules must be positive when specified")
-    if config.step_derivative_method not in ("finite_difference", "autodiff"):
+    if config.step_derivative_method not in (None, "finite_difference", "autodiff"):
         raise ValueError("step_derivative_method must be finite_difference or autodiff")
     scale = config.step_trust_scale
     if scale is not None and (not math.isfinite(scale) or scale <= 0):
         raise ValueError("step_trust_scale must be finite and positive")
+    if config.step_proposal_count is not None and (type(config.step_proposal_count) is not int or config.step_proposal_count < 0):
+        raise ValueError("step_proposal_count must be a nonnegative integer")
+    if config.step_place_proposal_count is not None and (
+        type(config.step_place_proposal_count) is not int or config.step_place_proposal_count < 0
+    ):
+        raise ValueError("step_place_proposal_count must be a nonnegative integer")
+    if config.step_proposal_count and config.step_mode != "model":
+        raise ValueError("Forward command proposals require step_mode=model")
     updates = config.step_refine_iterations
     if (updates is not None and (type(updates) is not int or updates < 0)) or config.step_particle_batch_size < 1:
         raise ValueError("Invalid step refinement iteration or batch count")

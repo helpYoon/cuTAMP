@@ -62,6 +62,79 @@ def _sole_trajectory(model, physical):
     return tuple(value.reshape(batch, ticks, *value.shape[1:]) for value in outputs)
 
 
+class _HoldTickGraph:
+    """Replay a single deployed tick, advancing each particle until its own deadline."""
+
+    def __init__(self, model, state, dynamics, capacity):
+        self.state = tuple(x.clone(memory_format=torch.contiguous_format) for x in state)
+        self.dynamics = dynamics.clone(memory_format=torch.contiguous_format)
+        self.index = torch.zeros(1, device=dynamics.device, dtype=torch.long)
+        self.end = self.index.new_full((len(dynamics),), capacity)
+        self.hold = dynamics.new_zeros(len(dynamics), 5)  # captured kernels retain this device address
+        physical_and_action = (*state[:6], state[6][:, :state[4].shape[1]])
+        self.trace = tuple(x.new_empty((capacity, *x.shape)) for x in physical_and_action)
+        self.graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream(device=dynamics.device)
+        caller = torch.cuda.current_stream(dynamics.device)
+        stream.wait_stream(caller)
+        with torch.cuda.stream(stream):
+            model(self.state, self.hold, self.dynamics)  # initialize kernels and the stream's BLAS workspace
+            self.graph.capture_begin(capture_error_mode="thread_local")
+            try:
+                advanced = model(self.state, self.hold, self.dynamics)
+                active = self.index < self.end
+                for src, dst in zip(advanced, self.state):
+                    dst.copy_(torch.where(active.view(-1, *([1] * (dst.ndim - 1))), src, dst))
+                for dst, src in zip(self.trace, (*self.state[:6], self.state[6][:, :state[4].shape[1]])):
+                    dst.index_copy_(0, self.index, src.unsqueeze(0))
+                self.index.add_(1)
+            finally:
+                self.graph.capture_end()
+        caller.wait_stream(stream)
+
+    def reset(self, state, dynamics, counts):
+        for dst, src in zip(self.state, state):
+            dst.copy_(src)
+        self.dynamics.copy_(dynamics)
+        self.end.copy_(counts)
+        self.index.zero_()
+
+    def run(self, state, dynamics, counts, ticks):
+        self.reset(state, dynamics, counts)
+        for _ in range(ticks):
+            self.graph.replay()
+        # Each result outlives the next replay, including the single-particle case.
+        terminal = tuple(x.clone() for x in self.state)
+        trace = tuple(x[:ticks].transpose(0, 1).clone(memory_format=torch.contiguous_format) for x in self.trace)
+        return terminal, trace[:6], trace[6]
+
+
+def _hold_trace(predictor, state, dynamics, counts, ticks):
+    """Return post-tick physical states and actions, preserving rows past their last valid tick."""
+    cache = getattr(predictor, "_hold_graphs", None)
+    if cache is not None and not torch.is_autocast_enabled() and all(
+        x.dtype == torch.float32 and x.device == predictor.device and not x.requires_grad
+        and torch.autograd.forward_ad.unpack_dual(x).tangent is None for x in (*state, dynamics)
+    ):
+        capacity = max(ticks, 62 + predictor.hold_ticks)
+        shapes = tuple(x.shape for x in (*state, dynamics))
+        key = (torch.cuda.current_stream(dynamics.device).cuda_stream, torch.is_inference_mode_enabled(), shapes, capacity)
+        if key not in cache:
+            if len(cache) >= 8:
+                cache.pop(next(iter(cache)))
+            cache[key] = _HoldTickGraph(predictor.model, state, dynamics, capacity)
+        return cache[key].run(state, dynamics, counts, ticks)
+    hold = dynamics.new_zeros(len(dynamics), 5)
+    frames, actions = [], []
+    for i in range(ticks):
+        advanced = predictor.model(state, hold, dynamics)
+        active = i < counts
+        state = tuple(torch.where(active.view(-1, *([1] * (v.ndim - 1))), v, old) for v, old in zip(advanced, state))
+        frames.append(state[:6])
+        actions.append(state[6][:, :state[4].shape[1]])
+    return state, tuple(torch.stack(series, dim=1) for series in zip(*frames)), torch.stack(actions, dim=1)
+
+
 @dataclass(frozen=True)
 class LandingProfile:
     """Phase tolerances in meters and radians for the model-predicted foot trace."""
@@ -161,9 +234,9 @@ class StepPrediction:
     xy_error: Tensor
     yaw_error: Tensor
     tracking_ok: Tensor
-    max_joint_rms: Tensor
-    max_root_speed: Tensor
-    near_rest: Tensor
+    max_joint_rms: Tensor | None
+    max_root_speed: Tensor | None
+    near_rest: Tensor | None  # Requires a 25-tick post-landing HOLD window.
     terminal: LandingState
     # Batches can finish on different ticks. Padding holds the handoff state.
     trajectory: tuple[Tensor, ...]  # root p,R,v,w, joints q,qd; [B,T,...]
@@ -285,6 +358,7 @@ class LandingPredictor:
         *,
         expected_deployment=None,
         derivative_method="finite_difference",
+        use_cuda_graph=False,
     ):
         if derivative_method not in ("finite_difference", "autodiff"):
             raise ValueError("derivative_method must be finite_difference or autodiff")
@@ -310,6 +384,7 @@ class LandingPredictor:
         self.device = self.model.home_joints.device
         self.hold_ticks = hold_ticks
         self.profile = LandingProfile() if profile is None else profile
+        self._hold_graphs = {} if use_cuda_graph else None
 
     @torch.no_grad()
     @prediction_precision()
@@ -334,40 +409,36 @@ class LandingPredictor:
             tensors = self.model(tensors, hold, dynamics)
         return LandingState(tensors, dynamics, "synthetic_home_50_hold")
 
-    def _step(self, initial, side, command):
+    def _step(self, initial, side, command, hold_ticks):
         physical = initial.tensors
         before = self.model.feet(physical[:6])[0]
         if not ((physical[-1][:, 0] > 0.5) & (physical[-1][:, 2:4] == 0).all(-1)).all():
             raise ValueError("A landing must be issued from an initialized HOLD")
         reference = _intended_pair(before, side, command)
         issue = torch.cat((torch.ones_like(command[:, :1]), torch.full_like(command[:, :1], side), command), dim=-1)
-        hold = torch.zeros_like(issue)
         state = self.model(physical, issue, initial.dynamics)
         clock = state[-1][:, 2].detach().to(torch.long) + 1
         if not ((clock >= 40) & (clock <= 62)).all():
             raise ValueError("The deployed clock did not accept the command")
-        end = clock + self.hold_ticks
+        end = clock + hold_ticks
         times = torch.arange(1, int(end.max()) + 1, device=end.device)
         valid = times[None, :] <= end[:, None]
-        traces, actions = [], []
-        for i in range(len(times)):
-            if i:
-                advanced = self.model(state, hold, initial.dynamics)
-                state = tuple(
-                    torch.where(valid[:, i].view(-1, *([1] * (v.ndim - 1))), v, old) for v, old in zip(advanced, state)
-                )
-            traces.append(state[:6])
-            actions.append(state[6][:, : state[4].shape[1]])
-        trajectory = tuple(torch.stack(sequence, dim=1) for sequence in zip(*traces))
+        issued = state
+        state, following, actions = _hold_trace(self, issued, initial.dynamics, end - 1, len(times) - 1)
+        trajectory = tuple(torch.cat((start[:, None], tail), dim=1) for start, tail in zip(issued, following))
+        actions = torch.cat((issued[6][:, None, :issued[4].shape[1]], actions), dim=1)
         # These world-frame measurements are readouts. The policy's observation
         # feedback and command latch were already advanced inside each model tick.
         sole_trace, sole_height, sole_tilt = _sole_trajectory(self.model, trajectory)
         achieved = sole_trace[:, -1]
         xy, yaw, tracks = landing_errors(achieved, reference)
-        with torch.no_grad():
+        joint_rms = root_speed = settled = None
+        if hold_ticks >= SETTLING_TICKS:
             window = valid & (times[None, :] > end[:, None] - SETTLING_TICKS)
-            joint_rms = trajectory[5].square().mean(-1).sqrt().masked_fill(~window, 0).amax(1)
-            root_speed = trajectory[2].norm(dim=-1).masked_fill(~window, 0).amax(1)
+            with torch.no_grad():
+                joint_rms = trajectory[5].square().mean(-1).sqrt().masked_fill(~window, 0).amax(1)
+                root_speed = trajectory[2].norm(dim=-1).masked_fill(~window, 0).amax(1)
+                settled = near_rest(joint_rms, root_speed)
         terminal = LandingState(state, initial.dynamics, initial.history_source)
         return StepPrediction(
             "LR"[side],
@@ -379,20 +450,24 @@ class LandingPredictor:
             tracks,
             joint_rms,
             root_speed,
-            near_rest(joint_rms, root_speed),
+            settled,
             terminal,
             trajectory,
             sole_trace,
             sole_height,
             sole_tilt,
-            torch.stack(actions, 1),
+            actions,
             valid,
             phase_checks(sole_trace, sole_height, reference, side, clock, valid, self.profile),
         )
 
     @prediction_precision()
-    def rollout(self, initial: LandingState, order: str, commands: Tensor) -> LandingPrediction:
-        """Evaluate one exact gap order in parallel across all rows, with a fresh clock on each call.
+    def rollout(
+        self, initial: LandingState, order: str, commands: Tensor, *, final_hold_ticks: int | None = None
+    ) -> LandingPrediction:
+        """Issue consecutive steps at their deadlines, then HOLD after the final step.
+
+        A single-command replay can supply the recorded HOLD duration to reproduce its handoff.
 
         Use normal ATen autograd for the deployed tick. Torch 2.9's profiling
         executor can specialize the recurrent backward incorrectly when a fresh
@@ -403,6 +478,10 @@ class LandingPredictor:
             order = ""
         if order not in ("", "L", "R", "LR", "RL"):
             raise ValueError(f"Unsupported step order {order!r}")
+        if final_hold_ticks is None:
+            final_hold_ticks = self.hold_ticks
+        if type(final_hold_ticks) is not int or final_hold_ticks < 0:
+            raise ValueError("Expected a nonnegative integer final HOLD duration in ticks")
         if commands.shape != (len(initial.dynamics), len(order), 3) or not len(commands):
             raise ValueError("Expected nonempty [batch,steps,3] foot commands")
         if commands.dtype != torch.float32 or commands.device != self.device or not torch.isfinite(commands).all():
@@ -416,7 +495,8 @@ class LandingPredictor:
         for j, foot in enumerate(order):
             side = "LR".index(foot)
             intended = _intended_pair(intended, side, commands[:, j])
-            step = self._step(state, side, commands[:, j])
+            hold_ticks = final_hold_ticks if j == len(order) - 1 else 0
+            step = self._step(state, side, commands[:, j], hold_ticks)
             steps.append(step)
             state = step.terminal
             achieved = step.achieved

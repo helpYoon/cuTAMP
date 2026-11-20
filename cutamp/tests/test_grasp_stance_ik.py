@@ -157,3 +157,102 @@ def test_zero_centering_weight_retains_the_feasible_command(one_cpu_thread):
     torch.testing.assert_close(hard.commands[0], command[0])
     assert (soft.center_distance < hard.center_distance - 0.001).all()
     assert (soft.margin >= 0.05).all()
+
+
+def test_shared_stance_improves_both_tied_worst_reaches(one_cpu_thread):
+    from cutamp.stance import abs_pose
+    from cutamp.step_refinement import refine_gap
+
+    wrist, seed = paired_inputs("cpu", torch.float32)
+    stance = seed.new_tensor([[[0.05220935, 0.10788354, -0.00239709], [0.04830433, -0.11117852, 0.0197674]]])
+    command = seed.new_tensor([[[0.12, 0.21, 0.0]]])
+    start = abs_pose(stance[:, 1], command[:, 0])
+
+    def future_reaches(prediction, ik):
+        dx, dy = (ik.soles[:, 0, :2] - start[:, :2]).unbind(-1)
+        # Both 22 cm endpoints must improve. An easier third reach has a bigger
+        # derivative in the opposite direction and dominates a sum of squares.
+        distances = (0.22 - dx, 0.22 - dy, 0.12 + 5 * (dx + dy))
+        return {}, [torch.stack((z, torch.zeros_like(z)), dim=-1) for z in distances]
+
+    refined = refine_gap(
+        None,
+        stance,
+        "L",
+        command,
+        "left",
+        wrist[:1],
+        seed[:1],
+        extra_rows=future_reaches,
+        max_iterations=2,
+        centering_weight=1e-3,
+    )
+    assert refined.ok.item()
+    assert refined.center_distance.item() < 0.22
+    _, reaches = future_reaches(None, refined.ik)
+    assert max(r.norm().item() for r in reaches) < 0.217
+
+
+@pytest.mark.parametrize("arm", ["left", "right"])
+def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, one_cpu_thread):
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_ik import _kinematics, solve_stance_ik
+
+    home = torch.tensor(REAL_LEGS.home, dtype=torch.double)
+    other = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
+    q = home.expand(3, -1).clone()
+    kin = _kinematics(q.device)
+    pose, com_home = kin.fk(q, arm, jacobian=False)
+    tools = pose.reshape(3, 3, 12)
+    soles = torch.cat([tools[:, :2, :2], q.new_zeros(3, 2, 1)], dim=-1)
+    wrist = torch.eye(4, dtype=q.dtype).repeat(3, 1, 1)
+    wrist[:, :3, :3] = tools[:, 2, 3:].reshape(3, 3, 3).mT / 0.2
+    wrist[:, :3, 3] = tools[:, 2, :3]
+    # An off-home witness can clear the obstacle in row 1. Nothing clears row 2.
+    q[:, other.start] += 0.8
+    q.requires_grad_()
+    levels = q.new_tensor([-1.0, 0.25, 1.2])
+    def blocked(posture):
+        return posture[:, other.start] - home[other.start] < levels
+
+    fitted = solve_stance_ik(soles, wrist, q, arm, collides=blocked)
+    assert fitted.ok.tolist() == [True, True, False]
+    torch.testing.assert_close(fitted.q[0, other], home[other], atol=1e-8, rtol=0)
+    assert 0.25 <= float(fitted.q[1, other.start].detach() - home[other.start]) <= 0.8
+    _, full_com = kin.fk(fitted.q, arm, jacobian=False)
+    torch.testing.assert_close(fitted.com, full_com)
+    assert float((fitted.com[1].detach() - com_home[1]).norm()) > 1e-4
+    seed_grad, = torch.autograd.grad(fitted.com[0].sum(), q)
+    assert torch.all(seed_grad[0, other] == 0)
+
+    carrying = q.detach()[:, other].clamp(kin.lower[other], kin.upper[other])
+    occupied = solve_stance_ik(soles, wrist, q.detach(), arm, other_arm_reference=carrying)
+    assert occupied.ok.all()
+    torch.testing.assert_close(occupied.q[:, other], carrying)
+
+def test_batched_com_jacobian_matches_perturbing_all_joints(one_cpu_thread):
+    from cutamp.step_ik import _kinematics
+
+    _, seed = paired_inputs("cpu", torch.float64)
+    kin = _kinematics(seed.device)
+    _, _, _, jac = kin.fk(seed, "left", com_jacobian=True)
+    shifted = seed[:, None, :] + 1j * 1e-25 * torch.eye(seed.shape[-1], dtype=torch.double)
+    _, com = kin.fk(shifted.reshape(-1, seed.shape[-1]), "left", False)
+    torch.testing.assert_close(jac, (com.imag / 1e-25).reshape(len(seed), seed.shape[-1], 3).mT)
+
+
+def test_particle_ik_follows_translated_feet_beyond_home_chart(one_cpu_thread):
+    from cutamp.step_ik import solve_stance_ik
+
+    wrist, seed = paired_inputs("cpu", torch.float64)
+    soles = seed.new_tensor([[[0.154, 0.094, 0.022], [0.042, -0.118, 0.029]]]).repeat(2, 1, 1)
+    regular = solve_stance_ik(soles, wrist, seed, "left")
+    shift = seed.new_tensor([[1.4, -0.3], [-1.3, 0.5]])
+    soles[..., :2] += shift[:, None]
+    wrist[:, :2, 3] += shift
+    seed[:, :2] += shift
+    moved = solve_stance_ik(soles, wrist, seed, "left")
+    assert moved.ok.all()
+    torch.testing.assert_close(moved.q[:, :2] - regular.q[:, :2], shift, atol=1e-6, rtol=0)
+    torch.testing.assert_close(moved.q[:, 2:], regular.q[:, 2:], atol=1e-6, rtol=0)
+    torch.testing.assert_close(moved.margin, regular.margin)
