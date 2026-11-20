@@ -109,7 +109,8 @@ def entrypoint():
     )
 
     parser.add_argument(
-        "-n", "--num_particles", type=int, default=_defaults.num_particles, help="Number of plan particles per skeleton."
+        "-n", "--num_particles", type=int, default=None,
+        help="Number of plan particles per skeleton (default 256 with --step_mode off, 64 otherwise)."
     )
     parser.add_argument(
         "--surface_height", type=float, default=0.0,
@@ -158,12 +159,14 @@ def entrypoint():
     )
     parser.add_argument(
         "--com_comfort_margin_m", type=float, default=_defaults.com_comfort_margin_m,
-        help="Requested CoM clearance from the physical support polygon at pick and place, in meters.",
+        help="Requested CoM clearance from the physical support polygon at pick and place, in meters "
+             "(step routes; --step_mode off does not apply it).",
     )
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
         help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the squared "
-             "centering term (default 4 for fast learned steps, 1 otherwise). Zero disables centering.",
+             "centering term (default 4 for fast learned steps, 0 with --step_mode off, 1 otherwise). "
+             "Zero disables centering.",
     )
     parser.add_argument("--step_mode", choices=("off", "rank", "geometric", "model"), default=_defaults.step_mode,
                         help="Rank foot schedules, refine a geometric ablation, or use the frozen T1 landing model.")
@@ -195,7 +198,8 @@ def entrypoint():
         default=_defaults.max_loop_dur,
         help="Cooperative search budget from planner entry. By default forward-only search allows 9.5 s to find "
              "a full motion, compares feasible motions up to 4.4 s from entry, and allows 8 s for keyframes. "
-             "An explicit duration controls the entire search.",
+             "An explicit duration controls the entire search. With --step_mode off it is one budget timed from the "
+             "end of initial sampling: the optimization that runs out stops, and the search ends after its skeleton.",
     )
     parser.add_argument(
         "--motion_plan",

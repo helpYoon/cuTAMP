@@ -2,7 +2,9 @@
 
 Run in the cuTAMP environment with local CUDA access. The first run for each mode and
 request warms dependencies. The subsequent AB/BA pairs use the same initial seed and
-identical geometric, particle and trajectory checks. Every call uses public run_cutamp.
+particle count. Fixed-feet planning is the planner from before stepping (no CoM comfort
+margin or centring, GraspGenX's full grasp pool, cuRobo's arm paths checked by the balance
+gate only), so the pairs compare the two planners as shipped. Every call uses public run_cutamp.
 """
 
 import argparse

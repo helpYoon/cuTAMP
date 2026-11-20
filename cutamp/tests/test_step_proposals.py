@@ -20,7 +20,9 @@ def test_forward_proposals_require_model_and_preserve_explicit_updates():
     assert config.for_refinement(stepped=False).step_proposal_count == 0
     assert TAMPConfiguration().num_particles == 64
     assert TAMPConfiguration().curobo_plan
-    assert TAMPConfiguration(step_mode="off").num_particles == 64
+    assert TAMPConfiguration(step_mode="off").num_particles == 256
+    assert TAMPConfiguration(step_mode="off").for_refinement(stepped=False).com_center_weight == 0
+    assert TAMPConfiguration(step_mode="off", com_center_weight=2.0).for_refinement(stepped=False).com_center_weight == 2.0
     assert TAMPConfiguration(step_mode="model", num_particles=8).num_particles == 8
     assert (
         replace(config, step_derivative_method="finite_difference").for_refinement(stepped=True).step_proposal_count

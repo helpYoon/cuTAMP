@@ -161,9 +161,11 @@ def test_retimed_retract_rejects_self_collision_between_clear_endpoints(real_wor
     monkeypatch.setattr(ms, "_balance_gate", lambda *a: (retimed, stats, original))
     meta = SimpleNamespace(action_type="retract", arm="left", is_motion=True)
     op = SimpleNamespace(operator=SimpleNamespace(metadata=meta), name="Retract", values=("q_ret",))
-    with pytest.raises(RuntimeError, match=r"self.collision.*frame 1") as err:
+    from cutamp.config import TAMPConfiguration
+
+    with pytest.raises(RuntimeError, match=r"self.collision.*frame 1") as err:  # a step-route check
         ms.solve_curobo({"plan_skeleton": [op]}, {"left_q0": home, "q_ret": home}, real_world,
-                        None, TorchTimer(), None, get_planner=lambda: planner, ik_tol=None)
+                        TAMPConfiguration(), TorchTimer(), None, get_planner=lambda: planner, ik_tol=None)
     assert err.value.check == "self_collision" and err.value.op_idx == 0
 
 

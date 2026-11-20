@@ -501,7 +501,8 @@ its README gives the provenance.
   `Right…` twins.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
-  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles=64`;
+  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 64 (256 with
+  `step_mode="off"`);
   `soft_cost=["place_close_to_base", "joint_limit_margin",
   "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
   balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
@@ -666,7 +667,9 @@ seed is 641. The planner generates fresh grasp candidates and chooses the footst
 on each invocation. Use `--seed` to try another draw. Select the `curobo` timeline
 in Rerun to play the complete motion.
 
-The fixed-feet route (`--step_mode off`) uses 64 particles by default
+The fixed-feet route (`--step_mode off`) is the planner from before stepping,
+on the current robot model: 256 particles by default, GraspGenX's full grasp
+pool, no CoM-centring cost or 5 cm comfort margin, the first satisfying skeleton,
 and the soft costs `place_close_to_base`, `joint_limit_margin` and
 `minimize_body_movement`, optimized under re-IK-coupled Adam with the
 balance-first GN refresh replayed as CUDA graphs, and balance-first GN IK, so
@@ -753,7 +756,7 @@ skips the robot's meshes; both cut bandwidth.
 ## Troubleshooting
 
 - **`torch.OutOfMemoryError: CUDA out of memory`** — use fewer particles
-  (default 64), e.g. `-n 32`.
+  (default 64, or 256 with `--step_mode off`), e.g. `-n 32`.
 
 ## Key Design Decisions
 

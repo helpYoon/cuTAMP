@@ -599,7 +599,9 @@ def solve_curobo(
     # disabled movable, and blocks at its placements, all of which corrupt the
     # retry attempt.
     _reset_attachment_state(planner, world)
-    self_collision = SelfCollisionCost(SelfCollisionCostCfg(
+    # The fixed-feet baseline (step_mode off) keeps cuRobo's arm paths and checks the balance gate and the palm line only.
+    baseline = config.step_mode == "off"
+    self_collision = None if baseline else SelfCollisionCost(SelfCollisionCostCfg(
         weight=world.device_cfg.to_device([1.0]), device_cfg=world.device_cfg,
         self_collision_kin_config=planner.kinematics.get_self_collision_config(),
     ))
@@ -648,8 +650,9 @@ def solve_curobo(
                 if not compatible_boundary(boundary_errors(start.position[0], start.velocity[0],
                             last_js.position.reshape(-1), last_js.velocity.reshape(-1))).all():
                     raise _gate_error("handoff", "Supported trajectory cannot connect to the arriving state and velocity")
-            _check_supported_path_geometry(planner, world, self_collision, accepted, dt)
-            _check_path_rates(planner, accepted)
+            if not baseline:
+                _check_supported_path_geometry(planner, world, self_collision, accepted, dt)
+                _check_path_rates(planner, accepted)
             if line:
                 palm = _hand_poses(world, _full_positions(world, accepted), arm)[:, :3, 3]
                 check_line(palm, palm[0], _hand_poses(world, conf.reshape(1, -1), arm)[0, :3, 3])
@@ -681,7 +684,7 @@ def solve_curobo(
                             )
                     path = _interp_plan(result)
                     opposite = "right" if arm == "left" else "left"
-                    if opposite not in held:
+                    if not baseline and opposite not in held:
                         idle = getattr(world.model, opposite + "_arm")
                         def collides(candidate):
                             q = _full_positions(world, candidate)

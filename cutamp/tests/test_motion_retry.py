@@ -136,11 +136,12 @@ def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budg
                           experiment_id="fake")[2]
 
 
-@pytest.mark.parametrize("budget, solved", [(1, False), (2, True)])
-def test_failed_motion_resumes_skeletons_after_early_kinematic_hit(monkeypatch, budget, solved):
-    metrics = _run_skeletons(monkeypatch, [(False, 2), (True, 1)], initial_witness=True, skeleton_budget=budget)
-    assert metrics["found_solution"] is solved and metrics["motion_plan_success"] is solved
-    assert metrics["num_initial_plans"] == metrics["num_optimized_plans"] == budget
+def test_baseline_motion_plans_only_the_queued_skeletons(monkeypatch):
+    """Without centring, as before stepping, a motion failure on the queue ends the run: no further skeleton is
+    initialized, even with skeleton budget left."""
+    metrics = _run_skeletons(monkeypatch, [(False, 2), (True, 1)], initial_witness=True, skeleton_budget=2)
+    assert metrics["found_solution"] is False and metrics["motion_plan_success"] is False
+    assert metrics["num_initial_plans"] == metrics["num_optimized_plans"] == 1
 
 
 def test_only_selected_motion_appears_on_curobo_timeline(monkeypatch):

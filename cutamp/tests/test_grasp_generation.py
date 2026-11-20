@@ -128,8 +128,7 @@ def test_grasps_are_made_for_the_objects_a_skeleton_picks(monkeypatch):
         time.sleep(0.2)
         events.append("warmup ends")
 
-    def fake_grasp_sets(objs, device, *, max_grasps, counts):
-        assert max_grasps == 64
+    def fake_grasp_sets(objs, device, *, counts):  # the fixed-feet route asks for the full pool
         events.append(list(objs))
         return dict.fromkeys(objs, "grasps")
 

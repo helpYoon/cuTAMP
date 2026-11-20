@@ -22,8 +22,9 @@ SUPPORTED_SOFT_COSTS = (
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
-    # Number of particles to initialize and optimize over; pass -n for larger sweeps.
-    num_particles: int = 64
+    # Number of particles to initialize and optimize over. None resolves in __post_init__ to 256 for
+    # step_mode off (the fixed-feet baseline) and 64 for the step routes.
+    num_particles: int | None = None
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
@@ -107,12 +108,16 @@ class TAMPConfiguration:
     experiment_root: str = "/tmp/cutamp-experiments"
 
     # Minimum projected CoM clearance from the physical sole hull at each pick and place.
+    # The fixed-feet baseline (step_mode off) does not apply it.
     com_comfort_margin_m: float = 0.05
     # Positive values enable center-first plan selection and weight the Adam centering term.
-    # Zero restores step-count/effort selection.
+    # Zero restores step-count/effort selection. None resolves in for_refinement: 0 for step_mode off,
+    # 4 for fast learned steps, 1 otherwise.
     com_center_weight: float | None = None
 
     def __post_init__(self):
+        if self.num_particles is None:
+            object.__setattr__(self, "num_particles", 256 if self.step_mode == "off" else 64)
         if self.curobo_plan is None:
             object.__setattr__(self, "curobo_plan", self.step_mode == "model")
         if self.soft_cost is None:
@@ -132,6 +137,8 @@ class TAMPConfiguration:
         proposals = self._model_proposal_count() if stepped and self.step_mode == "model" else 0
         fast = stepped and self.step_mode == "model" and derivative == "finite_difference"
         updates, trust_scale, weight = (2, 2.0, 4.0) if fast else (4, 1.0, 1.0)
+        if self.step_mode == "off":
+            weight = 0.0  # the fixed-feet baseline keeps its first satisfying plan
         place_proposals = proposals
         if proposals:
             updates = 0

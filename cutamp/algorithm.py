@@ -433,10 +433,12 @@ def run_cutamp(
                 wait_for_sampler_load()  # also when no skeleton was reached or setup raised
     if step_inputs is not None:
         raise ValueError("Explicit step inputs require step_mode rank, geometric or model")
-
     # GraspGenX's model loads on a background thread while the robot and the world load and the task planner runs.
     start_sampler_load()
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
+    # The fixed-feet baseline: centring is off unless --com_center_weight asks for it (for_refinement). Resolved after
+    # setup_cutamp, which validates and logs the configuration as given.
+    config = config.for_refinement(stepped=False)
     particle_initializer = ParticleInitializer(world, config, constraint_checker)
 
     # Task plan generator
@@ -467,8 +469,7 @@ def run_cutamp(
         if planner_thread is not None:
             planner_thread.join()
         with timer.time("generate_grasps", log_callback=_log.info):
-            world.grasps.update(grasp_sets(objs, world.device, max_grasps=min(64, config.num_particles),
-                                          counts=grasp_counts))
+            world.grasps.update(grasp_sets(objs, world.device, counts=grasp_counts))  # the full reference pool
         gc.collect()
         gc.freeze()  # GraspGenX's import and the grasps (setup_cutamp), before the next graph capture
 
@@ -581,15 +582,17 @@ def run_cutamp(
 
     def motion_candidates():
         yield from plan_queue
-        if config.curobo_plan or center_first:
+        if center_first:
             # Completing the first kinematic initialization can leave unused skeleton
-            # budget. Resume lazily for centering comparisons or subsequent motion retries.
+            # budget. Resume lazily for centering comparisons and their motion retries.
             for plan_info, _ in pending_plans:
                 yield plan_info
 
     # Optimization loop for each skeleton and its particles
     timer.start("start_optimization")
-    deadline = None if config.max_loop_dur is None else monotonic() + config.max_loop_dur
+    # Without centring, as before, only the Adam loop checks max_loop_dur (time since start_optimization): the search
+    # ends after the skeleton whose loop runs out.
+    deadline = None if config.max_loop_dur is None or not center_first else monotonic() + config.max_loop_dur
     incumbent = None
     for idx, plan_info in enumerate(motion_candidates()):
         if deadline is not None and monotonic() >= deadline:
