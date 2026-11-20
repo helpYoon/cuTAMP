@@ -65,9 +65,9 @@ def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
 
     retract_calls, retract_values = [], CostFunction._retract_motion_values
 
-    def count(self):
+    def count(self, achieved_stances=None):
         retract_calls.append(1)
-        return retract_values(self)
+        return retract_values(self, achieved_stances)
 
     monkeypatch.setattr(CostFunction, "_retract_motion_values", count)
     replays, eager = install_step_replay_spy(monkeypatch), install_refresh_spy(monkeypatch)
