@@ -77,8 +77,6 @@ def test_cli_forwards_physical_margin_in_meters(monkeypatch):
     validate_tamp_config(TAMPConfiguration(com_comfort_margin_m=0.))
     seen = []
     monkeypatch.setattr(sys, "argv", ["cutamp-demo", "--com_comfort_margin_m", ".036"])
-    monkeypatch.setattr(cli, "load_env", lambda _: object())
-    monkeypatch.setattr(cli, "raise_surface_height", lambda *args: None)
     monkeypatch.setattr(cli, "cutamp_demo", lambda env, config, **kw: seen.append(config))
     cli.entrypoint()
     assert seen[0].com_comfort_margin_m == .036

@@ -21,6 +21,20 @@ from cutamp.task_planning.constraints import StablePlacement
 BLOCKS = os.path.join(get_env_dir(), "blocks_t1.yml")
 
 
+@pytest.mark.parametrize("flags, expected", [([], 641), (["--seed", "0"], 0)])
+def test_cli_uses_scene_seed_unless_overridden(monkeypatch, flags, expected):
+    import sys
+    import torch
+    from cutamp.scripts import run_cutamp as cli
+
+    seeds = []
+    monkeypatch.setattr(sys, "argv", ["run_cutamp", "--env", "two_steps_floor_transfer", *flags])
+    monkeypatch.setattr(torch, "manual_seed", seeds.append)
+    monkeypatch.setattr(cli, "cutamp_demo", lambda *args, **kwargs: None)
+    cli.entrypoint()
+    assert seeds == [expected]
+
+
 def test_quaternions_are_unit_after_load():
     env = load_env(BLOCKS)
     block2 = next(o for o in env.movables if o.name == "block2")
@@ -46,6 +60,37 @@ def test_mesh_env_round_trip(tmp_path):
     assert after.file_path == before.file_path
     assert list(after.pose) == list(before.pose)
     assert list(after.color) == list(before.color)
+
+
+@pytest.mark.parametrize("name, start, seed", [
+    ("blocks_t1", "home", None), ("two_steps_floor_transfer", "synthetic_standing", 641),
+])
+def test_scene_start_and_demo_seed_round_trip(tmp_path, name, start, seed):
+    env = load_env(resolve_env_path(name))
+    assert (env.robot_start, env.demo_seed) == (start, seed)
+    out = tmp_path / "replay.yml"
+    out.write_text(yaml.safe_dump(get_env_dict(env)))
+    replay = load_env(str(out))
+    assert (replay.robot_start, replay.demo_seed) == (start, seed)
+
+
+def test_unknown_robot_start_rejected(tmp_path):
+    scene = get_env_dict(load_env(BLOCKS))
+    scene["robot_start"] = "standng"
+    out = tmp_path / "invalid.yml"
+    out.write_text(yaml.safe_dump(scene))
+    with pytest.raises(ValueError, match="robot_start"):
+        load_env(str(out))
+
+
+@pytest.mark.parametrize("seed", [True, 1.5, -(2**63) - 1, 2**64])
+def test_invalid_demo_seed_rejected(tmp_path, seed):
+    scene = get_env_dict(load_env(BLOCKS))
+    scene["demo_seed"] = seed
+    out = tmp_path / "invalid.yml"
+    out.write_text(yaml.safe_dump(scene))
+    with pytest.raises(ValueError, match="demo_seed"):
+        load_env(str(out))
 
 
 def test_suffix_tolerances():

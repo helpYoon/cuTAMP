@@ -19,6 +19,14 @@ from cutamp.landing_accuracy import CHECKPOINT_SHA256, SOURCE_SHA256
 SETTLING_TICKS = 25
 
 
+def nominal_landing_dynamics(like, batch_size, lag):
+    """Normalized seed-3 context for unit friction, nominal offsets and a shared actuator lag."""
+    dynamics = like.new_zeros(batch_size, 38)
+    dynamics[:, 0] = 0.25 / 0.45
+    dynamics[:, -5:] = (lag - 5) / 3
+    return dynamics
+
+
 @contextmanager
 def prediction_precision():
     """Use the checkpoint evaluation's FP32 matmuls, restoring the planner's precision afterwards.

@@ -14,6 +14,7 @@ import gc
 import json
 import logging
 from collections import deque
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from threading import local
@@ -833,6 +834,18 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
 
     validate_tamp_config(config)
     inputs = inputs if inputs is not None else StepInputs()
+    predictor = None
+    if (config.step_mode == "model" and getattr(env, "robot_start", "home") == "synthetic_standing"
+            and q_init is None and inputs.initial_state is None and inputs.dynamics is None):
+        from cutamp.landing_predictor import nominal_landing_dynamics
+        from cutamp.step_validation import StepStateAdapter
+
+        predictor = _load_predictor(config)
+        context = nominal_landing_dynamics(predictor.model.home_joints, 1, config.step_lag)
+        state = predictor.standing_start(context)
+        q, _ = StepStateAdapter(predictor).planner(state.tensors[:6])
+        q_init = q[0].tolist()
+        inputs = replace(inputs, initial_state=state)
     solver = config.for_refinement(stepped=True)
     screened = solver.step_proposal_count > 0 and solver.step_refine_iterations == 0
     budget = config.max_loop_dur
@@ -924,7 +937,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
     winning_motion = None
     winning_evidence = None
     selected_metrics = {}
-    predictor = initializer = optimizer = planner = None
+    initializer = optimizer = planner = None
     unavailable = None
 
     def get_planner():

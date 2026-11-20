@@ -10,7 +10,7 @@ import torch
 
 from cutamp.cost_function import CostFunction
 from cutamp.grasps import GRASP_SCORE_CUTOFF
-from cutamp.landing_predictor import LandingState, prediction_precision
+from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, prediction_precision
 from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
 from cutamp.rollout import RolloutFunction
 from cutamp.samplers import project_supported_placement
@@ -365,9 +365,7 @@ def _refine_batch(
     }
     rest = particles["left_q0"]
     incoming = _planar(world.stance_soles).expand(n, -1, -1)
-    d = like.new_zeros(n, 38)
-    d[:, 0] = 0.25 / 0.45  # friction 1.0; all other continuous parameters nominal
-    d[:, -5:] = (config.step_lag - 5) / 3
+    d = nominal_landing_dynamics(like, n, config.step_lag)
     observed = None
     if inputs.initial_state is not None:
         full = inputs.initial_state

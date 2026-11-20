@@ -639,6 +639,12 @@ allows 9.5 seconds to find a complete motion and, once one passes, compares alte
 until 4.4 seconds from entry. Use `--no-motion_plan` for an 8-second keyframe search
 or `--max_duration` to set one budget for the entire search.
 
+The `two_steps_floor_transfer` demo starts the learned-step planner from the same
+synthetic standing pose and controller history as its recorded run. Its CLI sampling
+seed is 641. The planner generates fresh grasp candidates and chooses the footsteps
+on each invocation. Use `--seed` to try another draw. Select the `curobo` timeline
+in Rerun to play the complete motion.
+
 The fixed-feet route (`--step_mode off`) uses 64 particles by default
 and the soft costs `place_close_to_base`, `joint_limit_margin` and
 `minimize_body_movement`, optimized under re-IK-coupled Adam with the
@@ -652,8 +658,8 @@ each segment as needed, up to 4×, and a candidate that still fails is dropped
 (`motion_solver._balance_gate`).
 
 ```bash
-# Recorded floor-transfer scene, generating the grasp and step order from its goal
-uv run python -m cutamp.scripts.run_cutamp --env two_steps_floor_transfer --save_plan
+# Full floor transfer in Rerun. The planner chooses the grasp and step order.
+uv run python -m cutamp.scripts.run_cutamp --env two_steps_floor_transfer --motion_plan
 
 # Fixed-feet smoke test (keyframes)
 uv run python -m cutamp.scripts.run_cutamp --step_mode off -n 16 --num_opt_steps 50

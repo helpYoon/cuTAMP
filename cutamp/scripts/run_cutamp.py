@@ -55,9 +55,13 @@ def cutamp_demo(
         from datetime import datetime
         experiment_id = datetime.now().isoformat().split(".")[0]
 
-    curobo_plan, _num_satisfying, _overall_metrics = run_cutamp(
+    curobo_plan, _num_satisfying, metrics = run_cutamp(
         env, config, cost_reducer, constraint_checker, experiment_id=experiment_id,
     )
+
+    if curobo_plan and config.enable_visualizer:
+        _log.info("Full motion ready (%d segments). In Rerun, open recording %s under %s and play the curobo timeline.",
+                  len(curobo_plan), experiment_id, env.name)
 
     if save_plan is not None and curobo_plan is not None:
         if save_plan == "auto":
@@ -75,8 +79,20 @@ def cutamp_demo(
         n_traj = len(curobo_plan)
         _log.info(f"Saved the motion plan ({n_traj} segments, schema_version {processed['schema_version']!r}) "
                   f"to {out_path}")
+    elif config.curobo_plan and curobo_plan is None:
+        details = ["No complete motion was found."]
+        budget = metrics.get("effective_search_budget_s")
+        if metrics.get("time_limit_reached") and budget is not None:
+            details.append(f"The search reached its {budget:g} s deadline.")
+        failures = metrics.get("motion_plan_failures") or [
+            attempt["reason"] for attempt in metrics.get("step_attempts", ()) if attempt.get("reason")
+        ]
+        if failures:
+            details.append(f"The first reported failure was ‘{failures[0]}’.")
+        details.append(f"See {Path(config.experiment_root) / experiment_id / 'overall_metrics.json'}")
+        _log.warning(" ".join(details))
     elif save_plan is not None and curobo_plan is None:
-        _log.warning(f"--save_plan requested but no motion plan was generated (curobo_plan is None)")
+        _log.warning("Saving a trajectory requires --motion_plan.")
 
 
 
@@ -192,7 +208,7 @@ def entrypoint():
     )
     parser.add_argument(
         "--seed", type=int, default=None,
-        help="torch.manual_seed for reproducible sampling.",
+        help="Override the scene's demo seed for reproducible sampling.",
     )
 
     # Visualization and logging
@@ -225,9 +241,6 @@ def entrypoint():
 
     # We only expose a subset of the full TAMPConfiguration. Check config.py for the full configuration.
     args = parser.parse_args()
-    if args.seed is not None:
-        import torch
-        torch.manual_seed(args.seed)
     config = TAMPConfiguration(
         num_particles=args.num_particles,
         num_opt_steps=args.num_opt_steps,
@@ -256,6 +269,10 @@ def entrypoint():
     # Load env and run demo
     env = load_env(resolve_env_path(args.env))
     raise_surface_height(env, args.surface_height)  # no-op at 0.0
+    seed = args.seed if args.seed is not None else env.demo_seed
+    if seed is not None:
+        import torch
+        torch.manual_seed(seed)
     cutamp_demo(env, config, experiment_id=args.experiment_id, save_plan=args.save_plan)
 
 

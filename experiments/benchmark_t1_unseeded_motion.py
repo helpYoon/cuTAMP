@@ -17,21 +17,8 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import load_env, resolve_env_path
 from cutamp.grasps import _SETS
-from cutamp.landing_predictor import LandingPredictor
+from cutamp.robots import REAL_LEGS
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-from cutamp.step_planner import StepInputs
-from cutamp.step_validation import StepStateAdapter
-
-
-def standing_observation():
-    # Reconstruct only the recorded starting robot observation. No task or trajectory data are loaded.
-    bundle = Path(__file__).resolve().parents[1] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    predictor = LandingPredictor(bundle)
-    dynamics = torch.zeros(1, 38, device=predictor.device)
-    dynamics[:, 0], dynamics[:, -5:] = 0.25 / 0.45, -1.0
-    state = predictor.standing_start(dynamics)
-    q, _ = StepStateAdapter(predictor).planner(state.tensors[:6])
-    return q[0].tolist(), StepInputs(initial_state=state)
 
 
 def main():
@@ -43,7 +30,7 @@ def main():
     parser.add_argument(
         "--cli-home",
         action="store_true",
-        help="Start at the CLI's default home instead of the recording's initial state.",
+        help="Start at the robot's nominal home instead of the scene's synthetic standing start.",
     )
     args = parser.parse_args()
     if args.runs < 1:
@@ -52,12 +39,12 @@ def main():
     torch.set_num_threads(1)
     cfg = TAMPConfiguration(enable_visualizer=False, experiment_root=str(args.output), max_loop_dur=args.max_duration)
     env = load_env(resolve_env_path("two_steps_floor_transfer"))
-    q, inputs = (None, None) if args.cli_home else standing_observation()
+    q = REAL_LEGS.home if args.cli_home else None
     reports = []
     for trial in range(args.runs):
         # Retain loaded weights between warm requests, regenerate the complete grasp set each time.
         _SETS.clear()
-        torch.manual_seed(641)
+        torch.manual_seed(env.demo_seed)
         with ExitStack() as stack:
             if args.profile:
                 from experiments.profile_run_cutamp import Timings
@@ -84,7 +71,6 @@ def main():
                 ConstraintChecker(default_constraint_to_tol.copy()),
                 q_init=q,
                 experiment_id=f"trial-{trial + 1}",
-                step_inputs=inputs,
             )
             torch.cuda.synchronize()
             finished = perf_counter()
@@ -116,7 +102,6 @@ def main():
             report["phase_calls"] = dict(phases.calls)
             report["phase_samples_seconds"] = dict(phases.samples)
         if complete:
-            from cutamp.robots import REAL_LEGS
             from cutamp.utils.plan_processor import raw_motion_plan
 
             plan_file = args.output / f"trial-{trial + 1}" / "motion_plan.pkl"

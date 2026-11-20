@@ -1,4 +1,6 @@
 name: two_steps_floor_transfer
+robot_start: synthetic_standing
+demo_seed: 641
 geometries:
   cuboid:
     part:

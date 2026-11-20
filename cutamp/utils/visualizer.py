@@ -87,7 +87,7 @@ class RerunVisualizer(Visualizer):
         rr.set_time_sequence(timeline, val)
 
     def set_time_seconds(self, timeline: str, val: float):
-        rr.set_time_seconds(timeline, val)
+        rr.set_time(timeline, duration=val)
 
     def set_joint_positions(self, q: Union[torch.Tensor, np.ndarray, list]):
         if isinstance(q, torch.Tensor):

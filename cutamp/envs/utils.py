@@ -28,12 +28,20 @@ class TAMPEnvironment:
         statics: List[Obstacle],
         type_to_objects: Dict[str, List[Obstacle]],
         goal_state: State,
+        robot_start: str = "home",
+        demo_seed: int | None = None,
     ):
         self.name = name
         self.movables = movables
         self.statics = statics
         self.type_to_objects = type_to_objects
         self.goal_state = goal_state
+        if robot_start not in ("home", "synthetic_standing"):
+            raise ValueError(f"Unknown robot_start {robot_start!r}; use 'home' or 'synthetic_standing'")
+        self.robot_start = robot_start
+        if demo_seed is not None and (type(demo_seed) is not int or not -(2**63) <= demo_seed < 2**64):
+            raise ValueError("demo_seed must be an integer in the range accepted by torch.manual_seed")
+        self.demo_seed = demo_seed
 
         # No object (identified by name) should be in both movables and statics
         movable_names = {obj.name for obj in movables}
@@ -127,6 +135,8 @@ def load_env(env_path: str) -> TAMPEnvironment:
         statics=statics,
         type_to_objects=type_to_objects,
         goal_state=goal_state,
+        robot_start=env_dict.get("robot_start", "home"),
+        demo_seed=env_dict.get("demo_seed"),
     )
     return env
 
@@ -227,10 +237,13 @@ def get_env_dict(env: TAMPEnvironment) -> dict:
 
     env_dict = {
         "name": env.name,
+        "robot_start": env.robot_start,
         "geometries": geometries,
         "types": {obj_type: [obj.name for obj in objs] for obj_type, objs in env.type_to_objects.items()},
         "goal": [{goal_atom.fluent.name: goal_atom.values} for goal_atom in env.goal_state],
     }
+    if env.demo_seed is not None:
+        env_dict["demo_seed"] = env.demo_seed
     return env_dict
 
 

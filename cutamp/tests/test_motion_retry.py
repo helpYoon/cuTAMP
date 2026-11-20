@@ -15,6 +15,34 @@ from cutamp.particle_initialization import PickChoice
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
+def test_demo_reports_why_no_motion_can_be_displayed(tmp_path, caplog, monkeypatch):
+    from cutamp.scripts import run_cutamp as cli
+
+    metrics = {
+        "time_limit_reached": True, "effective_search_budget_s": 9.5,
+        "motion_plan_failures": ["Controller history cannot be issued from the actual arriving configuration",
+                                 "T1 step refinement exceeded the planner deadline"],
+    }
+    monkeypatch.setattr(cli, "run_cutamp", lambda *args, **kwargs: (None, 0, metrics))
+    config = TAMPConfiguration(curobo_plan=True, experiment_root=str(tmp_path))
+    cli.cutamp_demo(None, config, experiment_id="floor-transfer")
+    assert "No complete motion" in caplog.text
+    assert "9.5 s" in caplog.text
+    assert metrics["motion_plan_failures"][0] in caplog.text
+    assert str(tmp_path / "floor-transfer" / "overall_metrics.json") in caplog.text
+
+
+def test_demo_names_successful_rerun_recording_and_playback_timeline(caplog, monkeypatch):
+    from cutamp.scripts import run_cutamp as cli
+
+    monkeypatch.setattr(cli, "run_cutamp", lambda *args, **kwargs: ([object()] * 12, 1, {}))
+    caplog.set_level("INFO", logger=cli.__name__)
+    cli.cutamp_demo(SimpleNamespace(name="two_steps_floor_transfer"), TAMPConfiguration(),
+                    experiment_id="floor-transfer")
+    assert "12 segments" in caplog.text and "two_steps_floor_transfer" in caplog.text
+    assert "floor-transfer" in caplog.text and "curobo" in caplog.text
+
+
 @pytest.mark.parametrize("centering_weight", [0.0, 1.0])
 def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch, centering_weight):
     # Ops read: 0 -> left_q0, left_q1; 1 -> grasp1, left_q1; 2 -> pose1, left_q3.
