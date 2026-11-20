@@ -139,14 +139,14 @@ def landing_constraint_rows(predictor, incoming, order, u, pred):
 
 
 def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, extra_rows, anchor, geometry_rows,
-              *, solve_ik=solve_stance_ik, prediction=None):
+              *, solve_ik=solve_stance_ik, prediction=None, screened_ik=None):
     pred = prediction
     if predictor is not None and pred is None:
         forward = getattr(predictor, "linearize", predictor.rollout) if u.requires_grad else predictor.rollout
         pred = forward(initial, order, u)
     rows, hard, before = landing_constraint_rows(predictor, incoming, order, u, pred)
     soles = before if anchor is None else anchor(before)
-    ik = solve_ik(soles, wrist, seed, arm)
+    ik = solve_ik(soles, wrist, seed, arm) if screened_ik is None else screened_ik
     rows.update(stance_ik_rows(ik, margin))
     centers = [stance_center_residual(ik)]
     if extra_rows is not None:
@@ -249,6 +249,7 @@ def refine_gap(
     solve_ik=solve_stance_ik,
     forward_only=False,
     screened_prediction=None,
+    screened_ik=None,
 ):
     """Optimize K commanded soles from a common actual state with one bound wrist per row.
 
@@ -291,6 +292,8 @@ def refine_gap(
         raise ValueError("Forward-only evaluation requires zero SQP updates")
     if screened_prediction is not None and not forward_only:
         raise ValueError("Reusing a screened trajectory requires forward-only evaluation")
+    if screened_ik is not None and (screened_prediction is None or anchor is not None):
+        raise ValueError("Reusing endpoint IK requires its original screened trajectory and stance frame")
 
     def evaluate(c):
         _check_deadline(deadline)
@@ -307,7 +310,7 @@ def refine_gap(
             extra_rows,
             anchor,
             geometry_rows,
-            solve_ik=solve_ik, prediction=screened_prediction,
+            solve_ik=solve_ik, prediction=screened_prediction, screened_ik=screened_ik,
         )
 
     u = commands.detach().clone()

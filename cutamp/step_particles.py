@@ -245,7 +245,8 @@ def _place_update(world, op, pose, soles, seed, grasp, requested_margin, centeri
         T = action_4dof_to_mat4x4(p)
         wrist = T @ tool[rows]
         other = None if other_arm_reference is None else other_arm_reference[rows]
-        ik = solve_stance_ik(soles[rows], wrist, seed[rows], arm, other_arm_reference=other)
+        ik = solve_stance_ik(soles[rows], wrist, seed[rows], arm, other_arm_reference=other,
+                             center_posture=bool(centering_weight))
         spheres = transform_spheres(local, T)
         lo = (bounds[0, :2] - (spheres[..., :2] - spheres[..., 3:])).clamp_min(0).amax((1, 2))
         hi = ((spheres[..., :2] + spheres[..., 3:]) - bounds[1, :2]).clamp_min(0).amax((1, 2))
@@ -442,17 +443,20 @@ def _refine_batch(
         opposite = "right" if groups[k][1].operator.metadata.arm == "left" else "left"
         return previous[:, getattr(world.model, opposite + "_arm")] if opposite in held_before[k] else None
 
+    solve_endpoint = partial(solve_stance_ik, center_posture=bool(config.com_center_weight))
+    posture_references = {}
+
     def endpoint_solver(k, previous, witness):
         action = groups[k][1]
         carrying = occupied_reference(k, previous)
         if carrying is not None:
-            return partial(solve_stance_ik, other_arm_reference=carrying)
+            return partial(solve_endpoint, other_arm_reference=carrying)
         idle = world.model.right_arm if action.operator.metadata.arm == "left" else world.model.left_arm
         nominal = witness.new_tensor(world.model.home[idle]).expand_as(witness[:, idle])
         if torch.equal(witness[:, idle], nominal):
             # The coupled scene rows below already check this sole candidate.
-            return solve_stance_ik
-        return partial(solve_stance_ik, collides=partial(endpoint_collisions, k))
+            return solve_endpoint
+        return partial(solve_endpoint, collides=partial(endpoint_collisions, k))
 
     def endpoint_collisions(k, q, owners=None):
         action = groups[k][1]
@@ -630,6 +634,7 @@ def _refine_batch(
                 object_poses=objects[j], held=held, count=proposal_count, max_choices=1,
                 target_soles=_nominal(incoming, order, cmds) if not config.com_center_weight else None,
                 margin_m=margin, other_arm_reference=other, endpoint_collides=partial(endpoint_collisions, j),
+                center_posture=bool(config.com_center_weight),
                 eligible_sources=eligible_sources, include_fallback=config.step_refine_iterations == 0, deadline=deadline,
             )
             cmds = cmds.clone()
@@ -646,6 +651,7 @@ def _refine_batch(
             margin_m=margin,
             forward_only=forward_only,
             screened_prediction=screened.batch_prediction if screened is not None and forward_only else None,
+            screened_ik=screened.batch_ik if screened is not None and forward_only else None,
             solve_ik=endpoint_solver(j, rest, seed),
             centering_weight=config.com_center_weight,
             max_iterations=0 if bindings is not None else config.step_refine_iterations,
@@ -689,6 +695,8 @@ def _refine_batch(
                 stances[name] = pair
                 particles[step.arg("sole_to")] = pair[:, foot]
         particles[op.arg("q")] = result.posture.detach()
+        if config.com_center_weight:
+            posture_references[op.arg("q") + "_ik_reference"] = seed.detach()
         stances[op.arg("q")] = final
         if j in retracted:
             with torch.no_grad():
@@ -768,6 +776,7 @@ def _refine_batch(
     rows = []
     for i in torch.where(passed)[0].tolist():
         particle = {key: v[i].detach().clone() for key, v in particles.items()}
+        particle.update({key: value[i].clone() for key, value in posture_references.items()})
         model_feasible = predictor is not None
         gaps = records(i)
         report = dict(

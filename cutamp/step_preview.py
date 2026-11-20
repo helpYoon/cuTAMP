@@ -21,8 +21,8 @@ from cutamp.step_validation import (
     compatible_boundary,
     validate_step_geometry,
 )
-from cutamp.supported_posture import fit_centered_posture, set_stance_base_limits
-from cutamp.utils.common import action_4dof_to_mat4x4, get_world_cfg, grasp_7dof_to_mat4x4
+from cutamp.supported_posture import set_stance_base_limits
+from cutamp.utils.common import get_world_cfg
 
 
 _HEAD = ("AAHead_yaw", "Head_pitch")
@@ -241,38 +241,8 @@ class PredictedSteppedMotion(SteppedMotion):
     def approach(self, idx, op, particle, object_poses, cfg, ik_tol):
         from cutamp.step_particles import _retract_on_stance
 
-        self.check_supported_start()
         arm = op.operator.metadata.arm
-        obj = (
-            object_poses[op.arg("obj")]
-            if op.operator.metadata.action_type == "pick"
-            else action_4dof_to_mat4x4(particle[op.arg("placement")])
-        )
-        wrist = (
-            obj
-            @ grasp_7dof_to_mat4x4(particle[op.arg("grasp")])
-            @ self.world.tool_from_ee[self.world.tool_frame_for_arm(arm)]
-        ).reshape(4, 4)
-        if cfg.com_center_weight:
-            key = op.arg("q")
-            try:
-                pose = fit_centered_posture(
-                    self.stance,
-                    wrist,
-                    particle[key],
-                    arm,
-                    cfg=self.supported_cfg,
-                    other_arm_reference=self.occupied_arm,
-                    centering_weight=6.0,
-                )
-                if (
-                    self.endpoint_collides is None
-                    or not self.endpoint_collides(particle[key].new_tensor(pose)[None]).any()
-                ):
-                    particle[key] = particle[key].new_tensor(pose)
-            except ValueError:
-                # Keep the searched endpoint available when the extra centering preference fails.
-                pass
+        self.check_supported_start()
         approach = super().approach(idx, op, particle, object_poses, cfg, ik_tol)
         if self.last_state is not None and idx + 1 < len(self.skeleton):
             following = self.skeleton[idx + 1]

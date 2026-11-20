@@ -864,7 +864,9 @@ class SteppedMotion:
         from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
 
         kind, arm = op.operator.metadata.action_type, op.operator.metadata.arm
-        seed = particle[op.arg("q")].reshape(1, -1)
+        key = op.arg("q")
+        # Replay the same posture prior even when the reissued steps change the stance.
+        seed = particle.get(key + "_ik_reference", particle[key]).reshape(1, -1)
         obj = object_poses[op.arg("obj")] if kind == "pick" else action_4dof_to_mat4x4(particle[op.arg("placement")])
         wrist = (
             obj
@@ -876,7 +878,8 @@ class SteppedMotion:
             s = self.adapter.predictor.model.feet(self.adapter.physical(self.world.q_init.reshape(1, -1)))[0][0]
         s = s.reshape(1, 2, 3)
         fitted = solve_stance_ik(s, wrist, seed, arm, other_arm_reference=self.occupied_arm,
-                                 collides=self.endpoint_collides, kinematics=self.supported_kinematics)
+                                 collides=self.endpoint_collides, kinematics=self.supported_kinematics,
+                                 center_posture=bool(cfg.com_center_weight))
 
         def pose_ok(ik):
             return (

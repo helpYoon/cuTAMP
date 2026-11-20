@@ -111,7 +111,8 @@ class TAMPConfiguration:
     # Minimum projected CoM clearance from the physical sole hull at each pick and place.
     # The fixed-feet baseline (step_mode off) does not apply it.
     com_comfort_margin_m: float = 0.05
-    # Positive values enable center-first plan selection and weight the Adam centering term.
+    # Positive values enable centered pick/place stance IK and center-first plan selection.
+    # Their magnitude weights the outer Adam objective. IK uses its own calibrated pose/CoM ratio.
     # Zero restores step-count/effort selection. None resolves in for_refinement: 0 for step_mode off,
     # 4 for fast learned steps, 1 otherwise.
     com_center_weight: float | None = None

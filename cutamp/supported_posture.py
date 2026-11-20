@@ -12,7 +12,6 @@ from scipy.optimize import least_squares
 
 from cutamp.com_polygon_cost import physical_support_centroid, physical_support_planes, support_region_planes
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.step_ik import _Kinematics, _targets
 
 
 @lru_cache(maxsize=4)
@@ -47,7 +46,7 @@ def set_stance_base_limits(cfg, soles):
     return limits
 
 
-class _CollisionSpheres:
+class PostureCollisionSpheres:
     """Padded active self-sphere pairs, using the same link transforms as CoM and wrist FK."""
 
     def __init__(self, cfg, kin):
@@ -66,11 +65,14 @@ class _CollisionSpheres:
         ignored = {frozenset((a, b)) for a, others in cfg["self_collision_ignore"].items() for b in others}
         pairs = [(i, j) for i, j in combinations(range(len(names)), 2)
                  if names[i] != names[j] and frozenset((names[i], names[j])) not in ignored]
-        self.i, self.j = torch.tensor(pairs, dtype=torch.long).reshape(-1, 2).T
-        self.links = torch.tensor([kin.links.index(link) for link in names], dtype=torch.long)
-        self.offsets = torch.tensor(offsets, dtype=torch.double)
-        radii = torch.tensor(radii, dtype=torch.double)
+        device = kin.lower.device
+        self.i, self.j = torch.tensor(pairs, dtype=torch.long, device=device).reshape(-1, 2).T
+        self.links = torch.tensor([kin.links.index(link) for link in names], dtype=torch.long, device=device)
+        self.offsets = torch.tensor(offsets, dtype=torch.double, device=device)
+        radii = torch.tensor(radii, dtype=torch.double, device=device)
         self.radii_sum = radii[self.i] + radii[self.j]
+        self.descendants = kin.descendants[6:, self.links]
+        self.joint_links = kin.joint_links
 
     def gaps(self, frames):
         pos, rot = frames[:2]
@@ -78,6 +80,48 @@ class _CollisionSpheres:
         d = (points[0, self.i] - points[0, self.j]).real
         norm = torch.linalg.vector_norm(d, dim=-1)
         return norm - self.radii_sum, d / norm[:, None].clamp_min(1e-12), points
+
+    def residual(self, frames, repeats=1):
+        """Pack every active 6 mm sphere-pair shortfall and its joint Jacobian per posture."""
+        pos, rot, _, axes = frames
+        points = pos[:, self.links] + (rot[:, self.links] @ self.offsets.to(rot.dtype)[..., None]).squeeze(-1)
+        # Complex-step Hessian columns share the same active sphere pairs as their real posture.
+        real = points.real[::repeats]
+        delta = real[:, self.i] - real[:, self.j]
+        limit = self.radii_sum + 0.006
+        if axes is None and not pos.is_complex():
+            # Trial scoring only uses the squared norm. Dense values avoid packing and a device sync.
+            return (limit - torch.linalg.vector_norm(delta, dim=-1)).clamp_min(0), None
+        active = delta.square().sum(-1) < limit.square()
+        owner, pair = active.nonzero(as_tuple=True)
+        if not len(pair):
+            jac = None if axes is None else pos.new_empty(len(pos), 0, axes.shape[1] + 6)
+            return pos.new_empty(len(pos), 0), jac
+        counts = active.sum(1)
+        width = int(counts.max())
+        slot = torch.arange(len(pair), device=pos.device) - (counts.cumsum(0) - counts)[owner]
+        if repeats > 1:
+            owner = (owner[:, None] * repeats + torch.arange(repeats, device=pos.device)).flatten()
+            pair = pair.repeat_interleave(repeats)
+            slot = slot.repeat_interleave(repeats)
+        i, j = self.i[pair], self.j[pair]
+        delta = points[owner, i] - points[owner, j]
+        squared = delta.square().sum(-1)
+        distance = torch.where(squared.real > 1e-24, squared, 1e-24).sqrt()
+        deficit = limit[pair] - distance
+        value = pos.new_zeros(len(pos), width)
+        value[owner, slot] = deficit
+        if axes is None:
+            return value, None
+        # Both spheres rotate together about any shared ancestor, so its
+        # contribution to their separation cancels (as do all six base DOFs).
+        lever = points[owner, i, None] - pos[owner[:, None], self.joint_links]
+        unit = (delta / distance[:, None])[:, None].expand_as(lever)
+        joint = (torch.linalg.cross(lever, unit) * axes[owner]).sum(-1)
+        mask = (self.descendants[:, j] - self.descendants[:, i]).T
+        jac = pos.new_zeros(len(pos), width, axes.shape[1] + 6)
+        jac[owner, slot, 6:] = joint * mask
+        return value, jac
 
 
 def fit_centered_posture(soles, wrist, seed, arm, *, cfg, head=None, other_arm_reference=None, centering_weight=2.0):
@@ -87,6 +131,8 @@ def fit_centered_posture(soles, wrist, seed, arm, *, cfg, head=None, other_arm_r
     Applies the stance-specific virtual base chart on a private config. The connected motion
     planner separately checks objects, obstacles and all interpolated states.
     """
+    from cutamp.step_ik import _Kinematics, _targets
+
     if arm not in ("left", "right") or not np.isfinite(centering_weight) or centering_weight < 0:
         raise ValueError("Expected a left/right acting arm and a finite nonnegative centering weight")
     cfg = deepcopy(_kinematics_cfg(cfg))
@@ -96,7 +142,7 @@ def fit_centered_posture(soles, wrist, seed, arm, *, cfg, head=None, other_arm_r
     if head is not None:
         cfg["lock_joints"].update(head)
     kin = _Kinematics(torch.device("cpu"), cfg)
-    spheres = _CollisionSpheres(cfg, kin)
+    spheres = kin.self_spheres
     seed = as_cpu(seed).reshape(kin.n).clamp(kin.lower, kin.upper)
     idle = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
     fixed = as_cpu(REAL_LEGS.home[idle] if other_arm_reference is None else other_arm_reference)

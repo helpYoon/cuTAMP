@@ -194,7 +194,8 @@ def test_shared_stance_improves_both_tied_worst_reaches(one_cpu_thread):
 
 
 @pytest.mark.parametrize("arm", ["left", "right"])
-def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, one_cpu_thread):
+@pytest.mark.parametrize("center_posture", [False, True])
+def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, center_posture, one_cpu_thread):
     from cutamp.robots.t1 import REAL_LEGS
     from cutamp.step_ik import _kinematics, solve_stance_ik
 
@@ -215,8 +216,9 @@ def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, one_cpu_thre
     def blocked(posture):
         return posture[:, other.start] - home[other.start] < levels
 
-    fitted = solve_stance_ik(soles, wrist, q, arm, collides=blocked)
+    fitted = solve_stance_ik(soles, wrist, q, arm, collides=blocked, center_posture=center_posture)
     assert fitted.ok.tolist() == [True, True, False]
+    assert torch.isfinite(fitted.optimality).all()
     torch.testing.assert_close(fitted.q[0, other], home[other], atol=1e-8, rtol=0)
     assert 0.25 <= float(fitted.q[1, other.start].detach() - home[other.start]) <= 0.8
     _, full_com = kin.fk(fitted.q, arm, jacobian=False)
@@ -226,7 +228,8 @@ def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, one_cpu_thre
     assert torch.all(seed_grad[0, other] == 0)
 
     carrying = q.detach()[:, other].clamp(kin.lower[other], kin.upper[other])
-    occupied = solve_stance_ik(soles, wrist, q.detach(), arm, other_arm_reference=carrying)
+    occupied = solve_stance_ik(soles, wrist, q.detach(), arm, other_arm_reference=carrying,
+                               center_posture=center_posture)
     assert occupied.ok.all()
     torch.testing.assert_close(occupied.q[:, other], carrying)
 
@@ -239,6 +242,60 @@ def test_batched_com_jacobian_matches_perturbing_all_joints(one_cpu_thread):
     shifted = seed[:, None, :] + 1j * 1e-25 * torch.eye(seed.shape[-1], dtype=torch.double)
     _, com = kin.fk(shifted.reshape(-1, seed.shape[-1]), "left", False)
     torch.testing.assert_close(jac, (com.imag / 1e-25).reshape(len(seed), seed.shape[-1], 3).mT)
+
+
+def test_centered_stance_ik_differentiates_through_wrist_soles_and_held_arm(one_cpu_thread):
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_ik import solve_stance_ik
+    from cutamp.step_refinement import stance_center_residual
+
+    wrist, seed = paired_inputs("cpu", torch.float64)
+    feet = seed.new_tensor([[[0.154, 0.094, 0.022], [0.042, -0.118, 0.029]]]).repeat(2, 1, 1)
+    idle = seed.new_tensor(REAL_LEGS.home[REAL_LEGS.right_arm]).repeat(2, 1)
+    reference = solve_stance_ik(feet, wrist, seed, "left", other_arm_reference=idle)
+    feet.requires_grad_()
+    wrist.requires_grad_()
+    idle.requires_grad_()
+
+    def solve(s, w, a):
+        return solve_stance_ik(s, w, seed, "left", other_arm_reference=a, center_posture=True)
+
+    fitted = solve(feet, wrist, idle)
+    assert fitted.ok.all()
+    assert (stance_center_residual(fitted).norm(dim=1) < stance_center_residual(reference).norm(dim=1) - 0.005).all()
+    torch.testing.assert_close(fitted.q[:, REAL_LEGS.right_arm], idle, rtol=0, atol=1e-9)
+    cost = stance_center_residual(fitted).square().sum()
+    gradients = torch.autograd.grad(cost, (feet, wrist, idle))
+    for k, (x, index) in enumerate(zip((feet, wrist, idle), [(0, 0), (0, 3), (0,)])):
+        delta = torch.zeros_like(x)
+        delta[(slice(None), *index)] = 0.0001
+        inputs = [feet, wrist, idle]
+        with torch.no_grad():
+            inputs[k] = x + delta
+            plus = stance_center_residual(solve(*inputs)).square().sum(1)
+            inputs[k] = x - delta
+            minus = stance_center_residual(solve(*inputs)).square().sum(1)
+        torch.testing.assert_close(gradients[k][(slice(None), *index)], (plus - minus) / 0.0002,
+                                   rtol=0.025, atol=2e-5)
+
+
+def test_centered_ik_sphere_residual_and_jacobian_match_direct_geometry(one_cpu_thread):
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_ik import _kinematics
+
+    _, q = paired_inputs("cpu", torch.float64)
+    q[0, REAL_LEGS.left_arm.start + 1] -= 0.4
+    q[1] = q.new_tensor(REAL_LEGS.home)
+    kin = _kinematics(q.device)
+    residual, jac = kin.self_spheres.residual(kin.link_frames(q, True))
+    gap = kin.self_spheres.gaps(kin.link_frames(q[:1]))[0]
+    assert gap.min() < 0 and (residual[1] == 0).all()
+    torch.testing.assert_close(residual[0].norm(), (0.006 - gap).relu().norm())
+    diff = 1j * 1e-25 * torch.eye(kin.n, dtype=q.dtype)
+    z = (q[:, None] + diff).flatten(0, 1)
+    value, _ = kin.self_spheres.residual(kin.link_frames(z), repeats=kin.n)
+    torch.testing.assert_close((residual[:, :, None] * jac).sum(1),
+                               (0.5 * value.square().sum(1).imag / 1e-25).reshape_as(q))
 
 
 def test_particle_ik_follows_translated_feet_beyond_home_chart(one_cpu_thread):

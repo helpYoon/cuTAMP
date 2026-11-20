@@ -146,6 +146,11 @@ def test_forward_batch_reuses_selected_or_nominal_prediction_for_every_source(mo
     nominal[:, 0, 0] = torch.arange(n)
     calls = []
 
+    @dataclass
+    class ScreenedIK:
+        q: torch.Tensor
+        soles: torch.Tensor
+
     def evaluate(predictor, initial, incoming, order, commands, arm, wrist, seed, *args, **kwargs):
         owner = initial.dynamics[:, 0].long()
         calls.append(owner)
@@ -153,7 +158,7 @@ def test_forward_batch_reuses_selected_or_nominal_prediction_for_every_source(mo
         distance = torch.arange(len(owner), 0, -1).to(commands)
         center = torch.stack([distance, torch.zeros_like(distance)], -1)[:, None]
         return SimpleNamespace(prediction=_Prediction(owner, (_Step(feet),)), ok=(owner == accepted_source),
-                               center=center, ik=SimpleNamespace(q=seed))
+                               center=center, ik=ScreenedIK(seed, feet))
 
     monkeypatch.setattr(proposals, "_evaluate", evaluate)
     monkeypatch.setattr(proposals, "validate_step_geometry", lambda w, a, p, **kw: {"valid": p.owner == 2})
@@ -168,6 +173,7 @@ def test_forward_batch_reuses_selected_or_nominal_prediction_for_every_source(mo
         assert not torch.equal(nominal[2], expected[2])
     assert result.batch_prediction.owner.tolist() == list(range(n))
     torch.testing.assert_close(result.batch_prediction.steps[0].achieved[:, 0], expected[:, 0])
+    torch.testing.assert_close(result.batch_ik.soles, result.batch_prediction.steps[0].achieved)
 
 
 def test_place_line_search_stops_before_next_ik_when_deadline_expires(monkeypatch):

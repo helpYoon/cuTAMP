@@ -2,7 +2,7 @@
 
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 
 import numpy as np
 import torch
@@ -11,6 +11,11 @@ from scipy.spatial.transform import Rotation
 from cutamp.com_polygon_cost import physical_support_centroid, physical_support_margin
 from cutamp.stance import stance_joint_limits
 from cutamp.robots.t1 import REAL_LEGS, t1_curobo_cfg
+from cutamp.supported_posture import PostureCollisionSpheres
+
+# Match the supported endpoint fit's CoM-to-pose residual ratio (6 to 50).
+_CENTER_WEIGHT = 6.0 / 50.0
+_SELF_COLLISION_WEIGHT = 24.0 / 50.0
 
 
 @dataclass
@@ -43,6 +48,7 @@ class _Kinematics:
         model = REAL_LEGS
         if cfg is None:
             cfg = t1_curobo_cfg(model)["robot_cfg"]["kinematics"]
+        self.cfg = cfg
         tree = ET.parse(cfg["urdf_path"]).getroot()
         names = model.joint_names
         self.n = len(names)
@@ -122,6 +128,8 @@ class _Kinematics:
         widths = np.array([clip[name] for name in names])
         self.lower, self.upper = tensor(lower + widths), tensor(upper - widths)
         self.prior = tensor([0.035] * 3 + [0.008] * (self.n - 3))
+        # Allow redundant joints to center the CoM while retaining a local, well-conditioned posture fit.
+        self.centered_prior = 0.5 * self.prior
         self.joint_links = indices(joint_links[6:])
         self.links = tuple(links)
         self.end = {}
@@ -141,8 +149,8 @@ class _Kinematics:
             centers.append(_xyz(inert.find("origin").get("xyz")) if inert is not None else np.zeros(3))
         self.centers = tensor(centers)
         self.mass_fraction = tensor(masses) / sum(masses)
-        descendant = [[j in ancestors[name] for name in links] for j in range(self.n)]
-        self.descendant_mass = tensor(descendant) * self.mass_fraction
+        self.descendants = tensor([[j in ancestors[name] for name in links] for j in range(self.n)])
+        self.descendant_mass = self.descendants * self.mass_fraction
         self.subtree_mass = self.descendant_mass.sum(-1, keepdim=True)
 
     def link_frames(self, q, jacobian=False):
@@ -172,6 +180,10 @@ class _Kinematics:
             link_axes = (rs.index_select(1, self.joint_links) @ self.axes.to(q.dtype)[..., None]).squeeze(-1)
         return frames[:, :, :3, 3], rs, axes, link_axes
 
+    @cached_property
+    def self_spheres(self):
+        return PostureCollisionSpheres(self.cfg, self)
+
     def fk(self, q, arm, jacobian=True, *, frames=None, com_jacobian=False):
         b = len(q)
         ps, rs, axes, link_axes = self.link_frames(q, jacobian) if frames is None else frames
@@ -200,37 +212,43 @@ class _Kinematics:
         if com_jacobian:
             # The derivative of each moving mass is axis × (mass center - joint origin).
             # Sum over descendants before taking the cross product for each joint.
-            moment = self.descendant_mass @ pcom - self.subtree_mass * origins
+            moment = self.descendant_mass.to(q.dtype) @ pcom - self.subtree_mass * origins
             angular_com = torch.linalg.cross(directions[:, 3:], moment[:, 3:])
             Jcom = torch.cat((self.eye.expand(b, -1, -1), angular_com.mT), dim=-1)
             return pose, J, com, Jcom
         return pose, J, com
 
-    def fitted(self, q, target, seed, arm, center_weight=0.0):
+    def fitted(self, q, target, seed, arm, center_weight=0.0, prior=None, repeats=1):
+        prior = self.prior if prior is None else prior
         if center_weight:
-            pose, J, com, Jcom = self.fk(q, arm, com_jacobian=True)
+            frames = self.link_frames(q, True)
+            pose, J, com, Jcom = self.fk(q, arm, frames=frames, com_jacobian=True)
+            collision, Jcollision = self.self_spheres.residual(frames, repeats)
             pose = torch.cat((pose, center_weight * com[:, :2]), -1)
-            J = torch.cat((J, center_weight * Jcom[:, :2]), 1)
+            residual = torch.cat((pose - target, _SELF_COLLISION_WEIGHT * collision), -1)
+            J = torch.cat((J, center_weight * Jcom[:, :2], _SELF_COLLISION_WEIGHT * Jcollision), 1)
         else:
             pose, J, _ = self.fk(q, arm)
-        gradient = (J.mT @ (pose - target)[..., None]).squeeze(-1) + self.prior.square() * (q - seed)
-        return pose, J, gradient
+            residual = pose - target
+        gradient = (J.mT @ residual[..., None]).squeeze(-1) + prior.square() * (q - seed)
+        return residual, J, gradient
 
     @torch.no_grad()
-    def solve(self, target, seed, arm, *, bounds=None, center_weight=0.0, iterations=100):
+    def solve(self, target, seed, arm, *, bounds=None, center_weight=0.0, iterations=100, prior=None):
+        prior = self.prior if prior is None else prior
         lower, upper = (self.lower, self.upper) if bounds is None else bounds
         q = seed.clamp(lower, upper)
         damping = q.new_full((len(q), 1), 1e-4)
         eye = torch.eye(self.n, device=q.device, dtype=q.dtype)
         for _ in range(iterations):
-            pose, J, g = self.fitted(q, target, seed, arm, center_weight)
+            residual, J, g = self.fitted(q, target, seed, arm, center_weight, prior)
             low = q <= lower + 1e-8
             high = q >= upper - 1e-8
             active = (low & (g >= 0)) | (high & (g <= 0))
             optimality = g.masked_fill(active, 0).abs().amax(-1)
             if (optimality < 2e-9).all():
                 break
-            A = J.mT @ J + (self.prior.square() + damping).diag_embed()
+            A = J.mT @ J + (prior.square() + damping).diag_embed()
             # At a box bound solve the restricted least-squares system. Projecting an
             # unconstrained direction alone can stall once one of the knees reaches a stop.
             for _ in range(4):
@@ -243,25 +261,31 @@ class _Kinematics:
                 active |= outward
             change = step * (0.4 / step.abs().amax(-1, keepdim=True).clamp_min(0.4))
             candidate = (q + change).clamp(lower, upper)
-            other, com = self.fk(candidate, arm, False)
+            frames = self.link_frames(candidate)
+            other, com = self.fk(candidate, arm, False, frames=frames)
             if center_weight:
+                collision, _ = self.self_spheres.residual(frames)
                 other = torch.cat((other, center_weight * com[:, :2]), -1)
-            cost = (pose - target).square().sum(-1) + ((q - seed) * self.prior).square().sum(-1)
-            trial = (other - target).square().sum(-1) + ((candidate - seed) * self.prior).square().sum(-1)
+            cost = residual.square().sum(-1) + ((q - seed) * prior).square().sum(-1)
+            trial = (other - target).square().sum(-1) + ((candidate - seed) * prior).square().sum(-1)
+            if center_weight:
+                trial += (_SELF_COLLISION_WEIGHT * collision).square().sum(-1)
             better = (trial < cost)[:, None]
             q = torch.where(better, candidate, q)
             damping = torch.where(better, damping * 0.35, damping * 5).clamp(1e-9, 100.0)
-        _, j, g = self.fitted(q, target, seed, arm, center_weight)
+        _, j, g = self.fitted(q, target, seed, arm, center_weight, prior)
         active = ((q <= lower + 5e-7) & (g >= 0)) | ((q >= upper - 5e-7) & (g <= 0))
-        return q, j, active, g.masked_fill(active, 0).abs().amax(-1)
+        return q, j[:, :target.shape[1]], active, g.masked_fill(active, 0).abs().amax(-1)
 
     @torch.no_grad()
-    def hessian(self, q, target, seed, arm):
+    def hessian(self, q, target, seed, arm, center_weight=0.0, prior=None):
         # Complex-step columns of J(q)^T r(q) + D^2(q-seed) include residual curvature.
         b, n = q.shape
         eye = torch.eye(n, device=q.device, dtype=torch.float64)
         qc = (q[:, None, :] + 1j * 1e-25 * eye).reshape(-1, n)
-        _, _, g = self.fitted(qc, target.repeat_interleave(n, 0), seed.repeat_interleave(n, 0), arm)
+        _, _, g = self.fitted(
+            qc, target.repeat_interleave(n, 0), seed.repeat_interleave(n, 0), arm, center_weight, prior, repeats=n
+        )
         return (g.imag / 1e-25).reshape(b, n, n).mT
 
 
@@ -299,12 +323,15 @@ def centered_stance_witnesses(soles, wrist, seeds, arm, other, weight):
     return torch.where(q.isfinite().all(-1, keepdim=True), q, seed).to(seeds)
 
 
-def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None, collides=None, kinematics=None):
+def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None, collides=None, kinematics=None,
+                    center_posture=False):
     """Fit both horizontal soles and the full bound wrist pose, with box-constrained T1 joints.
 
     The other arm uses its nominal joint posture, or the reference of an occupied hand.
     If nominal collides, try progressively larger excursions toward the supplied witness.
     Both arms contribute their actual mass and pose to the resulting CoM.
+    At a centered manipulation endpoint the horizontal CoM-to-hull-centroid
+    residual participates in both the bounded solve and its implicit derivative.
     """
     b = len(soles)
     if (
@@ -332,48 +359,82 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
     soles = torch.where(valid[:, None, None], soles, 0)
     wrist = torch.where(valid[:, None, None], wrist, 0)
     seed = torch.where(valid[:, None], seed, 0)
-    target = _targets(soles.double(), wrist)
-    bounds = stance_joint_limits(soles.double(), kin.lower, kin.upper) if kinematics is None else None
-    q, j, active, optimality = kin.solve(target, seed, arm, bounds=bounds)
-    optimality = torch.where(valid, optimality, torch.inf)
-    conditioning_ok = torch.ones_like(optimality, dtype=torch.bool)
-    if torch.is_grad_enabled() and (target.requires_grad or seed.requires_grad):
-        H = kin.hessian(q, target, seed, arm)
+    pose_target = _targets(soles.double(), wrist)
+    target = pose_target
+    weight = _CENTER_WEIGHT if center_posture else 0.0
+    regularizer = kin.centered_prior if center_posture else kin.prior
+    if center_posture:
+        centroid = physical_support_centroid(soles.double(), kin.box)
+        target = torch.cat((target, weight * centroid), dim=-1)
+    bounds = (stance_joint_limits(soles.double(), kin.lower, kin.upper) if kinematics is None
+              else (kin.lower.expand_as(seed), kin.upper.expand_as(seed)))
+
+    def fit(reference_pose):
+        lower, upper = bounds
+        if center_posture:
+            lower, upper = lower.clone(), upper.clone()
+            lower[:, other] = upper[:, other] = reference_pose[:, other]
+        q, j, active, optimality = kin.solve(target, reference_pose, arm, bounds=(lower, upper), center_weight=weight,
+                                             prior=regularizer)
+        conditioning_ok = torch.ones_like(optimality, dtype=torch.bool)
+        if not torch.is_grad_enabled() or not (target.requires_grad or reference_pose.requires_grad):
+            return q, optimality, conditioning_ok
+        H = kin.hessian(q, target, reference_pose, arm, weight, regularizer)
         free = ~active
+        dref = reference_pose - reference_pose.detach()
+        rhs = (j.mT @ (target - target.detach())[..., None]).squeeze(-1) + regularizer.square() * dref
+        # Equality-constrained joints follow the prescribed arm reference. Their
+        # mass couples into the free-joint optimum through the off-diagonal Hessian.
+        dq_fixed = torch.zeros_like(q)
+        if center_posture:
+            dq_fixed[:, other] = dref[:, other]
+            rhs = rhs - (H @ dq_fixed[..., None]).squeeze(-1)
         H = H * (free[:, :, None] & free[:, None, :]) + torch.diag_embed(active.to(H.dtype))
         ev = torch.linalg.eigvalsh((H + H.mT) * 0.5)
         conditioning_ok = (ev[:, 0] > 1e-10) & (ev[:, -1] < 1e10 * ev[:, 0])
         I = torch.eye(kin.n, device=q.device, dtype=q.dtype)
         H = torch.where(conditioning_ok[:, None, None], H, I)
-        rhs = (j.mT @ (target - target.detach())[..., None]).squeeze(-1) + kin.prior.square() * (seed - seed.detach())
-        q = q + torch.linalg.solve(H, (rhs * free)[..., None]).squeeze(-1) * conditioning_ok[:, None]
+        dq = dq_fixed + torch.linalg.solve(H, (rhs * free)[..., None]).squeeze(-1)
+        return q + dq * conditioning_ok[:, None], optimality, conditioning_ok
+
+    q, optimality, conditioning_ok = fit(seed)
+    collision_free = torch.ones_like(valid)
     if collides is not None:
         def blocked(candidate):
             with torch.no_grad():
                 return collides(candidate.to(posture_seed.dtype))
 
         collision = blocked(q)
-        if other_arm_reference is None and collision.any():
-            # None of the two sole or active-wrist poses depends on the idle arm.
-            # Its alternate can be checked on the fitted torso without another IK solve.
+        can_move = valid & (alternate.to(posture_seed.dtype) != reference.to(posture_seed.dtype)).any(-1)
+        if other_arm_reference is None and (collision & can_move).any():
+            # An idle-arm excursion changes the centered optimum through its mass.
             alternate = torch.where(valid[:, None], alternate, 0).clamp(kin.lower[other], kin.upper[other])
             reference = torch.where(valid[:, None], reference, 0)
             for fraction in (0.25, 0.5, 1.0):
                 candidate = q.clone()
                 candidate[:, other] = torch.lerp(reference, alternate, fraction)
+                if center_posture:
+                    changed = seed.clone()
+                    changed[:, other] = candidate[:, other]
+                    candidate, candidate_opt, candidate_condition = fit(changed)
                 cleared = collision & ~blocked(candidate)
                 q = torch.where(cleared[:, None], candidate, q)
+                if center_posture:
+                    optimality = torch.where(cleared, candidate_opt, optimality)
+                    conditioning_ok = torch.where(cleared, candidate_condition, conditioning_ok)
                 collision = collision & ~cleared
-                if not collision.any():
+                if not (collision & can_move).any():
                     break
-        valid = valid & ~collision
+        collision_free = ~collision
     pose, com = kin.fk(q, arm, False)
-    residual = (pose - target).reshape(b, 3, 12)
+    optimality = torch.where(valid, optimality, torch.inf)
+    residual = (pose - pose_target).reshape(b, 3, 12)
     pos = residual[..., :3].norm(dim=-1)
     angle = 2 * (residual[..., 3:].norm(dim=-1) / (0.2 * np.sqrt(8))).clamp_max(1).asin()
     margin = physical_support_margin(com[:, :2], soles.double(), kin.box)
     fixed = physical_support_margin(com[:, :2].detach(), soles.double(), kin.box)
     wp, wr = pos[:, 2], angle[:, 2]
     sp, sr = pos[:, :2].amax(-1), angle[:, :2].amax(-1)
-    ok = valid & conditioning_ok & (optimality < 2e-6) & (wp < 0.005) & (wr < 0.05) & (sp < 0.001) & (sr < 0.01)
+    pose_ok = (wp < 0.005) & (wr < 0.05) & (sp < 0.001) & (sr < 0.01)
+    ok = valid & collision_free & conditioning_ok & (optimality < 2e-6) & pose_ok
     return StanceIK(q.to(posture_seed.dtype), margin, fixed, com, wp, wr, sp, sr, optimality, ok, soles)

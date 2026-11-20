@@ -1,6 +1,7 @@
 """Same-state, same-command intervention on the grasp with the frozen deployed tick."""
 import argparse
 import json
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -8,6 +9,7 @@ import torch
 from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.landing_predictor import LandingPredictor, nominal_landing_dynamics, prediction_precision
 from cutamp.step_adam import optimize_particles
+from cutamp.step_ik import solve_stance_ik
 from cutamp.step_refinement import _evaluate
 from cutamp.tests.test_grasp_stance_ik import paired_inputs
 
@@ -23,7 +25,7 @@ def run():
     def evaluate(u):
         pred = predictor.rollout(start, "L", u)
         return _evaluate(predictor, start, feet, "L", u, "left", wrist, seed, 0.05,
-                         None, None, None, prediction=pred)
+                         None, None, None, prediction=pred, solve_ik=partial(solve_stance_ik, center_posture=True))
 
     def objective(x):
         ev = evaluate(x["foot"])

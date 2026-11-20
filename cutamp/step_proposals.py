@@ -6,7 +6,7 @@ from functools import partial
 import torch
 
 from cutamp.landing_predictor import LandingPrediction
-from cutamp.step_ik import solve_stance_ik
+from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_refinement import _check_deadline, _evaluate
 from cutamp.step_set import RHO
 from cutamp.step_validation import validate_step_geometry
@@ -32,6 +32,7 @@ class LandingChoices:
     particle_indices: torch.Tensor
     predictions: LandingPrediction
     batch_prediction: LandingPrediction | None = None
+    batch_ik: StanceIK | None = None
 
     def prediction(self, index):
         """Return the exact evaluated rollout, retaining a singleton batch dimension."""
@@ -62,6 +63,7 @@ def rank_landing_commands(
     max_choices=8,
     margin_m=0.05,
     other_arm_reference=None,
+    center_posture=False,
     endpoint_collides=None,
     eligible_sources=None,
     include_fallback=False,
@@ -118,10 +120,10 @@ def rank_landing_commands(
     state = _rows(initial, owners)
     predictor = adapter.predictor
     incoming = predictor.model.feet(state.tensors[:6])[0]
-    solve = solve_stance_ik
+    solve = partial(solve_stance_ik, center_posture=center_posture)
     if other_arm_reference is not None:
         other = batch(other_arm_reference, (other_arm_reference.shape[-1],))[owners]
-        solve = partial(solve_stance_ik, other_arm_reference=other)
+        solve = partial(solve, other_arm_reference=other)
     if endpoint_collides is not None:
         solve = partial(solve, collides=partial(endpoint_collides, owners=owners))
     _check_deadline(deadline)
@@ -179,9 +181,10 @@ def rank_landing_commands(
     accepted = torch.cat(selected) if selected else owners[:0]
     # Keep only the requested leading choices for each source (stable within particle).
     result = torch.cat([accepted[local_owners[accepted] == i][:max_choices] for i in range(width)])
-    batch_prediction = None
+    batch_prediction = batch_ik = None
     if include_fallback:
         nominal_indices[owners[result]] = result
         batch_prediction = _rows(prediction, nominal_indices)
+        batch_ik = _rows(ev.ik, nominal_indices)
     return LandingChoices(commands[result], soles[result], ev.ik.q[result], center[result], owners[result],
-                          _rows(prediction, result), batch_prediction)
+                          _rows(prediction, result), batch_prediction, batch_ik)
