@@ -107,7 +107,7 @@ class StepStateAdapter:
         )
 
     def raw_context(self, dynamics):
-        """Invert the seed-3 XiLayout normalization. Delay units are 4 ms physics substeps."""
+        """Invert the seed-3 XiLayout normalization. Delay units are 5 ms physics substeps."""
         return torch.cat(
             (
                 0.75 + 0.45 * dynamics[..., :1],

@@ -1,12 +1,13 @@
 """Build the offline T1 hand map and score a cuboid pick directly from it.
 
-From the worktree, with the cuTAMP environment active:
+From the repository root, with the cuTAMP environment active:
     python -m cutamp.scripts.t1_reachability build
     python -m cutamp.scripts.t1_reachability score --plot
     python -m cutamp.scripts.t1_reachability search --lag 8
 
-The score command queries the saved map on CPU. Plotting uses the visual URDF
-to draw and independently verify the two stored fixed-foot configurations.
+build writes the full map (every foot order's stances) under data/t1-reachability/, which score needs. search
+defaults to the shipped nominal map and the landing model's accuracy table. The score command queries the saved
+map on CPU. Plotting uses the visual URDF to draw and independently verify the two stored fixed-foot configurations.
 """
 
 import argparse
@@ -18,7 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
-from cutamp.reachability import ReachMap, canonical_stance, endpoint_orders, rank_orders, stance_key
+from cutamp.landing_accuracy import LANDING_ACCURACY
+from cutamp.reachability import REACH_MAP, ReachMap, canonical_stance, endpoint_orders, rank_orders, stance_key
 
 DEFAULT_DIR = Path("data/t1-reachability")
 
@@ -164,11 +166,11 @@ def main():
     search = commands.add_parser("search", help="Rank complete step schedules for ordered target regions on CPU")
     search.add_argument("--targets", type=Path, help="JSON list of TargetRegion records; defaults to the 48 cm pick and place example")
     search.add_argument("--lag", type=int, help="Use profiled landing accuracy at this actuator delay; omit for geometric scoring")
-    search.add_argument("--accuracy", type=Path, default=DEFAULT_DIR/"landing-accuracy/home-model.json")
+    search.add_argument("--accuracy", type=Path, default=LANDING_ACCURACY)
     search.add_argument("--limit", type=int, default=1, help="Maximum number of endpoint paths to print as JSON lines")
     build.add_argument("--map", type=Path, help="Output NPZ (defaults to a separate t1-nominal-hand-map.npz with --nominal-only)")
-    for operation in (query, search):
-        operation.add_argument("--map", type=Path, default=DEFAULT_DIR / "t1-hand-map.npz")
+    query.add_argument("--map", type=Path, default=DEFAULT_DIR / "t1-hand-map.npz")
+    search.add_argument("--map", type=Path, default=REACH_MAP)
     args = parser.parse_args()
     if args.command == "build":
         path = args.map or DEFAULT_DIR / ("t1-nominal-hand-map.npz" if args.nominal_only else "t1-hand-map.npz")

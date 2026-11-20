@@ -26,28 +26,27 @@ from cutamp.algorithm import run_cutamp
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
-from cutamp.reachability import ORDERS, ReachMap, apply_command
+from cutamp.landing_accuracy import LANDING_ACCURACY, LANDING_BUNDLE
+from cutamp.reachability import ORDERS, REACH_MAP, ReachMap, apply_command
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 from cutamp.step_planner import StepInputs
 from cutamp.step_search import StepSearch, TargetRegion
 from cutamp.tests.paired_grasp_scene import paired_setup
 
 DATA = ROOT / "data/t1-reachability"
-BUNDLE = DATA / "landing-accuracy/landing-seed3.pt"
-MAP = DATA / "t1-nominal-hand-map.npz"
 SEED = 641
 
 
 def atlas_benchmark():
     t0 = perf_counter()
-    atlas = ReachMap.load(MAP, nominal_only=True)
-    profile = json.loads((DATA / "landing-accuracy/home-model.json").read_text())
+    atlas = ReachMap.load(REACH_MAP, nominal_only=True)
+    profile = json.loads(LANDING_ACCURACY.read_text())
     all_depths = StepSearch(atlas, accuracy=profile, lag=8)
     standing = StepSearch(atlas, accuracy=profile, lag=8, postures=("standing",))
     load_s = perf_counter() - t0
     out = {
         "offline_build_seconds": atlas.metadata["build_seconds"],
-        "map_bytes": MAP.stat().st_size,
+        "map_bytes": REACH_MAP.stat().st_size,
         "map_profile_and_indices_load_seconds": load_s,
         "postures": [p["posture"] for p in atlas.layers(all_depths.home, "left")],
         "queries": {},
@@ -222,7 +221,7 @@ def main():
         max_loop_dur=args.max_seconds,
         num_opt_steps=20,
         cuda_graphs=False,
-        landing_bundle=str(BUNDLE),
+        landing_bundle=str(LANDING_BUNDLE),
     )
     report = {}
     suffix = "-" + args.case if args.case else ""

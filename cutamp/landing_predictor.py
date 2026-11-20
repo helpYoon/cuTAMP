@@ -364,7 +364,6 @@ class LandingPredictor:
         hold_ticks=75,
         profile=None,
         *,
-        expected_deployment=None,
         derivative_method="finite_difference",
         use_cuda_graph=False,
     ):
@@ -387,8 +386,6 @@ class LandingPredictor:
             or any(self.metadata["source_sha256"].get(name) != digest for name, digest in SOURCE_SHA256.items())
         ):
             raise ValueError(f"Incompatible T1 landing bundle: {bundle}")
-        if expected_deployment is not None and self.metadata["deployment_sha256"] != expected_deployment:
-            raise ValueError(f"T1 landing deployment fingerprint differs from the requested one: {bundle}")
         self.device = self.model.home_joints.device
         self.hold_ticks = hold_ticks
         self.profile = LandingProfile() if profile is None else profile

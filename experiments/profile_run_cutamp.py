@@ -18,6 +18,7 @@ import cutamp.algorithm as planner
 import cutamp.step_particles as particles
 import cutamp.step_refinement as refinement
 from cutamp.config import TAMPConfiguration
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
@@ -143,7 +144,7 @@ def main():
         enable_visualizer=False,
         curobo_plan=False,
         experiment_root=str(args.output),
-        landing_bundle=str(ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt"),
+        landing_bundle=str(LANDING_BUNDLE),
     )
     torch.manual_seed(641)
     bytes_before = torch.cuda.memory_allocated()

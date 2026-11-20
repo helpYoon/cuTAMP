@@ -9,6 +9,7 @@ from curobo.types import DeviceCfg
 
 from cutamp.envs import TAMPEnvironment
 from cutamp.grasps import GraspSet
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.landing_predictor import LandingPredictor
 from cutamp.robots.t1 import get_t1_tool_from_ee
 from cutamp.step_planner import StepInputs
@@ -45,7 +46,7 @@ def paired_setup(label, *, place=False):
     )
     obj_grasp = torch.linalg.inv(ws) @ world_wrist @ torch.linalg.inv(get_t1_tool_from_ee(dc)["left_base_link"])
     grasps = GraspSet(mat4x4_to_grasp_7dof(obj_grasp)[None], dc.to_device([1.0]))
-    bundle = ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
+    bundle = LANDING_BUNDLE
     predictor = LandingPredictor(bundle)
     d = torch.zeros(1, 38, device="cuda")
     d[:, 0] = 0.25 / 0.45

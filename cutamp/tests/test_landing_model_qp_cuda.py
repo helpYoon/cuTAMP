@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.tests.conftest import needs_cuda
 from cutamp.tests.test_grasp_stance_ik import paired_inputs
 
@@ -15,8 +16,7 @@ def test_only_grasp_moves_the_optimized_model_command():
     from cutamp.landing_predictor import LandingPredictor
     from cutamp.step_refinement import refine_gap, stance_center_residual
 
-    data = Path(__file__).resolve().parents[2] / "data/t1-reachability"
-    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", data / "landing-accuracy/landing-seed3.pt"))
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
     if not bundle.is_file() and "CUTAMP_LANDING_BUNDLE" not in os.environ:
         pytest.skip("Requires the local seed-3 CUDA bundle")
     p = LandingPredictor(bundle)
@@ -94,8 +94,7 @@ def test_zero_step_places_grasp_selects_the_earlier_landing():
     from cutamp.step_ik import solve_stance_ik
     from cutamp.step_refinement import refine_gap, stance_center_residual, stance_ik_rows
 
-    path = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", path))
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
     if not bundle.exists() and "CUTAMP_LANDING_BUNDLE" not in os.environ:
         pytest.skip("Requires the seed-3 deployment")
     p = LandingPredictor(bundle)
@@ -182,8 +181,7 @@ def test_first_command_moves_second_issue_and_final_grasp_margin(order):
     from cutamp.landing_predictor import LandingPredictor, prediction_precision
     from cutamp.step_ik import solve_stance_ik
 
-    path = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", path))
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
     if not bundle.exists() and "CUTAMP_LANDING_BUNDLE" not in os.environ:
         pytest.skip("Requires the seed-3 deployment")
     p = LandingPredictor(bundle)

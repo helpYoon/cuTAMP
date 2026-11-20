@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.step_validation import StepStateAdapter
 from cutamp.tests.conftest import needs_cuda
@@ -40,8 +41,7 @@ def test_source_sole_frames_and_observed_handoffs():
     from cutamp.landing_predictor import LandingPredictor
     from cutamp.robots.t1 import get_t1_kinematics
 
-    bundle = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    pred = LandingPredictor(bundle)
+    pred = LandingPredictor(LANDING_BUNDLE)
     adapter = StepStateAdapter(pred)
     q = torch.tensor(REAL_LEGS.home, device="cuda").repeat(3, 1)
     q[1:, :6] += q.new_tensor([0.07, 0.04, -0.02, 0.11, 0.09, 0.19])
@@ -90,8 +90,7 @@ def rollout_scene():
     from cutamp.robots import load_t1_container
     from cutamp.tamp_world import TAMPWorld
 
-    root = Path(__file__).resolve().parents[2]
-    predictor = LandingPredictor(root / "data/t1-reachability/landing-accuracy/landing-seed3.pt")
+    predictor = LandingPredictor(LANDING_BUNDLE)
     dc = DeviceCfg()
     q = dc.to_device(REAL_LEGS.home)
     world = TAMPWorld(

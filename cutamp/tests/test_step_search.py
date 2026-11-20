@@ -1,17 +1,15 @@
 """CPU search over exact foot orders and a transported nominal hand workspace."""
 
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from cutamp.landing_accuracy import CHECKPOINT_SHA256, SOURCE_SHA256
-from cutamp.reachability import ORDERS, ReachMap
+from cutamp.landing_accuracy import CHECKPOINT_SHA256, LANDING_ACCURACY, SOURCE_SHA256
+from cutamp.reachability import ORDERS, REACH_MAP, ReachMap
 from cutamp.step_search import StepSearch, TargetRegion
 
 HOME = ((0.0, 0.10, 0.0), (0.0, -0.10, 0.0))
 FWD = (0.12, 0.20, 0.0)
-DATA = Path(__file__).resolve().parents[2] / "data/t1-reachability"
 
 
 def test_stances_with_identical_frames_reuse_the_same_hand_map_query(monkeypatch):
@@ -209,7 +207,7 @@ def test_yawed_voxels_keep_pose_and_do_not_fill_sampling_gaps():
 
 def test_saved_low_pick_matches_geometric_and_lag8_contributor_counts():
     search = StepSearch.load(
-        DATA / "t1-nominal-hand-map.npz", accuracy_path=DATA / "landing-accuracy/home-model.json", lag=8
+        REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8
     )
     pick = TargetRegion("left", (0.48, 0.18, 0.025), (0.05, 0.05, 0.05), solid_pick=True)
     place = TargetRegion("left", (0.30, -0.40, 0.65), (0.05, 0.05, 0.05), loaded=True)

@@ -6,15 +6,16 @@ from cutamp.algorithm import run_cutamp
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 from cutamp.tests.conftest import needs_cuda
-from cutamp.tests.paired_grasp_scene import ROOT, paired_setup
+from cutamp.tests.paired_grasp_scene import paired_setup
 
 
 def paired_case(label, output, *, place=False, motion=False, validator=None, motion_validation="independent"):
     env, q, inp_args = paired_setup(label, place=place)
     inp_args.transition_validator = validator
-    bundle = ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
+    bundle = LANDING_BUNDLE
     cfg = TAMPConfiguration(
         step_mode="model",
         step_proposal_count=0,  # Exercise the differentiable SQP reference in these gradient tests.

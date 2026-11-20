@@ -70,17 +70,28 @@ Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
 `uv run pytest`) or after `source .venv/bin/activate`. Both put `.venv/bin`,
 which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
-The checkout includes the three T1 stepping inputs used by the default planner.
-The nominal hand reach map and landing-accuracy table guide task search. The
-frozen bfm_wm policy and world model in `landing-seed3.pt` evaluate candidate
-landings on logical CUDA device 0. To verify the exact files used in the
-four-step benchmark, run this from the repository root:
+The checkout includes the three T1 stepping inputs the default planner uses.
+The learned step model has its own folder, [`models/t1_landing/`](models/t1_landing/):
+`landing-seed3.pt` is the frozen bfm_wm step policy and world model, which
+evaluate candidate landings on logical CUDA device 0, and `home-model.json` is
+its measured landing accuracy. With the nominal hand reach map,
+`cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz`, the accuracy table
+guides task search.
+
+> **bfm_wm is not public yet.** The step model is a frozen export from bfm_wm,
+> the repository that trains the T1 controller and its world model. That code
+> is not released, so the model cannot be retrained or re-exported from this
+> repository; cuTAMP loads the export without importing bfm_wm
+> ([`models/t1_landing/README.md`](models/t1_landing/README.md)). The scripts
+> in `experiments/` that measured the model need bfm_wm and local data.
+
+To verify the shipped files, run this from the repository root:
 
 ```bash
 sha256sum -c <<'EOF'
-047174fe321ccdb3711dd88581a51142576b09a742b7a46f4c9784c4454d8bf7  data/t1-reachability/t1-nominal-hand-map.npz
-61413e2a0c8ecbbd398803a9466d3aafea2c66fe8f2acf404726a1af8ad5f686  data/t1-reachability/landing-accuracy/home-model.json
-2f8002e1dcf16957a7f64d37aacb89ca10e3a579cfc1c1756d154381b90f6c47  data/t1-reachability/landing-accuracy/landing-seed3.pt
+047174fe321ccdb3711dd88581a51142576b09a742b7a46f4c9784c4454d8bf7  cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz
+61413e2a0c8ecbbd398803a9466d3aafea2c66fe8f2acf404726a1af8ad5f686  models/t1_landing/home-model.json
+2f8002e1dcf16957a7f64d37aacb89ca10e3a579cfc1c1756d154381b90f6c47  models/t1_landing/landing-seed3.pt
 EOF
 ```
 
@@ -293,6 +304,12 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 ## Layout
 
+### 📁 [`models/t1_landing/`](models/t1_landing/)
+
+The frozen learned step model (`landing-seed3.pt`) and its measured landing
+accuracy (`home-model.json`), exported from bfm_wm, which is not public yet;
+its README gives the provenance.
+
 ### 📁 [`cutamp/robots/`](cutamp/robots/)
 
 - **[`assets/t1_29dof/`](cutamp/robots/assets/t1_29dof/)** — the planning
@@ -308,7 +325,9 @@ confs. The visualizer tracks both arms' held objects through every trajectory
   URDF, both YAML files and the two wrist meshes byte for byte.
   `write_mujoco_fixture.py` writes `mujoco_fixture.npz` (MuJoCo's FK, masses,
   inertias and soft limits on bfm_wm's `t1.xml`), which the tests check the
-  model against.
+  model against. `t1-nominal-hand-map.npz` is the hand reach map from the
+  home stance that step search reads (`python -m cutamp.scripts.t1_reachability
+  build --nominal-only` rebuilds it under `data/`).
 - **[`assets/t1_description/`](cutamp/robots/assets/t1_description/)** —
   cuTAMP's gripper: `gripper.urdf` (the links and joints the builder appends
   to each hand, weightless) and its 10 STL `meshes/`. Its collision spheres
@@ -600,7 +619,8 @@ live `--cuda_graphs` runs in
 
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
   (installed as `cutamp-demo`), T1 only. `--env` picks the scene, a shipped
-  name (`blocks_t1`, the default, `shelf_t1`, `cylinder_t1`, `cup_t1`) or an
+  name (`blocks_t1`, the default, `shelf_t1`, `cylinder_t1`, `cup_t1`,
+  `two_steps_floor_transfer`) or an
   env file's path; `--surface_height` raises its movables and surfaces onto a
   table top, `--seed` seeds the sampling, and `--save_plan PATH` (or `auto`,
   or no value: `motion_plan.pkl` next to the run's metrics) saves the raw
@@ -639,8 +659,9 @@ allows 9.5 seconds to find a complete motion and, once one passes, compares alte
 until 4.4 seconds from entry. Use `--no-motion_plan` for an 8-second keyframe search
 or `--max_duration` to set one budget for the entire search.
 
-The `two_steps_floor_transfer` demo starts the learned-step planner from the same
-synthetic standing pose and controller history as its recorded run. Its CLI sampling
+The `two_steps_floor_transfer` demo starts the learned-step planner from a
+synthetic standing start: the landing model's home pose with a settled controller
+history (`robot_start: synthetic_standing` in the scene file). Its CLI sampling
 seed is 641. The planner generates fresh grasp candidates and chooses the footsteps
 on each invocation. Use `--seed` to try another draw. Select the `curobo` timeline
 in Rerun to play the complete motion.

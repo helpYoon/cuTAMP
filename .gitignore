@@ -1,17 +1,8 @@
 # Ignore docs (internal notes, specs, plans)
 docs/
 
-# Keep the default T1 planner inputs alongside the generated experiments.
+# Ignore generated data (motion plans, experiment outputs)
 data/
-!/data/
-/data/*
-!/data/t1-reachability/
-/data/t1-reachability/*
-!/data/t1-reachability/t1-nominal-hand-map.npz
-!/data/t1-reachability/landing-accuracy/
-/data/t1-reachability/landing-accuracy/*
-!/data/t1-reachability/landing-accuracy/home-model.json
-!/data/t1-reachability/landing-accuracy/landing-seed3.pt
 
 # Python cache and build metadata
 __pycache__/

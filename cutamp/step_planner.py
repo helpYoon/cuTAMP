@@ -191,11 +191,9 @@ class ScheduleSearch:
         self.fallback = None
         self.cap = None
 
-    def _exact(self, orders, fallback=None):
+    def _exact(self, orders):
         proposal = next(ranked_step_skeletons(*self.args, orders=orders, deadline=self.deadline, prefer_reach=self.prefer_reach), None)
-        if proposal is None and fallback is None:
-            fallback = next(unseeded_step_skeletons(*self.args, fixed=orders), None)
-        return proposal if proposal is not None else fallback
+        return proposal if proposal is not None else next(unseeded_step_skeletons(*self.args, fixed=orders), None)
 
     def _counted(self, max_steps):
         # Actual count first; within that count A* prioritizes the best sampled evidence.

@@ -10,7 +10,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 HERE = ROOT / "data/t1-reachability/landing-accuracy"
 sys.path.insert(0, str(ROOT))
-from cutamp.landing_accuracy import handoff_precision
+from cutamp.landing_accuracy import LANDING_ACCURACY, handoff_precision
 from cutamp.reachability import ORDERS, ReachMap, rank_orders
 
 
@@ -48,7 +48,7 @@ def summary(rows, lags, standing):
 def main():
     fixture_path = HERE.parent / "floor-forward" / "ranking.json"
     fixture = json.loads(fixture_path.read_text())
-    model_path = HERE / "home-model.json"
+    model_path = LANDING_ACCURACY
     model = json.loads(model_path.read_text())
     map_path = HERE.parent / fixture["map"]
     map_sha = digest(map_path)

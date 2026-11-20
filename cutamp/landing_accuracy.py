@@ -1,6 +1,12 @@
 """Precision criteria for the offline seed-3 landing prior, in meters and degrees."""
 
 import math
+from pathlib import Path
+
+#: The frozen landing model the planner uses and its measured landing accuracy (models/t1_landing/README.md).
+LANDING_MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "t1_landing"
+LANDING_BUNDLE = LANDING_MODEL_DIR / "landing-seed3.pt"
+LANDING_ACCURACY = LANDING_MODEL_DIR / "home-model.json"
 
 CHECKPOINT_SHA256 = "766d602d8cabf1ccacfad7b59d7d09baac53ad17b59b9f6ead57e09739435f8b"
 SOURCE_SHA256 = {

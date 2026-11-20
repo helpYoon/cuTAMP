@@ -8,7 +8,7 @@ import torch
 
 from cutamp.robots.t1 import REAL_LEGS, t1_curobo_cfg
 from cutamp.step_ik import _Kinematics
-from experiments.t1_supported_posture import fit_centered_posture, set_stance_base_limits
+from cutamp.supported_posture import fit_centered_posture, set_stance_base_limits
 
 
 def test_transported_base_chart_intersects_both_leg_workspaces():

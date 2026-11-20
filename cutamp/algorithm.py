@@ -116,7 +116,7 @@ def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
     return priority
 
 
-def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int, *, rank_by_soft=False) -> List[int]:
+def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int) -> List[int]:
     """Try order, as positions into the ``s`` satisfying particles, of ``pool_idx`` ``[s, P]`` (each particle's pool
     row per pick); ``soft``, ``all_hi``, ``tilt``, ``travel`` and ``margin`` are ``[s]``. A group is the particles with
     equal ``pool_idx`` rows, ordered inside by ``(soft, position)``. Groups go by their first particle's
@@ -130,8 +130,7 @@ def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int, *, r
     for row, members in groups.items():
         members.sort(key=lambda i: (soft[i], i))
         f = members[0]
-        objective = soft[f] if rank_by_soft else 0.0
-        ranked.append(((not hi[f], objective, tilt[f], travel[f], -margin[f]), row, members))
+        ranked.append(((not hi[f], tilt[f], travel[f], -margin[f]), row, members))
     ranked.sort(key=lambda g: g[:2])
     rounds = max(len(g[2]) for g in ranked)
     return [g[2][r] for r in range(rounds) for g in ranked if r < len(g[2])][:n]
@@ -677,7 +676,6 @@ def run_cutamp(
     return curobo_plan, overall_metrics["num_satisfying_final"], overall_metrics
 
 
-_STEP_DATA = Path(__file__).resolve().parents[1] / "data/t1-reachability"
 _PREDICTOR_CACHE = local()  # A captured graph's mutable replay buffers belong to its worker.
 
 
@@ -690,11 +688,12 @@ def _file_version(path):
 
 
 def _load_step_search(config, *, applicable=True):
-    path = Path(config.step_reach_map) if config.step_reach_map else _STEP_DATA / "t1-nominal-hand-map.npz"
-    if not path.exists() and not config.step_reach_map:
-        path = _STEP_DATA / "t1-hand-map.npz"
+    from cutamp.landing_accuracy import LANDING_ACCURACY
+    from cutamp.reachability import REACH_MAP
+
+    path = Path(config.step_reach_map or REACH_MAP)
     lag = None if config.step_mode == "geometric" else config.step_lag
-    accuracy = Path(config.step_accuracy_table or _STEP_DATA / "landing-accuracy/home-model.json")
+    accuracy = Path(config.step_accuracy_table or LANDING_ACCURACY)
 
     tables, notes = _step_tables(_file_version(path), _file_version(accuracy) if lag is not None and applicable else None, lag)
     return tables, (
@@ -731,9 +730,10 @@ def _step_tables(map_version, accuracy_version, lag):
 
 
 def _load_predictor(config):
+    from cutamp.landing_accuracy import LANDING_BUNDLE
     from cutamp.landing_predictor import LandingPredictor
 
-    path = Path(config.landing_bundle or _STEP_DATA / "landing-accuracy/landing-seed3.pt")
+    path = Path(config.landing_bundle or LANDING_BUNDLE)
     version = _file_version(path)
     if version[1] is None or not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")

@@ -1,12 +1,13 @@
 """Regressions for distinguishing an execution prediction from an independent transition."""
 
-from types import SimpleNamespace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.landing_predictor import landing_errors
 from cutamp.step_preview import _check_issued_landings
 from cutamp.tests.conftest import needs_cuda
@@ -27,17 +28,19 @@ def test_composed_stance_miss_is_rejected_even_if_the_two_individual_steps_track
 def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landings(tmp_path, monkeypatch):
     """Fixed bindings isolate motion compilation. Each actual foot command is newly selected on this GPU."""
     from dataclasses import replace
+
     from curobo.scene import Cuboid
+
+    import cutamp.motion_solver as ms
     from cutamp.algorithm import run_cutamp
     from cutamp.config import TAMPConfiguration
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_reduction import CostReducer
     from cutamp.envs import TAMPEnvironment
-    from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-    from cutamp.tests.paired_grasp_scene import ROOT, paired_setup
-    from cutamp.utils.plan_processor import raw_motion_plan
     from cutamp.robots.t1 import REAL_LEGS
-    import cutamp.motion_solver as ms
+    from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
+    from cutamp.tests.paired_grasp_scene import paired_setup
+    from cutamp.utils.plan_processor import raw_motion_plan
 
     monkeypatch.setattr(ms, "build_motion_planner", lambda *a, **kw: pytest.fail("the direct paths are feasible"))
 
@@ -59,7 +62,7 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
         num_particles=1,
         step_proposal_count=192,
         max_loop_dur=60,
-        landing_bundle=str(ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt"),
+        landing_bundle=str(LANDING_BUNDLE),
         enable_visualizer=False,
         experiment_root=str(tmp_path),
     )

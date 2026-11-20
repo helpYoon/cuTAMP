@@ -26,6 +26,7 @@ from cutamp.algorithm import setup_cutamp
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.envs import TAMPEnvironment
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.landing_predictor import LandingPredictor
 from cutamp.particle_initialization import IKTol
 from cutamp.robots import load_t1_container
@@ -43,7 +44,7 @@ from cutamp.step_validation import (
 )
 from cutamp.t1_domain import all_t1_fluents, all_t1_operators, all_t1_step_operators
 from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
-from experiments.t1_supported_posture import fit_centered_posture, set_stance_base_limits
+from cutamp.supported_posture import fit_centered_posture, set_stance_base_limits
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = ("AAHead_yaw", "Head_pitch")
@@ -406,7 +407,7 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--pick-count", type=int, default=192)
     parser.add_argument("--place-count", type=int, default=128)
-    parser.add_argument("--bundle", type=Path, default=ROOT / "data/t1-reachability/landing-accuracy/landing-seed3.pt")
+    parser.add_argument("--bundle", type=Path, default=LANDING_BUNDLE)
     args = parser.parse_args()
     if min(args.pick_count, args.place_count) < 1:
         parser.error("Candidate counts must be positive")

@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from cutamp.landing_accuracy import LANDING_ACCURACY, LANDING_BUNDLE
 from cutamp.landing_predictor import LandingPredictor, prediction_precision
+from cutamp.reachability import REACH_MAP
 from cutamp.tests.conftest import needs_cuda
 
 
@@ -24,16 +26,14 @@ def assert_same_prediction(a, b):
 
 @pytest.fixture(scope="module")
 def predictor():
-    default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default))
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
     return LandingPredictor(bundle)
 
 
 @needs_cuda
 @torch.no_grad()
 def test_captured_rollout_matches_eager_and_retains_prior_results(predictor):
-    default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default))
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
     fast = LandingPredictor(bundle, use_cuda_graph=True)
     ctx = torch.zeros(2, 38, device="cuda")
     ctx[:, -5:] = -1
@@ -126,9 +126,8 @@ def test_chain_uses_terminal_histories_and_correct_row_clocks(order, predictor):
 def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
     from cutamp.step_search import StepSearch, TargetRegion
 
-    data = Path(__file__).resolve().parents[2] / "data/t1-reachability"
     search = StepSearch.load(
-        data / "t1-nominal-hand-map.npz", accuracy_path=data / "landing-accuracy/home-model.json", lag=8
+        REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8
     )
     target = TargetRegion("left", (0.48, 0.18, 0.025), (0.05,) * 3, solid_pick=True)
     edge = next(search.schedules(search.home, [target])).edges[0]
@@ -147,8 +146,7 @@ def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
 @needs_cuda
 def test_importing_external_history_into_fresh_module_preserves_command_jacobian(predictor):
     """A public planner run may construct its own predictor after an observation packet was prepared."""
-    default = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
-    independent = LandingPredictor(Path(os.environ.get("CUTAMP_LANDING_BUNDLE", default)))
+    independent = LandingPredictor(Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE)))
     context = torch.zeros(1, 38, device=predictor.device)
     context[:, 0] = 0.25 / 0.45
     context[:, -5:] = -1.0

@@ -1,12 +1,12 @@
 """The sole FK readout is equivalent to running the deployed FK separately at each control tick."""
 
 from dataclasses import fields
-from pathlib import Path
 
 import pytest
 import torch
 
 from cutamp import landing_predictor as lp
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.tests.conftest import needs_cuda
 
 
@@ -18,7 +18,7 @@ def _per_tick_readout(model, physical):
 @needs_cuda
 @pytest.mark.parametrize(("batch", "order"), [(1, "L"), (2, "LR"), (2, "RL")])
 def test_batched_sole_readout_preserves_frames_clocks_and_command_gradients(batch, order, monkeypatch):
-    bundle = Path(__file__).resolve().parents[2] / "data/t1-reachability/landing-accuracy/landing-seed3.pt"
+    bundle = LANDING_BUNDLE
     if not bundle.is_file():
         pytest.skip("Requires the exported seed-3 deployment")
     predictor = lp.LandingPredictor(bundle)

@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -55,7 +56,7 @@ runpy.run_module('cutamp.scripts.t1_reachability', run_name='__main__')
     subprocess.run(
         [sys.executable, "-c", driver, "score", "--map", str(filename), "--output", str(output),
          "--center", "0.29", "0.13", "0.21", "--size", "0.01", "0.01", "0.01"],
-        check=True,
+        cwd=Path(__file__).resolve().parents[2], check=True,
     )
     result = json.loads((output / "ranking.json").read_text())
     assert {row["order"] for row in result["combined"]} == {"none", "L", "R", "LR", "RL"}

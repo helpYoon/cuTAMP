@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import torch
 
+from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.landing_predictor import LandingPredictor, prediction_precision
 from cutamp.step_ik import solve_stance_ik
 from cutamp.step_refinement import refine_gap, stance_center_residual
@@ -63,7 +64,7 @@ def profile_order(predictor, start, commands, order, wrists, seeds):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", type=Path, default=Path("data/t1-reachability/landing-accuracy/landing-seed3.pt"))
+    parser.add_argument("--bundle", type=Path, default=LANDING_BUNDLE)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--centering-weight",
@@ -102,7 +103,6 @@ def main():
         t0 = now()
         with ExitStack() as context:
             if name == "fixed_com_gradient":
-                context.enter_context(patch("cutamp.step_refinement.solve_stance_ik", hull_gradient_ik))
                 context.enter_context(
                     patch(
                         "cutamp.step_refinement.stance_center_residual",
@@ -119,6 +119,8 @@ def main():
                 seeds,
                 max_iterations=4,
                 centering_weight=args.centering_weight,
+                # refine_gap binds its IK default at import, so the ablation passes its IK explicitly
+                solve_ik=hull_gradient_ik if name == "fixed_com_gradient" else solve_stance_ik,
             )
         elapsed = now() - t0
         peak = torch.cuda.max_memory_allocated() / 2**20

@@ -9,6 +9,9 @@ from pathlib import Path
 
 import numpy as np
 
+#: The nominal-stance hand reach map the step search loads by default (``t1_reachability build --nominal-only``).
+REACH_MAP = Path(__file__).parent / "robots" / "assets" / "t1_29dof" / "t1-nominal-hand-map.npz"
+
 ORDERS = ("none", "L", "R", "LR", "RL")
 # Mirror y and yaw for a right swing. A relative command's terminal foot shape is
 # reusable wherever the support sole lies, which keeps the offline map finite.

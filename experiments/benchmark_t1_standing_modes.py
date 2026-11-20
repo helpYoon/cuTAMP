@@ -59,10 +59,10 @@ def measure(directory, name, cfg, seed):
             chosen.update(info=info, particle=particle, world=world)
         return result
 
-    def timed_grasps(objects, device):
+    def timed_grasps(objects, device, **kwargs):
         before = len(grasps._SETS)
         begin = perf_counter()
-        pools = draw(objects, device)
+        pools = draw(objects, device, **kwargs)
         shape_work.append(
             {
                 "seconds": perf_counter() - begin,
