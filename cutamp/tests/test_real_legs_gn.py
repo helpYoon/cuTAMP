@@ -25,11 +25,7 @@ from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _poses, _s
 MOVE = (0.03, 0.0, 0.0)
 #: A move no balanced conf standing on the stance can follow: 30 cm forward and 20 cm down.
 FAR = (0.30, 0.0, -0.20)
-#: The most GN IK's accepted first-pick rows' median |CoM| / half may be on either axis, with margin, on the init whose
-#: first pick is block3's (PYTHONHASHSEED 0, seed 0, n 64): 0.00075 (x) and 0.00039 (y) there (2026-11-08). That
-#: init's first place's medians are 0.29 (x) and 0.046 (y); on the init whose first pick is block2's (PYTHONHASHSEED 1)
-#: the first pick's are 0.29 and 0.61 and the first place's 0.26 and 0.043. Four times the larger of each pair passes
-#: 1, the rectangle's edge, and bounds nothing, so only block3's first pick is bounded.
+#: Maximum median |CoM| / half on either axis for the fixed left-arm block3 pick.
 CENTRED = 0.004
 #: The least, deg, GN IK's level 4 must lower the median Trunk tilt of the accepted first-pick rows by, with margin, on
 #: the init whose first pick is block3's (PYTHONHASHSEED 0, seed 0, n 64): by 9.6 there, from 49.7 to 40.1
@@ -193,33 +189,39 @@ def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monk
 
 
 @needs_cuda
-def test_gn_ik_centres_the_com(real_world, real_plan, monkeypatch):
-    # Level 3 pulls the CoM toward the keyframe rectangle's centre in the freedom the hand, the soles, balance and
-    # collision leave. Without it GN IK leaves the init's accepted first-pick and first-place rows on the edge (a
-    # median |CoM| / half of 0.93-0.95 in x and 0.89-0.95 in y on blocks_t1, both inits, seed 0, 2026-11-08), the base
-    # slid sideways onto one leg, where trajopt's move there from home needed more than the Left_Ankle_Roll's effort.
-    # With it the medians drop on both axes on both inits, to the centre only on block3's first pick (CENTRED).
+def test_gn_ik_centres_the_com(real_world, monkeypatch):
+    # Fix the arm and block so the near-centre pick calibrated above is exercised under every hash seed.
     import cutamp.gn_refresh as gn_refresh
     import cutamp.particle_initialization as pi
+    from cutamp.config import TAMPConfiguration
     from cutamp.optimize_plan import _build_ik_deps
+    from cutamp.t1_domain import LeftPick, LeftPlace
     from cutamp.tests.conftest import default_checker
-    skeleton, particles = real_plan
-    deps = {dep.q_name: dep for dep in _build_ik_deps(skeleton, real_world)}
-    for kind in ("pick", "place"):
-        op = next(op for op in skeleton if op.operator.metadata.action_type == kind)
-        conf = op.values[-1]
-        dep = deps[conf]
-        centred = _com_frac(real_world, particles[conf][_accepted(real_world, real_plan, conf)]).abs().median(0).values
-        monkeypatch.setattr(gn_refresh, "_centring_step", lambda ja, jac, *_: torch.zeros_like(jac[:, 0]))
+    skeleton = [
+        LeftPick.ground(dict(obj="block3", grasp="grasp", q="pick")),
+        LeftPlace.ground(dict(obj="block3", grasp="grasp", placement="placement", surface="goal", q="place")),
+    ]
+    with torch.random.fork_rng(devices=[real_world.device]):
         torch.manual_seed(0)
-        q, ok = pi.gn_ik(real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles),
-                         pi.IKTol.from_checker(default_checker()))
-        monkeypatch.undo()
-        parked = _com_frac(real_world, q[ok]).abs().median(0).values
-        assert float(parked.min()) >= 0.8, (kind, parked.tolist())
-        assert bool((centred < parked).all()), (kind, centred.tolist(), parked.tolist())
-        if kind == "pick" and op.values[0] == "block3":
-            assert float(centred.max()) <= CENTRED, centred.tolist()
+        init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())
+        particles = init(skeleton)
+        for dep in _build_ik_deps(skeleton, real_world):
+            args = (real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles), init.ik_tol)
+            # Replay the same targets and noisy starts for both solves. The initializer may reuse a pool solution.
+            torch.manual_seed(0)
+            q_on, ok_on = pi.gn_ik(*args)
+            with monkeypatch.context() as m:
+                m.setattr(gn_refresh, "_centring_step", lambda ja, jac, *_: torch.zeros_like(jac[:, 0]))
+                torch.manual_seed(0)
+                q_off, ok_off = pi.gn_ik(*args)
+            common = ok_on & ok_off
+            assert int(common.sum()) >= 48, (dep.q_name, int(common.sum()))
+            centred = _com_frac(real_world, q_on[common]).abs().median(0).values
+            parked = _com_frac(real_world, q_off[common]).abs().median(0).values
+            assert float(parked.min()) >= 0.8, (dep.q_name, parked.tolist())
+            assert bool((centred < parked).all()), (dep.q_name, centred.tolist(), parked.tolist())
+            if dep.q_name == "pick":
+                assert float(centred.max()) <= CENTRED, centred.tolist()
 
 
 @needs_cuda
