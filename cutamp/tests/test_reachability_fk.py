@@ -4,7 +4,7 @@ from cutamp.tests.conftest import needs_cuda
 
 
 @needs_cuda
-def test_crouch_witnesses_keep_both_feet_planted_and_lower_the_shoulders():
+def test_crouch_witnesses_keep_both_feet_planted_and_lower_the_trunk():
     from cutamp.reachability_fk import T1MapSampler
 
     sampler = T1MapSampler(samples=128, seed=3)
@@ -16,12 +16,12 @@ def test_crouch_witnesses_keep_both_feet_planted_and_lower_the_shoulders():
     heights = {}
     for posture, batch in left.items():
         assert batch["margin"].min() >= .05
-        q = batch["q"][0]
-        marks = sampler.landmarks(q)
-        np.testing.assert_allclose(marks["left_arm"][-1], batch["points"][0], atol=1e-5)
-        for side, expected in zip(("left", "right"), soles):
-            np.testing.assert_allclose(marks[side + "_leg"][-1], [*expected[:2], 0], atol=3e-4)
-        heights[posture] = marks["left_arm"][0, 2]
+        q = sampler.cfg.to_device(batch["q"][0])
+        state = sampler._fk(sampler.kin, q)
+        np.testing.assert_allclose(sampler._contact(state, "left")[0].cpu(), batch["points"][0], atol=1e-5)
+        feet = sampler._feet(state)[0, :, :3, 3].cpu()
+        np.testing.assert_allclose(feet, np.c_[soles[:, :2], np.zeros(2)], atol=3e-4)
+        heights[posture] = q[2].item()  # The floating base's z carries the Trunk.
     assert heights["standing"] - min(heights.values()) > .06
 
 

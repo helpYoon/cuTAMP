@@ -1,6 +1,5 @@
 """Offline, grasp-independent FK sampling for T1 hand reachability on planted soles."""
 
-import copy
 import hashlib
 import xml.etree.ElementTree as ET
 from typing import NamedTuple
@@ -10,7 +9,7 @@ import torch
 import yaml
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
-from curobo.kinematics import Kinematics, KinematicsCfg
+from curobo.kinematics import Kinematics
 from curobo.types import DeviceCfg, JointState
 from scipy.optimize import least_squares
 from scipy.spatial import ConvexHull
@@ -25,7 +24,6 @@ from cutamp.robots.t1 import (
     TOOL_FRAME_FOR_ARM,
     get_t1_kinematics,
     load_sweep_volume,
-    t1_curobo_cfg,
 )
 
 
@@ -46,13 +44,6 @@ POSTURES = {
 COM_MARGIN_M = 0.05
 SOLE_POS_TOL_M = 0.0003
 SOLE_ANGLE_TOL_RAD = 0.001
-BODY_LINKS = {
-    "spine": ("Waist", "Trunk", "H2"),
-    "left_arm": ("AL1", "AL3", "AL5", "left_base_link"),
-    "right_arm": ("AR1", "AR3", "AR5", "right_base_link"),
-    "left_leg": ("Waist", "Hip_Pitch_Left", "Shank_Left", "left_sole_link"),
-    "right_leg": ("Waist", "Hip_Pitch_Right", "Shank_Right", "right_sole_link"),
-}
 
 
 def _sole_transforms(soles):
@@ -109,7 +100,6 @@ class T1MapSampler:
         self.cfg = DeviceCfg(device=self.device)
         self.kin = get_t1_kinematics(self.model, self.cfg)
         self.leg_kin = Kinematics(self.kin.config, compute_jacobian=True, compute_spheres=False)
-        self._viz_kin = None
         self.self_cost = SelfCollisionCost(SelfCollisionCostCfg(
             weight=self.cfg.to_device([1.0]), device_cfg=self.cfg,
             self_collision_kin_config=self.kin.get_self_collision_config(),
@@ -271,22 +261,3 @@ class T1MapSampler:
                 points, configs, margins = (np.concatenate(a) for a in zip(*chunks))
                 batches.append({"arm": arm, "posture": posture, "points": points, "q": configs, "margin": margins})
         return batches
-
-    @torch.no_grad()
-    def landmarks(self, q):
-        """Named polylines for a single saved witness, in the witness's local floor coordinates."""
-        if self._viz_kin is None:
-            cfg = copy.deepcopy(t1_curobo_cfg(self.model))
-            frames = list(dict.fromkeys(list(self.kin.tool_frames) + [link for path in BODY_LINKS.values() for link in path]))
-            self._viz_kin = Kinematics(KinematicsCfg.from_robot_yaml_file(cfg, tool_frames=frames, device_cfg=self.cfg),
-                                       compute_spheres=False)
-            if self._viz_kin.joint_names != self.joint_names:
-                raise RuntimeError("Visualization FK joint order differs from the map.")
-        state = self._fk(self._viz_kin, self.cfg.to_device(q))
-        lines = {}
-        for name, path in BODY_LINKS.items():
-            xyz = [state.tool_poses.get_link_pose(link).position.reshape(3) for link in path]
-            if name.endswith("_arm"):
-                xyz.append(self._contact(state, name.split("_")[0])[0])
-            lines[name] = torch.stack(xyz).cpu().numpy()
-        return lines

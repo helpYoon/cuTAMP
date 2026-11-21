@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from cutamp.reachability import ReachMap, apply_command, canonical_stance, endpoint_orders, rank_orders, stance_key
+from cutamp.reachability import ReachMap, _box_gaps, apply_command, canonical_stance, endpoint_orders, stance_key
 
 HOME = np.array([[0.0, 0.1, 0.0], [0.0, -0.1, 0.0]])
 
@@ -44,7 +44,7 @@ def layer(posture, points):
     }
 
 
-def test_map_roundtrip_and_crouch_witness(tmp_path):
+def test_map_roundtrip_keeps_one_witness_per_cell(tmp_path):
     atlas = ReachMap(0.02, metadata={"q_names": ["a", "b"]})
     atlas.add_stance(
         HOME,
@@ -57,55 +57,21 @@ def test_map_roundtrip_and_crouch_witness(tmp_path):
     atlas.save(path)
     saved = ReachMap.load(path)
     assert saved.metadata == atlas.metadata
-    assert len(saved.layers(HOME, "left")[1]["ijk"]) == 1
-    orders = {"none": [HOME], "L": endpoint_orders(HOME)["L"]}
-    kwargs = {"orders": orders}
-    result = rank_orders(saved, HOME, [0.09, 0.01, 0.21], [0.012, 0.012, 0.012], **kwargs)
-    assert result[0]["order"] == "none"
-    assert result[0]["distance_m"] == 0
-    assert result[0]["posture"] == "crouch_40"
-    assert result[1]["distance_m"] is None and result[1]["covered_count"] == 0
-    assert result[1]["uncovered_count"] == result[1]["endpoint_count"]
-    standing = rank_orders(saved, HOME, [0.09, 0.01, 0.21], [0.012, 0.012, 0.012], posture="standing", **kwargs)
-    assert standing[0]["distance_m"] == pytest.approx(0.30 - 0.216)
+    standing, crouch = saved.layers(HOME, "left")
+    assert (standing["posture"], crouch["posture"]) == ("standing", "crouch_40")
+    assert len(crouch["ijk"]) == 1
 
 
-def test_rotated_cell_to_box_distance_and_rigid_invariance():
-    # In local coordinates this cell is [0, .1]^2. The closest vertex of the
-    # rotated target is on the y=.05 line, at x=.3-.03*sqrt(2).
-    atlas = ReachMap(0.1)
-    atlas.add_stance(HOME, [layer("standing", [[0.05, 0.05, 0.05]])])
-    target = [0.30, 0.05, 0.05]
-    dims = [0.06, 0.06, 0.10]
-    yaw = np.pi / 4
-    expected = 0.30 - 0.03 * np.sqrt(2) - 0.1
-    (result,) = rank_orders(atlas, HOME, target, dims, target_yaw=yaw, orders={"none": [HOME]})
-    assert result["distance_m"] == pytest.approx(expected)
-    moved = placed(HOME, 0.6, -0.8, 2.9)
-    xy = placed(np.array([[target[0], target[1], 0]]), 0.6, -0.8, 2.9)[0, :2]
-    (shifted,) = rank_orders(atlas, moved, [*xy, target[2]], dims, target_yaw=yaw + 2.9, orders={"none": [moved]})
-    assert shifted["distance_m"] == pytest.approx(expected)
+def test_rotated_cell_to_box_distance():
+    # The cell [0, .1]^2 is centered .25 m short of the target on x. The closest
+    # vertex of the rotated target is on the y=.05 line, at x=.3-.03*sqrt(2).
+    (gap,) = _box_gaps(np.array([[-0.25, 0.0, 0.0]]), np.array([0.03, 0.03, 0.05]), 0.05, np.pi / 4)
+    assert gap == pytest.approx(0.30 - 0.03 * np.sqrt(2) - 0.1)
 
 
-def test_intersecting_boxes_with_no_vertex_inside_still_hit():
-    atlas = ReachMap(0.1)
-    atlas.add_stance(HOME, [layer("standing", [[0.05, 0.05, 0.05]])])
-    (result,) = rank_orders(
-        atlas, HOME, [0.05, 0.05, 0.05], [0.25, 0.012, 0.08], target_yaw=0.6, orders={"none": [HOME]}
-    )
-    assert result["distance_m"] == 0
-
-
-def test_touching_voxels_keep_zero_score_after_a_rigid_transform():
-    atlas = ReachMap(0.02)
-    atlas.add_stance(HOME, [layer("standing", [[0.095, 0.005, 0.215]])])
-    # Target x min = cell x max; touching closed volumes have distance zero.
-    target_center = np.array([[0.115, 0.01, 0.0]])
-    for angle in (0.0, 0.37, 2.09):
-        home = placed(HOME, 1.5, -0.29, angle)
-        xy = placed(target_center, 1.5, -0.29, angle)[0, :2]
-        (hit,) = rank_orders(atlas, home, [*xy, 0.21], [0.03, 0.02, 0.02], target_yaw=angle, orders={"none": [home]})
-        assert hit["distance_m"] == 0 and hit["status"] == "hit"
+def test_intersecting_boxes_with_no_vertex_inside_have_no_gap():
+    (gap,) = _box_gaps(np.zeros((1, 3)), np.array([0.125, 0.006, 0.04]), 0.05, 0.6)
+    assert gap == 0
 
 
 def test_failed_map_save_leaves_previous_map_loadable(tmp_path):
@@ -116,45 +82,3 @@ def test_failed_map_save_leaves_previous_map_loadable(tmp_path):
     with pytest.raises(TypeError):
         atlas.save(path)
     assert ReachMap.load(path).metadata == {}
-
-
-def test_roundoff_in_equal_gaps_preserves_stable_order():
-    atlas = ReachMap(0.1)
-    atlas.add_stance(HOME, [layer("standing", [[0.05, 0.05, 0.05]])])
-    orders = {"LR": [HOME], "RL": [placed(HOME, 1e-15, 0, 0)]}
-    rows = rank_orders(atlas, HOME, [0.20, 0.05, 0.05], [0.02, 0.02, 0.02], orders=orders)
-    assert [r["order"] for r in rows] == ["LR", "RL"]
-
-
-def test_solid_floor_pick_excludes_only_sole_overlaps_and_counts_missing_stances():
-    atlas = ReachMap(0.01, metadata={"sole_box_m": [0.2, 0.06]})
-    atlas.add_stance(HOME, [layer("crouching", [[0, -0.1, 0.025]])])
-    other = placed(HOME, 0.35, 0, 0)
-    missing = other.copy()
-    missing[0, 0] += 0.04
-    orders = {"none": [HOME], "RL": [HOME, other, missing]}
-    kwargs = {"target_size": [0.05] * 3, "orders": orders}
-    floor_center = [0, -0.1, 0.025]  # Under the right sole of HOME.
-    alternate, blocked = rank_orders(atlas, HOME, floor_center, solid_pick=True, **kwargs)
-    assert blocked["order"] == "none" and blocked["status"] == "blocked" and blocked["q"] is None
-    assert alternate["order"] == "RL" and alternate["endpoint_index"] == 1
-    assert [alternate[key] for key in ("sole_overlap_count", "covered_count", "uncovered_count")] == [1, 1, 1]
-    for target, flag in [(floor_center, False), ([0, -0.1, 0.15], True)]:
-        rows = rank_orders(atlas, HOME, target, solid_pick=flag, **kwargs)
-        assert all(r["sole_overlap_count"] == 0 for r in rows)
-    del atlas.metadata["sole_box_m"]  # Old map can still score a floor pick.
-    assert rank_orders(atlas, HOME, floor_center, solid_pick=True, **kwargs)[0]["status"] == "hit"
-
-
-def test_floor_pick_uses_oriented_sole_and_box_interiors():
-    atlas = ReachMap(0.01, metadata={"sole_box_m": [0.2, 0.06]})
-    atlas.add_stance(HOME, [layer("crouching", [[0, 0.1, 0.025]])])
-    # Thin box crosses the thin left sole at right angles without containing any
-    # of its vertices. Translating by .11 m leaves only an edge in contact.
-    for shift, expected in [(0, 1), (0.11, 0)]:
-        for angle in (0, 0.73):
-            home = placed(HOME, 0.3, 0.4, angle)
-            xy = placed(np.array([[shift, 0.1, 0]]), 0.3, 0.4, angle)[0, :2]
-            (row,) = rank_orders(atlas, home, [*xy, 0.025], [0.12, 0.02, 0.05],
-                                 target_yaw=angle + np.pi / 2, orders={"none": [home]}, solid_pick=True)
-            assert row["sole_overlap_count"] == expected

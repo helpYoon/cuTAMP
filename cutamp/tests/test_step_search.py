@@ -140,6 +140,20 @@ def test_only_objects_that_intersect_the_sole_height_band_block_a_landing():
         assert search.blocked_feet(HOME, cube) == expected
 
 
+def test_floor_pick_uses_oriented_sole_and_box_interiors():
+    search = StepSearch(atlas(), commands=())
+    # A thin box crosses the thin left sole at right angles without containing any
+    # of its vertices. Translating by .11 m leaves only an edge in contact.
+    for shift, expected in ((0, ("L",)), (0.11, ())):
+        for angle in (0, 0.73):
+            c, s = np.cos(angle), np.sin(angle)
+            turn = np.array([[c, s], [-s, c]])
+            feet = tuple((*(np.array(sole[:2]) @ turn + (0.3, 0.4)), sole[2] + angle) for sole in HOME)
+            xy = np.array([shift, 0.1]) @ turn + (0.3, 0.4)
+            cube = TargetRegion("left", (*xy, 0.025), (0.12, 0.02, 0.05), yaw=angle + np.pi / 2, solid_pick=True)
+            assert search.blocked_feet(feet, cube) == expected
+
+
 def test_matching_signed_commands_only_and_transferred_prior():
     records = profile("L", [{"lag": 8, "stages": [stage("L")], "all_handoffs_pass": True}])
     search = StepSearch(atlas(), accuracy=records, lag=8, commands=(FWD,))
@@ -254,30 +268,6 @@ def test_scene_pick_and_place_geometry_use_each_pose_once():
     assert TargetRegion.pick("left", cube).solid_pick
     tilt = Rotation.from_euler("x", 20, degrees=True).as_quat()[[3, 0, 1, 2]].tolist()
     assert TargetRegion.place("left", obj, SimpleNamespace(dims=(1, 1, 0.02), pose=[0, 0, 0.5, *tilt])).center is None
-
-
-def test_search_command_reads_region_list_and_emits_selected_commands(tmp_path, monkeypatch, capsys):
-    import json
-    import sys
-
-    from cutamp.scripts.t1_reachability import main
-
-    path = tmp_path / "map.npz"
-    atlas().save(path)
-    targets = tmp_path / "targets.json"
-    targets.write_text(json.dumps([{"arm": "left", "center": [0.065, 0.005, 0.505], "size": [0.008, 0.008, 0.008]}]))
-    records = passing("L")
-    records["schedules"][0]["commands"] = [[0.12, 0.21, 0]]
-    accuracy = tmp_path / "accuracy.json"
-    accuracy.write_text(json.dumps(records))
-    monkeypatch.setattr(sys, "argv", [
-        "t1_reachability", "search", "--map", str(path), "--targets", str(targets),
-        "--lag", "8", "--accuracy", str(accuracy),
-    ])
-    main()
-    row = json.loads(capsys.readouterr().out)
-    assert row["cost"] == [0, 1] and row["edges"][0]["order"] == "L"
-    assert row["edges"][0]["commands"] == [[0.12, 0.21, 0]]
 
 
 def test_fixed_order_schedule_keeps_endpoint_alternatives_and_validates_length():
