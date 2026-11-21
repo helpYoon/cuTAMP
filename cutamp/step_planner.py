@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -10,38 +9,20 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from cutamp.grasps import GraspSet
     from cutamp.landing_predictor import LandingState
 
 
 @dataclass
 class StepInputs:
-    """Optional supplied grasp pools and continuous seeds for a controlled planning run.
+    """An optional observed landing state, with its controller history and dynamics context, to plan the steps from."""
 
-    Commands have one list per manipulation, with signed x/y/yaw in the incoming support
-    frame. A supplied grasp pool binds through normal particle selection from pick to place.
-    """
-
-    grasps: dict[str, GraspSet] = field(default_factory=dict)
-    commands: tuple | None = None
     initial_state: LandingState | None = None
-    dynamics: torch.Tensor | None = None
-    posture_seeds: tuple | None = None
-    placements: dict | None = None
-
-    def __post_init__(self):
-        for cmds in self.commands or ():
-            if any(len(c) != 3 or not all(math.isfinite(v) for v in c) for c in cmds):
-                raise ValueError("Seed commands require finite x, y, yaw")
 
     def matches_accuracy_context(self, lag):
         """The deployed home table assumes nominal friction, offsets and a shared actuator lag."""
-        context = self.dynamics
-        if context is None and self.initial_state is not None:
-            context = self.initial_state.dynamics
-        if context is None:
+        if self.initial_state is None:
             return True
-        context = torch.as_tensor(context)
+        context = torch.as_tensor(self.initial_state.dynamics)
         if context.ndim not in (1, 2) or context.shape[-1] != 38:
             raise ValueError("Expected 38 normalized dynamics channels")
         expected = torch.zeros_like(context)

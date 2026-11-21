@@ -419,7 +419,7 @@ def run_cutamp(
     Keyframe-only searches can compare feasible solutions across skeletons.
     """
     if config.step_mode != "off":
-        preload = config.curobo_plan and not (step_inputs and step_inputs.grasps)
+        preload = config.curobo_plan
         if preload:
             # Only sampler construction overlaps world setup and search. Grasp generation itself
             # changes process-wide CUDA settings and runs synchronously for the selected objects.
@@ -797,7 +797,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
     inputs = inputs if inputs is not None else StepInputs()
     predictor = None
     if (getattr(env, "robot_start", "home") == "synthetic_standing"
-            and q_init is None and inputs.initial_state is None and inputs.dynamics is None):
+            and q_init is None and inputs.initial_state is None):
         from cutamp.landing_predictor import nominal_landing_dynamics
         from cutamp.step_validation import StepStateAdapter
 
@@ -809,7 +809,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         inputs = replace(inputs, initial_state=state)
     budget = config.max_loop_dur
     logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
-    world.grasps.update(inputs.grasps)
     deadline = start + budget if budget is not None else None
     timer.start("start_optimization")
     incoming = None

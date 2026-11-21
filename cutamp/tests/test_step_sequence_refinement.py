@@ -36,9 +36,8 @@ def test_adam_verification_refits_with_original_tolerance_and_no_warm_history(mo
                           step_ik_warm_start=True, step_adam_plateau_mm=None,
                           step_adam_trace_center=False, step_refine_iterations=2, lr=0.007)
     world = SimpleNamespace(q_init=initial)
-    inputs = SimpleNamespace(placements=None)
     for _ in range(2):
-        result = outer(proposal, world, cfg, None, None, inputs, None, None, None, 0, 3, None, None)
+        result = outer(proposal, world, cfg, None, None, None, None, None, None, 0, 3, None, None)
         assert result.diagnostics["adam"]["iterations"] == 2
     assert len(verified) == 2 and (verified[0] < initial).all()
     assert len(histories) == 6

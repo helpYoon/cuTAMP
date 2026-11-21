@@ -3,15 +3,12 @@
 import argparse
 import json
 import pickle
-from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["planner", "student", "native", "screen"],
-                        help="Use the public defaults, compare learned predictions with replay, or run a reference solver")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--env", default="two_steps_floor_transfer", help="Shipped scene name or a YAML path")
     parser.add_argument("--seed", type=int, default=641)
@@ -24,22 +21,15 @@ def main():
     parser.add_argument("--patience", type=int, default=5, help="Updates without material improvement before stopping")
     parser.add_argument("--min-updates", type=int)
     parser.add_argument("--trace-center", action="store_true", help="Record cumulative best predicted centering by update")
-    parser.add_argument("--warm-start-ik", action="store_true", help="Start each subsequent learned Adam endpoint IK fit from the previous posture")
     parser.add_argument("--ik-objective-tol", type=float, help="Projected-gradient tolerance during the learned objective only (native default: 2e-9)")
     parser.add_argument(
         "--max-step-schedules",
         type=int,
         default=0,
-        help="Maximum ranked schedules to try in Adam modes (default: uncapped)",
+        help="Maximum ranked schedules to try (default: uncapped)",
     )
     parser.add_argument("--budget-seconds", type=float, help="Public planner search budget, in seconds")
     args = parser.parse_args()
-    if args.mode == "student" and args.checkpoint is None:
-        parser.error("student mode needs --checkpoint")
-    if (args.warm_start_ik or args.ik_objective_tol is not None or args.checkpoint is not None) and args.mode not in ("student", "planner"):
-        parser.error("A learned checkpoint or inner IK settings require student or planner mode")
-    if args.mode == "screen" and (args.plateau_mm is not None or args.trace_center):
-        parser.error("plateau stopping and centering traces require an Adam mode")
     if (
         args.runs < 1
         or (args.iterations is not None and args.iterations < 1)
@@ -71,57 +61,33 @@ def main():
         "max_loop_dur": args.budget_seconds,
         "max_step_schedules": args.max_step_schedules or None,
     }
-    if args.mode == "planner":
-        overrides = {
-            "num_particles": args.particles,
-            "step_particle_batch_size": args.particle_batch_size,
-            "step_refine_iterations": args.iterations,
-            "step_adam_plateau_mm": args.plateau_mm,
-            "step_adam_plateau_min_updates": args.min_updates,
-            "step_ik_objective_tol": args.ik_objective_tol,
-            "step_sequence_bundle": str(args.checkpoint) if args.checkpoint else None,
-        }
-        cfg.update({key: value for key, value in overrides.items() if value is not None})
-    else:
-        cfg.update(num_particles=args.particles or 64, step_particle_batch_size=args.particle_batch_size or args.particles or 64)
-    if args.mode in ("student", "native"):
-        cfg.update(
-            step_optimizer="adam",
-            step_refine_iterations=args.iterations or 2,
-            step_adam_plateau_mm=args.plateau_mm,
-            step_adam_plateau_min_updates=args.min_updates or 0,
-        )
-    if args.mode == "screen":
-        cfg["step_optimizer"] = "screen"
-    else:
-        cfg.update(step_adam_plateau_patience=args.patience, step_adam_trace_center=args.trace_center)
+    overrides = {
+        "num_particles": args.particles,
+        "step_particle_batch_size": args.particle_batch_size,
+        "step_refine_iterations": args.iterations,
+        "step_adam_plateau_mm": args.plateau_mm,
+        "step_adam_plateau_min_updates": args.min_updates,
+        "step_ik_objective_tol": args.ik_objective_tol,
+        "step_sequence_bundle": str(args.checkpoint) if args.checkpoint else None,
+    }
+    cfg.update({key: value for key, value in overrides.items() if value is not None})
+    cfg.update(step_adam_plateau_patience=args.patience, step_adam_trace_center=args.trace_center)
     cfg = TAMPConfiguration(**cfg)
     solver = cfg.for_refinement(stepped=True)
     plateau = solver.adam_plateau()
     reports = []
-    student = None
     for i in range(args.runs):
         _SETS.clear()
         torch.manual_seed(args.seed)
         torch.cuda.synchronize()
         start = perf_counter()
-        load_s = 0
-        if args.mode == "student" and student is None:
-            from experiments.step_sequence_adapter import load_student, student_objectives
-
-            student, _ = load_student(args.checkpoint)
-            torch.cuda.synchronize()
-            load_s = perf_counter() - start
-        context = (student_objectives(student, warm_start_ik=args.warm_start_ik, ik_objective_tol=args.ik_objective_tol)
-                   if student is not None else nullcontext([]))
-        with context as diagnostics:
-            motion, _, metrics = algorithm.run_cutamp(
-                env,
-                cfg,
-                CostReducer(default_constraint_to_mult.copy()),
-                ConstraintChecker(default_constraint_to_tol.copy()),
-                experiment_id=f"{args.mode}-{i + 1}",
-            )
+        motion, _, metrics = algorithm.run_cutamp(
+            env,
+            cfg,
+            CostReducer(default_constraint_to_mult.copy()),
+            ConstraintChecker(default_constraint_to_tol.copy()),
+            experiment_id=f"planner-{i + 1}",
+        )
         torch.cuda.synchronize()
         elapsed = perf_counter() - start
         phases = [part["phase"] for part in motion or ()]
@@ -129,7 +95,6 @@ def main():
         complete = bool(phases and phases[-1] == "back_out" and grip == ["close", "open"])
         max_xy = metrics.get("max_predicted_landing_xy_m")
         report = {
-            "mode": args.mode,
             "scene": args.env,
             "seed": args.seed,
             "run": i + 1,
@@ -137,8 +102,8 @@ def main():
             "particles": cfg.num_particles,
             "particle_batch_size": cfg.step_particle_batch_size,
             "max_updates": solver.step_refine_iterations,
-            "warm_start_ik": solver.step_ik_warm_start if args.mode == "planner" else args.warm_start_ik,
-            "ik_objective_tol": solver.step_ik_objective_tol if args.mode == "planner" else args.ik_objective_tol,
+            "warm_start_ik": solver.step_ik_warm_start,
+            "ik_objective_tol": solver.step_ik_objective_tol,
             "plateau_mm": solver.step_adam_plateau_mm,
             "plateau_patience": solver.step_adam_plateau_patience,
             "plateau_min_updates": plateau.min_updates if plateau is not None else None,
@@ -146,7 +111,6 @@ def main():
             "complete": complete,
             "search_budget_s": metrics.get("search_budget_s"),
             "public_wall_s": elapsed,
-            "student_load_s": load_s,
             "status": metrics["status"],
             "solver_first_accepted_s": metrics.get("time_to_first_accepted_s"),
             "phases": phases,
@@ -161,7 +125,6 @@ def main():
             "margins_cm": [100 * x for x in metrics.get("com_margins_m", [])],
             "worst_xy_cm": 100 * max_xy if max_xy is not None else None,
             "worst_yaw_deg": metrics.get("max_predicted_landing_yaw_deg"),
-            "diagnostics": diagnostics,
             "attempts": [
                 {
                     "orders": a["orders"],
@@ -178,13 +141,13 @@ def main():
         if complete and report["n_steps"]:
             assert report["worst_xy_cm"] < 2 and report["worst_yaw_deg"] < 1 and min(report["margins_cm"]) >= 5
         if complete and i == 0:
-            file = args.output / f"{args.mode}-motion.pkl"
+            file = args.output / "planner-motion.pkl"
             with file.open("wb") as handle:
                 pickle.dump(raw_motion_plan(motion, REAL_LEGS), handle)
             report["motion_file"] = str(file)
         reports.append(report)
         print(json.dumps(report), flush=True)
-        (args.output / f"{args.mode}-results.json").write_text(json.dumps(reports, indent=2) + "\n")
+        (args.output / "planner-results.json").write_text(json.dumps(reports, indent=2) + "\n")
 
 
 if __name__ == "__main__":

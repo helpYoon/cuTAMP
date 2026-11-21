@@ -14,12 +14,9 @@ from cutamp.tests.paired_grasp_scene import paired_setup
 
 
 def paired_case(label, output):
-    env, q, inp_args = paired_setup(label, place=True)
     bundle = LANDING_BUNDLE
     cfg = TAMPConfiguration(
         step_mode="model",
-        step_refine_iterations=5,  # a short Adam run stays inside the dense teacher's precision on this fixture
-        num_particles=1,
         enable_visualizer=False,
         curobo_plan=False,
         max_step_schedules=1,
@@ -28,6 +25,7 @@ def paired_case(label, output):
     )
     torch.manual_seed(641)
     with pytest.MonkeyPatch.context() as mp:
+        env, q, inp_args = paired_setup(label, mp)
         only_schedule(mp, ("L", "none"), "left")
         _, count, metrics = run_cutamp(
             env,

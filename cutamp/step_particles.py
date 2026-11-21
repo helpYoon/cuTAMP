@@ -26,10 +26,8 @@ from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
 
 def _batch(value, first, stop, tail, like):
     x = torch.as_tensor(value, dtype=like.dtype, device=like.device)
-    if tuple(x.shape) == tail:
-        return x.expand(stop - first, *tail)
     if x.shape[1:] != tail or (len(x) != 1 and len(x) < stop):
-        raise ValueError(f"Expected {tail} or particle rows of that shape; got {tuple(x.shape)}")
+        raise ValueError(f"Expected particle rows of shape {tail}; got {tuple(x.shape)}")
     return x.expand(stop - first, *tail) if len(x) == 1 else x[first:stop]
 
 
@@ -122,9 +120,7 @@ def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None,
     return solve_stance_ik(soles, wrist, bounded, arm, other_arm_reference=other_arm_reference, kinematics=kinematics)
 
 
-def _inputs_for_gap(inputs, seeds, gap, op, incoming, cmds, q_rest, first, stop):
-    if inputs.posture_seeds is not None and inputs.posture_seeds[gap] is not None:
-        return _batch(inputs.posture_seeds[gap], first, stop, (q_rest.shape[-1],), q_rest)
+def _inputs_for_gap(seeds, gap, op, incoming, cmds, q_rest):
     by_order = {}
     has_fallback = False
     for i, seed in enumerate(seeds):
@@ -151,11 +147,9 @@ def _inputs_for_gap(inputs, seeds, gap, op, incoming, cmds, q_rest, first, stop)
     return out
 
 
-def _command_inputs(inputs, seeds, j, steps, like):
+def _command_inputs(seeds, steps, like):
     if not steps:
         return like.new_empty(len(seeds), 0, 3)
-    if inputs.commands is not None:
-        return like.new_tensor(inputs.commands[j]).expand(len(seeds), -1, -1).clone()
     return like.new_tensor([[seed.commands[step.arg("sole_to")] for step in steps] for seed in seeds])
 
 
@@ -187,7 +181,7 @@ def _generated_grasp_indices(pool, scores, objects, tool, arm, seeds, gap, ranks
     return choice
 
 
-def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds, bindings=None, grasp_indices=None):
+def _placements_and_grasps(groups, world, pools, first, stop, seeds, bindings=None, grasp_indices=None):
     n = stop - first
     like = world.q_init
     particles = {k: like.expand(n, -1).clone() for k in ("left_q0", "right_q0")}
@@ -203,8 +197,6 @@ def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds, bin
             idx = torch.arange(first, stop, device=like.device) % len(pool)
             if grasp_indices is not None:
                 choice = grasp_indices[grasp + "_idx"]
-            elif obj in inputs.grasps:
-                choice = torch.argsort(scores, descending=True, stable=True)[idx]
             else:
                 tool = world.tool_from_ee[world.tool_frame_for_arm(arm)]
                 choice = _generated_grasp_indices(pool, scores, objects[obj], tool, arm, seeds, gap, idx)
@@ -212,12 +204,9 @@ def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds, bin
         g = grasp_7dof_to_mat4x4(particles[grasp])
         if op.operator.metadata.action_type == "place":
             key = op.arg("placement")
-            fixed = inputs.placements or {}
             if bindings is not None and key in bindings:
                 particles[key] = project_supported_placement(bindings[key], world.get_collision_spheres(obj),
                                                             world.get_aabb(op.arg("surface")))
-            elif key in fixed:
-                particles[key] = _batch(fixed[key], first, stop, (4,), like).clone()
             else:
                 particles[key] = _draw_placements(
                     world,
@@ -306,7 +295,7 @@ def _refine_batch(
     n = stop - first
     like = world.q_init
     particles, objects, wrists, held_before = _placements_and_grasps(
-        groups, world, pools, inputs, first, stop, seeds, bindings, grasp_indices
+        groups, world, pools, first, stop, seeds, bindings, grasp_indices
     )
     if config.require_modeled_load and any(steps and held_before[j] for j, (steps, _) in enumerate(groups)):
         return StepResult([], None, "unavailable", "seed-3 dynamics have no payload model")
@@ -318,11 +307,11 @@ def _refine_batch(
     if bindings is None:
         from cutamp.step_adam import optimize_particles
 
-        initial = {key: value for key, value in placement_seeds.items() if key not in (inputs.placements or {})}
+        initial = dict(placement_seeds)
         bound_grasps = {key: value for key, value in particles.items() if key.endswith("_idx")}
         for j, (steps, _) in enumerate(groups):
             if steps:
-                initial[f"foot{j}"] = _command_inputs(inputs, seeds, j, steps, like)
+                initial[f"foot{j}"] = _command_inputs(seeds, steps, like)
 
         def evaluate(values, objective=True, *, ik_starts=None):
             return _refine_batch(proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first,
@@ -376,8 +365,6 @@ def _refine_batch(
         ts = tuple(_batch(x, first, stop, tuple(x.shape[1:]), like) for x in full.tensors)
         observed = LandingState(ts, _batch(full.dynamics, first, stop, (38,), like), full.history_source)
         d = observed.dynamics
-    if inputs.dynamics is not None:
-        d = _batch(inputs.dynamics, first, stop, (38,), like)
     adapter = StepStateAdapter(predictor)
     stances = {"left_q0": incoming, "right_q0": incoming}
     summaries = []
@@ -449,8 +436,8 @@ def _refine_batch(
     for j, (steps, op) in enumerate(groups):
         _check_deadline(deadline)
         order = proposal.orders[j]
-        cmds = bindings[f"foot{j}"] if steps else _command_inputs(inputs, seeds, j, steps, like)
-        seed = _inputs_for_gap(inputs, seeds, j, op, incoming, cmds, rest, first, stop)
+        cmds = bindings[f"foot{j}"] if steps else _command_inputs(seeds, steps, like)
+        seed = _inputs_for_gap(seeds, j, op, incoming, cmds, rest)
         arm = op.operator.metadata.arm
         held = held_before[j]
         other = occupied_reference(j, rest)
@@ -495,15 +482,11 @@ def _refine_batch(
             variables[op.arg("q")] = ik.q
             if last > j + 1 and steps:
                 after = adapter.planner(pred.terminal.tensors[:6])[0] if pred is not None else ik.q
-                if j in retracted and any(
-                    inputs.posture_seeds is None or inputs.posture_seeds[k] is None for k in range(j + 1, last)
-                ):
+                if j in retracted:
                     after = _retract_on_stance(ik.soles, after, arm, world.joint_limits, other_arm_reference=other).q
                 for k in range(j + 1, last):
                     future_op = groups[k][1]
-                    prior = _inputs_for_gap(
-                        inputs, seeds, k, future_op, ik.soles, like.new_empty(n, 0, 3), after, first, stop
-                    )
+                    prior = _inputs_for_gap(seeds, k, future_op, ik.soles, like.new_empty(n, 0, 3), after)
                     future = endpoint_solver(k, ik.q, prior)(ik.soles, wrists[k], prior, future_op.operator.metadata.arm)
                     rows.update({f"future_{k}_{key}": v for key, v in stance_ik_rows(future, margin).items()})
                     centers.append(stance_center_residual(future))
@@ -725,8 +708,7 @@ def refine_step_particles(
         return StepResult([], None, "unresolved", str(e))
     n = config.num_particles
     seeds = [proposal.seed]
-    if inputs.commands is None:
-        seeds.extend(islice(proposal.alternative_seeds, n - 1))
+    seeds.extend(islice(proposal.alternative_seeds, n - 1))
     rows, feedback, diagnostic = [], [], {}
     status, reason = "unresolved", "no particle met all applicable constraints"
     attempted_seeds, motion_inputs, adam_batches = [], {}, []
@@ -734,9 +716,7 @@ def refine_step_particles(
     for first in range(0, n, config.step_particle_batch_size):
         stop = min(first + config.step_particle_batch_size, n)
         batch_seeds = [seeds[i % len(seeds)] for i in range(first, stop)]
-        commands = [
-            _list(_command_inputs(inputs, batch_seeds, j, steps, world.q_init)) for j, (steps, _) in enumerate(groups)
-        ]
+        commands = [_list(_command_inputs(batch_seeds, steps, world.q_init)) for steps, _ in groups]
         for signature in zip(*commands):
             if signature not in attempted_seeds:
                 attempted_seeds.append(signature)

@@ -153,14 +153,12 @@ def harness(monkeypatch, tmp_path):
     }
 
     def run(**options):
-        inputs = options.pop("inputs", None)
         return alg.run_cutamp(
             None,
             TAMPConfiguration(**(cfg | options)),
             SimpleNamespace(cost_config={}),
             SimpleNamespace(constraint_config={}),
             experiment_id="test",
-            step_inputs=inputs,
         )
 
     return run, seen, world
@@ -678,11 +676,6 @@ def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatc
     assert result.diagnostics["motion_plan_attempts"] == 1 and result.diagnostics["motion_plan_failures"] == []
 
 
-def test_non_finite_seed_command_is_rejected():
-    with pytest.raises(ValueError, match="finite"):
-        StepInputs(commands=(((0.1, float("nan"), 0.0),),))
-
-
 def test_rank_assets_are_reused_and_regeneration_invalidates_cache(tmp_path):
     import os
     from dataclasses import replace
@@ -769,15 +762,16 @@ def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path,
 
 
 def test_unmatched_dynamics_never_receive_reference_tracking_credit():
+    from cutamp.landing_predictor import LandingState
     from cutamp.step_search import TargetRegion
 
     cfg = TAMPConfiguration(step_mode="model", step_lag=8)
     d = torch.zeros(1, 38)
     d[:, 0] = 0.25 / 0.45
     d[:, -5:] = 1.0
-    assert StepInputs(dynamics=d).matches_accuracy_context(8)
+    assert StepInputs(LandingState((), d, "synthetic_home_50_hold")).matches_accuracy_context(8)
     d[0, 1] = 0.25  # encoder offset differs from the unloaded home profile
-    assert not StepInputs(dynamics=d).matches_accuracy_context(8)
+    assert not StepInputs(LandingState((), d, "synthetic_home_50_hold")).matches_accuracy_context(8)
     search, meta = alg._load_step_search(cfg, applicable=False)
     assert meta["accuracy_status"] == "dynamics outside the profiled condition"
     home = search.home or ((0, 0.1, 0), (0, -0.1, 0))

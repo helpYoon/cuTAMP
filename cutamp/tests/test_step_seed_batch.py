@@ -36,9 +36,7 @@ def test_seed_transforms_batch_witnesses_and_preserve_particle_gradients(monkeyp
         return original(q, feet)
 
     monkeypatch.setattr(step_particles, "_carry_witness", capture)
-    actual = step_particles._inputs_for_gap(
-        SimpleNamespace(posture_seeds=None), seeds, 0, None, incoming, commands, rest, 0, n
-    )
+    actual = step_particles._inputs_for_gap(seeds, 0, None, incoming, commands, rest)
     torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
     inputs = (incoming, commands, rest)
     expected_grads = torch.autograd.grad(expected, inputs, weights, allow_unused=True)
@@ -48,14 +46,10 @@ def test_seed_transforms_batch_witnesses_and_preserve_particle_gradients(monkeyp
     assert max(batch_sizes) > 1
 
 
-def test_all_fallback_and_explicit_seed_batch_slice():
+def test_all_fallback_seed_batch_keeps_the_rest_posture():
     rest = torch.randn(3, 12)
     incoming = torch.zeros(3, 2, 3)
     commands = torch.empty(3, 0, 3)
     unwitnessed = SimpleNamespace(schedule=SimpleNamespace(edges=[SimpleNamespace(order="L", witness=None)]))
-    args = ([unwitnessed] * 3, 0, None, incoming, commands, rest, 2, 5)
-    fallback = step_particles._inputs_for_gap(SimpleNamespace(posture_seeds=None), *args)
+    fallback = step_particles._inputs_for_gap([unwitnessed] * 3, 0, None, incoming, commands, rest)
     torch.testing.assert_close(fallback, rest)
-    supplied = torch.arange(60).view(5, 12).float()
-    override = step_particles._inputs_for_gap(SimpleNamespace(posture_seeds=[supplied]), *args)
-    torch.testing.assert_close(override, supplied[2:5])

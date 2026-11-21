@@ -26,9 +26,8 @@ def test_composed_stance_miss_is_rejected_even_if_the_two_individual_steps_track
 
 @needs_cuda
 def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landings(tmp_path, monkeypatch):
-    """Fixed bindings isolate motion compilation. Learned step Adam selects each actual foot command on this GPU."""
-    from dataclasses import replace
-
+    """A fixed grasp and foot order isolate motion compilation. Learned step Adam selects the foot commands, postures
+    and placement on this GPU."""
     from curobo.scene import Cuboid
 
     import cutamp.motion_solver as ms
@@ -46,21 +45,15 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     monkeypatch.setattr(ms, "build_motion_planner", lambda *a, **kw: pytest.fail("the direct paths are feasible"))
 
     fixture = json.loads((Path(__file__).parent / "fixtures/t1_four_step_transfer.json").read_text())
-    old, q, inputs = paired_setup("far", place=True)
+    old, q, inputs = paired_setup("far", monkeypatch)
     part, floor, pad = (Cuboid(**obj) for obj in fixture["scene"])
     env = TAMPEnvironment(
         "fresh_foot_commands", [part], [floor, pad], {"Movable": [part], "Surface": [pad]}, old.goal_state
     )
     only_schedule(monkeypatch, ("LR", "LR"), "left")
-    inputs = replace(
-        inputs,
-        commands=None,
-        posture_seeds=tuple(g["posture_seed"] for g in fixture["gaps"]),
-        placements={"pose1": fixture["placement"]},
-    )
+    torch.manual_seed(641)  # the placement is drawn
     cfg = TAMPConfiguration(
         step_mode="model",
-        num_particles=16,
         max_step_schedules=1,
         max_loop_dur=60,
         landing_bundle=str(LANDING_BUNDLE),

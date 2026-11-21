@@ -7,6 +7,7 @@ import torch
 from curobo.scene import Cuboid
 from curobo.types import DeviceCfg
 
+from cutamp import algorithm
 from cutamp.envs import TAMPEnvironment
 from cutamp.grasps import GraspSet
 from cutamp.landing_accuracy import LANDING_BUNDLE
@@ -20,7 +21,8 @@ FIXTURE = Path(__file__).parent / "fixtures/t1_paired_grasps.json"
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def paired_setup(label, *, place=False):
+def paired_setup(label, monkeypatch):
+    """Pick the part off the floor and place it on the pad; the planner's grasp generator returns the label's grasp."""
     from cutamp.step_validation import StepStateAdapter
 
     dc = DeviceCfg()
@@ -35,17 +37,18 @@ def paired_setup(label, *, place=False):
     # A destination patch is a surface label; its top coincides with the floor.
     dest = [xyz[0] - 0.03, xyz[1] + 0.025, xyz[2] + 0.001, 0]
     patch = Cuboid(name="pad", pose=[*dest[:2], -0.005, 1.0, 0, 0, 0], dims=[0.19, 0.11, 0.010])
-    goal = next(f for f in all_t1_fluents if f.name == ("On" if place else "LeftHolding"))
-    statics = [floor, patch] if place else [floor]
+    goal = next(f for f in all_t1_fluents if f.name == "On")
     env = TAMPEnvironment(
         "paired_ground_pick",
         [part],
-        statics,
-        {"Movable": [part], "Surface": [patch] if place else []},
-        frozenset([goal.ground("part", "pad") if place else goal.ground("part")]),
+        [floor, patch],
+        {"Movable": [part], "Surface": [patch]},
+        frozenset([goal.ground("part", "pad")]),
     )
     obj_grasp = torch.linalg.inv(ws) @ world_wrist @ torch.linalg.inv(get_t1_tool_from_ee(dc)["left_base_link"])
     grasps = GraspSet(mat4x4_to_grasp_7dof(obj_grasp)[None], dc.to_device([1.0]))
+    monkeypatch.setattr(algorithm, "grasp_sets", lambda objs, device, **kw: {"part": grasps})
+    monkeypatch.setattr(algorithm, "start_sampler_load", lambda: None)
     bundle = LANDING_BUNDLE
     predictor = LandingPredictor(bundle)
     d = torch.zeros(1, 38, device="cuda")
@@ -53,12 +56,4 @@ def paired_setup(label, *, place=False):
     d[:, -5:] = -1.0
     start = predictor.standing_start(d)
     q, _ = StepStateAdapter(predictor).planner(start.tensors[:6])
-    # Seeds for the left arm stepping its left foot before the pick: orders ("L",), or ("L", "none") with the place.
-    inp_args = StepInputs(
-        grasps={"part": grasps},
-        commands=((((0.12, 0.21, 0.0),), ()) if place else (((0.12, 0.21, 0.0),),)),
-        initial_state=start,
-        posture_seeds=(inp["seed"],) * (2 if place else 1),
-        placements={"pose1": dest} if place else None,
-    )
-    return env, q[0].tolist(), inp_args
+    return env, q[0].tolist(), StepInputs(initial_state=start)
