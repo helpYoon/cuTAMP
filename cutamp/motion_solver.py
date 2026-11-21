@@ -574,7 +574,8 @@ def solve_curobo(
     ``get_planner`` (optional) returns a pre-built planner — the
     overlap path: algorithm.py starts ``build_motion_planner`` on a thread
     when the optimization loop starts, and the timer below then measures
-    only the residual wait. ``None`` builds it inline. Neither warms it up (``build_motion_planner``).
+    only the residual wait. ``None`` builds it inline on ``step_motion``'s initial soles. Neither warms it up
+    (``build_motion_planner``).
     ``ik_tol``: the tolerances the run's checker holds every IK conf to, which the pre and post confs of the picks and
     places meet too (``_approach_confs``).
     ``max_attempts`` is each segment's plan_cspace budget (``_plan_arm_to_conf``).
@@ -587,8 +588,6 @@ def solve_curobo(
         elif step_motion is not None:
             soles = step_motion.adapter.predictor.model.feet(step_motion.adapter.physical(world.q_init[None]))[0][0]
             planner = build_motion_planner(world, initial_soles=soles)
-        else:
-            planner = build_motion_planner(world)
         if step_motion is not None and not hasattr(planner, "set_support_stance"):
             raise ValueError("A stepped motion planner must track the achieved support in trajopt")
 

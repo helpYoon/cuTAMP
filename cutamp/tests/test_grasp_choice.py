@@ -202,9 +202,9 @@ def test_top_particles_go_round_the_grasps(monkeypatch):
     monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: torch.full((len(q),), 0.05))
     inputs = _ranking_inputs([0, 0, 1, 2, 1, 0], [0.3, 0.1, 0.0, 0.0, 0.0, 0.0],
                              [True] * 5 + [False], [1.0, 0.5, 2.0, 0.1, 3.0, 0.0])
-    tries = alg.get_top_satisfying_particles(*inputs, n=10)
+    tries, _ = alg.get_top_satisfying_particles(*inputs, n=10)
     assert [int(t["left_q1"][5]) for t in tries] == [2, 1, 3, 4, 0]
-    assert [int(t["left_q1"][5]) for t in alg.get_top_satisfying_particles(*inputs, n=4)] == [2, 1, 3, 4]
+    assert [int(t["left_q1"][5]) for t in alg.get_top_satisfying_particles(*inputs, n=4)[0]] == [2, 1, 3, 4]
 
 
 def test_standing_motion_uses_worst_centroid_error_then_effort_across_feasible_grasps(monkeypatch):
@@ -226,9 +226,7 @@ def test_standing_motion_uses_worst_centroid_error_then_effort_across_feasible_g
 
     cost_fn.config = SimpleNamespace(com_center_weight=1e-44)
     plan["cost_fn"] = cost_fn
-    candidates, ids = alg.get_top_satisfying_particles(
-        plan, checker, CostReducer(default_constraint_to_mult), n=4, return_indices=True
-    )
+    candidates, ids = alg.get_top_satisfying_particles(plan, checker, CostReducer(default_constraint_to_mult), n=4)
     assert ids == [1, 2, 3, 0]
     assert [int(c["left_q1"][5]) for c in candidates] == ids
 

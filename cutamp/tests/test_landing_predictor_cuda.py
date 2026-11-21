@@ -197,79 +197,38 @@ def test_command_grid_directional_derivative_on_smooth_clocks(side, predictor):
 
 
 @needs_cuda
-@pytest.mark.parametrize("order", ["L", "RL", "LR"])
-def test_cached_command_jacobian_matches_the_deployment_and_reverse_mode(order, predictor):
-    batch = len(order)
-    d = torch.zeros(batch, 38, device=predictor.device)
+@pytest.mark.parametrize("order", ["LR", "RL"])
+def test_first_command_moves_second_issue_and_final_grasp_margin(order):
+    from cutamp.step_ik import solve_stance_ik
+    from cutamp.tests.test_grasp_stance_ik import paired_inputs
+
+    bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
+    if not bundle.exists() and "CUTAMP_LANDING_BUNDLE" not in os.environ:
+        pytest.skip("Requires the seed-3 deployment")
+    p = LandingPredictor(bundle)
+    wrists, seeds = paired_inputs(p.device, torch.float32)
+    d = seeds.new_zeros(2, 38)
     d[:, 0] = 0.25 / 0.45
     d[:, -5:] = -1.0
-    if batch > 1:
-        d[1, -5:] = 1.0  # an independent actuator-lag condition
-    initial = predictor.standing_start(d)
-    c = d.new_tensor([[0.12, 0.21 if side == "L" else -0.21, 0.0] for side in order])[None].repeat(batch, 1, 1)
-    c[-1, 0, 0] += 0.03
-    c.requires_grad_()
+    state = p.standing_start(d)
+    c = d.new_tensor([[0.12, 0.21 if s == "L" else -0.21, 0.0] for s in order])[None].repeat(2, 1, 1).requires_grad_()
 
-    def diagnostic(p):
-        s = p.steps[-1]
-        # Terminal FK, trajectory, phase gates, pending commands and the second issue frame.
-        return torch.stack(
-            [
-                s.achieved[:, 0, 0],
-                s.terminal.tensors[-2][:, -1, :].mean(1),
-                s.sole_trace[:, :, 1, 1].mean(1),
-                s.actions[:, :, 2].mean(1),
-                s.trajectory[4][:, :, 3].mean(1),
-                s.reference[:, 0, 0] + s.phases.support_xy + s.phases.deadline_xy,
-                p.final_xy_error.sum(1) + p.final_yaw_error.sum(1),
-            ],
-            -1,
-        )
+    def score(u):
+        out = p.rollout(state, order, u)
+        result = solve_stance_ik(out.steps[-1].achieved, wrists, seeds, "left")
+        second_target_x = out.steps[-1].reference[:, "LR".index(order[-1]), 0]
+        return result.margin, second_target_x, tuple(s.clock for s in out.steps)
 
     with prediction_precision():
-        a = predictor.rollout(initial, order, c)
-        b = predictor.linearize_autodiff(initial, order, c)
-        assert_same_prediction(a, b)
-        assert all(type(s.actions.grad_fn).__name__ == "_CommandJacobianBackward" for s in b.steps)
-        ea, eb = diagnostic(a), diagnostic(b)
-        for k in range(ea.shape[1]):
-            (ga,) = torch.autograd.grad(ea[:, k].sum(), c, retain_graph=True)
-            (gb,) = torch.autograd.grad(eb[:, k].sum(), c, retain_graph=True)
-            torch.testing.assert_close(gb, ga, rtol=7e-4, atol=1.5e-4)
-
-
-@pytest.mark.parametrize("order", ["L", "R", "LR", "RL"])
-@needs_cuda
-def test_finite_difference_linearization_follows_each_particles_rollout(order, predictor, monkeypatch):
-    # Distinct commands and actuator lags expose cross-particle mixing. The first
-    # command of the alternating pair must also affect the other foot's landing.
-    context = torch.zeros(2, 38, device=predictor.device)
-    context[:, 0] = 0.25 / 0.45
-    context[:, -5:] = context.new_tensor([[-1.0], [1.0]])
-    initial = predictor.standing_start(context)
-    c = context.new_tensor([[0.12, 0.21 if foot == "L" else -0.21, 0.0] for foot in order])[None].repeat(2, 1, 1)
-    c[1, 0, 0] = 0.15
-    c.requires_grad_()
-    native = predictor.rollout(initial, order, c)
-    calls = []
-    rollout = predictor.rollout
-
-    def observe(state, sequence, targets):
-        result = rollout(state, sequence, targets)
-        calls.append(len(targets))
-        return result
-
-    monkeypatch.setattr(predictor, "rollout", observe)
-    approximate = predictor.linearize(initial, order, c)
-    assert calls == [2, 2 * 2 * c.shape[1] * 3], "This fixture must exercise batched FD on stable clocks"
-    assert_same_prediction(approximate, native)
-    with prediction_precision():
-        for get in (
-            lambda p: p.steps[-1].achieved[:, "LR".index(order[-1]), :2].sum(-1),
-            lambda p: p.steps[-1].achieved[:, "LR".index(order[-1]), 2],
-            lambda p: p.steps[-1].actions[:, :12, 2].mean(-1),
-            lambda p: p.steps[-1].terminal.tensors[7][:, -1, 5],
-        ):
-            (exact,) = torch.autograd.grad(get(native).sum(), c, retain_graph=True)
-            (fd,) = torch.autograd.grad(get(approximate).sum(), c, retain_graph=True)
-            torch.testing.assert_close(fd, exact, rtol=0.04, atol=0.015)
+        margin, second_x, clocks = score(c)
+        (dm,) = torch.autograd.grad(margin.sum(), c, retain_graph=True)
+        (dx,) = torch.autograd.grad(second_x.sum(), c)
+        delta = torch.zeros_like(c)
+        delta[:, 0, 0] = 0.0007
+        with torch.no_grad():
+            low, lx, lc = score(c - delta)
+            high, hx, hc = score(c + delta)
+    assert all(torch.equal(a, b) and torch.equal(b, e) for a, b, e in zip(lc, clocks, hc))
+    for gradient, finite_difference in ((dm, (high - low) / 0.0014), (dx, (hx - lx) / 0.0014)):
+        assert gradient[:, 0, 0].abs().min() > 0.05
+        torch.testing.assert_close(gradient[:, 0, 0].double(), finite_difference.double(), atol=0.004, rtol=0.01)

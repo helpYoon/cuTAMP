@@ -1,14 +1,14 @@
 """Differentiable T1 landing prediction in the deployed model's world and joint frames.
 
 Load a local bundle produced by experiments/export_t1_landing.py. TorchScript holds
-one closed-loop tick. Perturbed command rollouts estimate STEP and HOLD
-sensitivities, with native autodiff available on the nominal issue clocks. All poses below are sole-center (x, y, yaw), in m, m, rad.
+one closed-loop tick. Native autodiff differentiates a rollout on its nominal
+issue clocks. All poses below are sole-center (x, y, yaw), in m, m, rad.
 """
 
 import json
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -31,7 +31,7 @@ def nominal_landing_dynamics(like, batch_size, lag):
 def prediction_precision():
     """Use the checkpoint evaluation's FP32 matmuls, restoring the planner's precision afterwards.
 
-    Enclose a complete linearization, including autograd, when cuRobo has enabled TF32.
+    Enclose a complete differentiated call, including autograd, when cuRobo has enabled TF32.
     """
     previous = torch.backends.cuda.matmul.allow_tf32
     try:
@@ -266,96 +266,6 @@ class LandingPrediction:
     tracking_ok: Tensor  # precision only, full manipulation/motion feasibility is assessed by the caller
 
 
-class _CommandJacobian(torch.autograd.Function):
-    """Keep the deployed primal exactly. Its batch-independent command Jacobian is already known."""
-
-    @staticmethod
-    def forward(ctx, primal, tangent, commands):
-        ctx.save_for_backward(tangent)
-        ctx.command_shape = commands.shape
-        return primal
-
-    @staticmethod
-    def backward(ctx, adjoint):
-        (tangent,) = ctx.saved_tensors  # [particles, command coordinates, output coordinates]
-        grad = torch.bmm(tangent, adjoint.reshape(len(adjoint), -1, 1)).reshape(ctx.command_shape)
-        return None, None, grad
-
-
-def _repeat_state(state, count):
-    return LandingState(
-        tuple(x.repeat_interleave(count, 0) for x in state.tensors),
-        state.dynamics.repeat_interleave(count, 0),
-        state.history_source,
-    )
-
-
-def _same_clocks(primal, sampled, count):
-    return torch.stack(
-        [
-            (step.clock[:, None] == probe.clock.reshape(len(step.clock), count)).all()
-            for step, probe in zip(primal.steps, sampled.steps, strict=True)
-        ]
-    ).all()
-
-
-def _central_difference(samples, delta, angles):
-    """Reduce [particle, sign × coordinate, ...] probes to command Jacobians."""
-    plus, minus = samples.chunk(2, dim=1)
-    diff = plus - minus
-    if angles is not None:
-        diff[..., angles] = _wrap(diff[..., angles])
-    return diff.reshape(len(samples), len(delta), -1) / (2 * delta[:, None])
-
-
-def _attach_prediction(primal, samples, order, profile, attach):
-    """Attach command sensitivities to physical readouts, then recompute their nonlinear reductions."""
-    connected = []
-    for side, p, f in zip(order, primal.steps, samples.steps, strict=True):
-        achieved = attach(p.achieved, f.achieved, 2)
-        reference = attach(p.reference, f.reference, 2)
-        trace = attach(p.sole_trace, f.sole_trace, 2)
-        height = attach(p.sole_height, f.sole_height)
-        # Physical state is p,R,v,w,q,qd. Extra terminal fields are action queue,
-        # observation history, and an eight-component command latch ending in yaw.
-        angle_columns = {4: slice(None), 7: slice(0, p.trajectory[4].shape[-1]), 8: 7}
-        terminal = tuple(
-            attach(x, y, angle_columns.get(i))
-            for i, (x, y) in enumerate(zip(p.terminal.tensors, f.terminal.tensors, strict=True))
-        )
-        trajectory = tuple(
-            attach(x, y, slice(None) if i == 4 else None)
-            for i, (x, y) in enumerate(zip(p.trajectory, f.trajectory, strict=True))
-        )
-        xy, yaw, _ = landing_errors(achieved, reference)
-        connected.append(
-            replace(
-                p,
-                achieved=achieved,
-                reference=reference,
-                xy_error=xy,
-                yaw_error=yaw,
-                terminal=replace(p.terminal, tensors=terminal),
-                trajectory=trajectory,
-                sole_trace=trace,
-                sole_height=height,
-                sole_tilt=attach(p.sole_tilt, f.sole_tilt),
-                actions=attach(p.actions, f.actions),
-                phases=phase_checks(trace, height, reference, "LR".index(side), p.clock, p.valid_ticks, profile),
-            )
-        )
-    intended = attach(primal.intended_final, samples.intended_final, 2)
-    xy, yaw, _ = landing_errors(connected[-1].achieved, intended)
-    return replace(
-        primal,
-        steps=tuple(connected),
-        terminal=connected[-1].terminal,
-        intended_final=intended,
-        final_xy_error=xy,
-        final_yaw_error=yaw,
-    )
-
-
 class LandingPredictor:
     def __init__(
         self,
@@ -364,12 +274,8 @@ class LandingPredictor:
         hold_ticks=75,
         profile=None,
         *,
-        derivative_method="finite_difference",
         use_cuda_graph=False,
     ):
-        if derivative_method not in ("finite_difference", "autodiff"):
-            raise ValueError("derivative_method must be finite_difference or autodiff")
-        self.derivative_method = derivative_method
         device = torch.device(device)
         if device.type != "cuda" or (device.index if device.index is not None else torch.cuda.current_device()) != 0:
             raise ValueError("The seed-3 bundle requires logical CUDA device 0 (its FK uses traced device constants)")
@@ -512,71 +418,3 @@ class LandingPredictor:
             accurate = accurate & step.tracking_ok
         xy, yaw, final_ok = landing_errors(achieved, intended)
         return LandingPrediction(tuple(steps), state, intended, xy, yaw, accurate & final_ok)
-
-    def linearize(self, initial: LandingState, order: str, commands: Tensor) -> LandingPrediction:
-        """Differentiate the fixed incoming state's command. All nominal values and gates are deployed values."""
-        return self._linearize(initial, order, commands, self.derivative_method)
-
-    def linearize_autodiff(self, initial: LandingState, order: str, commands: Tensor) -> LandingPrediction:
-        """Reference method with three or six forward-mode directions through the frozen feedback recurrence."""
-        return self._linearize(initial, order, commands, "autodiff")
-
-    @prediction_precision()
-    def _linearize(self, initial, order, commands, method):
-        # The nominal grad-enabled rollout uses the exact kernels of the original
-        # differentiated call and gives a correct reverse-mode fallback at clock branches.
-        primal = self.rollout(initial, order, commands)
-        if not commands.requires_grad or not torch.is_grad_enabled() or not primal.steps:
-            return primal
-        if any(x.requires_grad for x in (*initial.tensors, initial.dynamics)):
-            return primal  # A command-only Jacobian would discard incoming-state derivatives.
-        batch, steps, coords = commands.shape
-        directions = steps * coords
-        basis = torch.eye(directions, device=commands.device, dtype=commands.dtype)
-        if method == "finite_difference":
-            # Each particle gets its own +/- perturbation of every command. An LR/RL
-            # probe carries its own achieved first stance and controller history into step two.
-            delta = commands.new_tensor([0.001, 0.001, math.radians(0.1)]).repeat(steps)
-            offsets = torch.cat((basis * delta, -basis * delta)).reshape(2 * directions, steps, coords)
-            with torch.no_grad():
-                probes = (commands[:, None] + offsets).reshape(-1, steps, coords)
-                samples = self.rollout(_repeat_state(initial, 2 * directions), order, probes)
-                clocks_match = _same_clocks(primal, samples, 2 * directions)
-            if clocks_match:
-                finite = []
-
-                def attach_fd(value, samples, angles=None):
-                    if not value.requires_grad:
-                        return value
-                    with torch.no_grad():
-                        probes = samples.reshape(batch, 2 * directions, *value.shape[1:])
-                        jac = _central_difference(probes, delta, angles)
-                        finite.append(torch.isfinite(jac).all())
-                    return _CommandJacobian.apply(value.detach(), jac, commands)
-
-                connected = _attach_prediction(primal, samples, order, self.profile, attach_fd)
-                if not finite or torch.stack(finite).all():
-                    return connected
-                del connected
-            del samples
-
-        # A probe crossed an issue clock, its slope was nonfinite, or exact AD was requested.
-        # Packed AD follows the nominal branch locally; FP32 batching can very rarely
-        # change a nominal clock too, in which case retain the original reverse graph.
-        with torch.autograd.forward_ad.dual_level():
-            with torch.no_grad():
-                tangents = basis.repeat(batch, 1).reshape(batch * directions, steps, coords)
-                packed = torch.autograd.forward_ad.make_dual(
-                    commands.detach().repeat_interleave(directions, 0), tangents
-                )
-                forward = self.rollout(_repeat_state(initial, directions), order, packed)
-                if not _same_clocks(primal, forward, directions):
-                    return primal
-
-            def attach_ad(value, dual, angles=None):
-                tangent = torch.autograd.forward_ad.unpack_dual(dual).tangent
-                if tangent is None:
-                    return value  # Constant, or a specialized TorchScript field retaining native reverse mode.
-                return _CommandJacobian.apply(value.detach(), tangent.reshape(batch, directions, -1), commands)
-
-            return _attach_prediction(primal, forward, order, self.profile, attach_ad)

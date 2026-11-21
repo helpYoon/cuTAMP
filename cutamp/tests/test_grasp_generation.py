@@ -133,8 +133,8 @@ def test_grasps_are_made_for_the_objects_a_skeleton_picks(monkeypatch):
         return dict.fromkeys(objs, "grasps")
 
     def sample(plan_gen, *args):
-        next(plan_gen)  # StopIteration after the two skeletons
-        return None, False
+        list(plan_gen)  # draws both skeletons, then the planner has none left
+        raise StopIteration
 
     timer = SimpleNamespace(time=lambda *a, **k: contextlib.nullcontext(), start=lambda m: None,
                             stop=lambda m: 0.0, get_summaries=dict)  # TorchTimer syncs CUDA

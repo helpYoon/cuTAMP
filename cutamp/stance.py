@@ -12,7 +12,6 @@ STEP_YAW_RANGE = (math.radians(-20.0), math.radians(50.0))  # rad, toes out posi
 STEP_SOLE_GAP = 0.02  # m between the two sole rectangles
 STEP_TRAVEL = (0.05, 0.60)  # m
 STEP_KIN_MARGIN = 0.03  # m; measured: the kinematic grid's error (design 5.5)
-STEP_LINE_POSES = 8  # the tested value
 STEP_LIFT = 0.025  # m; placeholder: the study's tested height of the swung sole in the lifted set
 
 

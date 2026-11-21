@@ -17,7 +17,7 @@ from cutamp.stance import stance_joint_limits
 from cutamp.robots.t1 import REAL_LEGS, t1_curobo_cfg
 from cutamp.supported_posture import PostureCollisionSpheres
 
-# Match the supported endpoint fit's CoM-to-pose residual ratio (6 to 50).
+# CoM-to-pose and self-collision-to-pose residual ratios (6 and 24 to 50).
 _CENTER_WEIGHT = 6.0 / 50.0
 _SELF_COLLISION_WEIGHT = 24.0 / 50.0
 
@@ -556,25 +556,6 @@ def _targets(soles, wrist):
     end_r = torch.cat((r, wrist[:, None, :3, :3]), dim=1)
     p = torch.cat((torch.cat((soles[..., :2], o[..., None]), -1), wrist[:, None, :3, 3]), dim=1)
     return torch.cat((p, 0.2 * end_r.transpose(-1, -2).reshape(b, 3, 9)), -1).reshape(b, -1)
-
-
-@torch.no_grad()
-def centered_stance_witnesses(soles, wrist, seeds, arm, other, weight):
-    """Initialize all particles' wrist, sole and projected-CoM residuals in one bounded solve."""
-    kin = _kinematics(soles.device)
-    soles = soles.double()
-    seed = seeds.double().clone()
-    idle = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
-    nominal = seed.new_tensor(REAL_LEGS.home[idle]) if other is None else other
-    seed[:, idle] = nominal.to(seed)
-    lower, upper = stance_joint_limits(soles, kin.lower, kin.upper)
-    lower[:, idle] = upper[:, idle] = seed[:, idle]
-    # As in fit_centered_posture, the wrist and sole residuals have weight 50.
-    center_weight = weight / 50.0
-    center = physical_support_centroid(soles, kin.box)
-    target = torch.cat((_targets(soles, wrist.double()), center_weight * center), -1)
-    q = kin.solve(target, seed, arm, bounds=(lower, upper), center_weight=center_weight, iterations=30)[0]
-    return torch.where(q.isfinite().all(-1, keepdim=True), q, seed).to(seeds)
 
 
 def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None, collides=None, kinematics=None,

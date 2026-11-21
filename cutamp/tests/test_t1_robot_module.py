@@ -57,6 +57,29 @@ def test_nominal_kinematics_reuses_parser_but_owns_spheres(monkeypatch, request)
     assert len(parses) == 2
 
 
+@needs_cuda
+def test_constructing_world_preserves_ik_robot_config():
+    from pathlib import Path
+
+    from curobo.types import DeviceCfg
+
+    from cutamp.envs.utils import get_env_dir, load_env
+    from cutamp.robots import load_t1_container
+    from cutamp.robots.t1 import REAL_LEGS, t1_curobo_cfg
+    from cutamp.step_ik import _Kinematics
+    from cutamp.tamp_world import TAMPWorld
+
+    dc = DeviceCfg()
+    env = load_env(str(Path(get_env_dir()) / "blocks_t1.yml"))
+    for _ in range(2):
+        world = TAMPWorld(env, dc, load_t1_container(REAL_LEGS, dc), dc.to_device(REAL_LEGS.home), grasps={})
+        assert isinstance(t1_curobo_cfg(REAL_LEGS)["robot_cfg"]["kinematics"]["extra_links"]["base_link_pitch"], dict)
+        k = _Kinematics(world.q_init.device)
+        q = world.q_init.reshape(1, -1).double()
+        _, _, com = k.fk(q, "left")
+        assert torch.isfinite(com).all()
+
+
 def _raw_plan_input():
     """A two-segment plan as solve_curobo returns one, every value distinct: each JointState a batch of one, in the
     real legs' joint order reversed plus the head's two locked joints. The balance gate slowed the second segment."""

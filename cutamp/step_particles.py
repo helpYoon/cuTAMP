@@ -255,20 +255,13 @@ def _summary(result, commands, order, initial, validation, i, *, incoming, wrist
         order=order,
         seed_commands=_list(commands[i]),
         commands=_list(result.commands[i]),
-        initial_achieved=_list(result.initial_achieved[i]),
         achieved=_list(result.achieved[i]),
-        initial_margin_gradient=None if result.initial_gradient is None else _list(result.initial_gradient[i]),
-        initial_margin_m=float(result.initial_margin[i]),
-        initial_center_distance_m=float(result.initial_center_distance[i]),
-        initial_center_residual_xy=_list(result.initial_center_residual_xy[i]),
         center_distance_m=float(result.center_distance[i]),
-        initial_center_gradient=None if result.initial_center_gradient is None else _list(result.initial_center_gradient[i]),
         com_xy=_list(ik.com[i, :2]),
         hull_centroid_xy=_list((ik.com[:, :2] - stance_center_residual(ik))[i]),
         margin_m=float(result.margin[i]),
         wrist_position_error_m=float(ik.wrist_pos_error[i]),
         wrist_rotation_error_rad=float(ik.wrist_rot_error[i]),
-        iterations=result.iterations,
         history_source=initial.history_source if isinstance(initial, LandingState) else None,
         failed_rows=[k for k, v in result.rows.items() if (v[i] > 0).any() or not v[i].isfinite().all()],
         steps=[],
@@ -549,8 +542,7 @@ def _refine_batch(
             if active_predictor is not None:
                 prediction = predict_sequence(active_predictor.sequence_model, active_predictor, start, order, cmds)
             ev = _evaluate(active_predictor, start, incoming, order.replace("none", ""), cmds, arm, wrists[j],
-                           seed, margin, coupled_rows, None, None, solve_ik=endpoint_solver(j, rest, seed),
-                           prediction=prediction)
+                           seed, margin, coupled_rows, solve_ik=endpoint_solver(j, rest, seed), prediction=prediction)
             penalties.append(ev.matrix().relu().square().sum(-1))
             center_costs.append(ev.worst_center_squared())
             incoming = ev.ik.soles
@@ -569,10 +561,7 @@ def _refine_batch(
             wrists[j],
             seed,
             margin_m=margin,
-            forward_only=True,
             solve_ik=endpoint_solver(j, rest, seed),
-            centering_weight=config.com_center_weight,
-            max_iterations=0,
             deadline=deadline,
             extra_rows=coupled_rows,
         )

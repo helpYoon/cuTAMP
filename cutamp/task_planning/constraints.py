@@ -13,9 +13,6 @@ from .tamp_structs import Constraint
 class Collision(Constraint):
     """This constraint is used more for typing purposes."""
 
-    def __init__(self):
-        super().__init__()
-
 
 class KinematicConstraint(Constraint):
     def __init__(self, conf, target_pose):
@@ -36,9 +33,6 @@ class ComPolygon(Constraint):
     """Hard filter: particle's final-config COM must project inside the
     stance's support rectangle (``world.model.support``). Mirrors how
     Collision filters particles."""
-
-    def __init__(self):
-        super().__init__()
 
 
 class ComComfort(Constraint):

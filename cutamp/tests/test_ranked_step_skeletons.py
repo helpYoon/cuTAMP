@@ -9,6 +9,7 @@ from cutamp.reachability import ORDERS, ReachMap, apply_command
 from cutamp.step_search import StepSearch, TargetRegion
 from cutamp.task_planning import task_plan_generator
 from cutamp.task_planning.step_schedules import ranked_step_skeletons
+from cutamp.tests.test_step_search import passing
 
 HOME = ((0.0, 0.10, 0.0), (0.0, -0.10, 0.0))
 MENU = ((0.12, 0.20, 0.0), (0.18, 0.20, 0.0))
@@ -85,7 +86,7 @@ def test_reach_evidence_changes_first_grounded_skeleton_before_any_grasp_or_ik(m
     )
     region = TargetRegion(arm, (0.065, 0.005, 0.505), (0.004, 0.004, 0.004))
     ranked = ranked_step_skeletons(
-        StepSearch(atlas, commands=MENU[:1]), skeleton, [region, region], initial, goal, HOME
+        StepSearch(atlas, accuracy=passing("L"), lag=8, commands=MENU[:1]), skeleton, [region, region], initial, goal, HOME
     )
     best = next(ranked)
     assert best.cost == (0, 1) and best.orders == ("L", "none")

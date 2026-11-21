@@ -441,7 +441,7 @@ class ParticleInitializer:
             "right_q0": self.world.q_init.repeat(n, 1),
         }
 
-    def __call__(self, plan_skeleton: PlanSkeleton, verbose: bool = True) -> Optional[Particles]:
+    def __call__(self, plan_skeleton: PlanSkeleton, verbose: bool = True) -> Particles:
         """``config.num_particles`` particles for ``plan_skeleton``. A pool walk solves every eligible grasp once, at
         its pick and its place (G3); :func:`choose_grasps` chooses each pick's grasps from it (``self.grasp_choice``);
         then the particle walk hands each pick's chosen grasps to the particles in turn (G4)."""

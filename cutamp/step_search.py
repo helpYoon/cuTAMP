@@ -136,7 +136,7 @@ class LandingEdge:
 
     @property
     def cost(self):
-        supported = self.accuracy in ("geometric", "no_step") or self.passes > 0
+        supported = self.accuracy == "no_step" or self.passes > 0
         return (int(self.distance_m != 0 or not supported), len(self.commands))
 
 
@@ -187,7 +187,7 @@ class _HandIndex:
 class StepSearch:
     """One immutable map/menu/accuracy profile shared by all queries in a planning run."""
 
-    def __init__(self, atlas, *, accuracy=None, lag=None, commands=COMMANDS, postures=None):
+    def __init__(self, atlas, *, accuracy=None, lag=None, commands=COMMANDS):
         self.lag = lag
         meta = atlas.metadata if atlas is not None else {}
         self.home = _tuples(meta["home_soles"]) if "home_soles" in meta else None
@@ -199,10 +199,7 @@ class StepSearch:
             if self.home is None:
                 raise ValueError("a transported map requires the nominal home_soles in its metadata")
             for arm in ("left", "right"):
-                layers = atlas.layers(self.home, arm)
-                if postures is not None:
-                    layers = [layer for layer in layers if layer["posture"] in postures]
-                self.hands[arm] = _HandIndex(layers, atlas.voxel_size)
+                self.hands[arm] = _HandIndex(atlas.layers(self.home, arm), atlas.voxel_size)
         if self.sole_half.shape != (2,) or not np.isfinite(self.sole_half).all() or (self.sole_half <= 0).any():
             raise ValueError("invalid sole footprint")
         template = _tuples(commands)
@@ -243,8 +240,6 @@ class StepSearch:
     def _accuracy(self, order, commands, exact_start, loaded):
         if order == "none":
             return "no_step", 0, 0
-        if self.lag is None:
-            return "geometric", 0, 0
         passes, trials = self.records.get((order, commands), (0, 0))
         if loaded or not trials:
             return "unknown", 0, 0

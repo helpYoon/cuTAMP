@@ -124,9 +124,9 @@ def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budg
     monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: iter(()))
     monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
     monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: optimize)
-    def candidates(info, *args, return_indices=False, **kwargs):
+    def candidates(info, *args, **kwargs):
         count = len(centers[info["idx"]]) if centers is not None else 0
-        return ([{}] * count, list(range(count))) if return_indices else [{}] * count
+        return [{}] * count, list(range(count))
     monkeypatch.setattr(alg, "get_top_satisfying_particles", candidates)
     monkeypatch.setattr(alg, "_motion_plan_with_retries", plan)
     monkeypatch.setattr(alg, "_planned_metrics", lambda world, plan, candidates, rank: {"motion_plan_rank": rank})

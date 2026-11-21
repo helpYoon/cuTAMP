@@ -13,8 +13,7 @@ support region (:func:`~cutamp.com_polygon_cost._region_halfplanes`, keyframe), 
 floor; small-weight rows choose among the solutions. A cell is in a set only when a configuration found passes
 :func:`_check`, which recomputes every condition from forward kinematics (an existence proof). The sets: ``planner``
 (the full test) and ``lift25`` (the left sole flat 2.5 cm up, no centre-of-mass test). The kinematic set K is the cells in
-both and in the piece of the lifted set that holds home. :class:`ExactStance` is the exact test of a stance that is not
-on the grid.
+both and in the piece of the lifted set that holds home.
 """
 
 import hashlib
@@ -113,10 +112,6 @@ def _strict_fp32():
 
 
 # ------------------------------------------------------------------------------------------------------ geometry
-def _wrap(a):
-    return (a + math.pi) % (2 * math.pi) - math.pi
-
-
 def _stance_world(c, mid_x, lift=0.0):
     """Relative stance c [..., 3] -> world poses (x, y, z, yaw) of the left and right soles, the stance frame at the home
     mid-sole, heading 0."""
@@ -612,66 +607,3 @@ def build_step_set(out_path: Path, log=print) -> None:
     np.savez_compressed(
         Path(out_path), sdf=sdf, xs=xs, ys=ys, ps=ps, rho=np.float64(RHO), fingerprint=np.array(step_set_fingerprint())
     )
-
-
-class ExactStance:
-    """The exact test of a stance ``c`` [N, 3] that need not be on the grid (the study's ``kexact``), on ``world``'s
-    model. :meth:`stand` is the planner's test (soles, limits, centre of mass in the support region, no overlap);
-    :meth:`lift` the same with the left sole flat ``STEP_LIFT`` up and no centre-of-mass test. Each first solves the
-    nearest cell of the kinematic set from the 4 fixed starts, then solves ``c`` from that cell's solution and from the
-    4 fixed starts; ``c`` passes when any of them passes ``_check``. Stances whose soles overlap fail."""
-
-    def __init__(self, world, grid: StepSetGrid | None = None):
-        from scipy import ndimage
-
-        self.rb = _Legs(world.model, world.kinematics_jac)
-        grid = load_step_set() if grid is None else grid
-        self.grid = grid
-        K = grid.sdf < 0
-        _, ind = ndimage.distance_transform_edt(
-            ~K, sampling=(0.02, 0.02, grid.rho * math.radians(5.0)), return_indices=True
-        )
-        X, Y, P = np.meshgrid(grid.xs, grid.ys, grid.ps, indexing="ij")
-        self.near = np.stack([X[tuple(ind)], Y[tuple(ind)], P[tuple(ind)]], -1)  # [nx, ny, nyaw, 3]
-
-    def _nearest_cell(self, c):
-        g = self.grid
-        i = [
-            np.clip(np.round((c[:, k] - a[0]) / (a[1] - a[0])).astype(int), 0, len(a) - 1)
-            for k, a in enumerate((g.xs, g.ys, g.ps))
-        ]
-        return self.near[i[0], i[1], i[2]]
-
-    def _exact(self, c, use_com, lift):
-        c = np.atleast_2d(np.asarray(c, float)).copy()
-        c[:, 2] = _wrap(c[:, 2])
-        out = np.zeros(len(c), bool)
-        gap = _rect_gap(c, self.rb.facts["sole_box"]) > 0
-        if not gap.any():
-            return out
-        c = c[gap]
-        N = len(c)
-        with _strict_fp32():
-            cell = self._nearest_cell(c)
-            q_cell = None
-            for kind in _STARTS:
-                good, q = _try(self.rb, cell, self.rb.seeds(N, kind), use_com, lift)
-                if q_cell is None:
-                    q_cell, found = q.clone(), good.clone()
-                else:
-                    q_cell[good & ~found], found = q[good & ~found], found | good
-            starts = [self.rb.seeds(N, kind) for kind in _STARTS] + [q_cell]
-            passed = torch.zeros(N, dtype=torch.bool, device=self.rb.dev)
-            for q0 in starts:
-                good, _ = _try(self.rb, c, q0, use_com, lift)
-                passed |= good
-        out[gap] = passed.cpu().numpy()
-        return out
-
-    def stand(self, c) -> np.ndarray:
-        """Batched: ``c`` ``[K, 3]`` -> bool ``[K]``."""
-        return self._exact(c, True, 0.0)
-
-    def lift(self, c) -> np.ndarray:
-        """Batched: ``c`` ``[K, 3]`` -> bool ``[K]``."""
-        return self._exact(c, False, STEP_LIFT)

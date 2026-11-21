@@ -93,14 +93,8 @@ def transform_spheres(
 def transform_points(
     points: torch.Tensor, transform: torch.Tensor
 ) -> torch.Tensor:
-    """Transform [num_points, 3] points by [*b, 4, 4] transformation matrices into [*b, num_points, 3]."""
+    """Transform [num_points, 3] points by a 4x4 transformation matrix into [num_points, 3]."""
     points_hom = torch.cat([points, torch.ones_like(points[:, :1])], dim=1)
-
-    # Add a dimension to broadcast over num_points
-    if transform.ndim > 2:
-        # (*b, 4, 4) -> (*b, 1, 4, 4)
-        transform = transform.unsqueeze(-3)
-
     out_points_hom = torch.einsum("...ij,...j->...i", transform, points_hom)
     out_points = out_points_hom[..., :3]
     return out_points

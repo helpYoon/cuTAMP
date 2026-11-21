@@ -55,24 +55,6 @@ def test_real_step_grid_has_model_fingerprint_and_supports_paired_seed():
     c = torch.tensor([[0.12, 0.21, 0.0], [0.12, -0.21, 0.0]])
     sides = torch.tensor([True, False])
     assert (b.g(c, sides) <= 0).all()
-    torch.testing.assert_close(b.hard_bound(c * torch.tensor([0.0, 1.0, 1.0]), c, sides), c)
-
-
-def test_geometric_sweep_rejects_blocked_side_before_the_second_landing():
-    from types import SimpleNamespace
-    from curobo.scene import Cuboid
-    from cutamp.robots.t1 import REAL_LEGS
-    from cutamp.sole_collision import geometric_sweep_rows
-
-    obstacle = Cuboid(name="brick", pose=[0.19, 0.10, 0.02, 1, 0, 0, 0], dims=[0.04, 0.04, 0.04])
-    world = SimpleNamespace(model=REAL_LEGS, statics=[obstacle], q_init=torch.zeros(33))
-    feet = torch.tensor([[[0.0, 0.10, 0.0], [0.0, -0.10, 0.0]]])
-    u = torch.tensor([[[0.30, 0.20, 0.0], [-0.05, -0.21, 0.0]]], requires_grad=True)
-    rows = geometric_sweep_rows(world, {}, {})(feet, "LR", u)
-    assert rows["step1_sweep"].item() > 0
-    r = geometric_sweep_rows(world, {}, {})(feet, "R", torch.tensor([[[0.30, -0.20, 0.0]]]))
-    assert r["step1_sweep"].item() < 0
-    assert torch.autograd.grad(rows["step1_sweep"].sum(), u)[0].isfinite().all()
 
 
 def test_hull_area_centroid_matches_independent_polygon_and_command_derivative():

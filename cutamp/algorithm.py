@@ -19,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from threading import local
 from time import monotonic
-from typing import Callable, List, Union, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -141,9 +141,9 @@ def get_top_satisfying_particles(
     constraint_checker: ConstraintChecker,
     cost_reducer: CostReducer,
     n: int,
-    *, return_indices: bool = False,
-) -> List[dict]:
-    """Order feasible motion candidates by worst manipulation CoM distance, then secondary effort.
+) -> Tuple[List[dict], List[int]]:
+    """Order feasible motion candidates by worst manipulation CoM distance, then secondary effort; return them with
+    their particle indices.
 
     Disabling centering selects the grasp-group retry order.
     """
@@ -181,9 +181,7 @@ def get_top_satisfying_particles(
             soft = cost_reducer.soft_costs(cost_dict)[satisfying_mask]
             order = grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n)
     candidates = [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
-    if return_indices:
-        return candidates, satisfying_mask.nonzero(as_tuple=True)[0][order].tolist()
-    return candidates
+    return candidates, satisfying_mask.nonzero(as_tuple=True)[0][order].tolist()
 
 
 def sample_plan_skeleton(
@@ -194,7 +192,7 @@ def sample_plan_skeleton(
     plan_count: int,
     constraint_checker: ConstraintChecker,
     particle_initializer: ParticleInitializer,
-) -> Tuple[Union[dict, None], bool]:
+) -> Tuple[dict, bool]:
     """
     Try sampling a plan skeleton (if any remain), then its particles and compute the heuristic.
     Returns the plan_info dict and whether any satisfying particles were found upon initialization.
@@ -206,8 +204,6 @@ def sample_plan_skeleton(
     # Sample particles
     with timer.time("initialize_particles"):
         plan_particles = particle_initializer(plan_skeleton)
-    if plan_particles is None:  # failed subgraph
-        return None, False
 
     # Rollout particles and compute costs
     rollout_fn = RolloutFunction(plan_skeleton, world)
@@ -524,11 +520,10 @@ def run_cutamp(
     # Sample initial plans and particles
     center_first = config.com_center_weight != 0
     found_solution_initially = False
-    num_skipped_plans = 0
     plan_count = 0
 
     def initialized_skeletons():
-        nonlocal num_skipped_plans, plan_count
+        nonlocal plan_count
         for idx in range(config.num_initial_plans):
             if (config.max_loop_dur is not None and timer.has_timer("start_optimization")
                     and timer.elapsed("start_optimization") >= config.max_loop_dur):
@@ -540,9 +535,6 @@ def run_cutamp(
             except StopIteration:
                 return
             plan_count += 1
-            if plan_info is None:
-                num_skipped_plans += 1
-                continue
             yield plan_info, has_solution
 
     pending_plans = initialized_skeletons()
@@ -556,12 +548,11 @@ def run_cutamp(
 
     with timer.time("sort_plans"):
         plan_queue.sort(key=lambda x: x["heuristic"])
-    _log.info(f"Num plans: {len(plan_queue)}, num skipped: {num_skipped_plans}")
+    _log.info(f"Num plans: {len(plan_queue)}")
     overall_metrics = {
         "grasp_proposals_by_object": grasp_counts,
         "num_optimized_plans": 0,
         "num_initial_plans": plan_count,
-        "num_skipped_plans": num_skipped_plans,
         "num_satisfying_final": 0,
         "num_particles": config.num_particles,
         "best_cost": float("inf"),
@@ -626,7 +617,7 @@ def run_cutamp(
             motion = None
             if config.curobo_plan:
                 candidates, indices = get_top_satisfying_particles(
-                    plan_info, constraint_checker, cost_reducer, n=config.motion_plan_max_retries, return_indices=True,
+                    plan_info, constraint_checker, cost_reducer, n=config.motion_plan_max_retries,
                 )
                 motion, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
                     plan_info, candidates, world, config, timer, None if center_first else visualizer,
@@ -664,7 +655,6 @@ def run_cutamp(
 
     # Dump metrics out
     overall_metrics["num_initial_plans"] = plan_count
-    overall_metrics["num_skipped_plans"] = num_skipped_plans
     overall_metrics["found_solution"] = found_solution
     exp_logger.log_dict("overall_metrics", overall_metrics)
     exp_logger.log_dict("timer_metrics", timer.get_summaries())
@@ -747,7 +737,7 @@ def _load_predictor(config):
         key = (version, sequence_version, stream.device, stream.cuda_stream)
         if getattr(_PREDICTOR_CACHE, "key", None) == key:
             return _PREDICTOR_CACHE.model
-    predictor = LandingPredictor(path, derivative_method="autodiff", use_cuda_graph=config.cuda_graphs)
+    predictor = LandingPredictor(path, use_cuda_graph=config.cuda_graphs)
     predictor.sequence_model = load_step_sequence_model(
         sequence_path, predictor.device, expected_deployment=predictor.metadata["deployment_sha256"]
     )
@@ -777,8 +767,6 @@ def _refine_standing_schedule(
         info, _ = sample_plan_skeleton(iter((plan,)), world, config, timer, 0, checker, initializer)
     except NoGraspCandidates as e:
         return StepResult([], None, "initialization_failed", str(e))
-    if info is None:
-        return StepResult([], None, "initialization_failed")
     if deadline is not None and monotonic() >= deadline:
         return StepResult([], None, "budget_exhausted", "standing initialization reached the time limit")
     optimizer(info, timer, visualizer, deadline=deadline)
@@ -816,9 +804,7 @@ def _refine_standing_schedule(
         ]
     diagnostics = {}
     if config.curobo_plan:
-        candidates, row_ids = get_top_satisfying_particles(
-            info, checker, reducer, config.motion_plan_max_retries, return_indices=True
-        )
+        candidates, row_ids = get_top_satisfying_particles(info, checker, reducer, config.motion_plan_max_retries)
         motion, traj, tries, rank, failed = _motion_plan_with_retries(
             info,
             candidates,

@@ -138,14 +138,6 @@ def test_swing_geometry_clearance_and_control_derivative(rollout_scene):
     rows = sweep_constraint_rows(world, adapter, result, fixed)
     (grad,) = torch.autograd.grad(rows["swept_geometry"].sum(), command)
     assert torch.isfinite(grad).all() and grad[0, 0, 0].abs() > 0.01
-    cached = sweep_constraint_rows(world, adapter, p.linearize_autodiff(start, "L", command), fixed)["swept_geometry"]
-    (cached_grad,) = torch.autograd.grad(cached.sum(), command)
-    torch.testing.assert_close(cached, rows["swept_geometry"], rtol=0, atol=0)
-    torch.testing.assert_close(cached_grad, grad, rtol=0.001, atol=0.0004)
-    fd = sweep_constraint_rows(world, adapter, p.linearize(start, "L", command), fixed)["swept_geometry"]
-    (fd_grad,) = torch.autograd.grad(fd.sum(), command)
-    torch.testing.assert_close(fd, rows["swept_geometry"], rtol=0, atol=0)
-    torch.testing.assert_close(fd_grad, grad, rtol=0.04, atol=0.015)
     # A carried block grazes a foreign arm/body; the exemption applies to its holding hand only.
     body_at_trunk = pose.clone()
     body_at_trunk[:3, 3] = 0
@@ -158,8 +150,19 @@ def test_swing_geometry_clearance_and_control_derivative(rollout_scene):
 @needs_cuda
 @torch.no_grad()
 def test_dense_collision_chunks_keep_each_particles_peaks(rollout_scene):
-    from cutamp.step_proposals import _rows
+    from dataclasses import fields, is_dataclass
+
     from cutamp.step_validation import validate_step_geometry
+
+    def select(value, indices):
+        """Select complete particles, including their physical traces and policy histories."""
+        if torch.is_tensor(value):
+            return value.index_select(0, indices)
+        if is_dataclass(value):
+            return type(value)(**{f.name: select(getattr(value, f.name), indices) for f in fields(value)})
+        if isinstance(value, tuple):
+            return tuple(select(v, indices) for v in value)
+        return value
 
     predictor, adapter, world, _, start, command = rollout_scene
     trace = predictor.rollout(start, "L", command)
@@ -174,7 +177,7 @@ def test_dense_collision_chunks_keep_each_particles_peaks(rollout_scene):
     assert expected[0]["valid"].item() and not expected[1]["valid"].item()
     # More than 2048 frames, with the chunk boundary inside a particle trajectory.
     rows = torch.arange(21, device=command.device) % 2
-    repeated = _rows(trace, torch.zeros_like(rows))
+    repeated = select(trace, torch.zeros_like(rows))
     actual = validate_step_geometry(world, adapter, repeated, object_poses={"block2": poses[rows]})
     assert torch.equal(actual["valid"], rows == 0)
     for name, peak in actual["penetration"].items():

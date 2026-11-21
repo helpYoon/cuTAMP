@@ -165,7 +165,7 @@ def main():
     query.add_argument("--plot", action="store_true", help="Draw the stored witnesses and write PNG and HTML")
     search = commands.add_parser("search", help="Rank complete step schedules for ordered target regions on CPU")
     search.add_argument("--targets", type=Path, help="JSON list of TargetRegion records; defaults to the 48 cm pick and place example")
-    search.add_argument("--lag", type=int, help="Use profiled landing accuracy at this actuator delay; omit for geometric scoring")
+    search.add_argument("--lag", type=int, help="Use profiled landing accuracy at this actuator delay; without it every step's accuracy is unknown")
     search.add_argument("--accuracy", type=Path, default=LANDING_ACCURACY)
     search.add_argument("--limit", type=int, default=1, help="Maximum number of endpoint paths to print as JSON lines")
     build.add_argument("--map", type=Path, help="Output NPZ (defaults to a separate t1-nominal-hand-map.npz with --nominal-only)")

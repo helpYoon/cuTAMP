@@ -87,8 +87,16 @@ def profile(order, trials):
     }
 
 
+def passing(*orders):
+    """A lag-8 profile in which each single-step order passed one trial of FWD."""
+    records = profile(orders[0], [{"lag": 8, "stages": [stage(orders[0])]}])
+    for order in orders[1:]:
+        records["schedules"] += profile(order, [{"lag": 8, "stages": [stage(order)]}])["schedules"]
+    return records
+
+
 def test_carry_incoming_feet_and_rank_complete_paths_against_enumeration():
-    search = StepSearch(atlas(), commands=(FWD,))
+    search = StepSearch(atlas(), accuracy=passing("L", "R"), lag=8, commands=(FWD,))
     goals = (target(0.065), target(0.065))
     initial = search.edges(HOME, goals[0])
     assert [e.order for e in initial] == list(ORDERS)
@@ -258,7 +266,14 @@ def test_search_command_reads_region_list_and_emits_selected_commands(tmp_path, 
     atlas().save(path)
     targets = tmp_path / "targets.json"
     targets.write_text(json.dumps([{"arm": "left", "center": [0.065, 0.005, 0.505], "size": [0.008, 0.008, 0.008]}]))
-    monkeypatch.setattr(sys, "argv", ["t1_reachability", "search", "--map", str(path), "--targets", str(targets)])
+    records = passing("L")
+    records["schedules"][0]["commands"] = [[0.12, 0.21, 0]]
+    accuracy = tmp_path / "accuracy.json"
+    accuracy.write_text(json.dumps(records))
+    monkeypatch.setattr(sys, "argv", [
+        "t1_reachability", "search", "--map", str(path), "--targets", str(targets),
+        "--lag", "8", "--accuracy", str(accuracy),
+    ])
     main()
     row = json.loads(capsys.readouterr().out)
     assert row["cost"] == [0, 1] and row["edges"][0]["order"] == "L"
@@ -266,7 +281,7 @@ def test_search_command_reads_region_list_and_emits_selected_commands(tmp_path, 
 
 
 def test_fixed_order_schedule_keeps_endpoint_alternatives_and_validates_length():
-    s = StepSearch(atlas(), commands=(FWD, (0.24, 0.20, 0)))
+    s = StepSearch(atlas(), accuracy=passing("L"), lag=8, commands=(FWD, (0.24, 0.20, 0)))
     targets = (target(0.065), target(0.065))
     paths = list(s.schedules(HOME, targets, orders=("L", "none")))
     assert len(paths) == 2 and [p.cost for p in paths] == [(0, 1), (2, 1)]

@@ -143,56 +143,6 @@ def test_expired_budget_interrupts_the_next_gap_evaluation(monkeypatch, one_cpu_
     assert len(calls) == (0 if expired_on_entry else 1)
 
 
-def test_zero_centering_weight_retains_the_feasible_command(one_cpu_thread):
-    from cutamp.step_refinement import refine_gap
-
-    wrist, seed = paired_inputs("cpu", torch.float32)
-    stance = seed.new_tensor([[[0.05220935, 0.10788354, -0.00239709], [0.04830433, -0.11117852, 0.0197674]]]).expand(
-        2, -1, -1
-    )
-    command = seed.new_tensor([[[0.12, 0.21, 0.0]]]).expand(2, -1, -1)
-    hard = refine_gap(None, stance, "L", command, "left", wrist, seed, max_iterations=4, centering_weight=0)
-    soft = refine_gap(None, stance, "L", command, "left", wrist, seed, max_iterations=4)
-    assert hard.ok.all() and soft.ok.all()
-    torch.testing.assert_close(hard.commands[0], command[0])
-    assert (soft.center_distance < hard.center_distance - 0.001).all()
-    assert (soft.margin >= 0.05).all()
-
-
-def test_shared_stance_improves_both_tied_worst_reaches(one_cpu_thread):
-    from cutamp.stance import abs_pose
-    from cutamp.step_refinement import refine_gap
-
-    wrist, seed = paired_inputs("cpu", torch.float32)
-    stance = seed.new_tensor([[[0.05220935, 0.10788354, -0.00239709], [0.04830433, -0.11117852, 0.0197674]]])
-    command = seed.new_tensor([[[0.12, 0.21, 0.0]]])
-    start = abs_pose(stance[:, 1], command[:, 0])
-
-    def future_reaches(prediction, ik):
-        dx, dy = (ik.soles[:, 0, :2] - start[:, :2]).unbind(-1)
-        # Both 22 cm endpoints must improve. An easier third reach has a bigger
-        # derivative in the opposite direction and dominates a sum of squares.
-        distances = (0.22 - dx, 0.22 - dy, 0.12 + 5 * (dx + dy))
-        return {}, [torch.stack((z, torch.zeros_like(z)), dim=-1) for z in distances]
-
-    refined = refine_gap(
-        None,
-        stance,
-        "L",
-        command,
-        "left",
-        wrist[:1],
-        seed[:1],
-        extra_rows=future_reaches,
-        max_iterations=2,
-        centering_weight=1e-3,
-    )
-    assert refined.ok.item()
-    assert refined.center_distance.item() < 0.22
-    _, reaches = future_reaches(None, refined.ik)
-    assert max(r.norm().item() for r in reaches) < 0.217
-
-
 @pytest.mark.parametrize("arm", ["left", "right"])
 @pytest.mark.parametrize("center_posture", [False, True])
 def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, center_posture, one_cpu_thread):
