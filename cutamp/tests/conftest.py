@@ -119,6 +119,21 @@ def real_plan(real_world):
     plan.clear()
 
 
+def only_schedule(monkeypatch, orders, arm):
+    """Pass on only the joint A*'s skeletons whose picks and places all use ``arm`` with these foot ``orders``."""
+    from cutamp.task_planning import arm_step_search
+
+    search = arm_step_search.arm_step_skeletons
+
+    def matching(*args, **kwargs):
+        for proposal in search(*args, **kwargs):
+            arms = {op.operator.metadata.arm for op in proposal.skeleton if op.operator.metadata.is_actionable}
+            if proposal.orders == tuple(orders) and arms == {arm}:
+                yield proposal
+
+    monkeypatch.setattr(arm_step_search, "arm_step_skeletons", matching)
+
+
 def clone_particles(particles: dict) -> dict:
     """Fresh leaf copies of ``particles``, each keeping its ``requires_grad``."""
     return {k: v.detach().clone().requires_grad_(v.requires_grad) for k, v in particles.items()}

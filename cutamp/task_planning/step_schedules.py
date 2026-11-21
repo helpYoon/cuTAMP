@@ -2,7 +2,6 @@
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
-from math import comb
 from time import monotonic
 
 from cutamp.reachability import ORDERS
@@ -86,53 +85,6 @@ def bind_schedule(search, skeleton, targets, initial, goal, incoming, path, opti
     primary = _bound_seed(path, soles)
     alternatives = _alternatives(search, incoming, targets, orders, tuple(primary.commands.values()), soles, options)
     return RankedStepSkeleton(grounded, orders, primary, alternatives)
-
-
-def ranked_step_skeletons(
-    search: StepSearch,
-    skeleton: PlanSkeleton,
-    regions: Sequence[TargetRegion | None],
-    initial: State,
-    goal: State,
-    incoming_soles,
-    *,
-    orders=None,
-    deadline=None,
-    step_count=None,
-    prefer_reach=False,
-) -> Iterator[RankedStepSkeleton]:
-    """Yield each sampled order schedule once, ranked by its best compatible endpoint path.
-
-    Supply one world target region per pick/place, or None for unknown geometry.
-    A command is relative to that step's incoming support foot. The edge
-    retains the nominal outgoing world soles and the hand map's posture witness.
-    """
-    targets = _targets(skeleton, regions, initial)
-    incoming = tuple(tuple(row) for row in incoming_soles)
-    seen_orders = set()
-    max_orders = len(ORDERS) ** len(targets) if orders is None else 1
-    options = {} if deadline is None else {"deadline": deadline}
-    if prefer_reach:
-        options["prefer_reach"] = True
-    if step_count is not None:
-        options["step_count"] = step_count
-        n = len(targets)
-        if orders is None:
-            # Choose the gaps containing two and one steps, then their first feet.
-            max_orders = sum(
-                comb(n, two) * comb(n - two, one) * 2 ** (two + one)
-                for two in range(step_count // 2 + 1)
-                if 0 <= (one := step_count - 2 * two) <= n - two
-            )
-    fixed = {} if orders is None else {"orders": orders}
-    for path in search.schedules(incoming, targets, **fixed, **options):
-        orders = tuple(edge.order for edge in path.edges)
-        if orders in seen_orders:
-            continue
-        seen_orders.add(orders)
-        yield bind_schedule(search, skeleton, targets, initial, goal, incoming, path, options)
-        if len(seen_orders) == max_orders:
-            return
 
 
 def unseeded_step_skeletons(

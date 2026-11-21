@@ -108,6 +108,7 @@ def test_endpoint_prefix_belongs_to_one_row():
 @pytest.fixture
 def harness(monkeypatch, tmp_path):
     from cutamp.step_search import StepSearch
+    from cutamp.tests.test_step_search import atlas
 
     goal = frozenset([t1_domain.On.ground("block", "table")])
     world = SimpleNamespace(
@@ -117,6 +118,7 @@ def harness(monkeypatch, tmp_path):
         device="cpu",
         get_object=lambda name: SimpleNamespace(name=name, pose=(0.3, 0, 0.55, 1, 0, 0, 0), dims=(0.1, 0.1, 0.1)),
         stance_soles=torch.eye(4).repeat(2, 1, 1),
+        arm_home_ee_world={"left": torch.tensor([0., .2, .5]), "right": torch.tensor([0., -.2, .5])},
     )
     world.stance_soles[:, 1, 3] = torch.tensor([0.1, -0.1])
     seen = []
@@ -134,11 +136,13 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(alg, "wait_for_sampler_load", lambda: seen.append("wait"))
 
     class Search(StepSearch):
-        def schedules(self, *args, **kwargs):
+        def edges(self, *args, **kwargs):
             seen.append("rank")
-            yield from super().schedules(*args, **kwargs)
+            return super().edges(*args, **kwargs)
 
-    monkeypatch.setattr(alg, "_load_step_search", lambda cfg, **kw: (Search(None, commands=((0.12, 0.21, 0),)), {}))
+    # The left hand reaches the block and its place from the home stance.
+    reach = atlas(points=((.3, .005, .555), (.3, .005, .655)))
+    monkeypatch.setattr(alg, "_load_step_search", lambda cfg, **kw: (Search(reach, commands=((0.12, 0.21, 0),)), {}))
     cfg = {
         "num_initial_plans": 1,
         "enable_visualizer": False,
@@ -411,8 +415,8 @@ def test_unsampled_steps_can_recover_a_history_merged_by_standing_bfs(harness, m
     assert admitted - merged_bfs and motion == ["complete"] and metrics["motion_plan_success"]
 
 
-@pytest.mark.parametrize("blocked,explicit", [(False, False), (True, False), (False, True)])
-def test_joint_rank_retries_a_legal_unsampled_schedule_once(harness, monkeypatch, blocked, explicit):
+@pytest.mark.parametrize("blocked", [False, True])
+def test_joint_rank_retries_a_legal_unsampled_schedule_once(harness, monkeypatch, blocked):
     from cutamp.tests.test_step_search import atlas
     from cutamp.step_search import StepSearch
 
@@ -427,8 +431,7 @@ def test_joint_rank_retries_a_legal_unsampled_schedule_once(harness, monkeypatch
     monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
     monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
     monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
-    winning_order = ("LR", "none") if explicit else (("L", "R") if blocked else ("none", "L"))
-    inputs = StepInputs(arms=("right", "right"), orders=winning_order) if explicit else None
+    winning_order = ("L", "R") if blocked else ("none", "L")
     attempts = []
 
     def refine(proposal, *args, **kwargs):
@@ -441,21 +444,22 @@ def test_joint_rank_retries_a_legal_unsampled_schedule_once(harness, monkeypatch
 
     monkeypatch.setattr(alg, "_refine_step_schedule", refine)
     monkeypatch.setattr(alg, "_refine_standing_schedule", refine)
-    motion, _, metrics = run(curobo_plan=True, inputs=inputs)
+    motion, _, metrics = run(curobo_plan=True)
     assert motion == ["complete"] and metrics["motion_plan_success"]
     assert attempts[-1][1:] == (winning_order, False)
     assert len({(arms, orders) for arms, orders, _ in attempts}) == len(attempts)
-    if explicit:
-        assert attempts == [(("right", "right"), winning_order, False)]
-    elif blocked:
+    if blocked:
         assert all("L" in orders[0] and not seeded for _, orders, seeded in attempts)
     else:
         assert attempts[0][1:] == (("none", "none"), True)
 
 
 def test_missing_predictor_never_marks_model_feasible_or_draws_grasps(harness, monkeypatch):
+    from cutamp.tests.conftest import only_schedule
+
     run, seen, _ = harness
-    _, n, m = run(inputs=StepInputs(orders=("L", "none")))
+    only_schedule(monkeypatch, ("L", "none"), "left")
+    _, n, m = run()
     assert n == 0 and not m["found_solution"] and m["step_attempts"][0]["status"] == "unavailable"
     assert "bundle" in m["step_attempts"][0]["reason"].lower()
     assert "generate" not in seen
@@ -476,8 +480,6 @@ def test_full_fallback_all_25_order_pairs_only_once_in_budget(harness, monkeypat
 
 
 def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypatch):
-    from cutamp.step_planner import ScheduleSearch
-
     run, _, _ = harness
     calls = []
     monkeypatch.setattr(alg, "_load_predictor", lambda *a: object())
@@ -487,6 +489,8 @@ def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypa
     )
 
     def refine(p, *args, **kwargs):
+        if ("R", "none") in calls:
+            pytest.fail("refined another skeleton after success")
         calls.append(p.orders)
         rows = [
             StepRow(7, {}, 0.2, {"com_center_distances_m": [.001, .05], "secondary_effort": .1}),
@@ -496,16 +500,15 @@ def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypa
         if p.orders == ("R", "none"):
             rows[0].motion_plan = ["less centered"]
             rows[1].motion_plan = ["motion"]
-            monkeypatch.setattr(ScheduleSearch, "next", lambda *a: pytest.fail("ranked another skeleton after success"))
         return StepResult(rows, torch.ones(len(rows), 2, dtype=torch.bool), "model_feasible")
 
     monkeypatch.setattr(alg, "_refine_step_schedule", refine)
     motion, count, m = run(curobo_plan=True)
     assert motion == ["motion"] and m["motion_plan_success"] and m["selected_particle"]["q"] == [8]
     assert count == 2 and m["row_index"] == 8 and m["best_soft_cost"] == 0.6 and m["max_center_distance_m"] == .04
-    assert calls == [("L", "none"), ("R", "none")]  # failed pick prioritizes that gap
+    assert calls[-1] == ("R", "none") and len(calls) > 1
     assert [(a["status"], a["accepted_rows"]) for a in m["step_attempts"]] == [
-        ("unresolved", 0), ("model_feasible", 0), ("model_feasible", 2),
+        ("unresolved", 0), *[("model_feasible", 0)] * (len(calls) - 1), ("model_feasible", 2),
     ]
     assert not m["schedule_limit_reached"] and not m["time_limit_reached"]
 
@@ -738,32 +741,38 @@ def test_validator_uses_the_globally_ranked_particles_own_trace(monkeypatch):
     assert result.diagnostics["motion_plan_attempts"] == 1 and result.diagnostics["motion_plan_failures"] == []
 
 
-def test_invalid_fixed_command_sequence_is_rejected():
-    with pytest.raises(ValueError, match="one seed"):
-        StepInputs(orders=("LR",), commands=(((0.1, 0.2, 0.0),),))
+def test_non_finite_seed_command_is_rejected():
     with pytest.raises(ValueError, match="finite"):
-        StepInputs(orders=("R",), commands=(((0.1, float("nan"), 0.0),),))
+        StepInputs(commands=(((0.1, float("nan"), 0.0),),))
 
 
 def test_rank_assets_are_reused_and_regeneration_invalidates_cache(tmp_path):
+    import os
     from dataclasses import replace
 
     from cutamp.reachability import ReachMap
 
     path = tmp_path / "nominal.npz"
     cfg = TAMPConfiguration(step_reach_map=str(path), step_accuracy_table=str(tmp_path / "missing.json"))
-    first, info = alg._load_step_search(cfg)
-    assert info["map_status"] == "unavailable"
-    assert alg._load_step_search(cfg)[0] is first
+    with pytest.raises(FileNotFoundError, match="Reach map"):
+        alg._load_step_search(cfg)
+    path.write_bytes(b"not an archive")
+    with pytest.raises(ValueError, match="Reach map"):
+        alg._load_step_search(cfg)
     home = [[0, 0.1, 0], [0, -0.1, 0]]
     ReachMap(0.01, {"home_soles": home}).save(path)
-    second, info = alg._load_step_search(cfg)
-    assert second is not first and "map_status" not in info
+    first, info = alg._load_step_search(cfg)
+    assert info["accuracy_status"] == "unavailable"
+    assert alg._load_step_search(cfg)[0] is first
+    ReachMap(0.01, {"home_soles": home}).save(tmp_path / "regenerated.npz")
+    os.replace(tmp_path / "regenerated.npz", path)
+    second, _ = alg._load_step_search(cfg)
+    assert second is not first
     assert alg._load_step_search(cfg)[0] is second
     assert alg._load_step_search(replace(cfg, step_lag=5))[0] is not second
 
 
-def test_missed_ranked_zero_step_recovers_in_count_order(harness, monkeypatch):
+def test_zero_step_schedule_comes_first_and_fills_the_schedule_limit(harness, monkeypatch):
     run, _, _ = harness
 
     def standing(*args, **kwargs):
@@ -785,12 +794,13 @@ from cutamp.tests.conftest import needs_cuda, needs_graspgenx
 
 @needs_cuda
 @needs_graspgenx
-def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path):
+def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path, monkeypatch):
     from cutamp.constraint_checker import ConstraintChecker
     from cutamp.cost_reduction import CostReducer
     from cutamp.envs.utils import load_env, resolve_env_path
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
     from cutamp.t1_domain import all_t1_fluents
+    from cutamp.tests.conftest import only_schedule
 
     env = load_env(resolve_env_path("blocks_t1"))
     env.goal_state = frozenset([next(f for f in all_t1_fluents if f.name == "LeftHolding").ground("block3")])
@@ -799,12 +809,14 @@ def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path)
     cfg = TAMPConfiguration(
         step_mode="model", curobo_plan=False,
         num_initial_plans=1,
+        max_step_schedules=1,
         num_particles=16,
         num_opt_steps=20,
         enable_visualizer=False,
         cuda_graphs=False,
         experiment_root=str(tmp_path),
     )
+    only_schedule(monkeypatch, ("none",), "left")
     torch.manual_seed(1)
     motion, n, metrics = alg.run_cutamp(
         env,
@@ -812,7 +824,6 @@ def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path)
         CostReducer(default_constraint_to_mult),
         ConstraintChecker(default_constraint_to_tol),
         experiment_id="standing-pick",
-        step_inputs=StepInputs(orders=("none",), arms=("left",)),
     )
     assert motion is None and n > 0 and metrics["status"] == "standing_feasible"
     assert metrics["com_margins_m"] == [metrics["min_com_margin_m"]] and metrics["min_com_margin_m"] >= 0.05

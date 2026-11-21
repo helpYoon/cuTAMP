@@ -189,17 +189,14 @@ class StepSearch:
 
     def __init__(self, atlas, *, accuracy=None, lag=None, commands=COMMANDS):
         self.lag = lag
-        meta = atlas.metadata if atlas is not None else {}
-        self.home = _tuples(meta["home_soles"]) if "home_soles" in meta else None
+        meta = atlas.metadata
+        if "home_soles" not in meta:
+            raise ValueError("a transported map requires the nominal home_soles in its metadata")
+        self.home = _tuples(meta["home_soles"])
         self.sole_half = np.asarray(meta.get("sole_box_m", (0.224868, 0.10)), dtype=float) / 2
         # Older T1 maps record only the planar footprint. Their URDF foot box is 43.66 mm tall.
         self.foot_height = float(meta.get("foot_height_m", 0.04366))
-        self.hands = {}
-        if atlas is not None:
-            if self.home is None:
-                raise ValueError("a transported map requires the nominal home_soles in its metadata")
-            for arm in ("left", "right"):
-                self.hands[arm] = _HandIndex(atlas.layers(self.home, arm), atlas.voxel_size)
+        self.hands = {arm: _HandIndex(atlas.layers(self.home, arm), atlas.voxel_size) for arm in ("left", "right")}
         if self.sole_half.shape != (2,) or not np.isfinite(self.sole_half).all() or (self.sole_half <= 0).any():
             raise ValueError("invalid sole footprint")
         template = _tuples(commands)
@@ -268,7 +265,7 @@ class StepSearch:
         known = target.center is not None and target.size is not None
         if known:
             center, half = np.asarray(target.center), tuple(np.asarray(target.size) / 2)
-        arm_map = self.hands.get(target.arm)
+        arm_map = self.hands[target.arm]
         exact_start = self.profile_stance is not None and np.allclose(incoming, self.profile_stance, atol=1e-7, rtol=0)
         candidates = []
         # Share composed prefixes, including between a one-step and its two-step alternatives.
@@ -289,7 +286,7 @@ class StepSearch:
             if self.blocked_feet(feet, target):
                 continue
             gap, posture, q = None, None, None
-            if known and arm_map is not None:
+            if known:
                 _, frame = canonical_stance(feet)
                 local = (*((center[:2] - frame[:2]) @ _rot(-frame[2])), center[2])
                 gap, posture, q = arm_map.nearest(local, half, target.yaw - frame[2])
@@ -297,7 +294,7 @@ class StepSearch:
             candidates.append(LandingEdge(order, commands, feet, steps, gap, posture, q, *evidence))
         return tuple(candidates)
 
-    def schedules(self, incoming_soles, targets, *, orders=None, deadline=None, step_count=None, prefer_reach=False):
+    def schedules(self, incoming_soles, targets, *, orders=None, deadline=None, prefer_reach=False):
         """Yield complete endpoint paths in lexicographic A* order, preserving alternatives.
 
         Defer one-action lookahead until a partial path reaches the top of the
@@ -310,8 +307,6 @@ class StepSearch:
             orders = tuple(orders)
             if len(orders) != len(targets) or any(order not in ORDERS for order in orders):
                 raise ValueError("supply one exact foot order per manipulation")
-        if step_count is not None and not 0 <= step_count <= 2 * len(targets):
-            raise ValueError("Step count is outside the capacity of the manipulation gaps")
         start = _tuples(_soles_array(incoming_soles))
         queue = []
         serial = count()
@@ -334,9 +329,6 @@ class StepSearch:
                 edges = self.edges(path[-1].soles if path else start, targets[len(path)])
                 if orders is not None:
                     edges = tuple(e for e in edges if e.order == orders[len(path)])
-                if step_count is not None:
-                    later_capacity = 2 * (len(targets) - len(path) - 1)
-                    edges = tuple(e for e in edges if 0 <= step_count - cost[1] - e.cost[1] <= later_capacity)
                 if edges:
                     push(path, cost, gap, edges)
             else:

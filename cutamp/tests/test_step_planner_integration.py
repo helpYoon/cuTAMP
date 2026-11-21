@@ -1,5 +1,6 @@
 """Matched local-GPU acceptance through the public cuTAMP entry point."""
 
+import pytest
 import torch
 
 from cutamp.algorithm import run_cutamp
@@ -8,7 +9,7 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-from cutamp.tests.conftest import needs_cuda
+from cutamp.tests.conftest import needs_cuda, only_schedule
 from cutamp.tests.paired_grasp_scene import paired_setup
 
 
@@ -28,15 +29,17 @@ def paired_case(label, output, *, place=False, motion=False, validator=None, mot
         landing_bundle=str(bundle),
     )
     torch.manual_seed(641)
-    path, count, metrics = run_cutamp(
-        env,
-        cfg,
-        CostReducer(default_constraint_to_mult.copy()),
-        ConstraintChecker(default_constraint_to_tol.copy()),
-        q_init=q,
-        step_inputs=inp_args,
-        experiment_id=label + ("-place" if place else "-pick"),
-    )
+    with pytest.MonkeyPatch.context() as mp:
+        only_schedule(mp, ("L", "none") if place else ("L",), "left")
+        path, count, metrics = run_cutamp(
+            env,
+            cfg,
+            CostReducer(default_constraint_to_mult.copy()),
+            ConstraintChecker(default_constraint_to_tol.copy()),
+            q_init=q,
+            step_inputs=inp_args,
+            experiment_id=label + ("-place" if place else "-pick"),
+        )
     if motion:
         assert path is None and count == 0, metrics
     else:

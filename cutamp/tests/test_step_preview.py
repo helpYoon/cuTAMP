@@ -39,6 +39,7 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     from cutamp.envs import TAMPEnvironment
     from cutamp.robots.t1 import REAL_LEGS
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
+    from cutamp.tests.conftest import only_schedule
     from cutamp.tests.paired_grasp_scene import paired_setup
     from cutamp.utils.plan_processor import raw_motion_plan
 
@@ -50,9 +51,9 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     env = TAMPEnvironment(
         "fresh_foot_commands", [part], [floor, pad], {"Movable": [part], "Surface": [pad]}, old.goal_state
     )
+    only_schedule(monkeypatch, ("LR", "LR"), "left")
     inputs = replace(
         inputs,
-        orders=("LR", "LR"),
         commands=None,
         posture_seeds=tuple(g["posture_seed"] for g in fixture["gaps"]),
         placements={"pose1": fixture["placement"]},
@@ -60,6 +61,7 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     cfg = TAMPConfiguration(
         step_mode="model",
         num_particles=16,
+        max_step_schedules=1,
         max_loop_dur=60,
         landing_bundle=str(LANDING_BUNDLE),
         enable_visualizer=False,

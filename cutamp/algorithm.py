@@ -697,16 +697,14 @@ def _step_tables(map_version, accuracy_version, lag):
     from cutamp.step_search import StepSearch
 
     path = Path(map_version[0])
+    if map_version[1] is None:
+        raise FileNotFoundError(f"Reach map is unavailable at {path}")
+    try:
+        atlas = ReachMap.load(path, nominal_only=True)
+    except (ValueError, KeyError, OSError) as e:
+        raise ValueError(f"Reach map at {path} failed to load: {e}") from e
     accuracy = Path(accuracy_version[0]) if accuracy_version else None
     notes = {"map": str(path), "accuracy": str(accuracy) if accuracy is not None else None}
-    atlas = None
-    if map_version[1] is not None:
-        try:
-            atlas = ReachMap.load(path, nominal_only=True)
-        except (ValueError, KeyError, OSError) as e:
-            notes["map_status"] = str(e)
-    if atlas is None:
-        notes.setdefault("map_status", "unavailable")
     records = None
     if accuracy is not None and accuracy.is_file():
         try:
@@ -826,7 +824,7 @@ def _refine_standing_schedule(
 
 def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inputs):
     start = monotonic()
-    from cutamp.step_planner import ScheduleSearch, StepInputs, StepResult, furthest_endpoint, manipulation_regions
+    from cutamp.step_planner import StepInputs, StepResult, furthest_endpoint, manipulation_regions
 
     validate_tamp_config(config)
     inputs = inputs if inputs is not None else StepInputs()
@@ -862,27 +860,20 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         soles = world.stance_soles
         yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
         incoming = torch.cat((soles[..., :2, 3], yaw[:, None]), -1).detach().cpu().tolist()
-        joint = bool(search.hands) and inputs.arms is None and inputs.orders is None
         admitted = {}
-        if joint:
-            for proposal in arm_step_skeletons(search, world, all_t1_operators, incoming,
-                                               max_base_plans=config.num_initial_plans, admitted=admitted, deadline=deadline):
-                metrics["num_symbolic_skeletons"] = len(admitted)
-                if step_cap is None or proposal.step_count <= step_cap:
-                    yield None, proposal
+        for proposal in arm_step_skeletons(search, world, all_t1_operators, incoming,
+                                           max_base_plans=config.num_initial_plans, admitted=admitted, deadline=deadline):
+            metrics["num_symbolic_skeletons"] = len(admitted)
+            if step_cap is None or proposal.step_count <= step_cap:
+                yield proposal
 
         def streams():
             for skeleton, regions in base_skeletons(admitted):
-                if joint:
-                    _, tried = admitted[tuple(op.name for op in skeleton)]
-                    yield None, unseeded_step_skeletons(
-                        search, skeleton, regions, world.initial_state, world.goal_state, incoming,
-                        tried_orders=tried, deadline=deadline,
-                    )
-                else:
-                    stream = ScheduleSearch(search, skeleton, regions, world, incoming, fixed=inputs.orders,
-                                            prefer_reach=inputs.orders is None, deadline=deadline)
-                    yield stream, None
+                _, tried = admitted[tuple(op.name for op in skeleton)]
+                yield unseeded_step_skeletons(
+                    search, skeleton, regions, world.initial_state, world.goal_state, incoming,
+                    tried_orders=tried, deadline=deadline,
+                )
 
         sources = iter(streams())
         active = deque()
@@ -892,12 +883,11 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 if not active:
                     return
                 source = active.popleft()
-            stream, unseeded = source
-            proposal = stream.next(step_cap) if stream is not None else next(unseeded, None)
+            proposal = next(source, None)
             if proposal is not None:
                 active.append(source)
                 if step_cap is None or proposal.step_count <= step_cap:
-                    yield stream, proposal
+                    yield proposal
 
     def base_skeletons(admitted):
         # Distinct action histories can reach the same symbolic state. BFS can merge them,
@@ -914,11 +904,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         for skeleton in base_plans:
             if deadline is not None and monotonic() >= deadline:
                 break
-            arms = tuple(op.operator.metadata.arm for op in skeleton if op.operator.metadata.is_actionable)
-            if inputs.arms is not None and tuple(inputs.arms) != arms:
-                continue
-            if inputs.orders is not None and len(arms) != len(inputs.orders):
-                continue
             identity = tuple(op.name for op in skeleton)
             if identity in seen:
                 continue
@@ -991,10 +976,9 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         rank_start = monotonic()
         # A shorter schedule can rule out longer ones only at the lower bound of the primary objective.
         step_cap = incumbent[1] if incumbent is not None and incumbent[0] == 0 else None
-        entry = next(candidates, None)
-        if entry is None:
+        proposal = next(candidates, None)
+        if proposal is None:
             break
-        stream, proposal = entry
         if deadline is not None and monotonic() >= deadline:
             break
         attempt = {
@@ -1025,8 +1009,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 }
                 for i, e in enumerate(proposal.seed.schedule.edges)
             ]
-        if inputs.commands is not None:
-            attempt["supplied_command_seeds"] = inputs.commands
         metrics["step_attempts"].append(attempt)
         if proposal.step_count and predictor is None and unavailable is None:
             try:
@@ -1101,8 +1083,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 attempt["particle_candidate"] = dict(
                     best_model.metrics, row_index=best_model.index, soft_cost=best_model.soft_cost
                 )
-            if stream is not None:
-                stream.feedback(proposal.orders, result.endpoint_ok)
             continue
         row = min(accepted, key=lambda r: plan_key(r, proposal.step_count))
         key = plan_key(row, proposal.step_count)

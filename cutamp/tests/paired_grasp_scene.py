@@ -53,14 +53,12 @@ def paired_setup(label, *, place=False):
     d[:, -5:] = -1.0
     start = predictor.standing_start(d)
     q, _ = StepStateAdapter(predictor).planner(start.tensors[:6])
-    orders = ("L", "none") if place else ("L",)
+    # Seeds for the left arm stepping its left foot before the pick: orders ("L",), or ("L", "none") with the place.
     inp_args = StepInputs(
         grasps={"part": grasps},
-        orders=orders,
-        arms=("left",) * len(orders),
         commands=((((0.12, 0.21, 0.0),), ()) if place else (((0.12, 0.21, 0.0),),)),
         initial_state=start,
-        posture_seeds=(inp["seed"],) * len(orders),
+        posture_seeds=(inp["seed"],) * (2 if place else 1),
         placements={"pose1": dest} if place else None,
     )
     return env, q[0].tolist(), inp_args
