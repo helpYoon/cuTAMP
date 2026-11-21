@@ -63,7 +63,7 @@ only the kernels this checkout and toolchain have not compiled before.
 # cuRobo v0.9.0 comes as curobo/ and GraspGenX as GraspGenX/; the variable skips GraspGenX's git-LFS files
 GIT_LFS_SKIP_SMUDGE=1 git clone --recursive https://github.com/helpYoon/cuTAMP.git
 cd cuTAMP
-uv sync  # --extra editor adds the sphere editor's open3d
+uv sync
 ```
 
 Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
@@ -646,10 +646,6 @@ live `--cuda_graphs` runs in
   (`PREFIX.json`, `PREFIX.md`).
 - [`utils.py`](cutamp/scripts/utils.py) — the default cost multipliers and
   constraint tolerances, and `setup_logging`.
-- [`robot_sphere_editor.py`](cutamp/scripts/robot_sphere_editor.py) —
-  interactive collision-sphere editor of `t1_29dof/upper_body_spheres.yml`
-  (the gripper links included), against `t1_planner.urdf`. After saving,
-  rerun `build_planner_model.py`. It needs `open3d` (the `editor` extra).
 
 ## Usage
 

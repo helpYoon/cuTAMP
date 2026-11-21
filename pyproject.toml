@@ -39,11 +39,6 @@ dependencies = [
     "yourdfpy==0.0.58",
 ]
 
-[project.optional-dependencies]
-editor = [
-    "open3d",
-]
-
 [dependency-groups]
 dev = [
     "pytest==9.0.2",  # 9.2's monkeypatch undo deletes torch's allow_tf32 instead of restoring it
