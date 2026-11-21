@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from cutamp.step_search import TargetRegion
-
 if TYPE_CHECKING:
     from cutamp.grasps import GraspSet
     from cutamp.landing_predictor import LandingState
@@ -139,16 +137,3 @@ def standing_endpoint_flags(masks, rollout, plan, costs):
         for t, (_, name) in enumerate(group):
             flags[:, placement_gaps[name]] &= supported[:, t]
     return flags
-
-
-def manipulation_regions(skeleton, world):
-    regions = []
-    for op in skeleton:
-        meta = op.operator.metadata
-        if meta.action_type == "pick":
-            regions.append(TargetRegion.pick(meta.arm, world.get_object(op.arg("obj"))))
-        elif meta.action_type == "place":
-            regions.append(
-                TargetRegion.place(meta.arm, world.get_object(op.arg("obj")), world.get_object(op.arg("surface")))
-            )
-    return regions

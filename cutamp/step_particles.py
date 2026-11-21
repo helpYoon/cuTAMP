@@ -128,7 +128,7 @@ def _inputs_for_gap(inputs, seeds, gap, op, incoming, cmds, q_rest, first, stop)
     by_order = {}
     has_fallback = False
     for i, seed in enumerate(seeds):
-        edge = seed.schedule.edges[gap] if seed is not None and seed.schedule.edges else None
+        edge = seed.schedule.edges[gap] if seed.schedule.edges else None
         if edge is None or edge.witness is None:
             has_fallback = True
         else:
@@ -156,18 +156,7 @@ def _command_inputs(inputs, seeds, j, steps, like):
         return like.new_empty(len(seeds), 0, 3)
     if inputs.commands is not None:
         return like.new_tensor(inputs.commands[j]).expand(len(seeds), -1, -1).clone()
-    # Leave every unscored symbolic order a legal starting proposal for refinement.
-    rows = []
-    for seed in seeds:
-        rows.append(
-            [
-                seed.commands[step.arg("sole_to")]
-                if seed is not None
-                else (0.12, 0.21 if step.operator.metadata.foot == "left" else -0.21, 0.0)
-                for step in steps
-            ]
-        )
-    return like.new_tensor(rows)
+    return like.new_tensor([[seed.commands[step.arg("sole_to")] for step in steps] for seed in seeds])
 
 
 def _generated_grasp_indices(pool, scores, objects, tool, arm, seeds, gap, ranks):
@@ -176,7 +165,7 @@ def _generated_grasp_indices(pool, scores, objects, tool, arm, seeds, gap, ranks
     choice = by_score[ranks].clone()
     rows, poses, soles = [], [], []
     for i, seed in enumerate(seeds):
-        edges = seed.schedule.edges if seed is not None else ()
+        edges = seed.schedule.edges
         if edges and edges[gap].witness is not None:
             rows.append(i)
             poses.append(edges[gap].witness)
@@ -740,7 +729,7 @@ def refine_step_particles(
         return StepResult([], None, "unresolved", str(e))
     n = config.num_particles
     seeds = [proposal.seed]
-    if proposal.seed is not None and inputs.commands is None:
+    if inputs.commands is None:
         seeds.extend(islice(proposal.alternative_seeds, n - 1))
     rows, feedback, diagnostic = [], [], {}
     status, reason = "unresolved", "no particle met all applicable constraints"

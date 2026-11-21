@@ -377,83 +377,6 @@ def test_pose_still_ranks_both_hands_when_object_reach_bounds_are_unknown(harnes
         assert attempt["search_priority"] == pytest.approx([distance, 2, 0])
 
 
-def test_unsampled_steps_can_recover_a_history_merged_by_standing_bfs(harness, monkeypatch):
-    from cutamp.step_search import StepSearch
-    from cutamp.tests.test_step_search import atlas
-
-    run, _, world = harness
-    world.initial_state = t1_domain.get_initial_state(["a", "b"], ["table"])
-    world.goal_state = frozenset([
-        t1_domain.On.ground("a", "table"), t1_domain.On.ground("b", "table"),
-        *(f.ground() for f in t1_domain.all_t1_fluents if f.name in ("LeftCanMove", "RightCanMove")),
-    ])
-    world.arm_home_ee_world = {arm: torch.tensor([0., y, .5]) for arm, y in (("left", .2), ("right", -.2))}
-    search = StepSearch(atlas(), commands=())
-    monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
-    monkeypatch.setattr(alg, "grasp_sets", lambda objs, *a, **kw: {obj.name: object() for obj in objs})
-    monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
-    monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
-
-    def picks(skeleton):
-        return tuple((op.operator.metadata.arm, op.arg("obj")) for op in skeleton if op.operator.metadata.action_type == "pick")
-
-    merged_bfs = {picks(plan) for plan in alg.task_plan_generator(world.initial_state, world.goal_state, t1_domain.all_t1_operators)}
-    admitted = set()
-
-    def refine(proposal, *args, **kwargs):
-        history = picks(proposal.skeleton)
-        if proposal.seed is not None:
-            admitted.add(history)
-        elif history in admitted - merged_bfs:
-            row = StepRow(0, {}, 0., {"com_center_distances_m": [.01] * 4, "secondary_effort": 0.}, ["complete"])
-            return StepResult([row], None, "model_feasible" if proposal.step_count else "standing_feasible")
-        return StepResult([], None, "unresolved")
-
-    monkeypatch.setattr(alg, "_refine_standing_schedule", refine)
-    monkeypatch.setattr(alg, "_refine_step_schedule", refine)
-    motion, _, metrics = run(curobo_plan=True, num_initial_plans=16, max_step_schedules=40)
-    assert admitted - merged_bfs and motion == ["complete"] and metrics["motion_plan_success"]
-
-
-@pytest.mark.parametrize("blocked", [False, True])
-def test_joint_rank_retries_a_legal_unsampled_schedule_once(harness, monkeypatch, blocked):
-    from cutamp.tests.test_step_search import atlas
-    from cutamp.step_search import StepSearch
-
-    run, _, world = harness
-    world.arm_home_ee_world = {"left": torch.tensor([0., .2, .5]), "right": torch.tensor([0., -.2, .5])}
-    if blocked:
-        world.get_object = lambda name: SimpleNamespace(
-            name=name, dims=(.05,) * 3, pose=(0., .1, .025, 1., 0., 0., 0.) if name == "block"
-            else (.3, 0., .55, 1., 0., 0., 0.)
-        )
-    search = StepSearch(atlas(points=((.3, .005, .555), (.3, .005, .655))), commands=())
-    monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
-    monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
-    monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
-    winning_order = ("L", "R") if blocked else ("none", "L")
-    attempts = []
-
-    def refine(proposal, *args, **kwargs):
-        arms = [op.operator.metadata.arm for op in proposal.skeleton if op.operator.metadata.is_actionable]
-        attempts.append((tuple(arms), proposal.orders, proposal.seed is not None))
-        if proposal.orders == winning_order:
-            row = StepRow(0, {}, 0., {"com_center_distances_m": [.01, .01], "secondary_effort": 0.}, ["complete"])
-            return StepResult([row], None, "model_feasible" if proposal.step_count else "standing_feasible")
-        return StepResult([], None, "unresolved")
-
-    monkeypatch.setattr(alg, "_refine_step_schedule", refine)
-    monkeypatch.setattr(alg, "_refine_standing_schedule", refine)
-    motion, _, metrics = run(curobo_plan=True)
-    assert motion == ["complete"] and metrics["motion_plan_success"]
-    assert attempts[-1][1:] == (winning_order, False)
-    assert len({(arms, orders) for arms, orders, _ in attempts}) == len(attempts)
-    if blocked:
-        assert all("L" in orders[0] and not seeded for _, orders, seeded in attempts)
-    else:
-        assert attempts[0][1:] == (("none", "none"), True)
-
-
 def test_missing_predictor_never_marks_model_feasible_or_draws_grasps(harness, monkeypatch):
     from cutamp.tests.conftest import only_schedule
 
@@ -465,18 +388,27 @@ def test_missing_predictor_never_marks_model_feasible_or_draws_grasps(harness, m
     assert "generate" not in seen
 
 
-def test_full_fallback_all_25_order_pairs_only_once_in_budget(harness, monkeypatch):
-    run, seen, _ = harness
+def test_every_legal_order_pair_once_then_the_search_runs_out(harness, monkeypatch):
+    from cutamp.step_search import TargetRegion
+
+    run, seen, world = harness
     empty = StepResult([], None, "initialization_failed")
     monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
     monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **k: empty)
     monkeypatch.setattr(alg, "_refine_step_schedule", lambda *a, **k: empty)
     _, n, metrics = run(max_step_schedules=25)
     attempts = metrics["step_attempts"]
-    assert n == 0 and len({tuple(a["orders"]) for a in attempts}) == len(attempts) == 25
+    assert n == 0 and metrics["status"] == "unresolved" and not metrics["schedule_limit_reached"]
     assert attempts[0]["orders"] == ["none", "none"]
     assert seen.index("rank") < seen.index("generate") and seen.count("generate") == 1
     assert seen.index("generate") < seen.index("wait")
+    search, _ = alg._load_step_search(None)
+    block = world.get_object("block")
+    pick, place = TargetRegion.pick("left", block), TargetRegion.place("left", block, world.get_object("table"))
+    home = ((0., .1, 0.), (0., -.1, 0.))
+    legal = {(a.order, b.order) for a in search.edges(home, pick) for b in search.edges(a.soles, place)}
+    assert len({tuple(a["orders"]) for a in attempts}) == len(attempts) == len(legal) < 25
+    assert {tuple(a["orders"]) for a in attempts} == legal
 
 
 def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypatch):
@@ -699,7 +631,7 @@ def test_validator_uses_the_globally_ranked_particles_own_trace(monkeypatch):
     )
     pools = {"grasp1": (torch.eye(7)[:2], torch.tensor([0.9, 0.5]))}
     op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="pick")), values=("q1",))
-    proposal = SimpleNamespace(skeleton=[op], seed=None)
+    proposal = SimpleNamespace(skeleton=[op], seed=None, alternative_seeds=iter(()))
     world = SimpleNamespace(q_init=torch.zeros(33))
     monkeypatch.setattr(step_particles, "ParticleInitializer", lambda *a: SimpleNamespace(_pick_pools=lambda p: pools))
     monkeypatch.setattr(step_particles, "worst_posture", lambda w, qs: (torch.zeros(len(qs[0])),) * 3)

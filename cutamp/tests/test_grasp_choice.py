@@ -50,14 +50,14 @@ def test_generated_grasps_match_the_witness_orientation_and_keep_the_pool():
     obj = torch.eye(4, dtype=posture.dtype)
     obj[:3, 3] = hand[:3]
     obj[:3, :3] = hand[3:].reshape(3, 3).T / 0.2
-    seed = SimpleNamespace(schedule=SimpleNamespace(edges=[
-        SimpleNamespace(soles=[[0, .1, 0], [0, -.1, 0]], witness=posture.tolist())
-    ]))
+    seed, unwitnessed = (SimpleNamespace(schedule=SimpleNamespace(edges=[
+        SimpleNamespace(soles=[[0, .1, 0], [0, -.1, 0]], witness=witness)
+    ])) for witness in (posture.tolist(), None))
     # The highest score points backward. The two other grasps match the witness, one below cutoff.
     pool = torch.tensor([[0, 0, 0, 0, 0, 0, 1], [0, 0, 0, 1, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]], dtype=obj.dtype)
     scores = pool.new_tensor([.98, .8, .5])
     indices = _generated_grasp_indices(pool, scores, obj.expand(4, 4, 4), torch.eye(4, dtype=obj.dtype),
-                                       "left", [seed, seed, seed, None], 0, torch.tensor([0, 1, 2, 0]))
+                                       "left", [seed, seed, seed, unwitnessed], 0, torch.tensor([0, 1, 2, 0]))
     assert indices.tolist() == [1, 0, 2, 0]
 
 

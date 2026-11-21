@@ -8,7 +8,7 @@ from cutamp import step_particles
 
 @pytest.mark.parametrize("mixed", [False, True])
 def test_seed_transforms_batch_witnesses_and_preserve_particle_gradients(monkeypatch, mixed):
-    orders = ["RL"] * 8 if not mixed else ["LR", None, "none", "RL", "L", "LR", "missing", "R"]
+    orders = ["RL"] * 8 if not mixed else ["LR", "missing", "none", "RL", "L", "LR", "missing", "R"]
     gen = torch.Generator().manual_seed(37)
     n = len(orders)
     dtype = torch.float64
@@ -21,8 +21,8 @@ def test_seed_transforms_batch_witnesses_and_preserve_particle_gradients(monkeyp
     for i, order in enumerate(orders):
         witness = tuple(torch.randn(12, generator=gen, dtype=dtype).tolist()) if order != "missing" else None
         edge = SimpleNamespace(order=order, witness=witness)
-        seeds.append(SimpleNamespace(schedule=SimpleNamespace(edges=[edge])) if order is not None else None)
-        if order is None or witness is None:
+        seeds.append(SimpleNamespace(schedule=SimpleNamespace(edges=[edge])))
+        if witness is None:
             reference.append(rest[i])
         else:
             nominal = step_particles._nominal(incoming[i : i + 1], order, commands[i : i + 1])
@@ -52,7 +52,8 @@ def test_all_fallback_and_explicit_seed_batch_slice():
     rest = torch.randn(3, 12)
     incoming = torch.zeros(3, 2, 3)
     commands = torch.empty(3, 0, 3)
-    args = ([None] * 3, 0, None, incoming, commands, rest, 2, 5)
+    unwitnessed = SimpleNamespace(schedule=SimpleNamespace(edges=[SimpleNamespace(order="L", witness=None)]))
+    args = ([unwitnessed] * 3, 0, None, incoming, commands, rest, 2, 5)
     fallback = step_particles._inputs_for_gap(SimpleNamespace(posture_seeds=None), *args)
     torch.testing.assert_close(fallback, rest)
     supplied = torch.arange(60).view(5, 12).float()

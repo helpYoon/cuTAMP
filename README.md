@@ -666,7 +666,8 @@ must pass the 2 cm XY and 1° yaw limits. The planner tries validated particles 
 order of their worst pick/place CoM distance to the support polygon centroid,
 then secondary effort. It returns the first connected motion on the first
 successful skeleton. If refinement or motion planning fails, A* supplies the
-next skeleton. Use `--max_duration` or `--max_step_schedules` to bound this search.
+next skeleton; when A* runs out, the planner reports failure. Use `--max_duration`
+or `--max_step_schedules` to bound this search.
 A connected prediction carries the status `model_predicted_motion`. Independent
 transition evidence can be supplied through the Python API.
 

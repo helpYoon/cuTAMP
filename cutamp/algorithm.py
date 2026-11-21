@@ -13,7 +13,6 @@ import atexit
 import gc
 import json
 import logging
-from collections import deque
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
@@ -824,7 +823,7 @@ def _refine_standing_schedule(
 
 def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inputs):
     start = monotonic()
-    from cutamp.step_planner import StepInputs, StepResult, furthest_endpoint, manipulation_regions
+    from cutamp.step_planner import StepInputs, StepResult, furthest_endpoint
 
     validate_tamp_config(config)
     inputs = inputs if inputs is not None else StepInputs()
@@ -850,7 +849,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
     def proposals():
         nonlocal incoming
         from cutamp.task_planning.arm_step_search import arm_step_skeletons
-        from cutamp.task_planning.step_schedules import unseeded_step_skeletons
 
         load_start = monotonic()
         search, cache_info = _load_step_search(config, applicable=inputs.matches_accuracy_context(config.step_lag))
@@ -866,53 +864,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             metrics["num_symbolic_skeletons"] = len(admitted)
             if step_cap is None or proposal.step_count <= step_cap:
                 yield proposal
-
-        def streams():
-            for skeleton, regions in base_skeletons(admitted):
-                _, tried = admitted[tuple(op.name for op in skeleton)]
-                yield unseeded_step_skeletons(
-                    search, skeleton, regions, world.initial_state, world.goal_state, incoming,
-                    tried_orders=tried, deadline=deadline,
-                )
-
-        sources = iter(streams())
-        active = deque()
-        while deadline is None or monotonic() < deadline:
-            source = next(sources, None)
-            if source is None:
-                if not active:
-                    return
-                source = active.popleft()
-            proposal = next(source, None)
-            if proposal is not None:
-                active.append(source)
-                if step_cap is None or proposal.step_count <= step_cap:
-                    yield proposal
-
-    def base_skeletons(admitted):
-        # Distinct action histories can reach the same symbolic state. BFS can merge them,
-        # so resume every admitted history directly when trying unsampled landing orders.
-        seen = set(admitted)
-        for skeleton, _ in list(admitted.values()):
-            yield skeleton, manipulation_regions(skeleton, world)
-        if len(seen) >= config.num_initial_plans:
-            return
-        base_plans = task_plan_generator(
-            world.initial_state, world.goal_state, operators=all_t1_operators,
-            ground_op_priority_fn=make_arm_affinity_priority_fn(world), deadline=deadline,
-        )
-        for skeleton in base_plans:
-            if deadline is not None and monotonic() >= deadline:
-                break
-            identity = tuple(op.name for op in skeleton)
-            if identity in seen:
-                continue
-            admitted[identity] = skeleton, set()
-            seen.add(identity)
-            metrics["num_symbolic_skeletons"] = len(admitted)
-            yield skeleton, manipulation_regions(skeleton, world)
-            if len(seen) >= config.num_initial_plans:
-                break
 
     metrics = {
         "found_solution": False,
@@ -988,27 +939,25 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             "heuristic_cost": proposal.cost,
             "rank_seconds": monotonic() - rank_start,
         }
-        if proposal.arm_approach_m is not None:
-            attempt["arm_approach_m"] = proposal.arm_approach_m
-            distances = [e.distance_m for e in proposal.seed.schedule.edges]
-            attempt["missing_reach_evidence"] = None in distances
-            worst_gap = max((distance for distance in distances if distance is not None), default=0.)
-            attempt["search_priority"] = [proposal.arm_approach_m + worst_gap, *proposal.cost]
-        if proposal.seed:
-            attempt["gaps"] = [
-                {
-                    "incoming_soles": incoming if i == 0 else proposal.seed.schedule.edges[i - 1].soles,
-                    "commands": e.commands,
-                    "outgoing_soles": e.soles,
-                    "posture": e.posture,
-                    "distance_m": e.distance_m,
-                    "accuracy": e.accuracy,
-                    "passes": e.passes,
-                    "trials": e.trials,
-                    "cost": e.cost,
-                }
-                for i, e in enumerate(proposal.seed.schedule.edges)
-            ]
+        attempt["arm_approach_m"] = proposal.arm_approach_m
+        distances = [e.distance_m for e in proposal.seed.schedule.edges]
+        attempt["missing_reach_evidence"] = None in distances
+        worst_gap = max((distance for distance in distances if distance is not None), default=0.)
+        attempt["search_priority"] = [proposal.arm_approach_m + worst_gap, *proposal.cost]
+        attempt["gaps"] = [
+            {
+                "incoming_soles": incoming if i == 0 else proposal.seed.schedule.edges[i - 1].soles,
+                "commands": e.commands,
+                "outgoing_soles": e.soles,
+                "posture": e.posture,
+                "distance_m": e.distance_m,
+                "accuracy": e.accuracy,
+                "passes": e.passes,
+                "trials": e.trials,
+                "cost": e.cost,
+            }
+            for i, e in enumerate(proposal.seed.schedule.edges)
+        ]
         metrics["step_attempts"].append(attempt)
         if proposal.step_count and predictor is None and unavailable is None:
             try:
