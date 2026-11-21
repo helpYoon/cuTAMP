@@ -110,8 +110,7 @@ def entrypoint():
 
     parser.add_argument(
         "-n", "--num_particles", type=int, default=None,
-        help="Number of plan particles per skeleton (default 256 with --step_mode off, 128 for learned step Adam, "
-             "64 for the other step routes)."
+        help="Number of plan particles per skeleton (default 256 with --step_mode off, 128 on the step route)."
     )
     parser.add_argument(
         "--surface_height", type=float, default=0.0,
@@ -166,26 +165,19 @@ def entrypoint():
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
         help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the squared "
-             "centering term (default 4 for fast learned steps, 0 with --step_mode off, 1 otherwise). "
+             "centering term (default 0 with --step_mode off, 1 on the step route). "
              "Zero disables centering.",
     )
-    parser.add_argument("--step_mode", choices=("off", "rank", "geometric", "model"), default=_defaults.step_mode,
-                        help="Rank foot schedules, refine a geometric ablation, or use the frozen T1 landing model.")
+    parser.add_argument("--step_mode", choices=("off", "model"), default=_defaults.step_mode,
+                        help="Plan on fixed feet (off) or step with the frozen T1 landing model (model).")
     parser.add_argument("--step_motion_validation", choices=("model", "independent"), default=_defaults.step_motion_validation,
                         help="Return a predicted motion, or require independent transition evidence.")
-    parser.add_argument("--step_search_order", choices=("astar", "count"), default=_defaults.step_search_order)
     parser.add_argument("--max_step_schedules", type=int, default=None,
                         help="Maximum distinct grounded schedules attempted across all arm assignments.")
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
     parser.add_argument("--landing_bundle", help="Path to the exported seed-3 CUDA bundle.")
     parser.add_argument("--step_reach_map", help="Path to the T1 nominal hand reach map.")
     parser.add_argument("--step_accuracy_table", help="Path to the measured landing precision profile.")
-    parser.add_argument("--step_derivative_method", choices=("finite_difference", "autodiff"),
-                        default=_defaults.step_derivative_method,
-                        help="Learned-step solver. Batched finite differences use two wider updates; autodiff uses the four-update reference.")
-    parser.add_argument("--step_optimizer", choices=("learned_adam", "adam", "screen"),
-                        help="Stepping optimizer. Model stepping defaults to learned sequence Adam with native replay. "
-                             "Choose adam for recurrent policy/world-model gradients or screen for forward proposals.")
     parser.add_argument("--step_sequence_bundle", help="Override the trained step sequence bundle for learned Adam.")
     parser.add_argument("--step_ik_warm_start", action=argparse.BooleanOptionalAction, default=_defaults.step_ik_warm_start,
                         help="Reuse the preceding Adam iterate's posture to initialize learned-objective IK.")
@@ -199,24 +191,18 @@ def entrypoint():
                         help="Earliest update at which the CoM plateau rule may stop (5 by default for learned Adam).")
     parser.add_argument("--step_adam_trace_center", action="store_true",
                         help="Record the best objective-feasible worst-endpoint CoM distance after each update.")
-    parser.add_argument("--step_proposal_count", type=int, default=_defaults.step_proposal_count,
-                        help="Commands to screen per batch (screen mode defaults to 192 for pick, 128 for place). Use 0 for the historical SQP route. "
-                             "Positive counts default to forward-only checking; use --step_refine_iterations to add SQP.")
     parser.add_argument("--step_refine_iterations", type=int, default=_defaults.step_refine_iterations,
-                        help="Override the learned-step or geometric solver's maximum updates.")
-    parser.add_argument("--step_trust_scale", type=float, default=_defaults.step_trust_scale,
-                        help="Scale the 1.8 cm per-axis / 2 degree per-update box. Defaults to 2 for fast learned steps, 1 otherwise.")
-    parser.add_argument("--step_particle_batch_size", type=int, help="Maximum particles optimized together (128 for learned Adam, 64 otherwise).")
+                        help="Override learned step Adam's maximum updates (default 48).")
+    parser.add_argument("--step_particle_batch_size", type=int, help="Maximum particles optimized together (default 128).")
     parser.add_argument("--require_modeled_load", action="store_true",
                         help="Only accept loaded steps with an applicable payload model.")
     parser.add_argument(
         "--max_duration",
         type=float,
         default=_defaults.max_loop_dur,
-        help="Cooperative search budget in seconds. Learned step Adam (the default) runs uncapped and forward "
-             "screening allows 9.5 s for a full motion and 8 s for keyframes, both timed from planner entry; "
-             "the other step routes time it from the end of world setup. An explicit duration controls the "
-             "entire search. With --step_mode off it is one budget timed from the end of initial sampling: the "
+        help="Cooperative search budget in seconds. The step route runs uncapped by default; an explicit "
+             "duration controls its entire search, timed from planner entry. With --step_mode off it is one "
+             "budget timed from the end of initial sampling: the "
              "optimization that runs out stops, and the search ends after its skeleton.",
     )
     parser.add_argument(
@@ -272,16 +258,15 @@ def entrypoint():
         com_comfort_margin_m=args.com_comfort_margin_m,
         com_center_weight=args.com_center_weight,
         max_loop_dur=args.max_duration,
-        step_mode=args.step_mode, step_search_order=args.step_search_order,
+        step_mode=args.step_mode,
         max_step_schedules=args.max_step_schedules, step_lag=args.step_lag,
         landing_bundle=args.landing_bundle, step_reach_map=args.step_reach_map,
-        step_accuracy_table=args.step_accuracy_table, step_proposal_count=args.step_proposal_count,
-        step_refine_iterations=args.step_refine_iterations, step_optimizer=args.step_optimizer,
+        step_accuracy_table=args.step_accuracy_table,
+        step_refine_iterations=args.step_refine_iterations,
         step_sequence_bundle=args.step_sequence_bundle, step_ik_warm_start=args.step_ik_warm_start,
         step_ik_objective_tol=args.step_ik_objective_tol,
         step_adam_plateau_mm=args.step_adam_plateau_mm, step_adam_plateau_patience=args.step_adam_plateau_patience,
         step_adam_plateau_min_updates=args.step_adam_plateau_min_updates, step_adam_trace_center=args.step_adam_trace_center,
-        step_derivative_method=args.step_derivative_method, step_trust_scale=args.step_trust_scale,
         step_particle_batch_size=args.step_particle_batch_size, require_modeled_load=args.require_modeled_load,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,

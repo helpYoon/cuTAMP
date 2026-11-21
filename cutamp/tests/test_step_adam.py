@@ -67,10 +67,10 @@ def test_plateau_needs_a_feasible_particle_and_respects_minimum(feasible, minimu
     {"step_adam_plateau_mm": 1., "step_adam_plateau_patience": 0},
     {"step_adam_plateau_mm": 1., "step_adam_plateau_min_updates": -1},
     {"step_adam_trace_center": True, "com_center_weight": 0},
-    {"step_adam_trace_center": True, "step_optimizer": "screen"},
+    {"step_adam_trace_center": True, "step_mode": "off"},
 ])
 def test_invalid_plateau_controls(options):
     from cutamp.config import TAMPConfiguration, validate_tamp_config
 
     with pytest.raises(ValueError, match="CoM plateau"):
-        validate_tamp_config(TAMPConfiguration(**({"step_optimizer": "adam"} | options)))
+        validate_tamp_config(TAMPConfiguration(**options))

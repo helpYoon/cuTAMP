@@ -15,14 +15,13 @@ from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, pre
 from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
 from cutamp.rollout import RolloutFunction
 from cutamp.samplers import project_supported_placement
-from cutamp.sole_collision import geometric_sweep_rows
 from cutamp.stance import abs_pose, stance_joint_limits
-from cutamp.step_ik import centered_stance_witnesses, solve_stance_ik, stance_ik_tolerance
+from cutamp.step_ik import solve_stance_ik, stance_ik_tolerance
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refinement import _check_deadline, refine_gap, stance_center_residual, stance_ik_rows
 from cutamp.step_sequence import predict_sequence
 from cutamp.step_validation import StepStateAdapter, sweep_constraint_rows, sweep_penetration_rows, validate_step_geometry
-from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4, transform_spheres
+from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
 
 
 def _batch(value, first, stop, tail, like):
@@ -249,63 +248,8 @@ def _placements_and_grasps(groups, world, pools, inputs, first, stop, seeds, bin
     return particles, snapshots, wrists, held_before
 
 
-def _place_update(world, op, pose, soles, seed, grasp, requested_margin, centering_weight, *,
-                  other_arm_reference=None, deadline=None):
-    """A fresh stance IK and a projected update of the particle's placement on its surface."""
-    arm = op.operator.metadata.arm
-    tool = grasp_7dof_to_mat4x4(grasp) @ world.tool_from_ee[world.tool_frame_for_arm(arm)]
-    local = world.get_collision_spheres(op.arg("obj"))
-    bounds = world.get_aabb(op.arg("surface"))
-
-    def score(p, rows=slice(None)):
-        _check_deadline(deadline)
-        T = action_4dof_to_mat4x4(p)
-        wrist = T @ tool[rows]
-        other = None if other_arm_reference is None else other_arm_reference[rows]
-        ik = solve_stance_ik(soles[rows], wrist, seed[rows], arm, other_arm_reference=other,
-                             center_posture=bool(centering_weight))
-        spheres = transform_spheres(local, T)
-        lo = (bounds[0, :2] - (spheres[..., :2] - spheres[..., 3:])).clamp_min(0).amax((1, 2))
-        hi = ((spheres[..., :2] + spheres[..., 3:]) - bounds[1, :2]).clamp_min(0).amax((1, 2))
-        hard = list(stance_ik_rows(ik, requested_margin).values()) + [lo / 0.02, hi / 0.02]
-        loss = torch.stack(hard, dim=-1).clamp_min(0).square().sum(-1)
-        center = stance_center_residual(ik).square().sum(-1)
-        return loss, centering_weight * center, wrist
-
-    with torch.enable_grad():
-        current = pose.detach().requires_grad_(True)
-        loss, center, wrist = score(current)
-        # Satisfy the hard rows first. Once feasible, descend on centering
-        # without giving up feasible wrist, support or placement constraints.
-        feasible = loss == 0
-        objective = torch.where(feasible, center, loss)
-        (grad,) = torch.autograd.grad(objective.sum(), current)
-    # Z is established by supporting contact. Vary planar position and yaw jointly.
-    grad = grad.detach() * pose.new_tensor([1.0, 1.0, 0.0, 0.3])
-    delta = -grad / grad.norm(dim=-1, keepdim=True).clamp_min(1e-10) * 0.015
-    best, best_loss, best_center, best_wrist = pose.detach(), loss.detach(), center.detach(), wrist.detach()
-    if (grad.norm(dim=-1) > 1e-7).any():
-        # Score all three line-search lengths with one batched IK, preserving their order.
-        strides = pose.new_tensor([1.0, 0.5, 0.25])[:, None, None]
-        trials = project_supported_placement((pose.detach() + strides * delta).flatten(0, 1), local, bounds)
-        owners = torch.arange(len(pose), device=pose.device).repeat(3)
-        with torch.no_grad():
-            losses, centers, wrists = score(trials, owners)
-        for trial, trial_loss, trial_center, trial_wrist in zip(
-            trials.chunk(3), losses.chunk(3), centers.chunk(3), wrists.chunk(3)
-        ):
-            improved = ((best_loss > 0) & (trial_loss < best_loss)) | (
-                (best_loss == 0) & (trial_loss == 0) & (trial_center < best_center)
-            )
-            best = torch.where(improved[:, None], trial, best)
-            best_wrist = torch.where(improved[:, None, None], trial_wrist, best_wrist)
-            best_loss = torch.where(improved, trial_loss, best_loss)
-            best_center = torch.where(improved, trial_center, best_center)
-    return best, best_wrist
-
-
 def _summary(result, commands, order, initial, validation, i, *, incoming, wrist, initialization,
-             screened_indices=None, proposal_seed=None, placement=None, placement_seed=None):
+             placement=None, placement_seed=None):
     ik = result.ik
     record = dict(
         order=order,
@@ -331,8 +275,6 @@ def _summary(result, commands, order, initial, validation, i, *, incoming, wrist
         incoming=_list(incoming[i]),
         wrist_world=_list(wrist[i]),
     )
-    if screened_indices is not None:
-        record.update(proposal_seed_commands=_list(proposal_seed[i]), proposal_found=bool((screened_indices == i).any()))
     if placement is not None:
         record.update(placement_seed=_list(placement_seed[i]), placement=_list(placement[i]))
     if initialization is not None:
@@ -391,8 +333,7 @@ def _refine_batch(
         for _, op in groups
         if op.operator.metadata.action_type == "place"
     }
-    learned_adam = config.step_optimizer == "learned_adam"
-    if config.step_optimizer in ("learned_adam", "adam") and bindings is None:
+    if bindings is None:
         from cutamp.step_adam import optimize_particles
 
         initial = {key: value for key, value in placement_seeds.items() if key not in (inputs.placements or {})}
@@ -410,9 +351,9 @@ def _refine_batch(
         if config.step_adam_plateau_mm is not None or config.step_adam_trace_center:
             options.update(plateau=config.adam_plateau(), trace_center=config.step_adam_trace_center,
                            center_weight=config.com_center_weight)
-        objective_fn = partial(evaluate, ik_starts={}) if learned_adam and config.step_ik_warm_start else evaluate
+        objective_fn = partial(evaluate, ik_starts={}) if config.step_ik_warm_start else evaluate
         tolerance = nullcontext()
-        if learned_adam and config.step_ik_objective_tol is not None:
+        if config.step_ik_objective_tol is not None:
             tolerance = stance_ik_tolerance(config.step_ik_objective_tol)
         with tolerance:
             best, report = optimize_particles(initial, objective_fn, config.step_refine_iterations, config.lr, **options)
@@ -421,7 +362,6 @@ def _refine_batch(
             verified = evaluate(best, objective=False)
         for row in verified.rows:
             idx = row.index - first
-            row.metrics["step_optimizer"] = config.step_optimizer
             row.metrics["adam_updates_completed"] = report["updates_completed"]
             row.metrics["adam_stop_reason"] = report["stop_reason"]
             row.metrics["selected_adam_iteration"] = int(report["iteration"][idx])
@@ -432,7 +372,6 @@ def _refine_batch(
                     grad = report.get("initial_gradient", {}).get(key)
                     gap["initial_adam_loss_gradient"] = _list(grad[idx]) if grad is not None else None
         verified.diagnostics["adam"] = {
-            "optimizer": config.step_optimizer,
             "first_index": first, "iterations": report["updates_completed"], "max_updates": config.step_refine_iterations,
             "stop_reason": report["stop_reason"],
             "selected_iteration": _list(report["iteration"]), "violation": _list(report["violation"]),
@@ -457,7 +396,7 @@ def _refine_batch(
         d = observed.dynamics
     if inputs.dynamics is not None:
         d = _batch(inputs.dynamics, first, stop, (38,), like)
-    adapter = StepStateAdapter(predictor) if predictor is not None else None
+    adapter = StepStateAdapter(predictor)
     stances = {"left_q0": incoming, "right_q0": incoming}
     summaries = []
 
@@ -467,7 +406,6 @@ def _refine_batch(
     predictions = {}
     rest_at_gap = []
     stance_at_gap = []
-    prepared_places = set()
     retracted = set()
     gap = -1
     for movement in proposal.skeleton:
@@ -529,8 +467,7 @@ def _refine_batch(
     for j, (steps, op) in enumerate(groups):
         _check_deadline(deadline)
         order = proposal.orders[j]
-        cmds = (bindings[f"foot{j}"] if bindings is not None and steps
-                else _command_inputs(inputs, seeds, j, steps, like))
+        cmds = bindings[f"foot{j}"] if steps else _command_inputs(inputs, seeds, j, steps, like)
         seed = _inputs_for_gap(inputs, seeds, j, op, incoming, cmds, rest, first, stop)
         arm = op.operator.metadata.arm
         held = held_before[j]
@@ -540,7 +477,7 @@ def _refine_batch(
         usable = torch.ones(n, dtype=torch.bool, device=like.device)
         active_predictor = None
         init = None
-        if steps and predictor is not None:
+        if steps:
             _check_deadline(deadline)
             obs = observed if j == 0 else None
             if inputs.initial_state is not None and j == 0:
@@ -564,56 +501,8 @@ def _refine_batch(
             active_predictor = predictor
             if j == 0:
                 stances.update(left_q0=incoming, right_q0=incoming)
-        eligible_sources = None
-        if bindings is None and config.step_mode == "model" and inputs.orders is None and config.step_refine_iterations == 0 and endpoints:
-            prefix = torch.stack(endpoints, dim=1)
-            eligible_sources = usable & prefix.all(1)
-            if not eligible_sources.any():
-                flags = torch.zeros((n, len(groups)), device=usable.device, dtype=torch.bool)
-                flags[:, :j] = prefix
-                best = int(prefix.long().cumprod(1).sum(1).argmax())
-                return StepResult([], flags, "unresolved", "no feasible prefix has a compatible landing state",
-                                  {"row": first + best, "gaps": records(best)})
-        # Bind free placements before differentiating this stance. A later place
-        # on these same feet must use exactly that binding in its final IK too.
-        last = next((k for k in range(j + 1, len(groups)) if groups[k][0]), len(groups))
-        for k in range(j, last):
-            place = groups[k][1]
-            if place.operator.metadata.action_type != "place" or k in prepared_places:
-                continue
-            key = place.arg("placement")
-            if bindings is None and key not in (inputs.placements or {}):
-                nominal = _nominal(incoming, order, cmds)
-                place_seed = (
-                    seed
-                    if j == k
-                    else _inputs_for_gap(inputs, seeds, k, place, nominal, like.new_empty(n, 0, 3), rest, first, stop)
-                )
-                owners = slice(None) if eligible_sources is None else eligible_sources
-                other_arm = occupied_reference(k, rest)
-                selected, wrist = _place_update(
-                    world, place, particles[key][owners], nominal[owners], place_seed[owners],
-                    particles[place.arg("grasp")][owners], margin, config.com_center_weight,
-                    other_arm_reference=None if other_arm is None else other_arm[owners], deadline=deadline,
-                )
-                placed = particles[key].clone()
-                wrists[k] = wrists[k].clone()
-                placed[owners], wrists[k][owners] = selected, wrist
-                particles[key] = placed
-                obj = place.arg("obj")
-                transformation = action_4dof_to_mat4x4(placed)
-                for m in range(k + 1, len(groups)):
-                    future_op = groups[m][1]
-                    objects[m][obj] = transformation
-                    if future_op.arg("obj") == obj:
-                        if future_op.operator.metadata.action_type == "place":
-                            break
-                        grasp = grasp_7dof_to_mat4x4(particles[future_op.arg("grasp")])
-                        frame = world.tool_frame_for_arm(future_op.operator.metadata.arm)
-                        wrists[m] = transformation @ grasp @ world.tool_from_ee[frame]
-            prepared_places.add(k)
-
         # Later manipulations without another step must also stand on these same feet.
+        last = next((k for k in range(j + 1, len(groups)) if groups[k][0]), len(groups))
         validation = None
         def coupled_rows(pred, ik):
             nonlocal validation
@@ -644,7 +533,7 @@ def _refine_batch(
             limits = [(v - checker._get_tol("Collision", key)) / 0.02 for key, v in scene.items()]
             rows["manipulation_collision"] = torch.cat(limits, dim=1).amax(1)
             if pred is not None and pred.steps:
-                if forward_only:
+                if not objective:
                     validation = validate_step_geometry(world, adapter, pred, object_poses=objects[j], held=held)
                     rows.update(sweep_penetration_rows(validation["penetration"]))
                 else:
@@ -656,13 +545,9 @@ def _refine_batch(
 
             # Each replay starts from the shared initial state. The next gap includes
             # the retraction and controller history prepared from this gap's prediction.
-            forward_only = False
             prediction = None
             if active_predictor is not None:
-                if learned_adam:
-                    prediction = predict_sequence(active_predictor.sequence_model, active_predictor, start, order, cmds)
-                else:
-                    prediction = active_predictor.rollout(start, order, cmds)
+                prediction = predict_sequence(active_predictor.sequence_model, active_predictor, start, order, cmds)
             ev = _evaluate(active_predictor, start, incoming, order.replace("none", ""), cmds, arm, wrists[j],
                            seed, margin, coupled_rows, None, None, solve_ik=endpoint_solver(j, rest, seed),
                            prediction=prediction)
@@ -675,28 +560,6 @@ def _refine_batch(
                 rest = _retract_on_stance(incoming, rest, arm, world.joint_limits, other_arm_reference=other).q
             continue
 
-        screened = None
-        proposal_seed = cmds
-        proposal_count = config.step_place_proposal_count if op.operator.metadata.action_type == "place" else config.step_proposal_count
-        if steps and active_predictor is not None and proposal_count:
-            from cutamp.step_proposals import rank_landing_commands
-
-            if inputs.commands is None and inputs.posture_seeds is None and config.com_center_weight:
-                _check_deadline(deadline)
-                seed = centered_stance_witnesses(
-                    _nominal(incoming, order, cmds), wrists[j], seed, arm, other, config.com_center_weight
-                )
-            screened = rank_landing_commands(
-                world, adapter, start, order, cmds, wrists[j], seed, arm,
-                object_poses=objects[j], held=held, count=proposal_count, max_choices=1,
-                target_soles=_nominal(incoming, order, cmds) if not config.com_center_weight else None,
-                margin_m=margin, other_arm_reference=other, endpoint_collides=partial(endpoint_collisions, j),
-                center_posture=bool(config.com_center_weight),
-                eligible_sources=eligible_sources, include_fallback=config.step_refine_iterations == 0, deadline=deadline,
-            )
-            cmds = cmds.clone()
-            cmds[screened.particle_indices] = screened.commands
-        forward_only = bindings is not None or (screened is not None and config.step_refine_iterations == 0)
         result = refine_gap(
             active_predictor,
             start,
@@ -706,48 +569,24 @@ def _refine_batch(
             wrists[j],
             seed,
             margin_m=margin,
-            forward_only=forward_only,
-            screened_prediction=screened.batch_prediction if screened is not None and forward_only else None,
-            screened_ik=screened.batch_ik if screened is not None and forward_only else None,
+            forward_only=True,
             solve_ik=endpoint_solver(j, rest, seed),
             centering_weight=config.com_center_weight,
-            max_iterations=0 if bindings is not None else config.step_refine_iterations,
-            trust_scale=config.step_trust_scale,
+            max_iterations=0,
             deadline=deadline,
             extra_rows=coupled_rows,
-            geometry_rows=geometric_sweep_rows(world, objects[j], held) if steps and predictor is None else None,
         )
         usable = usable & result.ok
         final = result.achieved.detach().to(like)
         if steps:
-            if active_predictor is not None:
-                prediction = result.prediction
-                if validation is None:
-                    validation = validate_step_geometry(world, adapter, prediction, object_poses=objects[j], held=held)
-                usable = usable & validation["valid"]
-                predictions[j] = (start, result.commands, prediction, init.preparation)
-            pair = incoming
+            prediction = result.prediction
+            usable = usable & validation["valid"]
+            predictions[j] = (start, result.commands, prediction, init.preparation)
             for k, step in enumerate(steps):
                 foot = "LR".index(order[k])
-                pair = (
-                    _nominal(pair, order[k], result.commands[:, k : k + 1]).detach()
-                    if validation is None
-                    else result.prediction.steps[k].achieved.detach()
-                )
-                rest = (
-                    _retract_on_stance(pair, rest, arm, world.joint_limits, other_arm_reference=other)
-                    if validation is None
-                    else adapter.planner(result.prediction.steps[k].terminal.tensors[:6])[0].detach()
-                )
+                pair = result.prediction.steps[k].achieved.detach()
+                rest = adapter.planner(result.prediction.steps[k].terminal.tensors[:6])[0].detach()
                 name = step.arg("q_land")
-                if validation is None:
-                    usable &= rest.ok & (stance_ik_rows(rest, 0)["supported"] <= 0)
-                    rest = rest.q.detach()
-                    carried = {obj: (owner, transform) for owner, (obj, transform) in held.items()}
-                    at_step = cost_function.stepped_scene_costs({name: rest}, [step], objects[j], carried)["values"]
-                    usable &= (at_step.pop("self_collision") <= 0.0).all(1)
-                    for key, v in at_step.items():
-                        usable &= (v <= checker._get_tol("Collision", key)).all(1)
                 particles[name] = rest
                 stances[name] = pair
                 particles[step.arg("sole_to")] = pair[:, foot]
@@ -767,19 +606,7 @@ def _refine_batch(
         place_key = op.arg("placement") if op.operator.metadata.action_type == "place" else None
         summaries.append(partial(_summary, result, cmds, order, start, validation, incoming=incoming, wrist=wrists[j],
                                  initialization=None if init is None else init.diagnostics,
-                                 screened_indices=None if screened is None else screened.particle_indices,
-                                 proposal_seed=proposal_seed, placement_seed=placement_seeds.get(place_key),
-                                 placement=particles.get(place_key)))
-        if bindings is None and forward_only and inputs.orders is None and j + 1 < len(groups):
-            prefix = torch.stack(endpoints, dim=1)
-            if not prefix.all(1).any():
-                # Every complete particle must pass *all* its handoffs. A later solve
-                # cannot repair a failed fixed prefix in this forward-only batch.
-                flags = torch.zeros((n, len(groups)), device=prefix.device, dtype=torch.bool)
-                flags[:, :j + 1] = prefix
-                best = int(prefix.long().cumprod(1).sum(1).argmax())
-                return StepResult([], flags, "unresolved", "all particles failed a manipulation prefix",
-                                  {"row": first + best, "gaps": records(best)})
+                                 placement_seed=placement_seeds.get(place_key), placement=particles.get(place_key)))
         incoming = final
 
     if objective:
@@ -834,7 +661,6 @@ def _refine_batch(
     for i in torch.where(passed)[0].tolist():
         particle = {key: v[i].detach().clone() for key, v in particles.items()}
         particle.update({key: value[i].clone() for key, value in posture_references.items()})
-        model_feasible = predictor is not None
         gaps = records(i)
         report = dict(
             gaps=gaps,
@@ -844,28 +670,21 @@ def _refine_batch(
             sole_box_m=list(world.model.sole_box),
             com_center_weight=config.com_center_weight,
             kinematic_candidate=True,
-            model_feasible=model_feasible,
+            model_feasible=True,
             load_status=(
                 "load_unmodeled" if any(g.get("load_status") == "load_unmodeled" for g in gaps) else "unloaded"
             ),
             independent_motion="untested",
+            deployment_sha256=predictor.metadata["deployment_sha256"],
+            checkpoint_sha256=predictor.metadata["checkpoint_sha256"],
+            step_refine_iterations=config.step_refine_iterations,
+            normalized_dynamics=_list(d[i]),
+            step_lag=config.step_lag,
         )
-        if model_feasible:
-            report.update(
-                deployment_sha256=predictor.metadata["deployment_sha256"],
-                checkpoint_sha256=predictor.metadata["checkpoint_sha256"],
-                step_derivative_method=config.step_derivative_method,
-                step_refine_iterations=config.step_refine_iterations,
-                step_trust_scale=config.step_trust_scale,
-                normalized_dynamics=_list(d[i]),
-                step_lag=config.step_lag,
-            )
-        evidence = None
-        if model_feasible:
-            saved = {gap: _take(trace, i, "cpu") for gap, trace in predictions.items()}
-            evidence = _evidence(adapter, saved)
-            if config.curobo_plan and (inputs.transition_validator is not None or config.step_motion_validation == "model"):
-                motion_inputs[first + i] = (adapter, saved)
+        saved = {gap: _take(trace, i, "cpu") for gap, trace in predictions.items()}
+        evidence = _evidence(adapter, saved)
+        if config.curobo_plan and (inputs.transition_validator is not None or config.step_motion_validation == "model"):
+            motion_inputs[first + i] = (adapter, saved)
         if config.curobo_plan:
             if first + i in motion_inputs:
                 report["motion_validation"] = "unattempted"
@@ -876,7 +695,7 @@ def _refine_batch(
     best = int((ep.sum(1) * -1e6 + hard.nan_to_num(1e6)).argmin())
     failures = [f"{kind}.{key}" for kind, items in masks.items() for key, mask in items.items() if not mask[best].all()]
     diagnostics = {"row": first + best, "gaps": records(best), "failed_constraints": failures}
-    status = ("model_feasible" if predictor is not None else "kinematic_candidate") if rows else "unresolved"
+    status = "model_feasible" if rows else "unresolved"
     return StepResult(rows, ep, status, None if rows else "no particle met all applicable constraints", diagnostics)
 
 
@@ -923,7 +742,7 @@ def _validate_motion_rows(rows, pools, skeleton, world, config, attempt, *, dead
 def refine_step_particles(
     proposal, world, config, cost_reducer, constraint_checker, *, inputs, predictor, timer, visualizer, deadline
 ):
-    if config.step_mode == "model" and predictor is None:
+    if predictor is None:
         return StepResult([], None, "unavailable", "missing trained landing predictor")
     config = config.for_refinement(stepped=True)
     try:

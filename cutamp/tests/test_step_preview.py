@@ -26,7 +26,7 @@ def test_composed_stance_miss_is_rejected_even_if_the_two_individual_steps_track
 
 @needs_cuda
 def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landings(tmp_path, monkeypatch):
-    """Fixed bindings isolate motion compilation. Each actual foot command is newly selected on this GPU."""
+    """Fixed bindings isolate motion compilation. Learned step Adam selects each actual foot command on this GPU."""
     from dataclasses import replace
 
     from curobo.scene import Cuboid
@@ -53,14 +53,13 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     inputs = replace(
         inputs,
         orders=("LR", "LR"),
-        commands=tuple(g["commands"] for g in fixture["gaps"]),
+        commands=None,
         posture_seeds=tuple(g["posture_seed"] for g in fixture["gaps"]),
         placements={"pose1": fixture["placement"]},
     )
     cfg = TAMPConfiguration(
         step_mode="model",
-        num_particles=1,
-        step_proposal_count=192,
+        num_particles=16,
         max_loop_dur=60,
         landing_bundle=str(LANDING_BUNDLE),
         enable_visualizer=False,

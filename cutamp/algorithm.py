@@ -424,7 +424,7 @@ def run_cutamp(
     Keyframe-only searches can compare feasible solutions across skeletons.
     """
     if config.step_mode != "off":
-        preload = config.step_mode == "model" and config.curobo_plan and not (step_inputs and step_inputs.grasps)
+        preload = config.curobo_plan and not (step_inputs and step_inputs.grasps)
         if preload:
             # Only sampler construction overlaps world setup and search. Grasp generation itself
             # changes process-wide CUDA settings and runs synchronously for the selected objects.
@@ -435,7 +435,7 @@ def run_cutamp(
             if preload:
                 wait_for_sampler_load()  # also when no skeleton was reached or setup raised
     if step_inputs is not None:
-        raise ValueError("Explicit step inputs require step_mode rank, geometric or model")
+        raise ValueError("Explicit step inputs require step_mode model")
     # GraspGenX's model loads on a background thread while the robot and the world load and the task planner runs.
     start_sampler_load()
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
@@ -693,10 +693,9 @@ def _load_step_search(config, *, applicable=True):
     from cutamp.reachability import REACH_MAP
 
     path = Path(config.step_reach_map or REACH_MAP)
-    lag = None if config.step_mode == "geometric" else config.step_lag
     accuracy = Path(config.step_accuracy_table or LANDING_ACCURACY)
 
-    tables, notes = _step_tables(_file_version(path), _file_version(accuracy) if lag is not None and applicable else None, lag)
+    tables, notes = _step_tables(_file_version(path), _file_version(accuracy) if applicable else None, config.step_lag)
     return tables, (
         dict(notes) if applicable else dict(notes, accuracy_status="dynamics outside the profiled condition")
     )
@@ -725,7 +724,7 @@ def _step_tables(map_version, accuracy_version, lag):
             return StepSearch(atlas, accuracy=records, lag=lag), notes
         except (ValueError, KeyError) as e:
             notes["accuracy_status"] = str(e)
-    elif lag is not None:
+    else:
         notes["accuracy_status"] = "unavailable"
     return StepSearch(atlas, lag=lag), notes
 
@@ -733,33 +732,26 @@ def _step_tables(map_version, accuracy_version, lag):
 def _load_predictor(config):
     from cutamp.landing_accuracy import LANDING_BUNDLE
     from cutamp.landing_predictor import LandingPredictor
+    from cutamp.step_sequence_model import DEFAULT_STEP_SEQUENCE_MODEL, load_step_sequence_model
 
     path = Path(config.landing_bundle or LANDING_BUNDLE)
     version = _file_version(path)
     if version[1] is None or not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
-    solver = config.for_refinement(stepped=True)
-    sequence_path = sequence_version = None
-    if solver.step_optimizer == "learned_adam":
-        from cutamp.step_sequence_model import DEFAULT_STEP_SEQUENCE_MODEL, load_step_sequence_model
-
-        sequence_path = Path(config.step_sequence_bundle or DEFAULT_STEP_SEQUENCE_MODEL)
-        sequence_version = _file_version(sequence_path)
-        if sequence_version[1] is None or not sequence_path.is_file():
-            raise FileNotFoundError(f"Step sequence bundle is unavailable at {sequence_path}")
-    screened = solver.step_proposal_count and solver.step_refine_iterations == 0
-    reuse = config.cuda_graphs and (screened or solver.step_optimizer in ("adam", "learned_adam"))
-    if reuse:
+    sequence_path = Path(config.step_sequence_bundle or DEFAULT_STEP_SEQUENCE_MODEL)
+    sequence_version = _file_version(sequence_path)
+    if sequence_version[1] is None or not sequence_path.is_file():
+        raise FileNotFoundError(f"Step sequence bundle is unavailable at {sequence_path}")
+    if config.cuda_graphs:
         stream = torch.cuda.current_stream()
-        key = (version, sequence_version, solver.step_derivative_method, stream.device, stream.cuda_stream)
+        key = (version, sequence_version, stream.device, stream.cuda_stream)
         if getattr(_PREDICTOR_CACHE, "key", None) == key:
             return _PREDICTOR_CACHE.model
-    predictor = LandingPredictor(path, derivative_method=solver.step_derivative_method, use_cuda_graph=bool(reuse))
-    if sequence_path is not None:
-        predictor.sequence_model = load_step_sequence_model(
-            sequence_path, predictor.device, expected_deployment=predictor.metadata["deployment_sha256"]
-        )
-    if reuse:
+    predictor = LandingPredictor(path, derivative_method="autodiff", use_cuda_graph=config.cuda_graphs)
+    predictor.sequence_model = load_step_sequence_model(
+        sequence_path, predictor.device, expected_deployment=predictor.metadata["deployment_sha256"]
+    )
+    if config.cuda_graphs:
         _PREDICTOR_CACHE.model = predictor
         _PREDICTOR_CACHE.key = key
     return predictor
@@ -847,13 +839,13 @@ def _refine_standing_schedule(
 
 
 def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inputs):
-    request_start = monotonic()
+    start = monotonic()
     from cutamp.step_planner import ScheduleSearch, StepInputs, StepResult, furthest_endpoint, manipulation_regions
 
     validate_tamp_config(config)
     inputs = inputs if inputs is not None else StepInputs()
     predictor = None
-    if (config.step_mode == "model" and getattr(env, "robot_start", "home") == "synthetic_standing"
+    if (getattr(env, "robot_start", "home") == "synthetic_standing"
             and q_init is None and inputs.initial_state is None and inputs.dynamics is None):
         from cutamp.landing_predictor import nominal_landing_dynamics
         from cutamp.step_validation import StepStateAdapter
@@ -864,16 +856,9 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         q, _ = StepStateAdapter(predictor).planner(state.tensors[:6])
         q_init = q[0].tolist()
         inputs = replace(inputs, initial_state=state)
-    solver = config.for_refinement(stepped=True)
-    screened = solver.step_proposal_count > 0 and solver.step_refine_iterations == 0
     budget = config.max_loop_dur
-    if screened and budget is None:
-        budget = 9.5 if config.curobo_plan else 8.0
     logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
     world.grasps.update(inputs.grasps)
-    setup_end = monotonic()
-    budget_from_entry = screened or solver.step_optimizer == "learned_adam"
-    start = request_start if budget_from_entry else setup_end
     deadline = start + budget if budget is not None else None
     timer.start("start_optimization")
     incoming = None
@@ -891,7 +876,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         soles = world.stance_soles
         yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
         incoming = torch.cat((soles[..., :2, 3], yaw[:, None]), -1).detach().cpu().tolist()
-        joint = config.step_search_order == "astar" and bool(search.hands) and inputs.arms is None and inputs.orders is None
+        joint = bool(search.hands) and inputs.arms is None and inputs.orders is None
         admitted = {}
         if joint:
             for proposal in arm_step_skeletons(search, world, all_t1_operators, incoming,
@@ -910,8 +895,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                     )
                 else:
                     stream = ScheduleSearch(search, skeleton, regions, world, incoming, fixed=inputs.orders,
-                                            strategy=config.step_search_order, prefer_reach=inputs.orders is None,
-                                            deadline=deadline)
+                                            prefer_reach=inputs.orders is None, deadline=deadline)
                     yield stream, None
 
         sources = iter(streams())
@@ -970,7 +954,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         "step_search": {},
         "search_budget_s": budget,
         "improvement_budget_s": None,
-        "search_budget_start": "planner_entry" if budget_from_entry else "after_world_setup",
+        "search_budget_start": "planner_entry",
         "grasp_generation_calls": 0,
         "grasp_proposals_by_object": {},
         "best_cost": None,
@@ -1058,11 +1042,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         if inputs.commands is not None:
             attempt["supplied_command_seeds"] = inputs.commands
         metrics["step_attempts"].append(attempt)
-        if config.step_mode == "rank":
-            attempt["status"] = "ranked"
-            metrics["status"] = "ranked"
-            continue
-        if proposal.step_count and config.step_mode == "model" and predictor is None and unavailable is None:
+        if proposal.step_count and predictor is None and unavailable is None:
             try:
                 predictor = _load_predictor(config)
             except (FileNotFoundError, RuntimeError, ValueError, KeyError, OSError) as e:
@@ -1121,13 +1101,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         if config.curobo_plan:
             metrics["motion_plan_attempts"] += result.diagnostics.get("motion_plan_attempts", 0)
             metrics["motion_plan_failures"] += result.diagnostics.get("motion_plan_failures", [])
-        required_level = (
-            "standing_feasible"
-            if not proposal.step_count
-            else "model_feasible"
-            if config.step_mode == "model"
-            else "kinematic_candidate"
-        )
+        required_level = "standing_feasible" if not proposal.step_count else "model_feasible"
         accepted = [
             row
             for row in result.rows

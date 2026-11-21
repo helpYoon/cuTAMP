@@ -507,7 +507,7 @@ provenance.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
   and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 128 for
-  learned step Adam (256 with `step_mode="off"`, 64 for the other step routes);
+  learned step Adam (256 with `step_mode="off"`);
   `soft_cost=["place_close_to_base", "joint_limit_margin",
   "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
   balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
@@ -670,9 +670,6 @@ next skeleton. Use `--max_duration` or `--max_step_schedules` to bound this sear
 A connected prediction carries the status `model_predicted_motion`. Independent
 transition evidence can be supplied through the Python API.
 
-To run the original recurrent Adam objective, pass `--step_optimizer adam`.
-For forward screening, use `--step_optimizer screen`.
-
 The `two_steps_floor_transfer` demo starts the learned-step planner from a
 synthetic standing start: the landing model's home pose with a settled controller
 history (`robot_start: synthetic_standing` in the scene file). Its CLI sampling
@@ -769,7 +766,7 @@ skips the robot's meshes; both cut bandwidth.
 ## Troubleshooting
 
 - **`torch.OutOfMemoryError: CUDA out of memory`** — use fewer particles
-  (default 128, 64 for the other step routes, or 256 with `--step_mode off`),
+  (default 128, or 256 with `--step_mode off`),
   e.g. `-n 32`.
 
 ## Key Design Decisions

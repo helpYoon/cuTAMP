@@ -136,7 +136,6 @@ def main():
             "gpu": torch.cuda.get_device_name(),
             "particles": cfg.num_particles,
             "particle_batch_size": cfg.step_particle_batch_size,
-            "step_optimizer": solver.step_optimizer,
             "max_updates": solver.step_refine_iterations,
             "warm_start_ik": solver.step_ik_warm_start if args.mode == "planner" else args.warm_start_ik,
             "ik_objective_tol": solver.step_ik_objective_tol if args.mode == "planner" else args.ik_objective_tol,

@@ -174,18 +174,14 @@ def manipulation_regions(skeleton, world):
 class ScheduleSearch:
     """Rank and retry foot orders for one fixed arm/object skeleton."""
 
-    def __init__(self, search, skeleton, regions, world, incoming, *, fixed=None, strategy="astar", deadline=None, prefer_reach=False):
+    def __init__(self, search, skeleton, regions, world, incoming, *, fixed=None, deadline=None, prefer_reach=False):
         self.args = (search, skeleton, regions, world.initial_state, world.goal_state, incoming)
         self.seen = set()
         self.targeted = deque()
         self.fixed = fixed
         self.deadline = deadline
         self.gaps = len(regions)
-        self.count_first = (
-            strategy == "count"
-            or not search.hands
-            or any(target is None or target.center is None for target in regions)
-        )
+        self.count_first = not search.hands or any(target is None or target.center is None for target in regions)
         self.prefer_reach = prefer_reach and not self.count_first
         self.ranked = ranked_step_skeletons(*self.args, deadline=deadline, prefer_reach=self.prefer_reach)
         self.fallback = None

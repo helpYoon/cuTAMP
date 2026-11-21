@@ -1,43 +1,13 @@
 """Regression for preserving each particle's own incoming state in forward screening."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from cutamp import step_proposals as proposals
-from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.landing_predictor import LandingState
-
-
-def test_forward_proposals_require_model_and_preserve_explicit_updates():
-    config = TAMPConfiguration(step_mode="model", step_optimizer="screen")
-    assert config.num_particles == 64
-    assert config.for_refinement(stepped=True).step_proposal_count == 192
-    assert config.for_refinement(stepped=True).step_place_proposal_count == 128
-    assert replace(config, step_proposal_count=48).for_refinement(stepped=True).step_place_proposal_count == 48
-    assert config.for_refinement(stepped=False).step_proposal_count == 0
-    assert TAMPConfiguration().num_particles == 128
-    assert TAMPConfiguration().curobo_plan
-    assert TAMPConfiguration(step_mode="off").num_particles == 256
-    assert TAMPConfiguration(step_mode="off").for_refinement(stepped=False).com_center_weight == 0
-    assert TAMPConfiguration(step_mode="off", com_center_weight=2.0).for_refinement(stepped=False).com_center_weight == 2.0
-    assert TAMPConfiguration(step_mode="model", num_particles=8).num_particles == 8
-    assert (
-        replace(config, step_derivative_method="finite_difference").for_refinement(stepped=True).step_proposal_count
-        == 0
-    )
-    assert replace(config, step_refine_iterations=3).for_refinement(stepped=True).step_proposal_count == 0
-    validate_tamp_config(config)
-    assert config.for_refinement(stepped=True).step_refine_iterations == 0
-    assert replace(config, step_refine_iterations=3).for_refinement(stepped=True).step_refine_iterations == 3
-    for bad in [
-        replace(config, step_mode="geometric", step_proposal_count=64),
-        replace(config, step_proposal_count=-1),
-    ]:
-        with pytest.raises(ValueError):
-            validate_tamp_config(bad)
 
 
 @dataclass
@@ -174,30 +144,3 @@ def test_forward_batch_reuses_selected_or_nominal_prediction_for_every_source(mo
     assert result.batch_prediction.owner.tolist() == list(range(n))
     torch.testing.assert_close(result.batch_prediction.steps[0].achieved[:, 0], expected[:, 0])
     torch.testing.assert_close(result.batch_ik.soles, result.batch_prediction.steps[0].achieved)
-
-
-def test_place_line_search_stops_before_next_ik_when_deadline_expires(monkeypatch):
-    from cutamp import step_particles, step_refinement
-
-    clock = [0.]
-    monkeypatch.setattr(step_refinement, "monotonic", lambda: clock[0])
-    eye = torch.eye(4)
-    world = SimpleNamespace(tool_from_ee={"tool": eye}, tool_frame_for_arm=lambda arm: "tool",
-                            get_collision_spheres=lambda obj: torch.tensor([[0., 0., 0., .01]]),
-                            get_aabb=lambda surf: torch.tensor([[-1., -1., 0.], [1., 1., 1.]]))
-    op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(arm="left")), arg=lambda v: v)
-    invocations = []
-
-    def solve(soles, wrist, seed, arm, **kwargs):
-        invocations.append(len(wrist))
-        clock[0] = 1.
-        return SimpleNamespace(xy=wrist[:, :2, 3])
-
-    monkeypatch.setattr(step_particles, "solve_stance_ik", solve)
-    monkeypatch.setattr(step_particles, "stance_ik_rows", lambda ik, m: {"supported": ik.xy[:, 0] * 0.})
-    monkeypatch.setattr(step_particles, "stance_center_residual", lambda ik: ik.xy)
-    with pytest.raises(TimeoutError, match="planner deadline"):
-        step_particles._place_update(world, op, torch.tensor([[.3, 0., 0., 0.]]), torch.zeros(1, 2, 3),
-                                     torch.zeros(1, 33), torch.tensor([[0., 0., 0., 1., 0., 0., 0.]]),
-                                     .05, 4., deadline=1.)
-    assert invocations == [1]
