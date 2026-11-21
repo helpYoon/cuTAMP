@@ -787,6 +787,5 @@ def test_unmatched_dynamics_never_receive_reference_tracking_credit():
     assert not StepInputs(LandingState((), d, "synthetic_home_50_hold")).matches_accuracy_context(8)
     search, meta = alg._load_step_search(cfg, applicable=False)
     assert meta["accuracy_status"] == "dynamics outside the profiled condition"
-    home = search.home or ((0, 0.1, 0), (0, -0.1, 0))
-    options = search.edges(home, TargetRegion("left", None, None))
+    options = search.edges(search.home, TargetRegion("left", None, None))
     assert all(e.accuracy == "unknown" for e in options if e.commands)

@@ -169,16 +169,16 @@ def test_matching_signed_commands_only_and_transferred_prior():
     assert StepSearch(atlas(), commands=(FWD,), lag=8).edges(HOME, query)[1].cost == (1, 1)
 
 
-def test_screened_search_prefers_loaded_reach_over_a_known_miss():
+def test_prefer_reach_ranks_loaded_reach_over_a_known_miss():
     search = StepSearch(atlas(), commands=(FWD,), lag=2)
     # From the starting feet the grasp-independent place query misses by 6 cm.
     # A step overlaps the reach map but has no controller prior with this payload.
     region = target(0.065, loaded=True)
     reference = list(search.schedules(HOME, [region]))
-    screened = list(search.schedules(HOME, [region], prefer_reach=True))
+    preferred = list(search.schedules(HOME, [region], prefer_reach=True))
     assert reference[0].edges[0].order == "none"
-    assert screened[0].edges[0].distance_m == 0 and screened[0].edges[0].accuracy == "unknown"
-    assert {plan.edges[0] for plan in reference} == {plan.edges[0] for plan in screened}
+    assert preferred[0].edges[0].distance_m == 0 and preferred[0].edges[0].accuracy == "unknown"
+    assert {plan.edges[0] for plan in reference} == {plan.edges[0] for plan in preferred}
 
 
 def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():

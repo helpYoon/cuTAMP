@@ -311,8 +311,8 @@ class StepSearch:
         def push(path, cost, gap, children=None):
             h = min(e.cost for e in children) if children else (0, 0)
             f = (cost[0] + h[0], cost[1] + h[1])
-            # Screening will measure controller precision from the actual history. In this
-            # mode a missing load profile should not outrank a measured miss of the hand map.
+            # With prefer_reach (the joint A*), a missing load profile should not outrank a
+            # measured miss of the hand map.
             # Worst reach miss is monotone along the path and lower-bounds the completed plan.
             priority = (gap, *f) if prefer_reach else (*f, gap)
             heapq.heappush(queue, (priority, gap, next(serial), path, cost, children))
