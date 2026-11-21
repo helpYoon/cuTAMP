@@ -38,6 +38,7 @@ def test_captured_rollout_matches_eager_and_retains_prior_results(predictor):
     ctx = torch.zeros(2, 38, device="cuda")
     ctx[:, -5:] = -1
     start = predictor.standing_start(ctx)
+    assert_same_prediction(fast.standing_start(ctx), start)
     commands = ctx.new_tensor([[[.12,.21,0], [.10,-.21,0]], [[.24,.21,0], [.06,-.21,0]]])
     expected = predictor.rollout(start, "LR", commands)
     result = fast.rollout(start, "LR", commands)
@@ -47,6 +48,7 @@ def test_captured_rollout_matches_eager_and_retains_prior_results(predictor):
     changed[..., 0] += .01
     ctx[:, 0] += .25
     other = predictor.standing_start(ctx)
+    assert_same_prediction(fast.standing_start(ctx), other)
     assert_same_prediction(fast.rollout(other, "LR", changed), predictor.rollout(other, "LR", changed))
     assert_same_prediction(result, expected)
 

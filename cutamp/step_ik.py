@@ -1,8 +1,12 @@
 """Batched T1 sole and wrist IK with implicit differentiation of its bounded optimum."""
 
+import math
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
+from threading import local
 
 import numpy as np
 import torch
@@ -16,6 +20,32 @@ from cutamp.supported_posture import PostureCollisionSpheres
 # Match the supported endpoint fit's CoM-to-pose residual ratio (6 to 50).
 _CENTER_WEIGHT = 6.0 / 50.0
 _SELF_COLLISION_WEIGHT = 24.0 / 50.0
+
+
+_CUDA_GRAPHS = ContextVar("stance_ik_cuda_graphs", default=True)
+_IK_TOLERANCE = ContextVar("stance_ik_tolerance", default=2e-9)
+
+
+@contextmanager
+def stance_ik_graphs(enabled):
+    """Scope graph reuse to the planner request and its calling thread."""
+    token = _CUDA_GRAPHS.set(enabled)
+    try:
+        yield
+    finally:
+        _CUDA_GRAPHS.reset(token)
+
+
+@contextmanager
+def stance_ik_tolerance(value):
+    """Scope the numerical solve tolerance. Pose and landing acceptance have separate gates."""
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Stance IK solve tolerance must be finite and positive")
+    token = _IK_TOLERANCE.set(value)
+    try:
+        yield
+    finally:
+        _IK_TOLERANCE.reset(token)
 
 
 @dataclass
@@ -37,6 +67,180 @@ def _xyz(s):
     return np.fromstring(s, sep=" ")
 
 
+class _StanceIterationGraph:
+    """Capture one bounded damped least-squares iteration at a fixed batch shape."""
+
+    def __init__(self, kin, target, seed, arm, lower, upper, prior, weight, fixed_idle=False):
+        self.target = torch.empty_like(target)
+        self.seed = torch.empty_like(seed)
+        self.lower, self.upper, self.prior = [torch.empty_like(seed) for _ in range(3)]
+        self.q = torch.empty_like(seed)
+        self.damping = seed.new_empty((len(seed), 1))
+        self.converged = torch.empty(len(seed), dtype=torch.bool, device=seed.device)
+        self.invalid = self.converged.new_zeros(())
+        # Equality-constrained coordinates take a zero step in every active-set pass.
+        # Factor only the remaining principal block while evaluating FK and cost in full.
+        self.variables = None
+        width = kin.n
+        if fixed_idle:
+            idle = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
+            columns = [i for i in range(kin.n) if not idle.start <= i < idle.stop]
+            self.variables = torch.tensor(columns, device=seed.device)
+            width = len(columns)
+        self.eye = torch.eye(width, device=seed.device, dtype=seed.dtype)
+        self.pair_ids = torch.arange(len(kin.self_spheres.i), device=seed.device) if weight else None
+        self.reset(target, seed, lower, upper, prior)
+        caller = torch.cuda.current_stream(seed.device)
+        stream = torch.cuda.Stream(device=seed.device)
+        stream.wait_stream(caller)
+        with torch.cuda.stream(stream):
+            self.iterate(kin, arm, weight)
+        caller.wait_stream(stream)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=stream):
+            self.iterate(kin, arm, weight)
+
+    def reset(self, target, seed, lower, upper, prior):
+        for buf, value in zip((self.target, self.seed, self.lower, self.upper, self.prior),
+                              (target, seed, lower, upper, prior), strict=True):
+            buf.copy_(value)
+        self.q.copy_(seed.clamp(lower, upper))
+        self.damping.fill_(1e-4)
+        self.invalid.zero_()
+
+    def collisions(self, spheres, frames):
+        """Keep original pair order and flag overflow; eager fallback covers crowded cases."""
+        pos, rotation, _, axes = frames
+        points = pos[:, spheres.links] + (rotation[:, spheres.links] @ spheres.offsets[..., None]).squeeze(-1)
+        delta = points[:, spheres.i] - points[:, spheres.j]
+        limit = spheres.radii_sum + 0.006
+        n = len(self.pair_ids)
+        active = delta.square().sum(-1) < limit.square()
+        ranks = torch.where(active, n - self.pair_ids, 0)
+        k = min(48, n)
+        values, pairs = ranks.topk(k, sorted=True)
+        self.invalid.logical_or_((active.sum(-1) > k).any())
+        rows = torch.arange(len(pos), device=pos.device)[:, None]
+        i, j = spheres.i[pairs], spheres.j[pairs]
+        delta = points[rows, i] - points[rows, j]
+        distance = delta.square().sum(-1).clamp_min(1e-24).sqrt()
+        val = (limit[pairs] - distance) * (values > 0)
+        lever = points[rows, i, None] - pos[:, None, spheres.joint_links]
+        unit = (delta / distance[..., None])[:, :, None].expand_as(lever)
+        joint = (torch.linalg.cross(lever, unit) * axes[:, None]).sum(-1)
+        mask = (spheres.descendants.mT[j] - spheres.descendants.mT[i]) * (values > 0)[..., None]
+        jac = torch.cat((pos.new_zeros(len(pos), k, 6), joint * mask), -1)
+        return val, jac
+
+    def iterate(self, kin, arm, weight):
+        q, seed, target = self.q, self.seed, self.target
+        lo, hi, prior = self.lower, self.upper, self.prior
+        if weight:
+            frames = kin.link_frames(q, True)
+            pose, J, com, Jcom = kin.fk(q, arm, frames=frames, com_jacobian=True)
+            collision, Jcollision = self.collisions(kin.self_spheres, frames)
+            residual = torch.cat((torch.cat((pose, weight * com[:, :2]), -1) - target,
+                                  _SELF_COLLISION_WEIGHT * collision), -1)
+            J = torch.cat((J, weight * Jcom[:, :2], _SELF_COLLISION_WEIGHT * Jcollision), 1)
+            grad = (J.mT @ residual[..., None]).squeeze(-1) + prior.square() * (q - seed)
+        else:
+            residual, J, grad = kin.fitted(q, target, seed, arm, prior=prior)
+        low, high = q <= lo + 1e-8, q >= hi - 1e-8
+        active = (low & (grad >= 0)) | (high & (grad <= 0))
+        done = grad.masked_fill(active, 0).abs().amax(-1) < _IK_TOLERANCE.get()
+        self.converged.copy_(done)
+        finite_grad = grad.isfinite().all(-1)
+        damping_diag = prior.square() + self.damping
+        if self.variables is not None:
+            ids = self.variables
+            J = J.index_select(-1, ids)
+            damping_diag = damping_diag.index_select(-1, ids)
+            grad, low, high, active = (v.index_select(-1, ids) for v in (grad, low, high, active))
+        A = J.mT @ J + damping_diag.diag_embed()
+        # Positive damping makes every free block positive definite. These native
+        # CUDA operations support graph capture, including the restricted solves.
+        for _ in range(4):
+            free = ~active
+            system = A * (free[:, :, None] & free[:, None, :]) + self.eye * active[:, :, None]
+            chol, info = torch.linalg.cholesky_ex(system)
+            self.invalid.logical_or_((info != 0).any())
+            tmp = torch.linalg.solve_triangular(chol, (-grad * free)[..., None], upper=False)
+            step = torch.linalg.solve_triangular(chol.mT, tmp, upper=True).squeeze(-1)
+            active |= (low & (step < 0)) | (high & (step > 0))
+        if self.variables is not None:
+            step = torch.zeros_like(q).index_copy_(-1, self.variables, step)
+        change = step * (0.4 / step.abs().amax(-1, keepdim=True).clamp_min(0.4))
+        candidate = (q + change).clamp(lo, hi)
+        frames = kin.link_frames(candidate)
+        other, com = kin.fk(candidate, arm, False, frames=frames)
+        if weight:
+            collision, _ = kin.self_spheres.residual(frames)
+            other = torch.cat((other, weight * com[:, :2]), -1)
+        cost = residual.square().sum(-1) + ((q - seed) * prior).square().sum(-1)
+        trial = (other - target).square().sum(-1) + ((candidate - seed) * prior).square().sum(-1)
+        if weight:
+            trial = trial + (_SELF_COLLISION_WEIGHT * collision).square().sum(-1)
+        finite = step.isfinite().all(-1) & finite_grad & cost.isfinite() & trial.isfinite()
+        self.invalid.logical_or_((~finite).any())
+        better = ((trial < cost) & ~done)[:, None]
+        self.q.copy_(torch.where(better, candidate, q))
+        self.damping.copy_(torch.where(better, self.damping * 0.35, self.damping * 5.0).clamp(1e-9, 100.))
+
+def _graph_pose(kin, target, seed, arm, lower, upper, prior, center_weight, iterations, initial=None):
+    cache = getattr(kin._solve_graphs, "cache", None)
+    if cache is None:
+        cache = kin._solve_graphs.cache = {}
+    stream = torch.cuda.current_stream(seed.device)
+    idle = REAL_LEGS.right_arm if arm == "left" else REAL_LEGS.left_arm
+    fixed_idle = bool(center_weight) and torch.equal(lower[..., idle], upper[..., idle])
+
+    def setup(t, s, lo, hi, p):
+        key = (len(s), arm, center_weight, fixed_idle, stream.cuda_stream, torch.is_inference_mode_enabled(), _IK_TOLERANCE.get())
+        if key not in cache:
+            if len(cache) >= 16:
+                cache.pop(next(iter(cache)))
+            cache[key] = _StanceIterationGraph(kin, t, s, arm, lo, hi, p, center_weight, fixed_idle)
+        op = cache[key]
+        op.reset(t, s, lo, hi, p)
+        return op
+
+    op = setup(target, seed, lower, upper, prior)
+    if initial is not None:
+        op.q.copy_(initial.clamp(lower, upper))
+    rows = torch.arange(len(seed), device=seed.device)
+    completed = None
+    for start in range(0, iterations, 8):
+        for _ in range(min(8, iterations - start)):
+            op.graph.replay()
+        unfinished = ~op.converged[:len(rows)]
+        count = int(unfinished.sum())
+        if not count:
+            break
+        # Each converged particle is frozen immediately. Drop it from later replay
+        # once the working batch halves. Pad only with active rows to reuse graph sizes.
+        if 0 < count <= len(op.q) // 2 and len(op.q) > 4 and start + 8 < iterations:
+            if op.invalid:
+                return None
+            if completed is None:
+                completed = op.q.clone()
+            else:
+                completed.index_copy_(0, rows, op.q[:len(rows)])
+            keep = unfinished.nonzero().flatten()
+            rows = rows[keep]
+            size = max(4, 1 << (count - 1).bit_length())
+            keep = torch.cat((keep, keep[-1:].expand(size - count)))
+            q, damping = op.q[keep], op.damping[keep]
+            op = setup(*(v[keep] for v in (op.target, op.seed, op.lower, op.upper, op.prior)))
+            op.q.copy_(q)
+            op.damping.copy_(damping)
+    if op.invalid:
+        return None
+    if completed is None:
+        return op.q.clone()
+    completed.index_copy_(0, rows, op.q[:len(rows)])
+    return completed
+
+
 class _Kinematics:
     """Level-ordered URDF FK for both arms, sole centers, and the complete robot mass model.
 
@@ -49,6 +253,7 @@ class _Kinematics:
         if cfg is None:
             cfg = t1_curobo_cfg(model)["robot_cfg"]["kinematics"]
         self.cfg = cfg
+        self._solve_graphs = local()
         tree = ET.parse(cfg["urdf_path"]).getroot()
         names = model.joint_names
         self.n = len(names)
@@ -234,10 +439,20 @@ class _Kinematics:
         return residual, J, gradient
 
     @torch.no_grad()
-    def solve(self, target, seed, arm, *, bounds=None, center_weight=0.0, iterations=100, prior=None):
+    def solve(self, target, seed, arm, *, bounds=None, center_weight=0.0, iterations=100, prior=None, initial=None):
         prior = self.prior if prior is None else prior
         lower, upper = (self.lower, self.upper) if bounds is None else bounds
-        q = seed.clamp(lower, upper)
+        if (_CUDA_GRAPHS.get() and seed.is_cuda and seed.dtype == target.dtype == torch.float64 and 16 <= len(seed) <= 128
+                and iterations > 0 and not torch.cuda.is_current_stream_capturing()):
+            q = _graph_pose(self, target, seed, arm, lower, upper, prior, center_weight, iterations, initial)
+            if q is not None:
+                _, j, g = self.fitted(q, target, seed, arm, center_weight, prior)
+                active = ((q <= lower + 5e-7) & (g >= 0)) | ((q >= upper - 5e-7) & (g <= 0))
+                return q, j[:, :target.shape[1]], active, g.masked_fill(active, 0).abs().amax(-1)
+        full_problem = target, seed, lower.expand_as(seed), upper.expand_as(seed), prior.expand_as(seed)
+        rows = torch.arange(len(seed), device=seed.device)
+        completed = None
+        q = (seed if initial is None else initial).clamp(lower, upper)
         damping = q.new_full((len(q), 1), 1e-4)
         eye = torch.eye(self.n, device=q.device, dtype=q.dtype)
         for _ in range(iterations):
@@ -246,8 +461,14 @@ class _Kinematics:
             high = q >= upper - 1e-8
             active = (low & (g >= 0)) | (high & (g <= 0))
             optimality = g.masked_fill(active, 0).abs().amax(-1)
-            if (optimality < 2e-9).all():
+            converged = optimality < _IK_TOLERANCE.get()
+            count = int((~converged).sum())
+            if not count:
                 break
+            # Pack only when the batch halves to amortize GPU gathers. Converged rows stay fixed until then.
+            compact = count <= len(q) // 2
+            if compact:
+                keep = (~converged).nonzero().flatten()
             A = J.mT @ J + (prior.square() + damping).diag_embed()
             # At a box bound solve the restricted least-squares system. Projecting an
             # unconstrained direction alone can stall once one of the knees reaches a stop.
@@ -270,16 +491,30 @@ class _Kinematics:
             trial = (other - target).square().sum(-1) + ((candidate - seed) * prior).square().sum(-1)
             if center_weight:
                 trial += (_SELF_COLLISION_WEIGHT * collision).square().sum(-1)
-            better = (trial < cost)[:, None]
+            better = ((trial < cost) & ~converged)[:, None]
             q = torch.where(better, candidate, q)
             damping = torch.where(better, damping * 0.35, damping * 5).clamp(1e-9, 100.0)
+            if compact:
+                # Scatter the finished poses before shrinking the working set for the next iteration.
+                if completed is None:
+                    completed = q.clone()
+                else:
+                    completed.index_copy_(0, rows, q)
+                rows = rows.index_select(0, keep)
+                q = q.index_select(0, keep)
+                damping = damping.index_select(0, keep)
+                target, seed, lower, upper, prior = (v.index_select(0, rows) for v in full_problem)
+        if completed is not None:
+            completed.index_copy_(0, rows, q)
+            q = completed
+            target, seed, lower, upper, prior = full_problem
         _, j, g = self.fitted(q, target, seed, arm, center_weight, prior)
         active = ((q <= lower + 5e-7) & (g >= 0)) | ((q >= upper - 5e-7) & (g <= 0))
         return q, j[:, :target.shape[1]], active, g.masked_fill(active, 0).abs().amax(-1)
 
     @torch.no_grad()
     def hessian(self, q, target, seed, arm, center_weight=0.0, prior=None):
-        # Complex-step columns of J(q)^T r(q) + D^2(q-seed) include residual curvature.
+        # Complex-step columns of J(q)^T r(q) + D^2(q - seed) include residual curvature.
         b, n = q.shape
         eye = torch.eye(n, device=q.device, dtype=torch.float64)
         qc = (q[:, None, :] + 1j * 1e-25 * eye).reshape(-1, n)
@@ -292,6 +527,25 @@ class _Kinematics:
 @lru_cache(maxsize=4)
 def _kinematics(device):
     return _Kinematics(device)
+
+
+def _well_conditioned(hessian):
+    """The implicit derivative requires a positive, well-conditioned free-joint Hessian."""
+    symmetric = (hessian + hessian.mT) * 0.5
+    # The maximum absolute row sum bounds the largest eigenvalue. Positive
+    # definiteness after a conservative shift certifies both original tests.
+    # The factor of two keeps near-threshold decisions on the eigenvalue path.
+    upper = symmetric.abs().sum(-1).amax(-1)
+    shift = 2 * (upper * 1e-10).clamp_min(1e-10)
+    shifted = symmetric.clone()
+    shifted.diagonal(dim1=-2, dim2=-1).sub_(shift[:, None])
+    _, info = torch.linalg.cholesky_ex(shifted)
+    certified = (info == 0) & upper.isfinite()
+    unresolved = (~certified).nonzero().flatten()
+    if len(unresolved):
+        ev = torch.linalg.eigvalsh(symmetric.index_select(0, unresolved))
+        certified[unresolved] = (ev[:, 0] > 1e-10) & (ev[:, -1] < 1e10 * ev[:, 0])
+    return certified
 
 
 def _targets(soles, wrist):
@@ -324,12 +578,13 @@ def centered_stance_witnesses(soles, wrist, seeds, arm, other, weight):
 
 
 def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None, collides=None, kinematics=None,
-                    center_posture=False):
+                    center_posture=False, initial=None):
     """Fit both horizontal soles and the full bound wrist pose, with box-constrained T1 joints.
 
     The other arm uses its nominal joint posture, or the reference of an occupied hand.
     If nominal collides, try progressively larger excursions toward the supplied witness.
     Both arms contribute their actual mass and pose to the resulting CoM.
+    An optional numerical initial guess leaves the posture regularizer at posture_seed.
     At a centered manipulation endpoint the horizontal CoM-to-hull-centroid
     residual participates in both the bounded solve and its implicit derivative.
     """
@@ -340,6 +595,7 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
         or soles.shape != (b, 2, 3)
         or wrist.shape != (b, 4, 4)
         or posture_seed.shape != (b, 33)
+        or (initial is not None and initial.shape != posture_seed.shape)
     ):
         raise ValueError("Expected a left/right T1 wrist, [B,2,3] soles, [B,4,4] wrist and [B,33] posture")
     kin = _kinematics(soles.device) if kinematics is None else kinematics
@@ -359,6 +615,9 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
     soles = torch.where(valid[:, None, None], soles, 0)
     wrist = torch.where(valid[:, None, None], wrist, 0)
     seed = torch.where(valid[:, None], seed, 0)
+    if initial is not None:
+        initial = initial.detach().to(seed)
+        initial = torch.where(initial.isfinite().all(-1, keepdim=True), initial, seed)
     pose_target = _targets(soles.double(), wrist)
     target = pose_target
     weight = _CENTER_WEIGHT if center_posture else 0.0
@@ -369,13 +628,14 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
     bounds = (stance_joint_limits(soles.double(), kin.lower, kin.upper) if kinematics is None
               else (kin.lower.expand_as(seed), kin.upper.expand_as(seed)))
 
-    def fit(reference_pose):
+    def fit(reference_pose, start=None):
         lower, upper = bounds
         if center_posture:
             lower, upper = lower.clone(), upper.clone()
             lower[:, other] = upper[:, other] = reference_pose[:, other]
+        start_args = {} if start is None else {"initial": start}
         q, j, active, optimality = kin.solve(target, reference_pose, arm, bounds=(lower, upper), center_weight=weight,
-                                             prior=regularizer)
+                                             prior=regularizer, **start_args)
         conditioning_ok = torch.ones_like(optimality, dtype=torch.bool)
         if not torch.is_grad_enabled() or not (target.requires_grad or reference_pose.requires_grad):
             return q, optimality, conditioning_ok
@@ -390,14 +650,13 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
             dq_fixed[:, other] = dref[:, other]
             rhs = rhs - (H @ dq_fixed[..., None]).squeeze(-1)
         H = H * (free[:, :, None] & free[:, None, :]) + torch.diag_embed(active.to(H.dtype))
-        ev = torch.linalg.eigvalsh((H + H.mT) * 0.5)
-        conditioning_ok = (ev[:, 0] > 1e-10) & (ev[:, -1] < 1e10 * ev[:, 0])
+        conditioning_ok = _well_conditioned(H)
         I = torch.eye(kin.n, device=q.device, dtype=q.dtype)
         H = torch.where(conditioning_ok[:, None, None], H, I)
         dq = dq_fixed + torch.linalg.solve(H, (rhs * free)[..., None]).squeeze(-1)
         return q + dq * conditioning_ok[:, None], optimality, conditioning_ok
 
-    q, optimality, conditioning_ok = fit(seed)
+    q, optimality, conditioning_ok = fit(seed, initial)
     collision_free = torch.ones_like(valid)
     if collides is not None:
         def blocked(candidate):

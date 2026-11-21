@@ -10,6 +10,7 @@ from torch import Tensor
 
 from cutamp.landing_predictor import LandingState, _hold_trace, near_rest, prediction_precision
 from cutamp.robots.t1 import REAL_LEGS
+from cutamp.step_hold_graph import terminal_hold
 
 
 @dataclass
@@ -118,6 +119,29 @@ class StepStateAdapter:
             dim=-1,
         )
 
+    def _hold_start(self, physical):
+        _, R, _, w, joints, rates = physical
+        previous = joints.new_zeros(len(joints), 2 * joints.shape[-1])
+        raw = torch.cat(
+            (
+                joints - self.predictor.model.home_joints,
+                rates,
+                (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1),
+                -R[:, 2, :],
+                previous[:, : joints.shape[-1]],
+            ),
+            dim=-1,
+        )
+        hist = raw[:, None, :].repeat(1, self.predictor.metadata["history_ticks"], 1)
+        return (*physical, previous, hist, joints.new_zeros(len(joints), 8))
+
+    @prediction_precision()
+    def objective_state(self, q, dynamics, qd):
+        """Exact terminal history for a particle cost. Dense certification also checks preparation geometry."""
+        physical = self.physical(q, qd)
+        final = terminal_hold(self.predictor, self._hold_start(physical), dynamics)
+        return LandingState(final, dynamics, "synthetic_supported_hold_50")
+
     @prediction_precision()
     def initialize(self, q, dynamics, qd=None, *, observed=None, world=None, object_poses=None, held=None):
         """Issue state for one gap; caller must honor the per-row compatibility mask.
@@ -134,20 +158,7 @@ class StepStateAdapter:
         physical = self.physical(q, qd)
         preparation = None
         if observed is None:
-            _, R, _, w, joints, rates = physical
-            previous = joints.new_zeros(len(q), 2 * joints.shape[-1])
-            raw = torch.cat(
-                (
-                    joints - self.predictor.model.home_joints,
-                    rates,
-                    (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1),
-                    -R[:, 2, :],
-                    previous[:, : joints.shape[-1]],
-                ),
-                dim=-1,
-            )
-            hist = raw[:, None, :].repeat(1, self.predictor.metadata["history_ticks"], 1)
-            full = (*physical, previous, hist, q.new_zeros(len(q), 8))
+            full = self._hold_start(physical)
             initial = LandingState(full, dynamics, "synthetic_hold_issue")
             ticks = torch.full((len(q),), 50, dtype=torch.long, device=q.device)
             full, following, actions = _hold_trace(self.predictor, full, dynamics, ticks, 50)
@@ -370,6 +381,14 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
     head_offset = like.new_tensor([0.0625, 0, 0.243 + 0.06185]).reshape(3, 1)
     physical_limits = like.new_tensor(_physical_joint_limits(adapter.robot, adapter.names))
     half = like.new_tensor(_foot_half_extents(world.model))
+    objects = world.movables + world.statics
+    local_spheres = {obj.name: world.get_collision_spheres(obj) for obj in objects
+                     if obj in world.movables or obj.name in carried}
+    # Bound the largest batched sphere-pair temporary (self, robot/object, payload/object).
+    sphere_count = sum(s.shape[-2] for s in local_spheres.values())
+    max_pairs = max(1, world.kinematics.get_self_collision_config().collision_pairs.shape[0],
+                    kp.link_sphere_idx_map.numel() * sphere_count, sphere_count ** 2)
+    validation_chunk = max(1, min(2048, (4 << 20) // max_pairs))
     totals = {}
     history = []
     for idx, step in enumerate(prediction.steps):
@@ -391,7 +410,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
             kin = Kinematics(world.kinematics.config)
         else:
             kin = world.kinematics
-        chunk_size = B * T if torch.is_grad_enabled() else 256
+        chunk_size = B * T if torch.is_grad_enabled() else validation_chunk
         for start in range(0, B * T, chunk_size):
             stop = min(start + chunk_size, B * T)
             rows = torch.arange(start, stop, device=q.device) // T
@@ -414,7 +433,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
             pen = {"joint_hard_limit_rad": torch.maximum(
                 physical_limits[:, 0] - actual_joints, actual_joints - physical_limits[:, 1]
             ).amax(-1).clamp_min(0.)}
-            for obj in world.movables + world.statics:
+            for obj in objects:
                 if obj.name in carried:
                     arm = carried[obj.name]
                     body_pose = link(world.tool_frame_for_arm(arm)) @ at(held[arm][1], rows)
@@ -422,8 +441,8 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
                 else:
                     body_pose = at(poses[obj.name], rows)
                 boxes[obj.name] = _object_box(obj, body_pose)
-                if obj.name in carried or obj in world.movables:
-                    sphere_poses[obj.name] = transform_spheres(world.get_collision_spheres(obj), body_pose)
+                if obj.name in local_spheres:
+                    sphere_poses[obj.name] = transform_spheres(local_spheres[obj.name], body_pose)
             fixed = [s for name, s in sphere_poses.items() if name not in carried]
             pen["robot_collision_m"] = collision_penetration(world, spheres, torch.cat(fixed, 1) if fixed else None)
             pen["body_floor_m"] = (spheres[..., 3] - spheres[..., 2]).amax(-1).clamp_min(0)
@@ -445,7 +464,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
                 feet.append(foot)
                 bottom = foot[..., 2, 3] - (foot[..., 2, :3].abs() * half).sum(-1)
                 pen[f"{instr}_floor_m"] = (-0.005 - bottom).clamp_min(0)
-                for obj in world.movables + world.statics:
+                for obj in objects:
                     box, oh = boxes[obj.name]
                     # Floor boxes entirely at/below the support plane are accounted
                     # by the 5 mm contact band below. Elevated objects stay active.

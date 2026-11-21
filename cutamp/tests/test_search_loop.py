@@ -8,18 +8,20 @@ import torch
 
 import cutamp.algorithm as alg
 from cutamp import t1_domain
+from cutamp.algorithm import make_arm_affinity_priority_fn
 from cutamp.config import TAMPConfiguration
 from cutamp.step_planner import StepInputs, StepResult, StepRow, furthest_endpoint
 
 
-def test_screened_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("options", [{"step_optimizer": "screen"}, {"step_optimizer": "adam", "step_refine_iterations": 2}])
+def test_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_path, monkeypatch, options):
     from concurrent.futures import ThreadPoolExecutor
     from dataclasses import replace
     from cutamp import landing_predictor
 
     bundle = tmp_path / "landing.pt"
     bundle.write_bytes(b"deployment")
-    config = TAMPConfiguration(landing_bundle=str(bundle))
+    config = TAMPConfiguration(landing_bundle=str(bundle), **options)
     stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=0)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(landing_predictor, "LandingPredictor", lambda path, **kw: SimpleNamespace(**kw))
@@ -33,11 +35,44 @@ def test_screened_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_
     assert other is not model
     bundle.write_bytes(b"changed deployment")
     assert alg._load_predictor(config) is not other
-    reference = replace(config, step_refine_iterations=2)
+    reference = replace(config, step_optimizer="screen", step_refine_iterations=2)
+    eager = replace(config, cuda_graphs=False)
+    assert alg._load_predictor(eager) is not alg._load_predictor(eager)
     assert alg._load_predictor(reference) is not alg._load_predictor(reference)
     bundle.unlink()
     with pytest.raises(FileNotFoundError):
         alg._load_predictor(config)
+
+
+def test_learned_predictor_cache_tracks_both_bundles_and_optimizer(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from cutamp import landing_predictor, step_sequence_model
+
+    teacher = tmp_path / "landing.pt"
+    teacher.write_bytes(b"teacher")
+    student = tmp_path / "sequence.pt"
+    student.write_bytes(b"student")
+    device = torch.device("cuda:0")
+    stream = SimpleNamespace(device=device, cuda_stream=1)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(landing_predictor, "LandingPredictor", lambda *a, **kw: SimpleNamespace(
+        device=device, metadata={"deployment_sha256": "teacher-deployment"}
+    ))
+    loaded = []
+
+    def load(path, dev, *, expected_deployment):
+        assert dev == device and expected_deployment == "teacher-deployment"
+        loaded.append(path)
+        return object()
+
+    monkeypatch.setattr(step_sequence_model, "load_step_sequence_model", load)
+    cfg = TAMPConfiguration(landing_bundle=str(teacher), step_sequence_bundle=str(student))
+    first = alg._load_predictor(cfg)
+    assert alg._load_predictor(cfg) is first and loaded == [student]
+    student.write_bytes(b"updated model")
+    assert alg._load_predictor(cfg).sequence_model is not first.sequence_model
+    assert not hasattr(alg._load_predictor(replace(cfg, step_optimizer="adam")), "sequence_model")
+    assert loaded == [student, student]
 
 
 def test_standing_feedback_locates_scene_and_placement_failures_at_their_actions():
@@ -146,7 +181,7 @@ def test_standing_motion_respects_an_expired_requested_search_budget():
 
 
 @pytest.mark.parametrize("options,expected", [
-    ({}, 8.), ({"max_loop_dur": 2.}, 2.),
+    ({}, None), ({"step_optimizer": "screen"}, 8.), ({"max_loop_dur": 2.}, 2.),
     ({"step_mode": "rank"}, None), ({"step_mode": "geometric"}, None),
     ({"step_derivative_method": "autodiff"}, None), ({"step_proposal_count": 0}, None),
     ({"step_proposal_count": 64, "step_refine_iterations": 2}, None),
@@ -172,7 +207,7 @@ def test_search_deadline_scope_and_world_setup(harness, monkeypatch, options, ex
         assert not metrics["time_limit_reached"] and len(metrics["step_attempts"]) == 1
 
 
-def test_search_deadline_returns_incumbent_without_starting_next_refinement(harness, monkeypatch):
+def test_search_deadline_stops_retry_after_unsuccessful_skeleton(harness, monkeypatch):
     run, _, _ = harness
     clock = [alg.monotonic()]
     monkeypatch.setattr(alg, "monotonic", lambda: clock[0])
@@ -181,36 +216,35 @@ def test_search_deadline_returns_incumbent_without_starting_next_refinement(harn
         clock[0] += 10.
         return object()
 
-    row = StepRow(3, {}, 0., {"com_center_distances_m": [.04, .03], "secondary_effort": 0.}, ["accepted"])
-    monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **kw: StepResult([row], None, "standing_feasible"))
+    monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **kw: StepResult([], None, "unresolved"))
     monkeypatch.setattr(alg, "_load_predictor", expensive_model_load)
     monkeypatch.setattr(alg, "_refine_step_schedule", lambda *a, **kw: pytest.fail("started after deadline"))
     monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
-    motion, count, metrics = run(curobo_plan=True)
+    motion, count, metrics = run(curobo_plan=True, step_optimizer="screen")
     assert metrics["search_budget_s"] == 9.5
-    assert motion == ["accepted"] and count == 1 and metrics["row_index"] == 3
-    assert metrics["time_limit_reached"] and metrics["status"] == "motion_feasible"
+    assert motion is None and count == 0
+    assert metrics["time_limit_reached"] and not metrics["found_solution"]
     assert metrics["step_attempts"][-1]["status"] == "budget_exhausted"
 
 
-@pytest.mark.parametrize("explicit, expected_attempts", [(None, 1), (12., 2)])
-def test_full_motion_improvement_deadline_starts_only_after_acceptance(harness, monkeypatch, explicit, expected_attempts):
+@pytest.mark.parametrize("explicit", [None, 12.])
+def test_full_motion_returns_on_success_with_time_remaining(harness, monkeypatch, explicit):
     run, _, _ = harness
     clock = [alg.monotonic()]
     monkeypatch.setattr(alg, "monotonic", lambda: clock[0])
     row = StepRow(1, {}, 0., {"com_center_distances_m": [.02, .03], "secondary_effort": 0.}, ["complete"])
 
     def standing(*args, **kwargs):
-        clock[0] += 5.2  # cold start exceeds the short target before a valid motion exists
+        clock[0] += 5.2
         return StepResult([row], None, "standing_feasible")
 
     monkeypatch.setattr(alg, "_refine_standing_schedule", standing)
-    monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
-    monkeypatch.setattr(alg, "_refine_step_schedule", lambda *a, **kw: StepResult([], None, "unresolved"))
+    monkeypatch.setattr(alg, "_load_predictor", lambda config: pytest.fail("loaded a model after motion succeeded"))
     monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
-    motion, _, metrics = run(curobo_plan=True, max_loop_dur=explicit, max_step_schedules=2)
+    motion, _, metrics = run(curobo_plan=True, max_loop_dur=explicit)
     assert motion == ["complete"]
-    assert len(metrics["step_attempts"]) == expected_attempts
+    assert len(metrics["step_attempts"]) == 1
+    assert not metrics["time_limit_reached"] and not metrics["schedule_limit_reached"]
 
 
 def test_ranking_only_enters_at_run_cutamp_and_never_generates_grasps(harness, monkeypatch):
@@ -220,6 +254,202 @@ def test_ranking_only_enters_at_run_cutamp_and_never_generates_grasps(harness, m
     assert n == 0 and not metrics["found_solution"] and metrics["status"] == "ranked"
     assert len(metrics["step_attempts"]) == 3
     assert seen and set(seen) == {"rank"}
+
+
+@pytest.mark.parametrize("side,near_arm", [(-.15, "right"), (.15, "left")])
+@pytest.mark.parametrize("near_can_reach", [True, False])
+def test_step_search_charges_arm_choice_before_planning_the_pick(harness, monkeypatch, side, near_arm, near_can_reach):
+    from cutamp.reachability import ReachMap
+    from cutamp.step_search import StepSearch
+
+    run, seen, world = harness
+    homes = {"left": torch.tensor([0., .2, .5]), "right": torch.tensor([0., -.2, .5])}
+    world.arm_home_ee_world = homes
+    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", make_arm_affinity_priority_fn)
+    far_arm = "left" if near_arm == "right" else "right"
+    pick = (.8, side, .5)
+    pad = (.85, side, .45)
+    world.get_object = lambda name: SimpleNamespace(
+        name=name, dims=(.1, .1, .1), pose=(*(pick if name == "block" else pad), 1., 0., 0., 0.)
+    )
+    soles = ((0., .1, 0.), (0., -.1, 0.))
+    atlas = ReachMap(.01, {"home_soles": soles})
+    layers = []
+    for arm in homes:
+        dx = -1.2 if arm == near_arm and not near_can_reach else 0.
+        layers.append({
+            "arm": arm, "posture": "stand", "q": [[0.], [0.]], "margin": [.06, .06],
+            "points": [(pick[0] + dx, side, .5), (pad[0] + dx, side, .55)],
+        })
+    atlas.add_stance(soles, layers)
+    search = StepSearch(atlas, commands=((.12, .2, 0),))
+    queried = []
+    edges = search.edges
+
+    def record_edges(incoming, target):
+        queried.append(target.arm)
+        return edges(incoming, target)
+
+    monkeypatch.setattr(search, "edges", record_edges)
+    monkeypatch.setattr(alg, "_load_step_search", lambda *args, **kwargs: (search, {}))
+    # Always declare the expected winner last, so declaration order alone cannot pass.
+    winner = near_arm if near_can_reach else far_arm
+    ops = sorted(t1_domain.all_t1_operators, key=lambda op: op.metadata.arm == winner)
+    monkeypatch.setattr(alg, "all_t1_operators", ops)
+    _, _, metrics = run(step_mode="rank", num_initial_plans=2, max_step_schedules=1)
+
+    attempt, = metrics["step_attempts"]
+    assert any(op.startswith(f"{winner.capitalize()}Pick(block,") for op in attempt["skeleton"])
+    assert attempt["orders"] == ["none", "none"]
+    approach = (torch.tensor(pick) - homes[winner]).norm().item()
+    assert attempt["arm_approach_m"] == pytest.approx(approach)
+    assert attempt["search_priority"] == pytest.approx([approach, 0, 0])
+    # Opening the near-arm branch requires only its approach cost. If both tasks
+    # can be reached with that hand and fixed feet, A* can return it immediately.
+    assert queried[0] == near_arm
+    assert set(queried) == ({near_arm} if near_can_reach else {near_arm, far_arm})
+    assert "generate" not in seen
+
+
+def test_arm_approach_accumulates_only_picks_in_their_incoming_stances(harness, monkeypatch):
+    from math import cos, dist, sin
+    from cutamp.reachability import ReachMap, canonical_stance
+    from cutamp.step_search import StepSearch
+
+    run, _, world = harness
+    points = {"a": (.88, .12, .50), "b": (.88, -.12, .50), "pad": (.88, 0., .48)}
+    world.initial_state = t1_domain.get_initial_state(["a", "b"], ["pad"])
+    world.goal_state = frozenset(t1_domain.On.ground(obj, "pad") for obj in ("a", "b"))
+    world.get_object = lambda name: SimpleNamespace(name=name, dims=(.02,) * 3, pose=(*points[name], 1., 0., 0., 0.))
+    world.arm_home_ee_world = {arm: torch.tensor([0., y, .50]) for arm, y in (("left", .2), ("right", -.2))}
+    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", make_arm_affinity_priority_fn)
+    soles = ((0., .1, 0.), (0., -.1, 0.))
+    atlas = ReachMap(.01, {"home_soles": soles})
+    samples = [(.76, y, .50) for y in (.12, -.12, 0.)]
+    atlas.add_stance(soles, [
+        dict(arm=arm, posture="stand", points=samples, q=[[0.]] * 3, margin=[.06] * 3)
+        for arm in world.arm_home_ee_world
+    ])
+    search = StepSearch(atlas, commands=((.24, .20, 0.),))
+    monkeypatch.setattr(alg, "_load_step_search", lambda *args, **kwargs: (search, {}))
+
+    _, _, metrics = run(step_mode="rank", num_initial_plans=2, max_step_schedules=3)
+    checked_shift = False
+    for attempt in metrics["step_attempts"]:
+        actions = [op for op in attempt["skeleton"] if "Pick(" in op or "Place(" in op]
+        charged = []
+        for op, gap in zip(actions, attempt["gaps"], strict=True):
+            if "Pick(" in op:
+                arm, args = op.split("Pick(")
+                target = points[args.split(",")[0]]
+                _, (x, y, yaw) = canonical_stance(gap["incoming_soles"])
+                hx, hy, hz = world.arm_home_ee_world[arm.lower()].tolist()
+                hand = (x + hx * cos(yaw) - hy * sin(yaw), y + hx * sin(yaw) + hy * cos(yaw), hz)
+                charged.append(dist(hand, target))
+                checked_shift |= len(charged) == 2 and dist((x, y), (0., 0.)) > .01
+        assert len(charged) == 2
+        assert attempt["arm_approach_m"] == pytest.approx(sum(charged))
+    assert checked_shift
+
+
+def test_pose_still_ranks_both_hands_when_object_reach_bounds_are_unknown(harness, monkeypatch):
+    from cutamp.step_search import StepSearch
+    from cutamp.tests.test_step_search import atlas
+
+    run, _, world = harness
+    pick = (.5, -.15, .5)
+    world.get_object = lambda name: SimpleNamespace(name=name, pose=(*pick, 1., 0., 0., 0.))
+    homes = {"left": torch.tensor([0., .2, .5]), "right": torch.tensor([0., -.2, .5])}
+    world.arm_home_ee_world = homes
+    search = StepSearch(atlas(), commands=())
+    monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
+    _, _, metrics = run(step_mode="rank", num_initial_plans=2, max_step_schedules=2)
+
+    right, left = metrics["step_attempts"]
+    for attempt, arm in ((right, "right"), (left, "left")):
+        assert any(op.startswith(f"{arm.capitalize()}Pick(block,") for op in attempt["skeleton"])
+        assert attempt["missing_reach_evidence"] and attempt["gaps"][0]["distance_m"] is None
+        distance = (torch.tensor(pick) - homes[arm]).norm().item()
+        assert attempt["arm_approach_m"] == pytest.approx(distance)
+        assert attempt["search_priority"] == pytest.approx([distance, 2, 0])
+
+
+def test_unsampled_steps_can_recover_a_history_merged_by_standing_bfs(harness, monkeypatch):
+    from cutamp.step_search import StepSearch
+    from cutamp.tests.test_step_search import atlas
+
+    run, _, world = harness
+    world.initial_state = t1_domain.get_initial_state(["a", "b"], ["table"])
+    world.goal_state = frozenset([
+        t1_domain.On.ground("a", "table"), t1_domain.On.ground("b", "table"),
+        *(f.ground() for f in t1_domain.all_t1_fluents if f.name in ("LeftCanMove", "RightCanMove")),
+    ])
+    world.arm_home_ee_world = {arm: torch.tensor([0., y, .5]) for arm, y in (("left", .2), ("right", -.2))}
+    search = StepSearch(atlas(), commands=())
+    monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
+    monkeypatch.setattr(alg, "grasp_sets", lambda objs, *a, **kw: {obj.name: object() for obj in objs})
+    monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
+
+    def picks(skeleton):
+        return tuple((op.operator.metadata.arm, op.arg("obj")) for op in skeleton if op.operator.metadata.action_type == "pick")
+
+    merged_bfs = {picks(plan) for plan in alg.task_plan_generator(world.initial_state, world.goal_state, t1_domain.all_t1_operators)}
+    admitted = set()
+
+    def refine(proposal, *args, **kwargs):
+        history = picks(proposal.skeleton)
+        if proposal.seed is not None:
+            admitted.add(history)
+        elif history in admitted - merged_bfs:
+            row = StepRow(0, {}, 0., {"com_center_distances_m": [.01] * 4, "secondary_effort": 0.}, ["complete"])
+            return StepResult([row], None, "kinematic_candidate")
+        return StepResult([], None, "unresolved")
+
+    monkeypatch.setattr(alg, "_refine_standing_schedule", refine)
+    monkeypatch.setattr(alg, "_refine_step_schedule", refine)
+    motion, _, metrics = run(step_mode="geometric", curobo_plan=True, num_initial_plans=16, max_step_schedules=40)
+    assert admitted - merged_bfs and motion == ["complete"] and metrics["motion_plan_success"]
+
+
+@pytest.mark.parametrize("blocked,explicit", [(False, False), (True, False), (False, True)])
+def test_joint_rank_retries_a_legal_unsampled_schedule_once(harness, monkeypatch, blocked, explicit):
+    from cutamp.tests.test_step_search import atlas
+    from cutamp.step_search import StepSearch
+
+    run, _, world = harness
+    world.arm_home_ee_world = {"left": torch.tensor([0., .2, .5]), "right": torch.tensor([0., -.2, .5])}
+    if blocked:
+        world.get_object = lambda name: SimpleNamespace(
+            name=name, dims=(.05,) * 3, pose=(0., .1, .025, 1., 0., 0., 0.) if name == "block"
+            else (.3, 0., .55, 1., 0., 0., 0.)
+        )
+    search = StepSearch(atlas(points=((.3, .005, .555), (.3, .005, .655))), commands=())
+    monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
+    monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
+    winning_order = ("LR", "none") if explicit else (("L", "R") if blocked else ("none", "L"))
+    inputs = StepInputs(arms=("right", "right"), orders=winning_order) if explicit else None
+    attempts = []
+
+    def refine(proposal, *args, **kwargs):
+        arms = [op.operator.metadata.arm for op in proposal.skeleton if op.operator.metadata.is_actionable]
+        attempts.append((tuple(arms), proposal.orders, proposal.seed is not None))
+        if proposal.orders == winning_order:
+            row = StepRow(0, {}, 0., {"com_center_distances_m": [.01, .01], "secondary_effort": 0.}, ["complete"])
+            return StepResult([row], None, "kinematic_candidate")
+        return StepResult([], None, "unresolved")
+
+    monkeypatch.setattr(alg, "_refine_step_schedule", refine)
+    monkeypatch.setattr(alg, "_refine_standing_schedule", refine)
+    motion, _, metrics = run(step_mode="geometric", curobo_plan=True, inputs=inputs)
+    assert motion == ["complete"] and metrics["motion_plan_success"]
+    assert attempts[-1][1:] == (winning_order, False)
+    assert len({(arms, orders) for arms, orders, _ in attempts}) == len(attempts)
+    if explicit:
+        assert attempts == [(("right", "right"), winning_order, False)]
+    elif blocked:
+        assert all("L" in orders[0] and not seeded for _, orders, seeded in attempts)
+    else:
+        assert attempts[0][1:] == (("none", "none"), True)
 
 
 def test_missing_predictor_never_marks_model_feasible_or_draws_grasps(harness, monkeypatch):
@@ -243,10 +473,13 @@ def test_full_fallback_all_25_order_pairs_only_once_in_budget(harness, monkeypat
     assert seen.index("generate") < seen.index("wait")
 
 
-def test_accept_at_requested_level_and_keep_row_cost_after_retry(harness, monkeypatch):
+def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypatch):
+    from cutamp.step_planner import ScheduleSearch
+
     run, _, _ = harness
     calls = []
     monkeypatch.setattr(alg, "_load_predictor", lambda *a: object())
+    monkeypatch.setattr(alg, "play_curobo_motion", lambda *a: None)
     monkeypatch.setattr(
         alg, "_refine_standing_schedule", lambda *a, **k: StepResult([], torch.tensor([[False, True]]), "unresolved")
     )
@@ -254,24 +487,29 @@ def test_accept_at_requested_level_and_keep_row_cost_after_retry(harness, monkey
     def refine(p, *args, **kwargs):
         calls.append(p.orders)
         rows = [
-            StepRow(7, {"q": torch.tensor([7])}, 0.2, {"min_com_margin_m": 0.052}),
-            StepRow(8, {"q": torch.tensor([8])}, 0.6, {"min_com_margin_m": 0.056}),
+            StepRow(7, {}, 0.2, {"com_center_distances_m": [.001, .05], "secondary_effort": .1}),
+            StepRow(8, {"q": torch.tensor([8])}, 0.6, {"com_center_distances_m": [.04, .04], "secondary_effort": .6}),
+            StepRow(9, {}, 0.1, {"com_center_distances_m": [.001, .001], "secondary_effort": 0.}),
         ]
         if p.orders == ("R", "none"):
+            rows[0].motion_plan = ["less centered"]
             rows[1].motion_plan = ["motion"]
-        return StepResult(rows, torch.ones(2, 2, dtype=torch.bool), "model_feasible")
+            monkeypatch.setattr(ScheduleSearch, "next", lambda *a: pytest.fail("ranked another skeleton after success"))
+        return StepResult(rows, torch.ones(len(rows), 2, dtype=torch.bool), "model_feasible")
 
     monkeypatch.setattr(alg, "_refine_step_schedule", refine)
-    motion, _, m = run(curobo_plan=True, max_step_schedules=25, com_center_weight=0)
+    motion, count, m = run(curobo_plan=True, step_optimizer="adam", step_refine_iterations=2)
     assert motion == ["motion"] and m["motion_plan_success"] and m["selected_particle"]["q"] == [8]
-    assert m["row_index"] == 8 and m["best_soft_cost"] == 0.6 and m["min_com_margin_m"] == 0.056
-    assert calls[:2] == [("L", "none"), ("R", "none")]  # failed pick prioritizes that gap
-    assert any(a["status"] == "model_feasible" and a["accepted_rows"] == 0 for a in m["step_attempts"])
-    assert all(sum(len(o) for o in p if o != "none") <= 1 for p in calls)
+    assert count == 2 and m["row_index"] == 8 and m["best_soft_cost"] == 0.6 and m["max_center_distance_m"] == .04
+    assert calls == [("L", "none"), ("R", "none")]  # failed pick prioritizes that gap
+    assert [(a["status"], a["accepted_rows"]) for a in m["step_attempts"]] == [
+        ("unresolved", 0), ("model_feasible", 0), ("model_feasible", 2),
+    ]
+    assert not m["schedule_limit_reached"] and not m["time_limit_reached"]
 
 
-@pytest.mark.parametrize("weight,winning_id", [(None, 2), (0.1, 2), (0.0, 0)])
-def test_motion_feasibility_then_worst_center_then_count_then_effort(harness, monkeypatch, weight, winning_id):
+@pytest.mark.parametrize("weight,winning_id", [(None, 2), (0.1, 2), (0.0, 1)])
+def test_motion_feasibility_then_worst_center_then_effort_in_successful_skeleton(harness, monkeypatch, weight, winning_id):
     run, _, _ = harness
     viewer, displayed = object(), []
     setup = alg.setup_cutamp
@@ -281,23 +519,17 @@ def test_motion_feasibility_then_worst_center_then_count_then_effort(harness, mo
     monkeypatch.setattr(alg, "setup_cutamp", with_viewer)
     monkeypatch.setattr(alg, "play_curobo_motion", lambda world, motion, vis: displayed.append((motion, vis)))
     monkeypatch.setattr(alg, "_load_predictor", lambda *a: object())
-    standing = StepRow(0, {}, 0.01, {"com_center_distances_m": [0., .05], "secondary_effort": 0.}, ["standing"])
-    monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **kw: StepResult([standing], None, "standing_feasible"))
+    monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **kw: StepResult([], None, "unresolved"))
 
     def refine(proposal, *args, **kwargs):
         if weight != 0:
             assert kwargs["visualizer"] is None
-        if proposal.orders == ("L", "none"):
-            candidates = [
-                (1, [.0, .0495], .01, .0, ["worse at place"]),
-                (2, [.049, .049], 8., 1., ["selected"]),
-                (3, [.049, .005], 6., 2., ["higher effort"]),
-                (4, [.001, .001], .001, .001, None),
-            ]
-        elif proposal.orders == ("LR", "none"):
-            candidates = [(5, [.049, .0001], .005, 0., ["extra step"])]
-        else:
-            return StepResult([], None, "unresolved")
+        candidates = [
+            (1, [.0, .0495], .01, .0, ["worse at place"]),
+            (2, [.049, .049], 8., 1., ["selected"]),
+            (3, [.049, .005], 6., 2., ["higher effort"]),
+            (4, [.001, .001], .001, .001, None),
+        ]
         rows = [
             StepRow(i, {}, soft, {"gaps": [{"center_distance_m": x} for x in ds], "secondary_effort": effort}, motion)
             for i, ds, soft, effort, motion in candidates
@@ -305,16 +537,16 @@ def test_motion_feasibility_then_worst_center_then_count_then_effort(harness, mo
         return StepResult(rows, None, "model_feasible")
 
     monkeypatch.setattr(alg, "_refine_step_schedule", refine)
-    motion, _, metrics = run(curobo_plan=True, max_step_schedules=25, com_center_weight=weight)
+    motion, _, metrics = run(curobo_plan=True, com_center_weight=weight)
     assert metrics["row_index"] == winning_id
+    assert len(metrics["step_attempts"]) == 2
     if winning_id == 2:
         assert motion == ["selected"]
         assert displayed == [(motion, viewer)]
         assert metrics["max_center_distance_m"] == .049
         assert metrics["total_steps"] == 1 and metrics["secondary_effort"] == 1.
-        assert any(a["orders"] == ["LR", "none"] for a in metrics["step_attempts"])
     else:
-        assert motion == ["standing"] and len(metrics["step_attempts"]) == 1
+        assert motion == ["worse at place"]
 
 
 def test_secondary_effort_excludes_only_centering_even_with_custom_weights():
@@ -389,7 +621,8 @@ def test_fast_refinement_defaults_follow_the_selected_schedule_and_preserve_over
         resolved = cfg.for_refinement(stepped=stepped)
         return resolved.step_refine_iterations, resolved.step_trust_scale, resolved.com_center_weight
 
-    assert settings(model, True) == (0, 2.0, 4.0)
+    assert settings(model, True) == (48, 1.0, 1.0)
+    assert settings(replace(model, step_optimizer="screen"), True) == (0, 2.0, 4.0)
     assert settings(replace(model, step_proposal_count=0), True) == (2, 2.0, 4.0)
     assert settings(model, False) == (4, 1.0, 1.0)
     assert settings(replace(model, step_mode="geometric"), True) == (4, 1.0, 1.0)

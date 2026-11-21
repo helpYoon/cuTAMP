@@ -156,6 +156,33 @@ def test_swing_geometry_clearance_and_control_derivative(rollout_scene):
 
 
 @needs_cuda
+@torch.no_grad()
+def test_dense_collision_chunks_keep_each_particles_peaks(rollout_scene):
+    from cutamp.step_proposals import _rows
+    from cutamp.step_validation import validate_step_geometry
+
+    predictor, adapter, world, _, start, command = rollout_scene
+    trace = predictor.rollout(start, "L", command)
+    clear = world.get_object_pose("block2")
+    blocked = clear.clone()
+    blocked[:3, 3] = command.new_tensor([0.273, 0.094, 0.024])
+    poses = torch.stack((clear, blocked))
+    expected = [
+        validate_step_geometry(world, adapter, trace, object_poses={"block2": pose})
+        for pose in poses
+    ]
+    assert expected[0]["valid"].item() and not expected[1]["valid"].item()
+    # More than 2048 frames, with the chunk boundary inside a particle trajectory.
+    rows = torch.arange(21, device=command.device) % 2
+    repeated = _rows(trace, torch.zeros_like(rows))
+    actual = validate_step_geometry(world, adapter, repeated, object_poses={"block2": poses[rows]})
+    assert torch.equal(actual["valid"], rows == 0)
+    for name, peak in actual["penetration"].items():
+        reference = torch.cat([case["penetration"][name] for case in expected])[rows]
+        torch.testing.assert_close(peak, reference, atol=1.0e-7, rtol=0)
+
+
+@needs_cuda
 def test_independent_timeline_must_match_issued_command_and_velocity(rollout_scene):
     from dataclasses import replace
 

@@ -26,6 +26,7 @@ class RankedStepSkeleton:
     orders: tuple[str, ...]
     seed: GroundedStepSeed | None
     alternative_seeds: Iterator[GroundedStepSeed]
+    arm_approach_m: float | None = None
 
     @property
     def cost(self) -> tuple[int, int] | None:
@@ -78,6 +79,15 @@ def _ground(skeleton, orders, initial, goal):
     return with_steps(skeleton, gaps, initial, goal)
 
 
+def bind_schedule(search, skeleton, targets, initial, goal, incoming, path, options):
+    orders = tuple(edge.order for edge in path.edges)
+    grounded = _ground(skeleton, orders, initial, goal)
+    soles = [op.arg("sole_to") for op in grounded if op.operator.metadata.action_type == "step"]
+    primary = _bound_seed(path, soles)
+    alternatives = _alternatives(search, incoming, targets, orders, tuple(primary.commands.values()), soles, options)
+    return RankedStepSkeleton(grounded, orders, primary, alternatives)
+
+
 def ranked_step_skeletons(
     search: StepSearch,
     skeleton: PlanSkeleton,
@@ -120,13 +130,7 @@ def ranked_step_skeletons(
         if orders in seen_orders:
             continue
         seen_orders.add(orders)
-        grounded = _ground(skeleton, orders, initial, goal)
-        soles = [op.arg("sole_to") for op in grounded if op.operator.metadata.action_type == "step"]
-        primary = _bound_seed(path, soles)
-        alternatives = _alternatives(
-            search, incoming, targets, orders, tuple(primary.commands.values()), soles, options
-        )
-        yield RankedStepSkeleton(grounded, orders, primary, alternatives)
+        yield bind_schedule(search, skeleton, targets, initial, goal, incoming, path, options)
         if len(seen_orders) == max_orders:
             return
 

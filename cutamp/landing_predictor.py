@@ -409,9 +409,13 @@ class LandingPredictor:
         raw = torch.cat((qd, qd, v, -R[:, 2, :], qd), dim=-1)
         history = raw[:, None].repeat(1, self.metadata["history_ticks"], 1)
         tensors = (p, R, v, v, q, qd, previous, history, q.new_zeros(batch, 8))
-        hold = q.new_zeros(batch, 5)
-        for _ in range(50):
-            tensors = self.model(tensors, hold, dynamics)
+        if self._hold_graphs is not None:
+            counts = torch.full((batch,), 50, dtype=torch.long, device=q.device)
+            tensors, _, _ = _hold_trace(self, tensors, dynamics, counts, 50)
+        else:
+            hold = q.new_zeros(batch, 5)
+            for _ in range(50):
+                tensors = self.model(tensors, hold, dynamics)
         return LandingState(tensors, dynamics, "synthetic_home_50_hold")
 
     def _step(self, initial, side, command, hold_ticks):

@@ -12,13 +12,13 @@ from cutamp.landing_predictor import LandingState
 
 
 def test_forward_proposals_require_model_and_preserve_explicit_updates():
-    config = TAMPConfiguration(step_mode="model")
+    config = TAMPConfiguration(step_mode="model", step_optimizer="screen")
     assert config.num_particles == 64
     assert config.for_refinement(stepped=True).step_proposal_count == 192
     assert config.for_refinement(stepped=True).step_place_proposal_count == 128
     assert replace(config, step_proposal_count=48).for_refinement(stepped=True).step_place_proposal_count == 48
     assert config.for_refinement(stepped=False).step_proposal_count == 0
-    assert TAMPConfiguration().num_particles == 64
+    assert TAMPConfiguration().num_particles == 128
     assert TAMPConfiguration().curobo_plan
     assert TAMPConfiguration(step_mode="off").num_particles == 256
     assert TAMPConfiguration(step_mode="off").for_refinement(stepped=False).com_center_weight == 0

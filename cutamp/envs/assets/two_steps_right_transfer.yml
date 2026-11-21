@@ -1,0 +1,19 @@
+name: two_steps_right_transfer
+robot_start: synthetic_standing
+demo_seed: 641
+geometries:
+  cuboid:
+    part:
+      dims: [0.075, 0.015, 0.061]
+      pose: [0.8, -0.15, 0.0364999994635582, 1, 0, 0, 0]
+    floor:
+      dims: [3.0, 3.0, 0.2]
+      pose: [0, 0, -0.101, 1, 0, 0, 0]
+    pad:
+      dims: [0.19, 0.11, 0.01]
+      pose: [1.11, -0.18, -0.005, 1, 0, 0, 0]
+types:
+  Movable: [part]
+  Surface: [pad]
+goal:
+  - 'On': [part, pad]

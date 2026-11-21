@@ -419,7 +419,10 @@ def run_cutamp(
     experiment_id: str,
     step_inputs=None,
 ):
-    """Return the best feasible plan found within the configured search budget."""
+    """Return the highest-ranked feasible motion from the first successful skeleton.
+
+    Keyframe-only searches can compare feasible solutions across skeletons.
+    """
     if config.step_mode != "off":
         preload = config.step_mode == "model" and config.curobo_plan and not (step_inputs and step_inputs.grasps)
         if preload:
@@ -622,11 +625,6 @@ def run_cutamp(
                                                    "secondary_effort")} if center_first else {})
             motion = None
             if config.curobo_plan:
-                # Motion validation can only exclude rows from this kinematic ranking.
-                if center_first and incumbent is not None and (
-                    selection["max_center_distance_m"], selection["secondary_effort"]
-                ) >= incumbent:
-                    continue
                 candidates, indices = get_top_satisfying_particles(
                     plan_info, constraint_checker, cost_reducer, n=config.motion_plan_max_retries, return_indices=True,
                 )
@@ -653,7 +651,7 @@ def run_cutamp(
                 overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
                 overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
             found_solution = True
-            should_break |= not center_first
+            should_break |= config.curobo_plan or not center_first
 
         if should_break:
             break
@@ -741,22 +739,39 @@ def _load_predictor(config):
     if version[1] is None or not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
     solver = config.for_refinement(stepped=True)
-    if not (config.cuda_graphs and solver.step_proposal_count and solver.step_refine_iterations == 0):
-        return LandingPredictor(path, derivative_method=solver.step_derivative_method)
-    stream = torch.cuda.current_stream()
-    key = (version, solver.step_derivative_method, stream.device, stream.cuda_stream)
-    if getattr(_PREDICTOR_CACHE, "key", None) != key:
-        predictor = LandingPredictor(path, derivative_method=solver.step_derivative_method, use_cuda_graph=True)
+    sequence_path = sequence_version = None
+    if solver.step_optimizer == "learned_adam":
+        from cutamp.step_sequence_model import DEFAULT_STEP_SEQUENCE_MODEL, load_step_sequence_model
+
+        sequence_path = Path(config.step_sequence_bundle or DEFAULT_STEP_SEQUENCE_MODEL)
+        sequence_version = _file_version(sequence_path)
+        if sequence_version[1] is None or not sequence_path.is_file():
+            raise FileNotFoundError(f"Step sequence bundle is unavailable at {sequence_path}")
+    screened = solver.step_proposal_count and solver.step_refine_iterations == 0
+    reuse = config.cuda_graphs and (screened or solver.step_optimizer in ("adam", "learned_adam"))
+    if reuse:
+        stream = torch.cuda.current_stream()
+        key = (version, sequence_version, solver.step_derivative_method, stream.device, stream.cuda_stream)
+        if getattr(_PREDICTOR_CACHE, "key", None) == key:
+            return _PREDICTOR_CACHE.model
+    predictor = LandingPredictor(path, derivative_method=solver.step_derivative_method, use_cuda_graph=bool(reuse))
+    if sequence_path is not None:
+        predictor.sequence_model = load_step_sequence_model(
+            sequence_path, predictor.device, expected_deployment=predictor.metadata["deployment_sha256"]
+        )
+    if reuse:
         _PREDICTOR_CACHE.model = predictor
         _PREDICTOR_CACHE.key = key
-    return _PREDICTOR_CACHE.model
+    return predictor
 
 
-def _refine_step_schedule(*args, **kwargs):
+def _refine_step_schedule(proposal, world, config, *args, **kwargs):
     # The model and its CUDA deployment are optional for fixed-feet runs.
+    from cutamp.step_ik import stance_ik_graphs
     from cutamp.step_particles import refine_step_particles
 
-    return refine_step_particles(*args, **kwargs)
+    with stance_ik_graphs(config.cuda_graphs):
+        return refine_step_particles(proposal, world, config, *args, **kwargs)
 
 
 def _refine_standing_schedule(
@@ -852,22 +867,22 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
     solver = config.for_refinement(stepped=True)
     screened = solver.step_proposal_count > 0 and solver.step_refine_iterations == 0
     budget = config.max_loop_dur
-    improvement_budget = None
     if screened and budget is None:
         budget = 9.5 if config.curobo_plan else 8.0
-        if config.curobo_plan:
-            # Leave room for an in-flight GPU stage and serializing the selected evidence.
-            improvement_budget = 4.4
     logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
     world.grasps.update(inputs.grasps)
     setup_end = monotonic()
-    start = request_start if screened else setup_end
+    budget_from_entry = screened or solver.step_optimizer == "learned_adam"
+    start = request_start if budget_from_entry else setup_end
     deadline = start + budget if budget is not None else None
     timer.start("start_optimization")
     incoming = None
 
-    def streams():
+    def proposals():
         nonlocal incoming
+        from cutamp.task_planning.arm_step_search import arm_step_skeletons
+        from cutamp.task_planning.step_schedules import unseeded_step_skeletons
+
         load_start = monotonic()
         search, cache_info = _load_step_search(config, applicable=inputs.matches_accuracy_context(config.step_lag))
         metrics["step_search"].update(cache_info, load_seconds=monotonic() - load_start)
@@ -876,11 +891,56 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         soles = world.stance_soles
         yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
         incoming = torch.cat((soles[..., :2, 3], yaw[:, None]), -1).detach().cpu().tolist()
+        joint = config.step_search_order == "astar" and bool(search.hands) and inputs.arms is None and inputs.orders is None
+        admitted = {}
+        if joint:
+            for proposal in arm_step_skeletons(search, world, all_t1_operators, incoming,
+                                               max_base_plans=config.num_initial_plans, admitted=admitted, deadline=deadline):
+                metrics["num_symbolic_skeletons"] = len(admitted)
+                if step_cap is None or proposal.step_count <= step_cap:
+                    yield None, proposal
+
+        def streams():
+            for skeleton, regions in base_skeletons(admitted):
+                if joint:
+                    _, tried = admitted[tuple(op.name for op in skeleton)]
+                    yield None, unseeded_step_skeletons(
+                        search, skeleton, regions, world.initial_state, world.goal_state, incoming,
+                        tried_orders=tried, deadline=deadline,
+                    )
+                else:
+                    stream = ScheduleSearch(search, skeleton, regions, world, incoming, fixed=inputs.orders,
+                                            strategy=config.step_search_order, prefer_reach=inputs.orders is None,
+                                            deadline=deadline)
+                    yield stream, None
+
+        sources = iter(streams())
+        active = deque()
+        while deadline is None or monotonic() < deadline:
+            source = next(sources, None)
+            if source is None:
+                if not active:
+                    return
+                source = active.popleft()
+            stream, unseeded = source
+            proposal = stream.next(step_cap) if stream is not None else next(unseeded, None)
+            if proposal is not None:
+                active.append(source)
+                if step_cap is None or proposal.step_count <= step_cap:
+                    yield stream, proposal
+
+    def base_skeletons(admitted):
+        # Distinct action histories can reach the same symbolic state. BFS can merge them,
+        # so resume every admitted history directly when trying unsampled landing orders.
+        seen = set(admitted)
+        for skeleton, _ in list(admitted.values()):
+            yield skeleton, manipulation_regions(skeleton, world)
+        if len(seen) >= config.num_initial_plans:
+            return
         base_plans = task_plan_generator(
             world.initial_state, world.goal_state, operators=all_t1_operators,
             ground_op_priority_fn=make_arm_affinity_priority_fn(world), deadline=deadline,
         )
-        seen = set()
         for skeleton in base_plans:
             if deadline is not None and monotonic() >= deadline:
                 break
@@ -892,20 +952,10 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             identity = tuple(op.name for op in skeleton)
             if identity in seen:
                 continue
+            admitted[identity] = skeleton, set()
             seen.add(identity)
-            metrics["num_symbolic_skeletons"] += 1
-            regions = manipulation_regions(skeleton, world)
-            yield ScheduleSearch(
-                search,
-                skeleton,
-                regions,
-                world,
-                incoming,
-                fixed=inputs.orders,
-                strategy=config.step_search_order,
-                prefer_reach=inputs.orders is None,
-                deadline=deadline,
-            )
+            metrics["num_symbolic_skeletons"] = len(admitted)
+            yield skeleton, manipulation_regions(skeleton, world)
             if len(seen) >= config.num_initial_plans:
                 break
 
@@ -919,8 +969,8 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         "step_attempts": [],
         "step_search": {},
         "search_budget_s": budget,
-        "improvement_budget_s": improvement_budget,
-        "search_budget_start": "planner_entry" if screened else "after_world_setup",
+        "improvement_budget_s": None,
+        "search_budget_start": "planner_entry" if budget_from_entry else "after_world_setup",
         "grasp_generation_calls": 0,
         "grasp_proposals_by_object": {},
         "best_cost": None,
@@ -964,24 +1014,17 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         else:
             wait_for_sampler_load()  # a caller may have already started a process-wide preload
 
-    base_iter = iter(streams())
-    active = deque()
+    candidates = proposals()
     while config.max_step_schedules is None or len(metrics["step_attempts"]) < config.max_step_schedules:
         if deadline is not None and monotonic() >= deadline:
             break
-        # Each arm/object skeleton gets its first proposal before one skeleton consumes the whole budget.
-        stream = next(base_iter, None)
-        if stream is None:
-            if not active:
-                break
-            stream = active.popleft()
         rank_start = monotonic()
         # A shorter schedule can rule out longer ones only at the lower bound of the primary objective.
         step_cap = incumbent[1] if incumbent is not None and incumbent[0] == 0 else None
-        proposal = stream.next(step_cap)
-        if proposal is None:
-            continue
-        active.append(stream)
+        entry = next(candidates, None)
+        if entry is None:
+            break
+        stream, proposal = entry
         if deadline is not None and monotonic() >= deadline:
             break
         attempt = {
@@ -991,6 +1034,12 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             "heuristic_cost": proposal.cost,
             "rank_seconds": monotonic() - rank_start,
         }
+        if proposal.arm_approach_m is not None:
+            attempt["arm_approach_m"] = proposal.arm_approach_m
+            distances = [e.distance_m for e in proposal.seed.schedule.edges]
+            attempt["missing_reach_evidence"] = None in distances
+            worst_gap = max((distance for distance in distances if distance is not None), default=0.)
+            attempt["search_priority"] = [proposal.arm_approach_m + worst_gap, *proposal.cost]
         if proposal.seed:
             attempt["gaps"] = [
                 {
@@ -1092,15 +1141,14 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 attempt["particle_candidate"] = dict(
                     best_model.metrics, row_index=best_model.index, soft_cost=best_model.soft_cost
                 )
-            stream.feedback(proposal.orders, result.endpoint_ok)
+            if stream is not None:
+                stream.feedback(proposal.orders, result.endpoint_ok)
             continue
         row = min(accepted, key=lambda r: plan_key(r, proposal.step_count))
         key = plan_key(row, proposal.step_count)
         if incumbent is None or key < incumbent:
             if incumbent is None:
                 metrics["time_to_first_accepted_s"] = monotonic() - start
-                if improvement_budget is not None:
-                    deadline = start + improvement_budget
             incumbent = key
             winning_motion = row.motion_plan
             winning_evidence = row.evidence
@@ -1130,6 +1178,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             )
             if config.curobo_plan:
                 metrics["motion_plan_success"] = True
+                break
     search_end = monotonic()
     timer.stop("start_optimization")
     metrics.update(selected_metrics)
@@ -1138,9 +1187,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         metrics["model_evidence_path"] = str(artifact.resolve())
         del winning_evidence
     metrics["time_limit_reached"] = deadline is not None and search_end >= deadline
-    metrics["effective_search_budget_s"] = (
-        improvement_budget if incumbent is not None and improvement_budget is not None else budget
-    )
+    metrics["effective_search_budget_s"] = budget
     if not metrics["time_limit_reached"] and metrics["step_attempts"] and all(
         a["status"] == "unavailable" for a in metrics["step_attempts"]
     ):

@@ -37,7 +37,8 @@ def main():
         parser.error("--runs must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
-    cfg = TAMPConfiguration(enable_visualizer=False, experiment_root=str(args.output), max_loop_dur=args.max_duration)
+    cfg = TAMPConfiguration(step_optimizer="screen", num_particles=64, enable_visualizer=False,
+                            experiment_root=str(args.output), max_loop_dur=args.max_duration)
     env = load_env(resolve_env_path("two_steps_floor_transfer"))
     q = REAL_LEGS.home if args.cli_home else None
     reports = []

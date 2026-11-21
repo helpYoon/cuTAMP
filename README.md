@@ -70,20 +70,22 @@ Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
 `uv run pytest`) or after `source .venv/bin/activate`. Both put `.venv/bin`,
 which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
-The checkout includes the three T1 stepping inputs the default planner uses.
-The learned step model has its own folder, [`models/t1_landing/`](models/t1_landing/):
-`landing-seed3.pt` is the frozen bfm_wm step policy and world model, which
-evaluate candidate landings on logical CUDA device 0, and `home-model.json` is
-its measured landing accuracy. With the nominal hand reach map,
+The checkout includes the four T1 stepping inputs the default planner uses.
+The learned step models have their own folder, [`models/t1_landing/`](models/t1_landing/):
+`step-sequence-v1.pt` is the exported step-sequence model that Adam
+differentiates through; `landing-seed3.pt` is the frozen bfm_wm step policy and
+world model, which produce the post-retract history and verify the landings on
+logical CUDA device 0; and `home-model.json` is its measured landing accuracy.
+With the nominal hand reach map,
 `cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz`, the accuracy table
 guides task search.
 
-> **bfm_wm is not public yet.** The step model is a frozen export from bfm_wm,
+> **bfm_wm is not public yet.** The step models are frozen exports from bfm_wm,
 > the repository that trains the T1 controller and its world model. That code
-> is not released, so the model cannot be retrained or re-exported from this
-> repository; cuTAMP loads the export without importing bfm_wm
+> is not released, so the models cannot be retrained or re-exported from this
+> repository; cuTAMP loads the exports without importing bfm_wm
 > ([`models/t1_landing/README.md`](models/t1_landing/README.md)). The scripts
-> in `experiments/` that measured the model need bfm_wm and local data.
+> in `experiments/` that measured the models need bfm_wm and local data.
 
 To verify the shipped files, run this from the repository root:
 
@@ -92,6 +94,7 @@ sha256sum -c <<'EOF'
 047174fe321ccdb3711dd88581a51142576b09a742b7a46f4c9784c4454d8bf7  cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz
 61413e2a0c8ecbbd398803a9466d3aafea2c66fe8f2acf404726a1af8ad5f686  models/t1_landing/home-model.json
 2f8002e1dcf16957a7f64d37aacb89ca10e3a579cfc1c1756d154381b90f6c47  models/t1_landing/landing-seed3.pt
+e6558a4779e89c0ed68ae29a87a3668e2db95d214355741eb0d8e9d1526615fb  models/t1_landing/step-sequence-v1.pt
 EOF
 ```
 
@@ -166,10 +169,11 @@ graph LR
     D --> E["Playback / save<br/>(Rerun · raw plan pickle)"]
 ```
 
-1. **Task planning** — `task_plan_generator` (`cutamp/task_planning/`) enumerates
-   PDDL-style plan skeletons over the T1 operators in `t1_domain.py`
-   (`LeftPick`, `RightPlace`, `LeftRetractHolding`, …), breadth-first, trying
-   the closer arm for each object first (`make_arm_affinity_priority_fn`).
+1. **Task planning** — Automatic stepping A* with a nominal hand map puts arm,
+   object and foot choices in one queue. It charges the nominal palm-to-object
+   distance when a pick chooses its hand, then scores reach and landing evidence
+   for the candidate steps. Fixed-stance planning uses breadth-first symbolic
+   search with a pick-distance preference.
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
    / configs and solves each pick / place conf with GN IK
@@ -306,9 +310,10 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 ### 📁 [`models/t1_landing/`](models/t1_landing/)
 
-The frozen learned step model (`landing-seed3.pt`) and its measured landing
-accuracy (`home-model.json`), exported from bfm_wm, which is not public yet;
-its README gives the provenance.
+The frozen learned step models (`step-sequence-v1.pt`, `landing-seed3.pt`),
+the measured landing accuracy (`home-model.json`) and bfm_wm's third-party
+notices, exported from bfm_wm, which is not public yet; its README gives the
+provenance.
 
 ### 📁 [`cutamp/robots/`](cutamp/robots/)
 
@@ -501,8 +506,8 @@ its README gives the provenance.
   `Right…` twins.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
-  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 64 (256 with
-  `step_mode="off"`);
+  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 128 for
+  learned step Adam (256 with `step_mode="off"`, 64 for the other step routes);
   `soft_cost=["place_close_to_base", "joint_limit_margin",
   "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
   balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
@@ -621,7 +626,7 @@ live `--cuda_graphs` runs in
 - [`run_cutamp.py`](cutamp/scripts/run_cutamp.py) — main entry point
   (installed as `cutamp-demo`), T1 only. `--env` picks the scene, a shipped
   name (`blocks_t1`, the default, `shelf_t1`, `cylinder_t1`, `cup_t1`,
-  `two_steps_floor_transfer`) or an
+  `two_steps_floor_transfer`, `two_steps_right_transfer`) or an
   env file's path; `--surface_height` raises its movables and surfaces onto a
   table top, `--seed` seeds the sampling, and `--save_plan PATH` (or `auto`,
   or no value: `motion_plan.pkl` next to the run's metrics) saves the raw
@@ -648,17 +653,25 @@ live `--cuda_graphs` runs in
 
 ## Usage
 
-The T1 default runs `--step_mode model` and requests a complete motion. The public
-planner generates grasps for the scene, searches over the acting arm and footstep
-orders, and screens foot targets with the frozen landing policy and world model.
-It tries smooth, planted-foot manipulation paths with the inactive arm at nominal
-and uses cuRobo trajectory optimization when needed. A connected prediction carries
-the status `model_predicted_motion`. Independent transition validation is available
-through the Python API with `step_motion_validation="independent"` and an evidence
-provider. Both default full-motion deadlines start at planner entry. The planner
-allows 9.5 seconds to find a complete motion and, once one passes, compares alternatives
-until 4.4 seconds from entry. Use `--no-motion_plan` for an 8-second keyframe search
-or `--max_duration` to set one budget for the entire search.
+The default T1 planner uses A* to choose a hand and an ordered footstep sequence
+for each pick and place. It requests 64 grasps per object from GraspGen-X and
+refines 128 particles with Adam. Grasp and placement costs reach the foot
+commands through stance IK and the trained whole-step model. The place cost
+also differentiates through the 50 post-retract controller ticks. A batch stops
+after five updates without a cumulative 1 mm improvement in its best feasible
+centering, with at least five and at most 48 updates.
+
+The original controller and world model replay the optimized commands. Both feet
+must pass the 2 cm XY and 1° yaw limits. The planner tries validated particles in
+order of their worst pick/place CoM distance to the support polygon centroid,
+then secondary effort. It returns the first connected motion on the first
+successful skeleton. If refinement or motion planning fails, A* supplies the
+next skeleton. Use `--max_duration` or `--max_step_schedules` to bound this search.
+A connected prediction carries the status `model_predicted_motion`. Independent
+transition evidence can be supplied through the Python API.
+
+To run the original recurrent Adam objective, pass `--step_optimizer adam`.
+For forward screening, use `--step_optimizer screen`.
 
 The `two_steps_floor_transfer` demo starts the learned-step planner from a
 synthetic standing start: the landing model's home pose with a settled controller
@@ -682,8 +695,8 @@ each segment as needed, up to 4×, and a candidate that still fails is dropped
 (`motion_solver._balance_gate`).
 
 ```bash
-# Full floor transfer in Rerun. The planner chooses the grasp and step order.
-uv run python -m cutamp.scripts.run_cutamp --env two_steps_floor_transfer --motion_plan
+# Right-side four-step benchmark, with a complete motion in Rerun
+uv run python -m cutamp.scripts.run_cutamp --env two_steps_right_transfer --motion_plan
 
 # Fixed-feet smoke test (keyframes)
 uv run python -m cutamp.scripts.run_cutamp --step_mode off -n 16 --num_opt_steps 50
@@ -756,7 +769,8 @@ skips the robot's meshes; both cut bandwidth.
 ## Troubleshooting
 
 - **`torch.OutOfMemoryError: CUDA out of memory`** — use fewer particles
-  (default 64, or 256 with `--step_mode off`), e.g. `-n 32`.
+  (default 128, 64 for the other step routes, or 256 with `--step_mode off`),
+  e.g. `-n 32`.
 
 ## Key Design Decisions
 

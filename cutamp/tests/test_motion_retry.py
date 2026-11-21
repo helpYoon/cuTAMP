@@ -149,7 +149,7 @@ def test_only_selected_motion_appears_on_curobo_timeline(monkeypatch):
     monkeypatch.setattr(alg, "play_curobo_motion", lambda world, motion, vis: displayed.append((motion, vis)), raising=False)
     metrics = _run_skeletons(monkeypatch, [(True, 1), (True, 1), (False, 1)],
                              centers=[[.01], [.09], [.02]], viewer=viewer)
-    assert metrics["num_optimized_plans"] == 3
+    assert metrics["num_optimized_plans"] == 1
     assert displayed == [("plan-0", viewer)]
 
 
@@ -340,21 +340,11 @@ def test_reset_puts_placed_blocks_back():
         assert offset(obj) < 1e-4, obj.name
 
 
-def test_centered_fixed_stance_motion_compares_successful_rows_across_skeletons(monkeypatch):
-    # Skeleton 0's best posture fails motion, row 1 passes. Skeleton 1 then improves the successful plan.
-    # Skeleton 2 has the best posture but fails motion, so it cannot replace the incumbent.
-    result = _run_skeletons(monkeypatch, [(True, 2), (True, 1), (False, 1)], initial_witness=True,
-                            centers=[[.01, .18], [.11], [.001]])
-    assert result["num_optimized_plans"] == 3
-    assert result["motion_plan_success"]
-    assert result["max_center_distance_m"] == pytest.approx(.11)
-    assert result["motion_plan_rank"] == 0
-
-
-def test_fixed_stance_motion_skips_dominated_skeletons(monkeypatch):
-    # The second skeleton already loses at its most centered kinematic candidate.
-    result = _run_skeletons(monkeypatch, [(True, 1), (True, 1)], initial_witness=True,
-                            centers=[[.06], [.07]])
-    assert result["num_optimized_plans"] == 2
-    assert result["motion_plan_attempts"] == 1
-    assert result["max_center_distance_m"] == pytest.approx(.06)
+def test_centered_fixed_stance_motion_retries_until_first_connected_skeleton(monkeypatch):
+    # First skeleton fails its motion; the second connects on its next-best row.
+    result = _run_skeletons(monkeypatch, [(False, 1), (True, 2), (True, 1)], initial_witness=True,
+                            centers=[[.02], [.01, .18], [.001]])
+    assert result["num_initial_plans"] == result["num_optimized_plans"] == 2
+    assert result["motion_plan_success"] and result["motion_plan_attempts"] == 3
+    assert result["max_center_distance_m"] == pytest.approx(.18)
+    assert result["motion_plan_rank"] == 1

@@ -1,5 +1,6 @@
 """Refine the shared grasps, placements and commanded landings of a grounded T1 skeleton."""
 
+from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from functools import partial
 from itertools import islice
@@ -16,9 +17,10 @@ from cutamp.rollout import RolloutFunction
 from cutamp.samplers import project_supported_placement
 from cutamp.sole_collision import geometric_sweep_rows
 from cutamp.stance import abs_pose, stance_joint_limits
-from cutamp.step_ik import centered_stance_witnesses, solve_stance_ik
+from cutamp.step_ik import centered_stance_witnesses, solve_stance_ik, stance_ik_tolerance
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refinement import _check_deadline, refine_gap, stance_center_residual, stance_ik_rows
+from cutamp.step_sequence import predict_sequence
 from cutamp.step_validation import StepStateAdapter, sweep_constraint_rows, sweep_penetration_rows, validate_step_geometry
 from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4, transform_spheres
 
@@ -124,15 +126,30 @@ def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None,
 def _inputs_for_gap(inputs, seeds, gap, op, incoming, cmds, q_rest, first, stop):
     if inputs.posture_seeds is not None and inputs.posture_seeds[gap] is not None:
         return _batch(inputs.posture_seeds[gap], first, stop, (q_rest.shape[-1],), q_rest)
-    out = []
+    by_order = {}
+    has_fallback = False
     for i, seed in enumerate(seeds):
         edge = seed.schedule.edges[gap] if seed is not None and seed.schedule.edges else None
         if edge is None or edge.witness is None:
-            out.append(q_rest[i])
+            has_fallback = True
         else:
-            nominal = _nominal(incoming[i : i + 1], edge.order, cmds[i : i + 1])
-            out.append(_carry_witness(q_rest.new_tensor(edge.witness)[None], nominal)[0])
-    return torch.stack(out)
+            by_order.setdefault(edge.order, []).append((i, edge.witness))
+    if not by_order:
+        return q_rest.clone()
+    # A grounded skeleton normally gives all particles the same foot order.
+    # Keep the original row bindings for mixed orders and missing reach witnesses.
+    if len(by_order) == 1 and not has_fallback:
+        order, group = next(iter(by_order.items()))
+        witnesses = q_rest.new_tensor([pose for _, pose in group])
+        return _carry_witness(witnesses, _nominal(incoming, order, cmds))
+    out = q_rest.clone() if has_fallback else q_rest.new_empty(q_rest.shape)
+    for order, group in by_order.items():
+        rows, poses = zip(*group)
+        witnesses = q_rest.new_tensor(poses)
+        indices = torch.tensor(rows, device=q_rest.device)
+        nominal = _nominal(incoming[indices], order, cmds[indices])
+        out[indices] = _carry_witness(witnesses, nominal)
+    return out
 
 
 def _command_inputs(inputs, seeds, j, steps, like):
@@ -356,8 +373,9 @@ def _summary(result, commands, order, initial, validation, i, *, incoming, wrist
 
 def _refine_batch(
     proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop, motion_inputs, deadline,
-    *, bindings=None, grasp_indices=None, objective=False,
+    *, bindings=None, grasp_indices=None, objective=False, ik_starts=None,
 ):
+    _check_deadline(deadline)
     groups = _groups(proposal.skeleton)
     arm_skeleton = [op for op in proposal.skeleton if op.operator.metadata.action_type != "step"]
     cost_function = CostFunction(arm_skeleton, world, config)
@@ -366,12 +384,15 @@ def _refine_batch(
     particles, objects, wrists, held_before = _placements_and_grasps(
         groups, world, pools, inputs, first, stop, seeds, bindings, grasp_indices
     )
+    if config.require_modeled_load and any(steps and held_before[j] for j, (steps, _) in enumerate(groups)):
+        return StepResult([], None, "unavailable", "seed-3 dynamics have no payload model")
     placement_seeds = {
         op.arg("placement"): particles[op.arg("placement")].clone()
         for _, op in groups
         if op.operator.metadata.action_type == "place"
     }
-    if config.step_optimizer == "adam" and bindings is None:
+    learned_adam = config.step_optimizer == "learned_adam"
+    if config.step_optimizer in ("learned_adam", "adam") and bindings is None:
         from cutamp.step_adam import optimize_particles
 
         initial = {key: value for key, value in placement_seeds.items() if key not in (inputs.placements or {})}
@@ -380,17 +401,29 @@ def _refine_batch(
             if steps:
                 initial[f"foot{j}"] = _command_inputs(inputs, seeds, j, steps, like)
 
-        def evaluate(values, objective=True):
+        def evaluate(values, objective=True, *, ik_starts=None):
             return _refine_batch(proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first,
                                  stop, motion_inputs, deadline, bindings=values, grasp_indices=bound_grasps,
-                                 objective=objective)
+                                 objective=objective, ik_starts=ik_starts)
 
-        best, report = optimize_particles(initial, evaluate, config.step_refine_iterations, config.lr)
+        options = {}
+        if config.step_adam_plateau_mm is not None or config.step_adam_trace_center:
+            options.update(plateau=config.adam_plateau(), trace_center=config.step_adam_trace_center,
+                           center_weight=config.com_center_weight)
+        objective_fn = partial(evaluate, ik_starts={}) if learned_adam and config.step_ik_warm_start else evaluate
+        tolerance = nullcontext()
+        if learned_adam and config.step_ik_objective_tol is not None:
+            tolerance = stance_ik_tolerance(config.step_ik_objective_tol)
+        with tolerance:
+            best, report = optimize_particles(initial, objective_fn, config.step_refine_iterations, config.lr, **options)
+        # Rebuild each selected row from scratch using the dense teacher and native IK precision.
         with torch.no_grad():
             verified = evaluate(best, objective=False)
         for row in verified.rows:
             idx = row.index - first
-            row.metrics["step_optimizer"] = "adam"
+            row.metrics["step_optimizer"] = config.step_optimizer
+            row.metrics["adam_updates_completed"] = report["updates_completed"]
+            row.metrics["adam_stop_reason"] = report["stop_reason"]
             row.metrics["selected_adam_iteration"] = int(report["iteration"][idx])
             for j, gap in enumerate(row.metrics["gaps"]):
                 key = f"foot{j}"
@@ -399,7 +432,9 @@ def _refine_batch(
                     grad = report.get("initial_gradient", {}).get(key)
                     gap["initial_adam_loss_gradient"] = _list(grad[idx]) if grad is not None else None
         verified.diagnostics["adam"] = {
-            "first_index": first, "iterations": config.step_refine_iterations,
+            "optimizer": config.step_optimizer,
+            "first_index": first, "iterations": report["updates_completed"], "max_updates": config.step_refine_iterations,
+            "stop_reason": report["stop_reason"],
             "selected_iteration": _list(report["iteration"]), "violation": _list(report["violation"]),
             "initial_violation": _list(report["initial_violation"]),
             "invalid_gradients": _list(report["invalid_gradients"]),
@@ -407,6 +442,8 @@ def _refine_batch(
             "initial": {key: _list(value) for key, value in initial.items()},
             "selected": {key: _list(value) for key, value in best.items()},
         }
+        if "best_feasible_center_m" in report:
+            verified.diagnostics["adam"]["best_feasible_center_m"] = report["best_feasible_center_m"]
         return verified
     penalties, center_costs = [], []
     rest = particles["left_q0"]
@@ -450,13 +487,28 @@ def _refine_batch(
         action = groups[k][1]
         carrying = occupied_reference(k, previous)
         if carrying is not None:
-            return partial(solve_endpoint, other_arm_reference=carrying)
-        idle = world.model.right_arm if action.operator.metadata.arm == "left" else world.model.left_arm
-        nominal = witness.new_tensor(world.model.home[idle]).expand_as(witness[:, idle])
-        if torch.equal(witness[:, idle], nominal):
-            # The coupled scene rows below already check this sole candidate.
-            return solve_endpoint
-        return partial(solve_endpoint, collides=partial(endpoint_collisions, k))
+            solve = partial(solve_endpoint, other_arm_reference=carrying)
+        else:
+            idle = world.model.right_arm if action.operator.metadata.arm == "left" else world.model.left_arm
+            nominal = witness.new_tensor(world.model.home[idle]).expand_as(witness[:, idle])
+            # The coupled scene rows below already check the nominal idle arm.
+            solve = (solve_endpoint if torch.equal(witness[:, idle], nominal)
+                     else partial(solve_endpoint, collides=partial(endpoint_collisions, k)))
+        if ik_starts is None:
+            return solve
+
+        def fit(soles, wrist, seed, arm):
+            initial = None
+            if k in ik_starts:
+                prior_q, usable = ik_starts[k]
+                initial = torch.where(usable[:, None], prior_q, seed)
+            endpoint = solve(soles, wrist, seed, arm, initial=initial)
+            # Reuse only the starting point. Bounds, posture prior, and implicit
+            # derivative all belong to the new particle evaluation.
+            ik_starts[k] = (endpoint.q.detach(), endpoint.optimality.detach() < 2e-6)
+            return endpoint
+
+        return fit
 
     def endpoint_collisions(k, q, owners=None):
         action = groups[k][1]
@@ -475,8 +527,7 @@ def _refine_batch(
         return blocked
 
     for j, (steps, op) in enumerate(groups):
-        if deadline is not None and monotonic() >= deadline:
-            return StepResult([], None, "budget_exhausted", "continuous refinement time budget expired")
+        _check_deadline(deadline)
         order = proposal.orders[j]
         cmds = (bindings[f"foot{j}"] if bindings is not None and steps
                 else _command_inputs(inputs, seeds, j, steps, like))
@@ -496,22 +547,23 @@ def _refine_batch(
                 _, qd = adapter.planner(obs.tensors[:6])
             else:
                 qd = torch.zeros_like(rest)
-            init = adapter.initialize(rest, d, qd, observed=obs, world=world, object_poses=objects[j], held=held)
-            start, usable = init.state, init.compatible
-            if not usable.any() and not objective:
-                return StepResult(
-                    [],
-                    None,
-                    "unavailable",
-                    "landing history does not match the incoming state",
-                    {k: _list(v) if torch.is_tensor(v) else v for k, v in init.diagnostics.items()},
-                )
+            if objective and obs is None:
+                start = adapter.objective_state(rest, d, qd)
+            else:
+                init = adapter.initialize(rest, d, qd, observed=obs, world=world, object_poses=objects[j], held=held)
+                start, usable = init.state, init.compatible
+                if not objective and not usable.any():
+                    return StepResult(
+                        [],
+                        None,
+                        "unavailable",
+                        "landing history does not match the incoming state",
+                        {k: _list(v) if torch.is_tensor(v) else v for k, v in init.diagnostics.items()},
+                    )
             incoming = predictor.model.feet(start.tensors[:6])[0]
             active_predictor = predictor
             if j == 0:
                 stances.update(left_q0=incoming, right_q0=incoming)
-        if steps and held and config.require_modeled_load:
-            return StepResult([], None, "unavailable", "seed-3 dynamics have no payload model")
         eligible_sources = None
         if bindings is None and config.step_mode == "model" and inputs.orders is None and config.step_refine_iterations == 0 and endpoints:
             prefix = torch.stack(endpoints, dim=1)
@@ -605,7 +657,12 @@ def _refine_batch(
             # Each replay starts from the shared initial state. The next gap includes
             # the retraction and controller history prepared from this gap's prediction.
             forward_only = False
-            prediction = active_predictor.rollout(start, order, cmds) if active_predictor is not None else None
+            prediction = None
+            if active_predictor is not None:
+                if learned_adam:
+                    prediction = predict_sequence(active_predictor.sequence_model, active_predictor, start, order, cmds)
+                else:
+                    prediction = active_predictor.rollout(start, order, cmds)
             ev = _evaluate(active_predictor, start, incoming, order.replace("none", ""), cmds, arm, wrists[j],
                            seed, margin, coupled_rows, None, None, solve_ik=endpoint_solver(j, rest, seed),
                            prediction=prediction)

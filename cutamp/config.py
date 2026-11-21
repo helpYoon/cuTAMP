@@ -23,7 +23,7 @@ SUPPORTED_SOFT_COSTS = (
 @dataclass(frozen=True)
 class TAMPConfiguration:
     # Number of particles to initialize and optimize over. None resolves in __post_init__ to 256 for
-    # step_mode off (the fixed-feet baseline) and 64 for the step routes.
+    # step_mode off (the fixed-feet baseline), 128 for learned step Adam and 64 for the other step routes.
     num_particles: int | None = None
 
     # Optimization hyperparams
@@ -76,13 +76,20 @@ class TAMPConfiguration:
     step_reach_map: str | None = None
     step_accuracy_table: str | None = None
     step_derivative_method: str | None = None
-    step_optimizer: str | None = None  # opt-in experimental joint Adam
+    step_optimizer: str | None = None  # learned_adam, native adam, or screen/SQP
+    step_sequence_bundle: str | None = None
+    step_ik_warm_start: bool = True
+    step_ik_objective_tol: float | None = 5e-7
+    step_adam_plateau_mm: float | None = None
+    step_adam_plateau_patience: int = 5
+    step_adam_plateau_min_updates: int | None = None
+    step_adam_trace_center: bool = False
     # None selects the solver settings for the actual schedule (see for_refinement).
     step_refine_iterations: int | None = None
     step_trust_scale: float | None = None
     step_proposal_count: int | None = None  # Explicit counts apply to both pick and place.
     step_place_proposal_count: int | None = None
-    step_particle_batch_size: int = 64
+    step_particle_batch_size: int | None = None
     require_modeled_load: bool = False
 
     ## Trajectories and cuRobo
@@ -118,16 +125,29 @@ class TAMPConfiguration:
     com_center_weight: float | None = None
 
     def __post_init__(self):
+        batch = 128 if self._step_optimizer() == "learned_adam" else 64
         if self.num_particles is None:
-            object.__setattr__(self, "num_particles", 256 if self.step_mode == "off" else 64)
+            object.__setattr__(self, "num_particles", 256 if self.step_mode == "off" else batch)
+        if self.step_particle_batch_size is None:
+            object.__setattr__(self, "step_particle_batch_size", min(batch, self.num_particles))
         if self.curobo_plan is None:
             object.__setattr__(self, "curobo_plan", self.step_mode == "model")
         if self.soft_cost is None:
             default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
             object.__setattr__(self, "soft_cost", default)
 
+    def _step_optimizer(self):
+        if self.step_optimizer is not None:
+            return self.step_optimizer
+        # Explicit SQP/screening controls retain their original meaning.
+        sqp_options = (self.step_derivative_method, self.step_trust_scale,
+                       self.step_proposal_count, self.step_place_proposal_count)
+        if self.step_mode == "model" and all(x is None for x in sqp_options):
+            return "learned_adam"
+        return "screen"
+
     def _model_proposal_count(self):
-        if self.step_optimizer == "adam":
+        if self._step_optimizer() in ("adam", "learned_adam"):
             return 0
         if self.step_proposal_count is not None:
             return self.step_proposal_count
@@ -135,14 +155,27 @@ class TAMPConfiguration:
             return 0
         return 192
 
+    def adam_plateau(self):
+        if self.step_adam_plateau_mm is None:
+            return None
+        from cutamp.step_adam import PlateauStop
+        minimum = self.step_adam_plateau_min_updates
+        if minimum is None:
+            minimum = 5 if self._step_optimizer() == "learned_adam" else 0
+        return PlateauStop(self.step_adam_plateau_mm / 1000., self.step_adam_plateau_patience, minimum)
+
     def for_refinement(self, *, stepped: bool) -> "TAMPConfiguration":
         """Resolve optional overrides once a candidate's actual footstep count is known."""
-        derivative = "autodiff" if self.step_optimizer == "adam" else self.step_derivative_method or "finite_difference"
+        optimizer = self._step_optimizer()
+        learned = stepped and optimizer == "learned_adam"
+        derivative = "autodiff" if optimizer in ("adam", "learned_adam") else self.step_derivative_method or "finite_difference"
         proposals = self._model_proposal_count() if stepped and self.step_mode == "model" else 0
         fast = stepped and self.step_mode == "model" and derivative == "finite_difference"
         updates, trust_scale, weight = (2, 2.0, 4.0) if fast else (4, 1.0, 1.0)
         if self.step_mode == "off":
             weight = 0.0  # the fixed-feet baseline keeps its first satisfying plan
+        if learned:
+            updates = 48
         place_proposals = proposals
         if proposals:
             updates = 0
@@ -150,8 +183,13 @@ class TAMPConfiguration:
                 place_proposals = self.step_place_proposal_count
             elif self.step_proposal_count is None:
                 place_proposals = 128
+        plateau = self.step_adam_plateau_mm
+        if learned and plateau is None and self.com_center_weight != 0:
+            plateau = 1.0
         return replace(
             self,
+            step_optimizer=optimizer,
+            step_adam_plateau_mm=plateau,
             step_proposal_count=proposals,
             step_place_proposal_count=place_proposals,
             step_derivative_method=derivative,
@@ -214,11 +252,21 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError("step_place_proposal_count must be a nonnegative integer")
     if config.step_proposal_count and config.step_mode != "model":
         raise ValueError("Forward command proposals require step_mode=model")
-    if config.step_optimizer == "adam" and (
+    optimizer = config._step_optimizer()
+    if optimizer not in ("learned_adam", "adam", "screen"):
+        raise ValueError("step_optimizer must be learned_adam, adam or screen")
+    if optimizer in ("adam", "learned_adam") and (
         config.step_mode != "model" or config.step_proposal_count or config.step_place_proposal_count
         or config.step_derivative_method == "finite_difference"
     ):
-        raise ValueError("The experimental Adam route uses model autodiff and zero screening proposals")
+        raise ValueError("Step Adam uses model autodiff and zero screening proposals")
+    if config.step_ik_objective_tol is not None and (
+        not math.isfinite(config.step_ik_objective_tol) or config.step_ik_objective_tol <= 0
+    ):
+        raise ValueError("step_ik_objective_tol must be finite and positive")
+    if config.adam_plateau() is not None or config.step_adam_trace_center:
+        if optimizer not in ("adam", "learned_adam") or config.com_center_weight == 0:
+            raise ValueError("CoM plateau tracking requires the Adam step optimizer and a positive centering weight")
     updates = config.step_refine_iterations
     if (updates is not None and (type(updates) is not int or updates < 0)) or config.step_particle_batch_size < 1:
         raise ValueError("Invalid step refinement iteration or batch count")
