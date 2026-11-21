@@ -238,7 +238,10 @@ def test_centered_ik_sphere_residual_and_jacobian_match_direct_geometry(one_cpu_
     q[1] = q.new_tensor(REAL_LEGS.home)
     kin = _kinematics(q.device)
     residual, jac = kin.self_spheres.residual(kin.link_frames(q, True))
-    gap = kin.self_spheres.gaps(kin.link_frames(q[:1]))[0]
+    spheres = kin.self_spheres
+    pos, rot = kin.link_frames(q[:1])[:2]
+    centers = pos[0, spheres.links] + (rot[0, spheres.links] @ spheres.offsets[..., None]).squeeze(-1)
+    gap = (centers[spheres.i] - centers[spheres.j]).norm(dim=-1) - spheres.radii_sum
     assert gap.min() < 0 and (residual[1] == 0).all()
     torch.testing.assert_close(residual[0].norm(), (0.006 - gap).relu().norm())
     diff = 1j * 1e-25 * torch.eye(kin.n, dtype=q.dtype)

@@ -43,10 +43,8 @@ class RobotContainer:
     gripper_spheres: Dict[str, torch.Tensor]  # each [n, 4]
 
 
-def load_t1_container(model: T1Model, device_cfg: DeviceCfg = None) -> RobotContainer:
+def load_t1_container(model: T1Model, device_cfg: DeviceCfg) -> RobotContainer:
     """T1 humanoid on ``model``, as a single robot with two tool frames."""
-    if device_cfg is None:
-        device_cfg = DeviceCfg()
     kin = get_t1_kinematics(model, device_cfg)
     joint_limits = kin.get_joint_limits().position
     assert joint_limits.shape[0] == 2

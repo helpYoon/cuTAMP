@@ -429,14 +429,12 @@ def load_sweep_volume() -> dict:
 
 def get_t1_gripper_spheres(
     arm: Literal["left", "right"],
-    device_cfg: DeviceCfg = None,
+    device_cfg: DeviceCfg,
 ) -> torch.Tensor:
     """``[n, 4]`` collision spheres of the named gripper, in its base frame: the ``{arm}_base_link`` spheres of
     ``t1_29dof_spheres.yml``, the file cuRobo loads (the finger links hold none)."""
     if arm not in ("left", "right"):
         raise ValueError(f"Invalid arm: {arm}")
-    if device_cfg is None:
-        device_cfg = DeviceCfg()
     spheres = load_yaml(str(T1_29DOF_DIR / "t1_29dof_spheres.yml"))["collision_spheres"][TOOL_FRAME_FOR_ARM[arm]]
     return torch.tensor([[*s["center"], s["radius"]] for s in spheres], dtype=torch.float32, device=device_cfg.device)
 

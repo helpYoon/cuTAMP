@@ -71,13 +71,6 @@ class PostureCollisionSpheres:
         self.descendants = kin.descendants[6:, self.links]
         self.joint_links = kin.joint_links
 
-    def gaps(self, frames):
-        pos, rot = frames[:2]
-        points = pos[:, self.links] + (rot[:, self.links] @ self.offsets.to(rot.dtype)[..., None]).squeeze(-1)
-        d = (points[0, self.i] - points[0, self.j]).real
-        norm = torch.linalg.vector_norm(d, dim=-1)
-        return norm - self.radii_sum, d / norm[:, None].clamp_min(1e-12), points
-
     def residual(self, frames, repeats=1):
         """Pack every active 6 mm sphere-pair shortfall and its joint Jacobian per posture."""
         pos, rot, _, axes = frames
