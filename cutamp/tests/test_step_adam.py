@@ -39,11 +39,8 @@ def test_center_plateau_tracks_complete_feasible_particles_and_cumulative_gain()
         return violation, centers
 
     _, report = optimize_particles({"foot": torch.zeros(2, 1)}, evaluate, 20, .001,
-                                   plateau=PlateauStop(.001, 3), center_weight=4., trace_center=True)
+                                   plateau=PlateauStop(.001, 3), center_weight=4.)
     assert report["updates_completed"] == 7 and report["stop_reason"] == "plateau"
-    trace = report["best_feasible_center_m"]
-    assert trace[:2] == [None, None]
-    assert trace[2:] == pytest.approx([.010, .0094, .0087, .0086, .0086, .0082])
     assert report["iteration"].tolist() == [0, 7]
 
 
@@ -66,8 +63,8 @@ def test_plateau_needs_a_feasible_particle_and_respects_minimum(feasible, minimu
     {"step_adam_plateau_mm": 0.},
     {"step_adam_plateau_mm": 1., "step_adam_plateau_patience": 0},
     {"step_adam_plateau_mm": 1., "step_adam_plateau_min_updates": -1},
-    {"step_adam_trace_center": True, "com_center_weight": 0},
-    {"step_adam_trace_center": True, "step_mode": "off"},
+    {"step_adam_plateau_mm": 1., "com_center_weight": 0},
+    {"step_adam_plateau_mm": 1., "step_mode": "off"},
 ])
 def test_invalid_plateau_controls(options):
     from cutamp.config import TAMPConfiguration, validate_tamp_config

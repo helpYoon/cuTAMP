@@ -194,16 +194,6 @@ def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():
     assert (edge.passes, edge.trials) == (1, 4)
 
 
-def test_legacy_hold_profile_keeps_single_step_evidence_only():
-    records = profile("LR", [{"lag": 8, "stages": [stage("L"), stage("R")]}])
-    del records["provenance"]["inter_step_hold_ticks"]
-    records["schedules"] += profile("L", [{"lag": 8, "stages": [stage("L")]}])["schedules"]
-    search = StepSearch(atlas(), accuracy=records, lag=8, commands=(FWD,))
-    edges = {e.order: e for e in search.edges(HOME, target(0.065))}
-    assert (edges["L"].passes, edges["L"].trials) == (1, 1)
-    assert (edges["LR"].accuracy, edges["LR"].trials) == ("unknown", 0)
-
-
 @pytest.mark.parametrize("field", ["source_sha256", "checkpoint_sha256", "hold_ticks"])
 def test_different_model_or_handoff_profile_does_not_supply_accuracy(field):
     records = profile("L", [{"lag": 8, "all_handoffs_pass": True, "stages": [stage("L")]}])

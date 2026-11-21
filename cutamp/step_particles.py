@@ -1,6 +1,5 @@
 """Refine the shared grasps, placements and commanded landings of a grounded T1 skeleton."""
 
-from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from functools import partial
 from itertools import islice
@@ -297,8 +296,6 @@ def _refine_batch(
     particles, objects, wrists, held_before = _placements_and_grasps(
         groups, world, pools, first, stop, seeds, bindings, grasp_indices
     )
-    if config.require_modeled_load and any(steps and held_before[j] for j, (steps, _) in enumerate(groups)):
-        return StepResult([], None, "unavailable", "seed-3 dynamics have no payload model")
     placement_seeds = {
         op.arg("placement"): particles[op.arg("placement")].clone()
         for _, op in groups
@@ -319,15 +316,12 @@ def _refine_batch(
                                  objective=objective, ik_starts=ik_starts)
 
         options = {}
-        if config.step_adam_plateau_mm is not None or config.step_adam_trace_center:
-            options.update(plateau=config.adam_plateau(), trace_center=config.step_adam_trace_center,
-                           center_weight=config.com_center_weight)
-        objective_fn = partial(evaluate, ik_starts={}) if config.step_ik_warm_start else evaluate
-        tolerance = nullcontext()
-        if config.step_ik_objective_tol is not None:
-            tolerance = stance_ik_tolerance(config.step_ik_objective_tol)
-        with tolerance:
-            best, report = optimize_particles(initial, objective_fn, config.step_refine_iterations, config.lr, **options)
+        if config.step_adam_plateau_mm is not None:
+            options.update(plateau=config.adam_plateau(), center_weight=config.com_center_weight)
+        with stance_ik_tolerance(5e-7):
+            best, report = optimize_particles(
+                initial, partial(evaluate, ik_starts={}), config.step_refine_iterations, config.lr, **options
+            )
         # Rebuild each selected row from scratch using the dense teacher and native IK precision.
         with torch.no_grad():
             verified = evaluate(best, objective=False)
@@ -352,8 +346,6 @@ def _refine_batch(
             "initial": {key: _list(value) for key, value in initial.items()},
             "selected": {key: _list(value) for key, value in best.items()},
         }
-        if "best_feasible_center_m" in report:
-            verified.diagnostics["adam"]["best_feasible_center_m"] = report["best_feasible_center_m"]
         return verified
     penalties, center_costs = [], []
     rest = particles["left_q0"]

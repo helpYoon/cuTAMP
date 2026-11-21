@@ -170,30 +170,10 @@ def entrypoint():
     )
     parser.add_argument("--step_mode", choices=("off", "model"), default=_defaults.step_mode,
                         help="Plan on fixed feet (off) or step with the frozen T1 landing model (model).")
-    parser.add_argument("--max_step_schedules", type=int, default=None,
-                        help="Maximum distinct grounded schedules attempted across all arm assignments.")
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
-    parser.add_argument("--landing_bundle", help="Path to the exported seed-3 CUDA bundle.")
-    parser.add_argument("--step_reach_map", help="Path to the T1 nominal hand reach map.")
-    parser.add_argument("--step_accuracy_table", help="Path to the measured landing precision profile.")
-    parser.add_argument("--step_sequence_bundle", help="Override the trained step sequence bundle for learned Adam.")
-    parser.add_argument("--step_ik_warm_start", action=argparse.BooleanOptionalAction, default=_defaults.step_ik_warm_start,
-                        help="Reuse the preceding Adam iterate's posture to initialize learned-objective IK.")
-    parser.add_argument("--step_ik_objective_tol", type=float, default=_defaults.step_ik_objective_tol,
-                        help="Projected-gradient tolerance for IK inside learned Adam. Final verification uses 2e-9.")
-    parser.add_argument("--step_adam_plateau_mm", type=float, default=_defaults.step_adam_plateau_mm,
-                        help="Minimum improvement in worst-endpoint CoM distance in mm (learned Adam defaults to 1).")
-    parser.add_argument("--step_adam_plateau_patience", type=int, default=_defaults.step_adam_plateau_patience,
-                        help="Updates to wait after the last material centering improvement.")
-    parser.add_argument("--step_adam_plateau_min_updates", type=int, default=_defaults.step_adam_plateau_min_updates,
-                        help="Earliest update at which the CoM plateau rule may stop (5 by default for learned Adam).")
-    parser.add_argument("--step_adam_trace_center", action="store_true",
-                        help="Record the best objective-feasible worst-endpoint CoM distance after each update.")
     parser.add_argument("--step_refine_iterations", type=int, default=_defaults.step_refine_iterations,
                         help="Override learned step Adam's maximum updates (default 48).")
     parser.add_argument("--step_particle_batch_size", type=int, help="Maximum particles optimized together (default 128).")
-    parser.add_argument("--require_modeled_load", action="store_true",
-                        help="Only accept loaded steps with an applicable payload model.")
     parser.add_argument(
         "--max_duration",
         type=float,
@@ -257,15 +237,9 @@ def entrypoint():
         com_center_weight=args.com_center_weight,
         max_loop_dur=args.max_duration,
         step_mode=args.step_mode,
-        max_step_schedules=args.max_step_schedules, step_lag=args.step_lag,
-        landing_bundle=args.landing_bundle, step_reach_map=args.step_reach_map,
-        step_accuracy_table=args.step_accuracy_table,
+        step_lag=args.step_lag,
         step_refine_iterations=args.step_refine_iterations,
-        step_sequence_bundle=args.step_sequence_bundle, step_ik_warm_start=args.step_ik_warm_start,
-        step_ik_objective_tol=args.step_ik_objective_tol,
-        step_adam_plateau_mm=args.step_adam_plateau_mm, step_adam_plateau_patience=args.step_adam_plateau_patience,
-        step_adam_plateau_min_updates=args.step_adam_plateau_min_updates, step_adam_trace_center=args.step_adam_trace_center,
-        step_particle_batch_size=args.step_particle_batch_size, require_modeled_load=args.require_modeled_load,
+        step_particle_batch_size=args.step_particle_batch_size,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,

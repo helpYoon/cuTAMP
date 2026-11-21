@@ -7,26 +7,23 @@ from cutamp.algorithm import run_cutamp
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
-from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-from cutamp.tests.conftest import needs_cuda, only_schedule
+from cutamp.tests.conftest import first_schedules, needs_cuda, only_schedule
 from cutamp.tests.paired_grasp_scene import paired_setup
 
 
 def paired_case(label, output):
-    bundle = LANDING_BUNDLE
     cfg = TAMPConfiguration(
         step_mode="model",
         enable_visualizer=False,
         curobo_plan=False,
-        max_step_schedules=1,
         experiment_root=str(output),
-        landing_bundle=str(bundle),
     )
     torch.manual_seed(641)
     with pytest.MonkeyPatch.context() as mp:
         env, q, inp_args = paired_setup(label, mp)
         only_schedule(mp, ("L", "none"), "left")
+        first_schedules(mp, 1)
         _, count, metrics = run_cutamp(
             env,
             cfg,

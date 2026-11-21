@@ -216,9 +216,6 @@ class StepSearch:
             check_profile(self.provenance)
             self.profile_stance = _tuples(_soles_array(accuracy["home_soles"]))
             for schedule in accuracy["schedules"]:
-                # Older tables measured alternating pairs with a dwell after the first landing.
-                if len(schedule["order"]) > 1 and self.provenance.get("inter_step_hold_ticks") != 0:
-                    continue
                 key = (schedule["order"], _tuples(schedule["commands"]))
                 matched = [
                     handoff_precision(t.get("stages"), schedule["order"]) for t in schedule["trials"] if t["lag"] == lag

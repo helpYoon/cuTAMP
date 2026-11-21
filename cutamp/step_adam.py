@@ -21,7 +21,7 @@ class PlateauStop:
             raise ValueError("CoM plateau minimum updates must be a nonnegative integer")
 
 
-def optimize_particles(initial, evaluate, iterations, lr, *, plateau=None, center_weight=1., trace_center=False):
+def optimize_particles(initial, evaluate, iterations, lr, *, plateau=None, center_weight=1.):
     """Keep the best entire iterate per particle, ordered by violation then centering."""
     x = {key: value.detach().clone().requires_grad_() for key, value in initial.items()}
     optimizer = torch.optim.Adam(x.values(), lr=lr)
@@ -31,9 +31,8 @@ def optimize_particles(initial, evaluate, iterations, lr, *, plateau=None, cente
     best_center = minimum.clone()
     which = torch.zeros_like(minimum, dtype=torch.long)
     report = {"invalid_gradients": torch.zeros_like(which)}
-    if (plateau is not None or trace_center) and (not math.isfinite(center_weight) or center_weight <= 0):
+    if plateau is not None and (not math.isfinite(center_weight) or center_weight <= 0):
         raise ValueError("CoM plateau tracking requires a finite positive centering weight")
-    center_history = []
     anchor_m = math.inf
     last_gain = None
     reason = "max_updates"
@@ -49,19 +48,15 @@ def optimize_particles(initial, evaluate, iterations, lr, *, plateau=None, cente
                 minimum = torch.where(better, violation, minimum)
                 best_center = torch.where(better, center, best_center)
                 which[better] = i
-            if plateau is not None or trace_center:
+            if plateau is not None:
                 # center is the weighted squared worst endpoint distance of each entire particle.
                 valid_center = (minimum == 0) & best_center.isfinite()
-                distance = (best_center.masked_fill(~valid_center, torch.inf).min() / center_weight).sqrt()
-                if trace_center:
-                    center_history.append(distance)
-                if plateau is not None:
-                    distance_m = distance.item()
-                    if math.isfinite(distance_m) and anchor_m - distance_m >= plateau.tolerance_m:
-                        anchor_m, last_gain = distance_m, i
-                    if last_gain is not None and i >= plateau.min_updates and i - last_gain >= plateau.patience:
-                        reason = "plateau"
-                        break
+                distance_m = (best_center.masked_fill(~valid_center, torch.inf).min() / center_weight).sqrt().item()
+                if math.isfinite(distance_m) and anchor_m - distance_m >= plateau.tolerance_m:
+                    anchor_m, last_gain = distance_m, i
+                if last_gain is not None and i >= plateau.min_updates and i - last_gain >= plateau.patience:
+                    reason = "plateau"
+                    break
             if i == iterations:
                 break
             optimizer.zero_grad(set_to_none=True)
@@ -79,6 +74,4 @@ def optimize_particles(initial, evaluate, iterations, lr, *, plateau=None, cente
                 report["initial_gradient"] = {k: v.grad.detach().clone() for k, v in x.items()}
             optimizer.step()
     report.update(iteration=which, violation=minimum, center=best_center, updates_completed=i, stop_reason=reason)
-    if trace_center:
-        report["best_feasible_center_m"] = [x if math.isfinite(x) else None for x in torch.stack(center_history).tolist()]
     return best, report

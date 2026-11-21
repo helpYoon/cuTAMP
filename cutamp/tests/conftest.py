@@ -134,6 +134,16 @@ def only_schedule(monkeypatch, orders, arm):
     monkeypatch.setattr(arm_step_search, "arm_step_skeletons", matching)
 
 
+def first_schedules(monkeypatch, count):
+    """Pass on only the first ``count`` skeletons of the joint A* (after any earlier :func:`only_schedule`)."""
+    from itertools import islice
+
+    from cutamp.task_planning import arm_step_search
+
+    search = arm_step_search.arm_step_skeletons
+    monkeypatch.setattr(arm_step_search, "arm_step_skeletons", lambda *a, **kw: islice(search(*a, **kw), count))
+
+
 def clone_particles(particles: dict) -> dict:
     """Fresh leaf copies of ``particles``, each keeping its ``requires_grad``."""
     return {k: v.detach().clone().requires_grad_(v.requires_grad) for k, v in particles.items()}

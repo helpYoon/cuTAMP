@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from cutamp.landing_accuracy import LANDING_BUNDLE
 from cutamp.landing_predictor import landing_errors
 from cutamp.step_preview import _check_issued_landings
 from cutamp.tests.conftest import needs_cuda
@@ -38,7 +37,7 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     from cutamp.envs import TAMPEnvironment
     from cutamp.robots.t1 import REAL_LEGS
     from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
-    from cutamp.tests.conftest import only_schedule
+    from cutamp.tests.conftest import first_schedules, only_schedule
     from cutamp.tests.paired_grasp_scene import paired_setup
     from cutamp.utils.plan_processor import raw_motion_plan
 
@@ -51,12 +50,11 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
         "fresh_foot_commands", [part], [floor, pad], {"Movable": [part], "Surface": [pad]}, old.goal_state
     )
     only_schedule(monkeypatch, ("LR", "LR"), "left")
+    first_schedules(monkeypatch, 1)
     torch.manual_seed(641)  # the placement is drawn
     cfg = TAMPConfiguration(
         step_mode="model",
-        max_step_schedules=1,
         max_loop_dur=60,
-        landing_bundle=str(LANDING_BUNDLE),
         enable_visualizer=False,
         experiment_root=str(tmp_path),
     )

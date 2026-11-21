@@ -3,8 +3,7 @@
 The learned step models the planner uses by default (`--step_mode model`).
 cuTAMP loads these files from `cutamp.landing_accuracy` (`LANDING_BUNDLE`,
 `LANDING_ACCURACY`) and `cutamp.step_sequence_model`
-(`DEFAULT_STEP_SEQUENCE_MODEL`); `--landing_bundle`, `--step_accuracy_table`
-and `--step_sequence_bundle` point it at others.
+(`DEFAULT_STEP_SEQUENCE_MODEL`).
 
 | File | What it is |
 | --- | --- |

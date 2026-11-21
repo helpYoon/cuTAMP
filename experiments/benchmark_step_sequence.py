@@ -9,7 +9,6 @@ from time import perf_counter
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--env", default="two_steps_floor_transfer", help="Shipped scene name or a YAML path")
     parser.add_argument("--seed", type=int, default=641)
     parser.add_argument("--runs", type=int, default=2)
@@ -20,14 +19,6 @@ def main():
     parser.add_argument("--plateau-mm", type=float, help="Minimum material improvement in worst-endpoint centering")
     parser.add_argument("--patience", type=int, default=5, help="Updates without material improvement before stopping")
     parser.add_argument("--min-updates", type=int)
-    parser.add_argument("--trace-center", action="store_true", help="Record cumulative best predicted centering by update")
-    parser.add_argument("--ik-objective-tol", type=float, help="Projected-gradient tolerance during the learned objective only (native default: 2e-9)")
-    parser.add_argument(
-        "--max-step-schedules",
-        type=int,
-        default=0,
-        help="Maximum ranked schedules to try (default: uncapped)",
-    )
     parser.add_argument("--budget-seconds", type=float, help="Public planner search budget, in seconds")
     args = parser.parse_args()
     if (
@@ -35,10 +26,9 @@ def main():
         or (args.iterations is not None and args.iterations < 1)
         or (args.particles is not None and args.particles < 1)
         or (args.particle_batch_size is not None and args.particle_batch_size < 1)
-        or args.max_step_schedules < 0
         or (args.budget_seconds is not None and args.budget_seconds <= 0)
     ):
-        parser.error("runs, updates, particle counts and time limits must be positive; max-step-schedules must be nonnegative")
+        parser.error("runs, updates, particle counts and time limits must be positive")
 
     import torch
 
@@ -59,7 +49,6 @@ def main():
         "curobo_plan": True,
         "experiment_root": str(args.output),
         "max_loop_dur": args.budget_seconds,
-        "max_step_schedules": args.max_step_schedules or None,
     }
     overrides = {
         "num_particles": args.particles,
@@ -67,11 +56,9 @@ def main():
         "step_refine_iterations": args.iterations,
         "step_adam_plateau_mm": args.plateau_mm,
         "step_adam_plateau_min_updates": args.min_updates,
-        "step_ik_objective_tol": args.ik_objective_tol,
-        "step_sequence_bundle": str(args.checkpoint) if args.checkpoint else None,
     }
     cfg.update({key: value for key, value in overrides.items() if value is not None})
-    cfg.update(step_adam_plateau_patience=args.patience, step_adam_trace_center=args.trace_center)
+    cfg.update(step_adam_plateau_patience=args.patience)
     cfg = TAMPConfiguration(**cfg)
     solver = cfg.for_refinement(stepped=True)
     plateau = solver.adam_plateau()
@@ -102,12 +89,9 @@ def main():
             "particles": cfg.num_particles,
             "particle_batch_size": cfg.step_particle_batch_size,
             "max_updates": solver.step_refine_iterations,
-            "warm_start_ik": solver.step_ik_warm_start,
-            "ik_objective_tol": solver.step_ik_objective_tol,
             "plateau_mm": solver.step_adam_plateau_mm,
             "plateau_patience": solver.step_adam_plateau_patience,
             "plateau_min_updates": plateau.min_updates if plateau is not None else None,
-            "max_step_schedules": cfg.max_step_schedules,
             "complete": complete,
             "search_budget_s": metrics.get("search_budget_s"),
             "public_wall_s": elapsed,

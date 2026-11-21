@@ -11,18 +11,21 @@ from cutamp import t1_domain
 from cutamp.algorithm import make_arm_affinity_priority_fn
 from cutamp.config import TAMPConfiguration
 from cutamp.step_planner import StepInputs, StepResult, StepRow, furthest_endpoint
+from cutamp.tests.conftest import first_schedules
 
 
 def test_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from dataclasses import replace
-    from cutamp import landing_predictor, step_sequence_model
+    from cutamp import landing_accuracy, landing_predictor, step_sequence_model
 
     bundle = tmp_path / "landing.pt"
     bundle.write_bytes(b"deployment")
     sequence = tmp_path / "sequence.pt"
     sequence.write_bytes(b"student")
-    config = TAMPConfiguration(landing_bundle=str(bundle), step_sequence_bundle=str(sequence))
+    monkeypatch.setattr(landing_accuracy, "LANDING_BUNDLE", bundle)
+    monkeypatch.setattr(step_sequence_model, "DEFAULT_STEP_SEQUENCE_MODEL", sequence)
+    config = TAMPConfiguration()
     stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=0)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(landing_predictor, "LandingPredictor", lambda path, **kw: SimpleNamespace(
@@ -47,7 +50,7 @@ def test_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_path, mon
 
 
 def test_learned_predictor_cache_tracks_both_bundles(tmp_path, monkeypatch):
-    from cutamp import landing_predictor, step_sequence_model
+    from cutamp import landing_accuracy, landing_predictor, step_sequence_model
 
     teacher = tmp_path / "landing.pt"
     teacher.write_bytes(b"teacher")
@@ -67,7 +70,9 @@ def test_learned_predictor_cache_tracks_both_bundles(tmp_path, monkeypatch):
         return object()
 
     monkeypatch.setattr(step_sequence_model, "load_step_sequence_model", load)
-    cfg = TAMPConfiguration(landing_bundle=str(teacher), step_sequence_bundle=str(student))
+    monkeypatch.setattr(landing_accuracy, "LANDING_BUNDLE", teacher)
+    monkeypatch.setattr(step_sequence_model, "DEFAULT_STEP_SEQUENCE_MODEL", student)
+    cfg = TAMPConfiguration()
     first = alg._load_predictor(cfg)
     assert alg._load_predictor(cfg) is first and loaded == [student]
     student.write_bytes(b"updated model")
@@ -107,6 +112,7 @@ def test_endpoint_prefix_belongs_to_one_row():
 
 @pytest.fixture
 def harness(monkeypatch, tmp_path):
+    from cutamp import landing_accuracy
     from cutamp.step_search import StepSearch
     from cutamp.tests.test_step_search import atlas
 
@@ -143,13 +149,13 @@ def harness(monkeypatch, tmp_path):
     # The left hand reaches the block and its place from the home stance.
     reach = atlas(points=((.3, .005, .555), (.3, .005, .655)))
     monkeypatch.setattr(alg, "_load_step_search", lambda cfg, **kw: (Search(reach, commands=((0.12, 0.21, 0),)), {}))
+    monkeypatch.setattr(landing_accuracy, "LANDING_BUNDLE", tmp_path / "no-checkpoint")
     cfg = {
         "num_initial_plans": 1,
         "enable_visualizer": False,
         "step_mode": "model",
         "curobo_plan": False,  # exercise the keyframe search unless a test requests motion
         "experiment_root": str(tmp_path),
-        "landing_bundle": str(tmp_path / "no-checkpoint"),
     }
 
     def run(**options):
@@ -205,7 +211,8 @@ def test_search_deadline_scope_and_world_setup(harness, monkeypatch, options, ex
 
     monkeypatch.setattr(alg, "setup_cutamp", slow_setup)
     monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **kw: StepResult([], None, "unresolved"))
-    _, _, metrics = run(max_step_schedules=1, **options)
+    first_schedules(monkeypatch, 1)
+    _, _, metrics = run(**options)
     assert metrics["search_budget_s"] == expected
     if expected is not None:
         assert metrics["time_limit_reached"] and metrics["status"] == "unresolved"
@@ -251,7 +258,7 @@ def test_full_motion_returns_on_success_with_time_remaining(harness, monkeypatch
     motion, _, metrics = run(curobo_plan=True, max_loop_dur=explicit)
     assert motion == ["complete"]
     assert len(metrics["step_attempts"]) == 1
-    assert not metrics["time_limit_reached"] and not metrics["schedule_limit_reached"]
+    assert not metrics["time_limit_reached"]
 
 
 @pytest.mark.parametrize("side,near_arm", [(-.15, "right"), (.15, "left")])
@@ -295,7 +302,8 @@ def test_step_search_charges_arm_choice_before_planning_the_pick(harness, monkey
     ops = sorted(t1_domain.all_t1_operators, key=lambda op: op.metadata.arm == winner)
     monkeypatch.setattr(alg, "all_t1_operators", ops)
     _no_refinement(monkeypatch)
-    _, _, metrics = run(num_initial_plans=2, max_step_schedules=1)
+    first_schedules(monkeypatch, 1)
+    _, _, metrics = run(num_initial_plans=2)
 
     attempt, = metrics["step_attempts"]
     assert any(op.startswith(f"{winner.capitalize()}Pick(block,") for op in attempt["skeleton"])
@@ -332,8 +340,9 @@ def test_arm_approach_accumulates_only_picks_in_their_incoming_stances(harness, 
     search = StepSearch(atlas, commands=((.24, .20, 0.),))
     monkeypatch.setattr(alg, "_load_step_search", lambda *args, **kwargs: (search, {}))
     _no_refinement(monkeypatch)
+    first_schedules(monkeypatch, 3)
 
-    _, _, metrics = run(num_initial_plans=2, max_step_schedules=3)
+    _, _, metrics = run(num_initial_plans=2)
     checked_shift = False
     for attempt in metrics["step_attempts"]:
         actions = [op for op in attempt["skeleton"] if "Pick(" in op or "Place(" in op]
@@ -364,7 +373,8 @@ def test_pose_still_ranks_both_hands_when_object_reach_bounds_are_unknown(harnes
     search = StepSearch(atlas(), commands=())
     monkeypatch.setattr(alg, "_load_step_search", lambda *a, **kw: (search, {}))
     _no_refinement(monkeypatch)
-    _, _, metrics = run(num_initial_plans=2, max_step_schedules=2)
+    first_schedules(monkeypatch, 2)
+    _, _, metrics = run(num_initial_plans=2)
 
     right, left = metrics["step_attempts"]
     for attempt, arm in ((right, "right"), (left, "left")):
@@ -394,9 +404,9 @@ def test_every_legal_order_pair_once_then_the_search_runs_out(harness, monkeypat
     monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
     monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **k: empty)
     monkeypatch.setattr(alg, "_refine_step_schedule", lambda *a, **k: empty)
-    _, n, metrics = run(max_step_schedules=25)
+    _, n, metrics = run()
     attempts = metrics["step_attempts"]
-    assert n == 0 and metrics["status"] == "unresolved" and not metrics["schedule_limit_reached"]
+    assert n == 0 and metrics["status"] == "unresolved"
     assert attempts[0]["orders"] == ["none", "none"]
     assert seen.index("rank") < seen.index("generate") and seen.count("generate") == 1
     assert seen.index("generate") < seen.index("wait")
@@ -440,7 +450,7 @@ def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypa
     assert [(a["status"], a["accepted_rows"]) for a in m["step_attempts"]] == [
         ("unresolved", 0), *[("model_feasible", 0)] * (len(calls) - 1), ("model_feasible", 2),
     ]
-    assert not m["schedule_limit_reached"] and not m["time_limit_reached"]
+    assert not m["time_limit_reached"]
 
 
 @pytest.mark.parametrize("weight,winning_id", [(None, 2), (0.1, 2), (0.0, 1)])
@@ -524,7 +534,7 @@ def test_logs_only_the_final_accepted_rows_model_evidence(harness, monkeypatch, 
         return StepResult([row], None, "model_feasible")
 
     monkeypatch.setattr(alg, "_refine_step_schedule", refine)
-    _, _, result = run(max_step_schedules=25)
+    _, _, result = run()
     assert result["gap_schedule"] == ["R", "none"]
     assert evidence_calls == ["R"]
     assert result["model_evidence_path"] == str(tmp_path / "model_evidence.json")
@@ -676,14 +686,17 @@ def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatc
     assert result.diagnostics["motion_plan_attempts"] == 1 and result.diagnostics["motion_plan_failures"] == []
 
 
-def test_rank_assets_are_reused_and_regeneration_invalidates_cache(tmp_path):
+def test_rank_assets_are_reused_and_regeneration_invalidates_cache(tmp_path, monkeypatch):
     import os
     from dataclasses import replace
 
+    from cutamp import landing_accuracy, reachability
     from cutamp.reachability import ReachMap
 
     path = tmp_path / "nominal.npz"
-    cfg = TAMPConfiguration(step_reach_map=str(path), step_accuracy_table=str(tmp_path / "missing.json"))
+    monkeypatch.setattr(reachability, "REACH_MAP", path)
+    monkeypatch.setattr(landing_accuracy, "LANDING_ACCURACY", tmp_path / "missing.json")
+    cfg = TAMPConfiguration()
     with pytest.raises(FileNotFoundError, match="Reach map"):
         alg._load_step_search(cfg)
     path.write_bytes(b"not an archive")
@@ -702,7 +715,7 @@ def test_rank_assets_are_reused_and_regeneration_invalidates_cache(tmp_path):
     assert alg._load_step_search(replace(cfg, step_lag=5))[0] is not second
 
 
-def test_zero_step_schedule_comes_first_and_fills_the_schedule_limit(harness, monkeypatch):
+def test_zero_step_schedule_comes_first(harness, monkeypatch):
     run, _, _ = harness
 
     def standing(*args, **kwargs):
@@ -714,9 +727,9 @@ def test_zero_step_schedule_comes_first_and_fills_the_schedule_limit(harness, mo
         )
 
     monkeypatch.setattr(alg, "_refine_standing_schedule", standing)
-    _, n, m = run(max_step_schedules=1)
+    first_schedules(monkeypatch, 1)
+    _, n, m = run()
     assert n == 1 and m["total_steps"] == 0 and m["status"] == "standing_feasible"
-    assert m["schedule_limit_reached"]
 
 
 from cutamp.tests.conftest import needs_cuda, needs_graspgenx
@@ -739,7 +752,6 @@ def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path,
     cfg = TAMPConfiguration(
         step_mode="model", curobo_plan=False,
         num_initial_plans=1,
-        max_step_schedules=1,
         num_particles=16,
         num_opt_steps=20,
         enable_visualizer=False,
@@ -747,6 +759,7 @@ def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path,
         experiment_root=str(tmp_path),
     )
     only_schedule(monkeypatch, ("none",), "left")
+    first_schedules(monkeypatch, 1)
     torch.manual_seed(1)
     motion, n, metrics = alg.run_cutamp(
         env,

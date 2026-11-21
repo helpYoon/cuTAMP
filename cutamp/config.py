@@ -69,22 +69,16 @@ class TAMPConfiguration:
     # Number of initial plans to sample
     num_initial_plans: int = 30
     step_mode: str = "model"  # off (fixed feet) or model (learned steps)
-    max_step_schedules: int | None = None
     step_lag: int = 2  # actuator delay in physics substeps
-    landing_bundle: str | None = None
-    step_reach_map: str | None = None
-    step_accuracy_table: str | None = None
-    step_sequence_bundle: str | None = None
-    step_ik_warm_start: bool = True
-    step_ik_objective_tol: float | None = 5e-7
+    # Learned step Adam's CoM plateau stop (adam_plateau): stop after `patience` updates without a cumulative `mm`
+    # gain in the best feasible worst-endpoint CoM distance, not before `min_updates` (None: 5). mm None resolves
+    # in for_refinement to 1 for a stepped candidate unless com_center_weight is 0.
     step_adam_plateau_mm: float | None = None
     step_adam_plateau_patience: int = 5
     step_adam_plateau_min_updates: int | None = None
-    step_adam_trace_center: bool = False
     # None caps learned step Adam at 48 updates (see for_refinement).
     step_refine_iterations: int | None = None
     step_particle_batch_size: int | None = None
-    require_modeled_load: bool = False
 
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
@@ -187,13 +181,7 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError("step_mode must be off or model")
     if config.step_mode == "off" and weight:
         raise ValueError("com_center_weight applies only to the step route: step_mode off is the fixed-feet baseline")
-    if config.max_step_schedules is not None and config.max_step_schedules <= 0:
-        raise ValueError("max_step_schedules must be positive when specified")
-    if config.step_ik_objective_tol is not None and (
-        not math.isfinite(config.step_ik_objective_tol) or config.step_ik_objective_tol <= 0
-    ):
-        raise ValueError("step_ik_objective_tol must be finite and positive")
-    if config.adam_plateau() is not None or config.step_adam_trace_center:
+    if config.adam_plateau() is not None:
         if config.step_mode != "model" or config.com_center_weight == 0:
             raise ValueError("CoM plateau tracking requires step Adam (step_mode model) and a positive centering weight")
     updates = config.step_refine_iterations

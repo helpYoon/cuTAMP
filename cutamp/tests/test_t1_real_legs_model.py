@@ -144,8 +144,7 @@ def test_main_cli_selects_the_learned_plateau_and_honors_particle_and_solver_ove
     assert (cfg.num_particles, cfg.step_particle_batch_size) == (128, 128)
     assert (cfg.step_refine_iterations, cfg.adam_plateau().tolerance_m,
             cfg.adam_plateau().patience, cfg.adam_plateau().min_updates) == (48, 0.001, 5, 5)
-    assert cfg.step_ik_warm_start and cfg.step_ik_objective_tol == 5e-7
-    assert cfg.max_loop_dur is cfg.max_step_schedules is None
+    assert cfg.max_loop_dur is None
     limited = _cli_config(monkeypatch, "-n", "32", "--step_refine_iterations", "3").for_refinement(stepped=True)
     assert (limited.num_particles, limited.step_refine_iterations) == (32, 3)
     assert _cli_config(monkeypatch, "--step_mode", "off").num_particles == 256

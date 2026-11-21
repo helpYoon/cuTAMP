@@ -649,10 +649,8 @@ def _load_step_search(config, *, applicable=True):
     from cutamp.landing_accuracy import LANDING_ACCURACY
     from cutamp.reachability import REACH_MAP
 
-    path = Path(config.step_reach_map or REACH_MAP)
-    accuracy = Path(config.step_accuracy_table or LANDING_ACCURACY)
-
-    tables, notes = _step_tables(_file_version(path), _file_version(accuracy) if applicable else None, config.step_lag)
+    accuracy = _file_version(LANDING_ACCURACY) if applicable else None
+    tables, notes = _step_tables(_file_version(REACH_MAP), accuracy, config.step_lag)
     return tables, (
         dict(notes) if applicable else dict(notes, accuracy_status="dynamics outside the profiled condition")
     )
@@ -689,11 +687,10 @@ def _load_predictor(config):
     from cutamp.landing_predictor import LandingPredictor
     from cutamp.step_sequence_model import DEFAULT_STEP_SEQUENCE_MODEL, load_step_sequence_model
 
-    path = Path(config.landing_bundle or LANDING_BUNDLE)
+    path, sequence_path = LANDING_BUNDLE, DEFAULT_STEP_SEQUENCE_MODEL
     version = _file_version(path)
     if version[1] is None or not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
-    sequence_path = Path(config.step_sequence_bundle or DEFAULT_STEP_SEQUENCE_MODEL)
     sequence_version = _file_version(sequence_path)
     if sequence_version[1] is None or not sequence_path.is_file():
         raise FileNotFoundError(f"Step sequence bundle is unavailable at {sequence_path}")
@@ -888,7 +885,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             wait_for_sampler_load()  # a caller may have already started a process-wide preload
 
     candidates = proposals()
-    while config.max_step_schedules is None or len(metrics["step_attempts"]) < config.max_step_schedules:
+    while True:
         if deadline is not None and monotonic() >= deadline:
             break
         rank_start = monotonic()
@@ -1050,9 +1047,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         metrics["status"] = "unavailable"
     metrics["search_elapsed_s"] = search_end - start
     metrics["elapsed_s"] = monotonic() - start
-    metrics["schedule_limit_reached"] = (
-        config.max_step_schedules is not None and len(metrics["step_attempts"]) >= config.max_step_schedules
-    )
     logger.log_dict("overall_metrics", metrics)
     logger.log_dict("timer_metrics", timer.get_summaries())
     if center_first and winning_motion is not None:
