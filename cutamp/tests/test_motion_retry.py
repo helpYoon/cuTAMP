@@ -83,7 +83,7 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch, centering
     assert failures == ["pick failed", "place failed"]
 
 
-def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budget=30, centers=None, viewer=None) -> dict:
+def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budget=30) -> dict:
     """run_cutamp's overall_metrics, on the CPU, over one skeleton per entry of ``results``, in order: ``None`` where
     no particle satisfies, else ``(planned, attempts)``: its motion plan tries ``attempts`` candidates, each failing
     but the last if ``planned``. Everything else run_cutamp calls is a stand-in."""
@@ -101,22 +101,15 @@ def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budg
     def optimize(plan_info, timer, visualizer):
         satisfying = results[plan_info["idx"]] is not None
         metrics = {"best_cost": 0.0, "best_soft_cost": 0.0, "num_satisfying_final": int(satisfying)}
-        if centers is not None and satisfying:
-            distances = torch.as_tensor(centers[plan_info["idx"]], dtype=torch.float64)
-            plan_info["row_quality"] = {"max_center_distance_m": distances, "secondary_effort": distances * 0,
-                                        "best_cost": distances * 0, "best_soft_cost": distances * 0}
-            metrics.update(max_center_distance_m=float(distances.min()), secondary_effort=0.)
         return satisfying, metrics, False
 
     def plan(plan_info, *args, **kwargs):
         planned, attempts = results[plan_info["idx"]]
         failures = [f"skeleton {plan_info['idx']}, candidate {i}" for i in range(attempts - planned)]
-        if viewer is not None:
-            assert args[4] is None, "intermediate candidates must leave the winner's timeline available"
         return (f"plan-{plan_info['idx']}", {}, attempts, attempts - 1, failures) if planned else (None, None, attempts, None, failures)
 
     logger, world = SimpleNamespace(log_dict=lambda name, d: None), SimpleNamespace(initial_state=None, goal_state=None)
-    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, viewer, timer, world))
+    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, timer, world))
     monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: SimpleNamespace(ik_tol=None))
     monkeypatch.setattr(alg, "build_motion_planner", lambda world: None)
     monkeypatch.setattr(alg, "start_sampler_load", lambda: None)  # no model in a stand-in run
@@ -124,33 +117,20 @@ def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budg
     monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: iter(()))
     monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
     monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: optimize)
-    def candidates(info, *args, **kwargs):
-        count = len(centers[info["idx"]]) if centers is not None else 0
-        return [{}] * count, list(range(count))
-    monkeypatch.setattr(alg, "get_top_satisfying_particles", candidates)
+    monkeypatch.setattr(alg, "get_top_satisfying_particles", lambda *args, **kwargs: ([], []))
     monkeypatch.setattr(alg, "_motion_plan_with_retries", plan)
     monkeypatch.setattr(alg, "_planned_metrics", lambda world, plan, candidates, rank: {"motion_plan_rank": rank})
-    config = TAMPConfiguration(step_mode="off", curobo_plan=True, enable_visualizer=False, num_initial_plans=skeleton_budget,
-                               com_center_weight=1.0 if centers is not None else 0.0)
+    config = TAMPConfiguration(step_mode="off", curobo_plan=True, enable_visualizer=False, num_initial_plans=skeleton_budget)
     return alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
                           experiment_id="fake")[2]
 
 
 def test_baseline_motion_plans_only_the_queued_skeletons(monkeypatch):
-    """Without centring, as before stepping, a motion failure on the queue ends the run: no further skeleton is
-    initialized, even with skeleton budget left."""
+    """As before stepping, a motion failure on the queue ends the run: no further skeleton is initialized, even with
+    skeleton budget left."""
     metrics = _run_skeletons(monkeypatch, [(False, 2), (True, 1)], initial_witness=True, skeleton_budget=2)
     assert metrics["found_solution"] is False and metrics["motion_plan_success"] is False
     assert metrics["num_initial_plans"] == metrics["num_optimized_plans"] == 1
-
-
-def test_only_selected_motion_appears_on_curobo_timeline(monkeypatch):
-    viewer, displayed = object(), []
-    monkeypatch.setattr(alg, "play_curobo_motion", lambda world, motion, vis: displayed.append((motion, vis)), raising=False)
-    metrics = _run_skeletons(monkeypatch, [(True, 1), (True, 1), (False, 1)],
-                             centers=[[.01], [.09], [.02]], viewer=viewer)
-    assert metrics["num_optimized_plans"] == 1
-    assert displayed == [("plan-0", viewer)]
 
 
 def test_motion_playback_starts_at_original_scene_and_replays_held_object():
@@ -338,13 +318,3 @@ def test_reset_puts_placed_blocks_back():
     ms._reset_attachment_state(planner, world)  # first thing the retry's solve_curobo does
     for obj in world.movables:
         assert offset(obj) < 1e-4, obj.name
-
-
-def test_centered_fixed_stance_motion_retries_until_first_connected_skeleton(monkeypatch):
-    # First skeleton fails its motion; the second connects on its next-best row.
-    result = _run_skeletons(monkeypatch, [(False, 1), (True, 2), (True, 1)], initial_witness=True,
-                            centers=[[.02], [.01, .18], [.001]])
-    assert result["num_initial_plans"] == result["num_optimized_plans"] == 2
-    assert result["motion_plan_success"] and result["motion_plan_attempts"] == 3
-    assert result["max_center_distance_m"] == pytest.approx(.18)
-    assert result["motion_plan_rank"] == 1

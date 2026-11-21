@@ -165,8 +165,8 @@ def entrypoint():
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
         help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the squared "
-             "centering term (default 0 with --step_mode off, 1 on the step route). "
-             "Zero disables centering.",
+             "centering term (default 1). Zero disables centering. Step route only: --step_mode off, the "
+             "fixed-feet baseline, has no centering.",
     )
     parser.add_argument("--step_mode", choices=("off", "model"), default=_defaults.step_mode,
                         help="Plan on fixed feet (off) or step with the frozen T1 landing model (model).")

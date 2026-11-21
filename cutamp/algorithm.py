@@ -434,8 +434,8 @@ def run_cutamp(
     # GraspGenX's model loads on a background thread while the robot and the world load and the task planner runs.
     start_sampler_load()
     exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
-    # The fixed-feet baseline: centring is off unless --com_center_weight asks for it (for_refinement). Resolved after
-    # setup_cutamp, which validates and logs the configuration as given.
+    # The fixed-feet baseline has no centring: for_refinement resolves its weight to 0. Resolved after setup_cutamp,
+    # which validates and logs the configuration as given.
     config = config.for_refinement(stepped=False)
     particle_initializer = ParticleInitializer(world, config, constraint_checker)
 
@@ -517,16 +517,12 @@ def run_cutamp(
             return planner_box["planner"]
 
     # Sample initial plans and particles
-    center_first = config.com_center_weight != 0
     found_solution_initially = False
     plan_count = 0
 
     def initialized_skeletons():
         nonlocal plan_count
         for idx in range(config.num_initial_plans):
-            if (config.max_loop_dur is not None and timer.has_timer("start_optimization")
-                    and timer.elapsed("start_optimization") >= config.max_loop_dur):
-                return
             try:
                 plan_info, has_solution = sample_plan_skeleton(
                     plan_gen, world, config, timer, idx, constraint_checker, particle_initializer
@@ -570,26 +566,14 @@ def run_cutamp(
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker, planner_busy=planner_busy)
     timer.start("first_solution")
     if found_solution_initially:
-        found_solution = not (config.curobo_plan or center_first)
+        found_solution = not config.curobo_plan
         timer.stop("first_solution")
-
-    def motion_candidates():
-        yield from plan_queue
-        if center_first:
-            # Completing the first kinematic initialization can leave unused skeleton
-            # budget. Resume lazily for centering comparisons and their motion retries.
-            for plan_info, _ in pending_plans:
-                yield plan_info
 
     # Optimization loop for each skeleton and its particles
     timer.start("start_optimization")
-    # Without centring, as before, only the Adam loop checks max_loop_dur (time since start_optimization): the search
-    # ends after the skeleton whose loop runs out.
-    deadline = None if config.max_loop_dur is None or not center_first else monotonic() + config.max_loop_dur
-    incumbent = None
-    for idx, plan_info in enumerate(motion_candidates()):
-        if deadline is not None and monotonic() >= deadline:
-            break
+    # Only the Adam loop checks max_loop_dur (time since start_optimization): the search ends after the skeleton whose
+    # loop runs out.
+    for idx, plan_info in enumerate(plan_queue):
         opt_iter = idx + 1
         should_break = False
         plan_skeleton = plan_info["plan_skeleton"]
@@ -598,9 +582,9 @@ def run_cutamp(
             f"heuristic = {plan_info['heuristic']:.2f}"
         )
         has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
-        if not center_first and metrics["best_cost"] is not None:
+        if metrics["best_cost"] is not None:
             overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
-        if not center_first and metrics["best_soft_cost"] is not None:
+        if metrics["best_soft_cost"] is not None:
             overall_metrics["best_soft_cost"] = min(overall_metrics["best_soft_cost"], metrics["best_soft_cost"])
         if time_exceeded:
             _log.info(f"Max loop duration reached, stopping optimization")
@@ -608,40 +592,27 @@ def run_cutamp(
         exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
 
         overall_metrics["num_optimized_plans"] += 1
-        if incumbent is None:
-            overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
+        overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
         if has_satisfying:
-            selection = ({k: metrics[k] for k in ("best_cost", "best_soft_cost", "max_center_distance_m",
-                                                   "secondary_effort")} if center_first else {})
-            motion = None
             if config.curobo_plan:
-                candidates, indices = get_top_satisfying_particles(
+                candidates, _ = get_top_satisfying_particles(
                     plan_info, constraint_checker, cost_reducer, n=config.motion_plan_max_retries,
                 )
-                motion, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
-                    plan_info, candidates, world, config, timer, None if center_first else visualizer,
-                    get_planner=get_planner, ik_tol=particle_initializer.ik_tol, deadline=deadline,
+                curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
+                    plan_info, candidates, world, config, timer, visualizer,
+                    get_planner=get_planner, ik_tol=particle_initializer.ik_tol,
                 )
                 overall_metrics["motion_plan_attempts"] = overall_metrics.get("motion_plan_attempts", 0) + attempts
                 overall_metrics["motion_plan_failures"] += failures
-                if motion is None:
+                if curobo_plan is None:
                     continue
-                if center_first:
-                    # A retry can succeed on a different particle from the kinematic winner.
-                    selection = {k: float(v[indices[rank]]) for k, v in plan_info["row_quality"].items()}
-                selection.update(traj_metrics or {})
-                selection.update(_planned_metrics(world, plan_skeleton, candidates, rank))
+                overall_metrics.update(traj_metrics)
+                overall_metrics.update(_planned_metrics(world, plan_skeleton, candidates, rank))
                 overall_metrics["motion_plan_success"] = True
-            key = (selection["max_center_distance_m"], selection["secondary_effort"]) if center_first else ()
-            if incumbent is None or key < incumbent:
-                incumbent = key
-                curobo_plan = motion
-                overall_metrics.update(selection)
-                overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
-                overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
-                overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
+            overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
+            overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
             found_solution = True
-            should_break |= config.curobo_plan or not center_first
+            should_break = True
 
         if should_break:
             break
@@ -653,7 +624,6 @@ def run_cutamp(
     _log.debug(f"Best cost: {overall_metrics['best_cost']:.4f}, soft cost: {overall_metrics['best_soft_cost']:.4f}")
 
     # Dump metrics out
-    overall_metrics["num_initial_plans"] = plan_count
     overall_metrics["found_solution"] = found_solution
     exp_logger.log_dict("overall_metrics", overall_metrics)
     exp_logger.log_dict("timer_metrics", timer.get_summaries())
@@ -661,8 +631,6 @@ def run_cutamp(
     # Log constraint and cost multipliers
     exp_logger.log_dict("multipliers", cost_reducer.cost_config)
     exp_logger.log_dict("tolerances", constraint_checker.constraint_config)
-    if center_first and curobo_plan is not None:
-        play_curobo_motion(world, curobo_plan, visualizer)
     return curobo_plan, overall_metrics["num_satisfying_final"], overall_metrics
 
 

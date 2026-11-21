@@ -574,8 +574,15 @@ def test_particle_and_motion_defaults_follow_the_route():
     assert TAMPConfiguration(step_mode="off").num_particles == 256
     assert not TAMPConfiguration(step_mode="off").curobo_plan
     assert TAMPConfiguration(step_mode="off").for_refinement(stepped=False).com_center_weight == 0
-    assert TAMPConfiguration(step_mode="off", com_center_weight=2.0).for_refinement(stepped=False).com_center_weight == 2.0
     assert TAMPConfiguration(step_mode="model", num_particles=8).num_particles == 8
+
+
+def test_step_mode_off_rejects_a_centering_weight():
+    from cutamp.config import validate_tamp_config
+
+    validate_tamp_config(TAMPConfiguration(step_mode="off", com_center_weight=0))
+    with pytest.raises(ValueError, match="fixed-feet baseline"):
+        validate_tamp_config(TAMPConfiguration(step_mode="off", com_center_weight=2.0))
 
 
 @pytest.mark.parametrize("limit,expire,expected", [(1, False, [5]), (5, False, [5, 2]), (5, True, [5])])

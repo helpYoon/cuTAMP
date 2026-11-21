@@ -114,7 +114,7 @@ class TAMPConfiguration:
     # Positive values enable centered pick/place stance IK and center-first plan selection.
     # Their magnitude weights the outer Adam objective. IK uses its own calibrated pose/CoM ratio.
     # Zero restores step-count/effort selection. None resolves in for_refinement: 0 for step_mode off,
-    # 1 for the step route.
+    # 1 for the step route. step_mode off, the fixed-feet baseline, takes no positive weight.
     com_center_weight: float | None = None
 
     def __post_init__(self):
@@ -185,6 +185,8 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
     if config.step_mode not in ("off", "model"):
         raise ValueError("step_mode must be off or model")
+    if config.step_mode == "off" and weight:
+        raise ValueError("com_center_weight applies only to the step route: step_mode off is the fixed-feet baseline")
     if config.max_step_schedules is not None and config.max_step_schedules <= 0:
         raise ValueError("max_step_schedules must be positive when specified")
     if config.step_ik_objective_tol is not None and (
