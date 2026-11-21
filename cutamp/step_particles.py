@@ -661,13 +661,9 @@ def _refine_batch(
         )
         saved = {gap: _take(trace, i, "cpu") for gap, trace in predictions.items()}
         evidence = _evidence(adapter, saved)
-        if config.curobo_plan and (inputs.transition_validator is not None or config.step_motion_validation == "model"):
-            motion_inputs[first + i] = (adapter, saved)
         if config.curobo_plan:
-            if first + i in motion_inputs:
-                report["motion_validation"] = "unattempted"
-            else:
-                report.update(motion_validation="unavailable", motion_reason="independent transition validator required")
+            motion_inputs[first + i] = (adapter, saved)
+            report["motion_validation"] = "unattempted"
         rows.append(StepRow(first + i, particle, float(soft[i]), report, evidence=evidence))
     # Keep same-row details for a failed ablation or an exhausted search.
     best = int((ep.sum(1) * -1e6 + hard.nan_to_num(1e6)).argmin())
@@ -776,21 +772,14 @@ def refine_step_particles(
         if deadline is not None and monotonic() >= deadline:
             break
     if motion_inputs:
-        from cutamp.motion_solver import plan_validated_step_motion
+        from cutamp.step_preview import plan_predicted_step_motion
 
         def attempt(row):
             adapter, saved = motion_inputs[row.index]
             traces = {gap: _take(trace, 0, world.q_init.device) for gap, trace in saved.items()}
-            if inputs.transition_validator is None and config.step_motion_validation == "model":
-                from cutamp.step_preview import plan_predicted_step_motion
-
-                return plan_predicted_step_motion(
-                    proposal.skeleton, row, traces, adapter, world, config, timer=timer, visualizer=visualizer,
-                    ik_tol=IKTol.from_checker(constraint_checker), deadline=deadline,
-                )
-            return plan_validated_step_motion(
-                proposal.skeleton, row.particle, traces, adapter, world, config, inputs.transition_validator,
-                timer=timer, visualizer=visualizer, ik_tol=IKTol.from_checker(constraint_checker),
+            return plan_predicted_step_motion(
+                proposal.skeleton, row, traces, adapter, world, config, timer=timer, visualizer=visualizer,
+                ik_tol=IKTol.from_checker(constraint_checker), deadline=deadline,
             )
 
         eligible = [row for row in rows if row.index in motion_inputs]

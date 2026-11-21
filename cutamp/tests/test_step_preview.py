@@ -1,4 +1,4 @@
-"""Regressions for distinguishing an execution prediction from an independent transition."""
+"""Regressions for the stepped motion the learned model predicts."""
 
 import json
 from pathlib import Path

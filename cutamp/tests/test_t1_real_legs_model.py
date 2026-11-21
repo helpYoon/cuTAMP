@@ -134,7 +134,7 @@ def _cli_config(monkeypatch, *argv) -> TAMPConfiguration:
 
 def test_cli_defaults_to_predicted_motion_and_allows_keyframes(monkeypatch):
     cfg = _cli_config(monkeypatch)
-    assert cfg.step_mode == "model" and cfg.curobo_plan and cfg.step_motion_validation == "model"
+    assert cfg.step_mode == "model" and cfg.curobo_plan
     assert not _cli_config(monkeypatch, "--no-motion_plan").curobo_plan
     assert not _cli_config(monkeypatch, "--step_mode", "off").curobo_plan
 

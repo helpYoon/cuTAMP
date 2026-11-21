@@ -551,46 +551,6 @@ def sweep_penetration_rows(peaks):
     return {"swept_geometry": torch.stack(limits, dim=-1).amax(-1)}
 
 
-@dataclass
-class TransitionRequest:
-    foot: str
-    command: Tensor
-    initial: LandingState
-    predicted: object
-    initial_position: Tensor
-    initial_velocity: Tensor
-    world: object
-    object_poses: dict
-    held: dict
-    dt: float = 0.02
-
-
-@dataclass
-class TransitionEvidence:
-    """Independent validator's heard/executed trace in model joint order, including the issue state.
-
-    A step path contains `clock + hold_ticks + 1` frames at 50 Hz, including the issue
-    state and the deadline. Consecutive alternating steps can join there with zero hold ticks. A preparatory
-    HOLD contains its 51 consecutive frames, starting at the arriving state. A measured terminal
-    state with actual observation/action histories is required before another step.
-    The source must certify continuous swept clearance and contact on this scene.
-    """
-
-    source: str
-    position: Tensor
-    velocity: Tensor
-    acceleration: Tensor
-    dt: float
-    contact_ok: bool
-    swept_clearance_ok: bool
-    load_ok: bool
-    terminal: LandingState | None = None
-
-
-class TransitionUnavailable(RuntimeError):
-    """No independent evidence at the requested validation level."""
-
-
 def model_step_record(adapter, initial, step, command, row=0, *, preparation=None):
     """A CPU replay record for a selected row, including its actual control and whole-body traces."""
     labels = (
@@ -658,107 +618,14 @@ def model_step_record(adapter, initial, step, command, row=0, *, preparation=Non
     return record
 
 
-def verify_transition(request, evidence, adapter, intended_final=None):
-    """Check independent execution in its own issue frame; preserve the actual end velocity."""
-    from curobo.types import JointState
-
-    from cutamp.landing_predictor import _intended_pair, landing_errors, phase_checks
-
-    if evidence is None:
-        raise TransitionUnavailable("Independent step validator supplied no transition")
-    if not isinstance(evidence, TransitionEvidence) or not evidence.source:
-        raise ValueError("Expected source-labelled TransitionEvidence")
-    step = request.predicted
-    hold = request.foot == "HOLD"
-    n = int(step.valid_ticks[0].sum()) + (0 if hold else 1)
-    values = (evidence.position, evidence.velocity, evidence.acceleration)
-    if abs(evidence.dt - request.dt) > 1.0e-7 or any(
-        x.shape != (n, len(adapter.robot.joint_names)) or not x.isfinite().all() for x in values
-    ):
-        raise ValueError("Independent step trace must include every STEP and HOLD frame at 50 Hz")
-    if not (evidence.contact_ok and evidence.swept_clearance_ok and (not request.held or evidence.load_ok)):
-        raise ValueError("Independent contact, clearance or carried-object check failed")
-    q, qd, acc = [v.to(request.initial_position) for v in values]
-    if not compatible_boundary(boundary_errors(q[0], qd[0], request.initial_position, request.initial_velocity)).all():
-        raise ValueError("Independent step trace does not begin at the arriving state and velocity")
-    if (_physical_joint_excess(adapter.robot, adapter.robot.joint_names[6:], q[:, 6:]) > 1.0e-6).any():
-        raise ValueError("Independent step trace exceeds a physical URDF joint limit")
-    trace, height, tilt = adapter.predictor.model.feet(adapter.physical(q, qd))
-    js = JointState(position=q, velocity=qd, acceleration=acc, joint_names=list(adapter.robot.joint_names))
-    if evidence.terminal is not None:
-        checked = adapter.initialize(q[-1:], request.initial.dynamics, qd[-1:], observed=evidence.terminal)
-        if not checked.compatible.all():
-            raise ValueError("Independent terminal state history is inconsistent with the delivered trajectory")
-    if hold:
-        if evidence.terminal is None:
-            raise TransitionUnavailable("Preparatory HOLD requires measured terminal histories before issuing a step")
-        _, _, planted = landing_errors(trace, trace[:1])
-        if not (planted.all() and (height.abs() <= 0.005).all() and (tilt <= 0.05).all()):
-            raise ValueError("Independent preparatory HOLD exceeds the planted-sole limits")
-        return (
-            js,
-            trace[-1],
-            {
-                "phase": "step_prepare",
-                "foot": "HOLD",
-                "source": evidence.source,
-                "dt": request.dt,
-                "history_source": request.initial.history_source,
-                "load_validated": bool(request.held and evidence.load_ok),
-                "issued": trace[0].detach(),
-                "achieved": trace[-1].detach(),
-                "clock": n - 1,
-            },
-        )
-    side = "LR".index(request.foot)
-    ref = _intended_pair(trace[:1], side, request.command.reshape(1, 3))
-    xy, yaw, tracks = landing_errors(trace[-1:], ref)
-    checks = phase_checks(
-        trace[None, 1:],
-        height[None, 1:],
-        ref,
-        side,
-        step.clock,
-        torch.ones((1, n - 1), dtype=torch.bool, device=q.device),
-        adapter.predictor.profile,
-    )
-    if not (tracks & checks.deadline_ok & checks.support_ok & checks.hold_ok).item():
-        raise ValueError("Independent landing missed the issued precision or phase limits")
-    if not ((height >= -0.005).all() and (height[-1].abs() <= 0.005).all() and (tilt[-1] <= 0.05).all()):
-        raise ValueError("Independent landing leaves the grounded-sole tolerance")
-    if intended_final is not None and not landing_errors(trace[-1:], intended_final)[2].all():
-        raise ValueError("Independent final stance missed the composed original command chain")
-    return (
-        js,
-        trace[-1],
-        {
-            "source": evidence.source,
-            "phase": "step",
-            "foot": request.foot,
-            "command": request.command.detach(),
-            "issued": ref[0].detach(),
-            "achieved": trace[-1].detach(),
-            "xy_error_m": xy[0].detach(),
-            "yaw_error_rad": yaw[0].detach(),
-            "tracking": True,
-            "clock": int(step.clock[0]),
-            "hold_ticks": n - 1 - int(step.clock[0]),
-            "history_source": request.initial.history_source,
-            "load_validated": bool(request.held and evidence.load_ok),
-            "dt": request.dt,
-        },
-    )
-
-
 class SteppedMotion:
-    """State of one independent step/arm motion attempt; shared across grounded operators."""
+    """State of one step/arm motion attempt; shared across grounded operators."""
 
-    def __init__(self, skeleton, predictions, adapter, world, validator):
-        self.inputs, self.adapter, self.world, self.validator = predictions, adapter, world, validator
+    def __init__(self, skeleton, predictions, adapter, world):
+        self.inputs, self.adapter, self.world = predictions, adapter, world
         self.by_op = {}
         self.last_state = None
         self.stance = None
-        self.records = []
         self.occupied_arm = None
         self.supported_kinematics = None
         self.planned_endpoints = {}
@@ -773,107 +640,10 @@ class SteppedMotion:
                 offset = 0
                 gap += 1
 
-    def check_supported_start(self):
-        """The arm planner pins both head joints. Verify their measured handoff before using its geometry."""
-        if self.stance is None:
-            return
-        if self.last_state is None:
-            raise TransitionUnavailable("Supported motion requires measured terminal head position and velocity")
-        names = ("AAHead_yaw", "Head_pitch")
-        columns = [self.adapter.names.index(n) for n in names]
-        from cutamp.robots.t1 import t1_curobo_cfg
-
-        q, qd = self.last_state.tensors[4:6]
-        pinned = t1_curobo_cfg(self.world.model)["robot_cfg"]["kinematics"]["lock_joints"]
-        err = (q[:, columns] - q.new_tensor([pinned[n] for n in names])).abs()
-        if not ((err <= 0.05).all() and (qd[:, columns].abs() <= 0.05).all()):
-            raise TransitionUnavailable("Measured head state cannot join the supported planner's locked head")
-
     def initial_velocity(self):
         initial, _, _, *preparations = self.inputs[0]
         source = preparations[0].initial if preparations and preparations[0] is not None else initial
         return self.adapter.planner(source.tensors[:6])[1]
-
-    def step_segments(self, idx, last_js, object_poses, held):
-        from cutamp.landing_predictor import _intended_pair
-
-        gap, j = self.by_op[idx]
-        initial, commands, prediction, *preparations = self.inputs[gap]
-        incoming = last_js.position.reshape(1, -1)
-        velocity = last_js.velocity.reshape(1, -1) if last_js.velocity is not None else torch.zeros_like(incoming)
-        bound = {
-            arm: (obj, torch.linalg.inv(self.world.tool_from_ee[self.world.tool_frame_for_arm(arm)]) @ grasp)
-            for arm, (obj, grasp) in held.items()
-        }
-        segments = []
-        if j == 0:
-            start = initial
-            original = self.adapter.predictor.model.feet(start.tensors[:6])[0]
-            for k, step in enumerate(prediction.steps):
-                original = _intended_pair(original, "LR".index(step.side), commands[:, k])
-            self.intended_final = original
-            if preparations and preparations[0] is not None:
-                # Independently advance the 50-tick preparatory HOLD from the actual
-                # end of the preceding segment. It can move the base/joints appreciably.
-                prepared = self.adapter.initialize(
-                    incoming, initial.dynamics, velocity, world=self.world, object_poses=object_poses, held=bound
-                )
-                if not prepared.compatible.all():
-                    raise ValueError("Actual arrival cannot execute the supported HOLD preparation")
-                hold = prepared.preparation
-                req = TransitionRequest(
-                    "HOLD",
-                    incoming.new_empty(0),
-                    hold.initial,
-                    hold.steps[0],
-                    incoming[0],
-                    velocity[0],
-                    self.world,
-                    object_poses,
-                    bound,
-                )
-                evidence = self.validator(req)
-                plan, _, record = verify_transition(req, evidence, self.adapter)
-                segments.append((plan, record))
-                start = evidence.terminal
-                incoming, velocity = plan.position[-1:], plan.velocity[-1:]
-        else:
-            if self.last_state is None:
-                raise TransitionUnavailable(
-                    "Adjacent step requires independent terminal observation and action histories"
-                )
-            start = self.last_state
-        # Rerun from the actual issue state and the saved command.
-        saved = prediction.steps[j]
-        foot = saved.side
-        # Preserve the recorded dwell even if the measured state gives a different step clock.
-        hold_ticks = int(saved.valid_ticks[0].sum() - saved.clock[0])
-        result = self.adapter.predictor.rollout(start, foot, commands[:, j : j + 1], final_hold_ticks=hold_ticks)
-        s = result.steps[0]
-        if not self.adapter.initialize(incoming, start.dynamics, velocity, observed=start).compatible.all():
-            raise ValueError("Previous motion cannot connect to the requested step state and velocity")
-        if not validate_step_geometry(self.world, self.adapter, result, object_poses=object_poses, held=bound)[
-            "valid"
-        ].all():
-            raise ValueError("Replayed command violates the model trace constraints")
-        request = TransitionRequest(
-            foot, commands[0, j], start, s, incoming[0], velocity[0], self.world, object_poses, bound
-        )
-        evidence = self.validator(request)
-        js, stance, record = verify_transition(
-            request, evidence, self.adapter, self.intended_final if j == len(prediction.steps) - 1 else None
-        )
-        self.stance, self.last_state = stance, evidence.terminal
-        self.records.append(record)
-        # Save the independently checked trace through JointState; retain the complete
-        # model prediction separately so command replay and auditor provenance stay explicit.
-        entry = dict(record, model_prediction=model_step_record(self.adapter, start, s, commands[:, j]))
-        if evidence.terminal is not None:
-            entry["measured_terminal"] = {
-                "history_source": evidence.terminal.history_source,
-                "tensors": [v[0].detach().cpu().tolist() for v in evidence.terminal.tensors],
-            }
-        return segments + [(js, entry)]
 
     def approach(self, idx, op, particle, object_poses, cfg, ik_tol):
         from cutamp.com_polygon_cost import margin_from_support_planes, support_region_planes
@@ -892,10 +662,7 @@ class SteppedMotion:
             @ grasp_7dof_to_mat4x4(particle[op.arg("grasp")])
             @ self.world.tool_from_ee[self.world.tool_frame_for_arm(arm)]
         ).reshape(1, 4, 4)
-        s = self.stance
-        if s is None:
-            s = self.adapter.predictor.model.feet(self.adapter.physical(self.world.q_init.reshape(1, -1)))[0][0]
-        s = s.reshape(1, 2, 3)
+        s = self.stance.reshape(1, 2, 3)
         fitted = solve_stance_ik(s, wrist, seed, arm, other_arm_reference=self.occupied_arm,
                                  collides=self.endpoint_collides, kinematics=self.supported_kinematics,
                                  center_posture=bool(cfg.com_center_weight))

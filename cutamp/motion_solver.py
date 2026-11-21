@@ -563,7 +563,7 @@ def solve_curobo(
     config: TAMPConfiguration,
     timer: TorchTimer,
     visualizer: Visualizer,
-    get_planner=None,
+    get_planner,
     *,
     ik_tol: IKTol,
     max_attempts: int = 20,
@@ -571,10 +571,10 @@ def solve_curobo(
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
-    ``get_planner`` (optional) returns a pre-built planner — the
+    ``get_planner`` returns a pre-built planner — the
     overlap path: algorithm.py starts ``build_motion_planner`` on a thread
     when the optimization loop starts, and the timer below then measures
-    only the residual wait. ``None`` builds it inline on ``step_motion``'s initial soles. Neither warms it up
+    only the residual wait. It does not warm it up
     (``build_motion_planner``).
     ``ik_tol``: the tolerances the run's checker holds every IK conf to, which the pre and post confs of the picks and
     places meet too (``_approach_confs``).
@@ -583,11 +583,7 @@ def solve_curobo(
     plan_skeleton = plan_info["plan_skeleton"]
 
     with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
-        if get_planner is not None:
-            planner = get_planner()
-        elif step_motion is not None:
-            soles = step_motion.adapter.predictor.model.feet(step_motion.adapter.physical(world.q_init[None]))[0][0]
-            planner = build_motion_planner(world, initial_soles=soles)
+        planner = get_planner()
         if step_motion is not None and not hasattr(planner, "set_support_stance"):
             raise ValueError("A stepped motion planner must track the achieved support in trajopt")
 
@@ -729,7 +725,7 @@ def solve_curobo(
                     approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
             if metadata.action_type == "step":
                 if step_motion is None:
-                    raise RuntimeError("A stepped motion requires independent transition evidence")
+                    raise RuntimeError("A step requires a stepped motion")
                 for plan, record in step_motion.step_segments(idx, last_js, obj_to_current_pose, held):
                     accum_plans.append({"arm": None, "dt": record["dt"], "op_idx": idx, "phase": record["phase"],
                                         "gripper": None, "plan": plan, "step": record,
@@ -1175,7 +1171,7 @@ def _supported_segment_gate(world, plan, dt, stance):
             dim=1,
         )
         if not soles_planted(*curobo_pose_error(soles, goal.expand_as(soles))).all():
-            raise _gate_error("soles", "Supported motion leaves the independently achieved stance")
+            raise _gate_error("soles", "Supported motion leaves the achieved stance")
         com, zmp = com_zmp_in_support(world, model)
 
         def margin(xy):
@@ -1206,30 +1202,3 @@ def _supported_segment_gate(world, plan, dt, stance):
             if reason not in ("zmp", "torque", "velocity") or scale == RETIME_MAX:
                 raise
 
-
-def plan_validated_step_motion(
-    skeleton, particle, predictions, adapter, world, config, validator, *, timer, visualizer, ik_tol, get_planner=None
-):
-    """Join independently validated landing paths to cuRobo supported manipulation segments."""
-    from cutamp.step_validation import SteppedMotion, TransitionUnavailable
-
-    if validator is None:
-        return None, {"motion_validation": "unavailable", "reason": "Missing independent step transition validator"}
-    motion = SteppedMotion(skeleton, predictions, adapter, world, validator)
-    try:
-        plan, metrics = solve_curobo(
-            {"plan_skeleton": skeleton},
-            dict(particle),
-            world,
-            config,
-            timer,
-            visualizer,
-            get_planner=get_planner,
-            ik_tol=ik_tol,
-            step_motion=motion,
-        )
-    except TransitionUnavailable as exc:
-        return None, {"motion_validation": "unavailable", "reason": str(exc)}
-    except (ValueError, RuntimeError) as exc:
-        return None, {"motion_validation": "rejected", "reason": str(exc)}
-    return plan, {**metrics, "motion_validation": "accepted", "validated_steps": motion.records}

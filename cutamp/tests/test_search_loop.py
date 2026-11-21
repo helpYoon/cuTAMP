@@ -623,8 +623,8 @@ def test_stepped_motion_with_no_grasp_columns_uses_particle_cost(monkeypatch):
     assert report["motion_plan_attempts"] == 1 and rows[1].motion_plan == [1]
 
 
-def test_validator_uses_the_globally_ranked_particles_own_trace(monkeypatch):
-    from cutamp import motion_solver, step_particles
+def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatch):
+    from cutamp import step_particles, step_preview
 
     cfg = TAMPConfiguration(
         step_mode="model", num_particles=4, step_particle_batch_size=2, motion_plan_max_retries=1, curobo_plan=True,
@@ -654,18 +654,16 @@ def test_validator_uses_the_globally_ranked_particles_own_trace(monkeypatch):
             rows.append(StepRow(i, particle, effort + 4 * sum(d ** 2 for d in distances), metrics))
         return StepResult(rows, torch.ones(len(rows), 1, dtype=torch.bool), "model_feasible")
 
-    def validate(skeleton, particle, traces, adapter, world, config, validator, **kwargs):
-        assert validator is independent
-        i = int(particle["q1"][0])
+    def plan(skeleton, row, traces, adapter, world, config, **kwargs):
+        i = int(row.particle["q1"][0])
         assert traces[0].item() == i
         attempted.append(i)
-        return ["path"], {"motion_validation": "accepted"}
+        return ["path"], {"motion_validation": "model_predicted"}
 
-    independent = object()
     monkeypatch.setattr(step_particles, "_refine_batch", feasible_chunk)
-    monkeypatch.setattr(motion_solver, "plan_validated_step_motion", validate)
+    monkeypatch.setattr(step_preview, "plan_predicted_step_motion", plan)
     result = step_particles.refine_step_particles(
-        proposal, world, cfg, None, None, inputs=StepInputs(transition_validator=independent), predictor=object(),
+        proposal, world, cfg, None, None, inputs=StepInputs(), predictor=object(),
         timer=None, visualizer=None, deadline=None,
     )
     assert chunks == [0, 2] and attempted == [3]

@@ -28,7 +28,6 @@ class StepInputs:
     dynamics: torch.Tensor | None = None
     posture_seeds: tuple | None = None
     placements: dict | None = None
-    transition_validator: Callable | None = None
 
     def __post_init__(self):
         for cmds in self.commands or ():
@@ -74,7 +73,7 @@ class StepRow:
 
 @dataclass
 class StepResult:
-    """Rows that passed final same-particle checks, even if a requested motion remains unavailable."""
+    """Rows that passed final same-particle checks, even if no requested motion connected."""
 
     rows: list[StepRow]
     endpoint_ok: torch.Tensor | None

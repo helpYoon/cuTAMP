@@ -89,7 +89,6 @@ class TAMPConfiguration:
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
     curobo_plan: bool | None = None
-    step_motion_validation: str = "model"  # independent mode requires a transition evidence provider
     # On RuntimeError from solve_curobo, retry on the next satisfying particle, going round the grasp groups,
     # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
@@ -186,8 +185,6 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
     if config.step_mode not in ("off", "model"):
         raise ValueError("step_mode must be off or model")
-    if config.step_motion_validation not in ("model", "independent"):
-        raise ValueError("step_motion_validation must be model or independent")
     if config.max_step_schedules is not None and config.max_step_schedules <= 0:
         raise ValueError("max_step_schedules must be positive when specified")
     if config.step_ik_objective_tol is not None and (

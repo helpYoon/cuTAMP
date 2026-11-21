@@ -668,8 +668,7 @@ then secondary effort. It returns the first connected motion on the first
 successful skeleton. If refinement or motion planning fails, A* supplies the
 next skeleton; when A* runs out, the planner reports failure. Use `--max_duration`
 or `--max_step_schedules` to bound this search.
-A connected prediction carries the status `model_predicted_motion`. Independent
-transition evidence can be supplied through the Python API.
+A connected prediction carries the status `model_predicted_motion`.
 
 The `two_steps_floor_transfer` demo starts the learned-step planner from a
 synthetic standing start: the landing model's home pose with a settled controller

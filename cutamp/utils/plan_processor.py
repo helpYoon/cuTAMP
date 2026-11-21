@@ -29,7 +29,8 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
                 "arm": "left" | "right" | None,
                 "dt": float,                         # s between frames: cuRobo's interpolation_dt
                 "op_idx": int,                       # the segment's op in the plan skeleton
-                "phase": "approach" | "insert" | "lift" | "back_out" | "retract" | "step" | "step_prepare",
+                "phase": "approach" | "insert" | "lift" | "back_out" | "retract" | "model_preparation" | "model_step_L"
+                         | "model_step_R",
                 "gripper": "close" | "open" | None,  # the gripper event at the segment's end
                 "position": [T, n],                  # float32, in joint_names order
                 "velocity": [T, n],
@@ -38,8 +39,8 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
                 # the same segment at the motion planner's own timing, as the same three arrays ([T', n] at the
                 # same dt); else None.
                 "planner_timing": {"position", "velocity", "acceleration"} | None,
-                # Step entries carry the prediction or independent validator source.
-                # A swing record also carries its learned prediction and the incoming controller history.
+                # Step entries carry their source, the frozen policy and world model.
+                # A swing record also carries its foot, command, landing errors and hold ticks.
             }],
         }
 
@@ -72,7 +73,7 @@ def raw_motion_plan(curobo_plan: List[Dict[str, Any]], model: "T1Model") -> Dict
         if "head" in entry:
             segments[-1]["head"] = entry["head"].detach().cpu().numpy().copy()
         if "step" in entry:
-            # Preserve the exact command, issued/achieved soles and independent validator provenance.
+            # Preserve the exact command, landing errors and source.
             segments[-1]["step"] = {
                 key: value.detach().cpu().numpy().copy() if torch.is_tensor(value) else value
                 for key, value in entry["step"].items()

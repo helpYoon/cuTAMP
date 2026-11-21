@@ -170,8 +170,6 @@ def entrypoint():
     )
     parser.add_argument("--step_mode", choices=("off", "model"), default=_defaults.step_mode,
                         help="Plan on fixed feet (off) or step with the frozen T1 landing model (model).")
-    parser.add_argument("--step_motion_validation", choices=("model", "independent"), default=_defaults.step_motion_validation,
-                        help="Return a predicted motion, or require independent transition evidence.")
     parser.add_argument("--max_step_schedules", type=int, default=None,
                         help="Maximum distinct grounded schedules attempted across all arm assignments.")
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
@@ -271,7 +269,7 @@ def entrypoint():
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,
-        curobo_plan=args.motion_plan, step_motion_validation=args.step_motion_validation,
+        curobo_plan=args.motion_plan,
         enable_visualizer=not args.disable_visualizer,
         experiment_root=args.experiment_root,
     )

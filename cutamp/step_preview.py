@@ -61,7 +61,7 @@ class PredictedSteppedMotion(SteppedMotion):
     def __init__(self, skeleton, particle, inputs, adapter, world, deadline):
         private_world = copy(world)
         private_world._site_kinematics = {}
-        super().__init__(skeleton, inputs, _HandoffAdapter(adapter.predictor, world.model), private_world, None)
+        super().__init__(skeleton, inputs, _HandoffAdapter(adapter.predictor, world.model), private_world)
         self.neutral_world = world
         self.skeleton = skeleton
         self.bindings = particle
