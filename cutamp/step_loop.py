@@ -7,9 +7,11 @@ from functools import partial
 from time import monotonic
 
 import torch
+from curobo.types import JointState
 
-from cutamp.com_polygon_cost import physical_support_centroid
+from cutamp.com_polygon_cost import physical_support_centroid, physical_support_margin
 from cutamp.cost_function import CostFunction
+from cutamp.costs import curobo_pose_error
 from cutamp.grasps import GRASP_SCORE_CUTOFF
 from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, prediction_precision
 from cutamp.particle_initialization import _draw_placements, pick_place_confs, worst_posture
@@ -19,8 +21,10 @@ from cutamp.samplers import project_supported_placement
 from cutamp.stance import STEP_TRAVEL, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
 from cutamp.step_ik import StanceIK, solve_stance_ik
-from cutamp.step_refresh import StandIn, draw_commands, refresh_gap
+from cutamp.step_planner import StepResult, StepRow
+from cutamp.step_refresh import StandIn, command_rows, draw_commands, refresh_gap
 from cutamp.step_validation import StepStateAdapter, validate_step_geometry
+from cutamp.task_planning.constraints import ComComfort, KinematicConstraint
 from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
 
 
@@ -337,7 +341,7 @@ class SteppedPlan:
                 if u is not None:
                     particles[self.command_names[j]] = u
 
-            cost_function = CostFunction(self.arm_skeleton, world, config)
+            self.cost_function = cost_function = CostFunction(self.arm_skeleton, world, config)
             groups = self.groups
 
             def occupied_reference(k, previous):
@@ -462,3 +466,168 @@ class SteppedPlan:
             self.stats["standin_error_m"].append({j: e.tolist() for j, e in errors.items()})
             self.stats["command_move_m"].append(moved.item())
         self.stats["refresh_s"].append(monotonic() - began)
+
+    def _commands(self, particles):
+        return [particles[self.command_names[j]] if j in self.command_names else None for j in range(len(self.groups))]
+
+    def _stances(self, particles):
+        """:meth:`stance_table` and the stand-in's pairs after each step of every gap."""
+        after, final = self.standin.stances(self.incoming, self._commands(particles))
+        table = {"left_q0": self.incoming, "right_q0": self.incoming}
+        table.update({name: final[j] for name, j in self.gap_of.items()})
+        return table, after
+
+    def stance_table(self, particles: dict) -> dict[str, torch.Tensor]:
+        """Posture name to the ``[n, 2, 3]`` sole pair it stands on, from the stand-in at the particles' current
+        commands: ``left_q0`` and ``right_q0`` the incoming pair, every pick, place and retract posture its gap's final
+        pair. Differentiable in the commands."""
+        return self._stances(particles)[0]
+
+    def _retract_sole_errors(self, particles, table):
+        """``retract_sole_pos_err`` and ``retract_sole_rot_err`` ``[n, 2 R]``: both soles of every retract posture
+        against its stance, as :meth:`CostFunction.kinematic_costs` checks the picks and places, from one FK."""
+        names = [name for name, _, _ in self.cost_function.retract_info]
+        if not names:
+            return {}
+        q = torch.stack([particles[name] for name in names], 1)
+        n, r = q.shape[:2]
+        fk = self.world.site_kinematics("retract_soles").compute_kinematics(JointState.from_position(q.view(n * r, -1)))
+        soles = torch.stack([fk.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().view(n, r, 4, 4)
+                             for frame in self.world.model.sole_frames], 2)
+        x, y, yaw = torch.stack([table[name] for name in names], 1).unbind(-1)
+        pos, rot = curobo_pose_error(soles, action_4dof_to_mat4x4(torch.stack((x, y, torch.zeros_like(x), yaw), -1)))
+        return {"retract_sole_pos_err": pos.flatten(1), "retract_sole_rot_err": rot.flatten(1)}
+
+    def __call__(self, rollout, particles: dict) -> dict:
+        """The cost the Adam loop reads (design 5): today's cost on the stand-in's stances, the balance cost as the
+        shortfall itself, the retracts' feet, the commands' rows, the last refresh's tests (read by the checker only)
+        and staying near the starting postures."""
+        table, after = self._stances(particles)
+        inner = {key: value for key, value in particles.items() if key not in self.landing_confs}
+        cost = self.cost_function(rollout, inner, achieved_stances=table)
+        stances = torch.stack([table[name] for name in rollout["conf_params"]], 1)
+        margin = physical_support_margin(rollout["com_xy"], stances, self.world.model.sole_box)
+        shortfall = (self.config.com_comfort_margin_m - margin).clamp_min(0)
+        cost[ComComfort.type] = {"type": "constraint", "values": {"margin_shortfall": shortfall}}
+        cost[KinematicConstraint.type]["values"].update(self._retract_sole_errors(particles, table))
+        rows = command_rows(self.orders, self.incoming, self._commands(particles), after)
+        cost["StepCommand"] = {"type": "constraint", "values": rows}
+        cost["StepTests"] = {"type": "constraint", "values": {"refresh_tests": (~self.tests_ok).to(margin.dtype)}}
+        stay = sum((particles[name] - start).square().sum(-1) for name, start in self.start_postures.items())
+        cost.setdefault("soft", {"type": "cost", "values": {}})["values"]["stay_near_start"] = stay
+        return cost
+
+    def _endpoints(self, masks, n):
+        """``[n, gaps]`` bool: each pick or place's requirements met, as today's stepped route attributes them, with
+        the balance row, the retract sole rows on their gap, each ``gap{j}_`` command row on gap ``j`` and the refresh
+        tests on every gap."""
+        ep = torch.ones(n, len(self.groups), dtype=torch.bool, device=self.incoming.device)
+        retracts = [name for name, _, _ in self.cost_function.retract_info]
+        for key, value in masks[KinematicConstraint.type].items():
+            if key.startswith("retract_sole_"):
+                value = value.reshape(n, len(retracts), 2).all(-1)
+                for r, name in enumerate(retracts):
+                    ep[:, self.gap_of[name]] &= value[:, r]
+                continue
+            if key.startswith("sole_"):
+                value = value.reshape(n, len(self.groups), 2).all(-1)
+            ep &= value
+        ep &= masks[ComComfort.type]["margin_shortfall"]
+        for key, value in masks["StepCommand"].items():
+            ep[:, int(key[len("gap"):key.index("_")])] &= value.reshape(n, -1).all(1)
+        ep &= masks["StepTests"]["refresh_tests"][:, None]
+        m, retract_index, placed_count = -1, 0, {}
+        timeline = [op for op in self.arm_skeleton if op.operator.metadata.action_type in ("pick", "place", "retract")]
+        for t, op in enumerate(timeline):
+            kind = op.operator.metadata.action_type
+            if kind != "retract":
+                m += 1
+                for key in ("joint_limit", "self_collision"):
+                    ep[:, m] &= masks["Motion"][key][:, m]
+            else:
+                for key in ("retract_joint_limit", "retract_self_collision"):
+                    ep[:, m] &= masks["Motion"][key][:, retract_index]
+                retract_index += 1
+            if kind == "place":
+                surface = op.arg("surface")
+                k = placed_count.get(surface, 0)
+                for suffix in ("_in_xy", "_support"):
+                    ep[:, m] &= masks["StablePlacement"][surface + suffix][:, k]
+                placed_count[surface] = k + 1
+            ep[:, m] &= masks["Collision"][f"{t}_movables"][:, 0] & masks["Collision"]["robot_to_world"][:, t]
+            ep[:, m] &= masks["ComPolygon"][op.arg("q_retract" if kind == "retract" else "q")]
+        return ep
+
+    def _gap_records(self, particles, i):
+        """Per pick or place, row ``i``: its order as the proposal wrote it, its commands, and from the last refresh
+        the pair it stands on and its final landing errors (a gap without steps stands on the pair before it)."""
+        records, before = [], self.incoming[i]
+        for j, order in enumerate(self.orders):
+            record = {"order": order or "none", "commands": []}
+            if j in self.last:
+                _, _, prediction, _ = self.last[j]
+                before = prediction.steps[-1].achieved[i]
+                record.update(commands=particles[self.command_names[j]][i].tolist(),
+                              final_xy_error_m=prediction.final_xy_error[i].tolist(),
+                              final_yaw_error_deg=prediction.final_yaw_error[i].rad2deg().tolist())
+            record["achieved"] = before.tolist()
+            records.append(record)
+        return records
+
+    def result(self, particles: dict, reducer, checker) -> StepResult:
+        """The rows handed to the motion stage, after the loop's last refresh (design 7): one evaluation without a
+        gradient, one :class:`StepRow` per particle the checker passes. ``motion_inputs`` maps each row's index to the
+        adapter and the row's saved refresh, for the motion stage; it stays out of ``diagnostics``."""
+        n = len(particles["left_q0"])
+        sole_box = self.world.model.sole_box
+        with torch.no_grad():
+            rollout = self.rollout_fn(particles)
+            costs = self(rollout, particles)
+            masks = checker.get_full_mask(costs)
+            passed = checker.get_mask(costs, verbose=False)
+            soft, effort, hard = reducer.soft_costs(costs), reducer.secondary_effort(costs), reducer(costs)
+            ep = self._endpoints(masks, n)
+            table = self.stance_table(particles)
+            stances = torch.stack([table[name] for name in rollout["conf_params"]], 1)
+            margin = physical_support_margin(rollout["com_xy"], stances, sole_box)
+            center = (rollout["com_xy"] - physical_support_centroid(stances, sole_box)).norm(dim=-1)
+            joints = range(len(self.world.model.joint_names))
+            arms = [*joints[self.world.model.left_arm], *joints[self.world.model.right_arm]]
+            move = torch.stack([(particles[name] - start)[:, arms].abs().amax(-1)
+                                for name, start in self.start_postures.items()], 1).amax(1)
+        adapter = StepStateAdapter(self.predictor)
+        self.motion_inputs, rows = {}, []
+        for i in torch.where(passed)[0].tolist():
+            particle = {key: value[i].detach().clone() for key, value in particles.items()}
+            particle.update({key: value[i].clone() for key, value in self.references.items()})
+            margins = margin[i].tolist()
+            report = dict(
+                com_margins_m=margins,
+                com_center_distances_m=center[i].tolist(),
+                min_com_margin_m=min(margins),
+                best_com_margin=min(margins),
+                secondary_effort=float(effort[i]),
+                cost=float(hard[i]),
+                largest_arm_joint_move_rad=float(move[i]),
+                gaps=self._gap_records(particles, i),
+                model_feasible=True,
+                sole_box_m=list(sole_box),
+                com_center_weight=self.config.com_center_weight,
+                independent_motion="untested",
+                deployment_sha256=self.predictor.metadata["deployment_sha256"],
+                checkpoint_sha256=self.predictor.metadata["checkpoint_sha256"],
+                normalized_dynamics=self._dynamics[i].tolist(),
+                step_lag=self.config.step_lag,
+            )
+            if self.config.curobo_plan:
+                report["motion_validation"] = "unattempted"
+            saved = {j: _take(trace, i, "cpu") for j, trace in self.last.items()}
+            self.motion_inputs[i] = (adapter, saved)
+            rows.append(StepRow(i, particle, float(soft[i]), report, evidence=_evidence(adapter, saved)))
+        if rows:
+            return StepResult(rows, ep, "model_feasible")
+        best = int((ep.sum(1) * -1e6 + hard.nan_to_num(1e6)).argmin())
+        failures = [f"{kind}.{key}" for kind, items in masks.items() for key, mask in items.items()
+                    if not mask[best].all()]
+        return StepResult(rows, ep, "unresolved", "no particle met all applicable constraints",
+                          {"row": best, "failed_constraints": failures})

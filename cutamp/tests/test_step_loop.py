@@ -144,3 +144,66 @@ def test_a_diverged_row_leaves_its_neighbours_alone(stepped_call):
     others = torch.arange(16, device="cuda") != 3
     assert not plan.tests_ok[3] and torch.equal(plan.tests_ok[others], ok[others])
     assert all(torch.equal(v[others], kept[k][others]) for k, v in p.items())
+
+
+from cutamp.com_polygon_cost import physical_support_margin
+from cutamp.optimize_plan import ADAM_CONSIDER_TYPES
+
+
+@needs_cuda
+def test_the_cost_reads_the_standin(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    for name in ("step_commands_0", *plan.start_postures):
+        p[name].requires_grad_()
+    cost = plan(plan.rollout_fn(p), p)
+    assert set(cost["ComComfort"]["values"]) == {"margin_shortfall"}
+    assert {"StepCommand", "StepTests"} <= set(cost)
+    assert not set(cost["ComPolygon"]["values"]) & plan.landing_confs
+    assert cost["KinematicConstraint"]["values"]["retract_sole_pos_err"].shape[0] == 16
+    assert (cost["soft"]["values"]["stay_near_start"] == 0).all()
+    assert torch.equal(cost["StepTests"]["values"]["refresh_tests"] > 0, ~plan.tests_ok)
+    stepped_call["reducer"](cost, consider_types=ADAM_CONSIDER_TYPES).sum().backward()
+    g = p["step_commands_0"].grad
+    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+@needs_cuda
+def test_the_balance_cost_is_the_shortfall_itself(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    with torch.no_grad():
+        rollout = plan.rollout_fn(p)
+        cost = plan(rollout, p)
+        table = plan.stance_table(p)
+        stances = torch.stack([table[c] for c in rollout["conf_params"]], 1)
+        margin = physical_support_margin(rollout["com_xy"], stances, stepped_call["world"].model.sole_box)
+    expected = (stepped_call["config"].com_comfort_margin_m - margin).clamp_min(0)
+    torch.testing.assert_close(cost["ComComfort"]["values"]["margin_shortfall"], expected)
+
+
+@needs_cuda
+def test_staying_near_the_start_counts_every_joint(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    name = next(iter(plan.start_postures))
+    with torch.no_grad():
+        p[name][:, 7] += 0.1
+        cost = plan(plan.rollout_fn(p), p)
+    torch.testing.assert_close(cost["soft"]["values"]["stay_near_start"], torch.full((16,), 0.01, device="cuda"), atol=1e-6, rtol=0)
+
+
+@needs_cuda
+def test_result_rows(stepped_call):
+    plan = make_plan(stepped_call)
+    res = plan.result(plan.particles, stepped_call["reducer"], stepped_call["checker"])
+    assert res.endpoint_ok.shape == (16, 2) and res.status in ("model_feasible", "unresolved")
+    assert set(plan.motion_inputs) == {row.index for row in res.rows}
+    for row in res.rows:
+        m = row.metrics
+        assert len(m["com_center_distances_m"]) == len(m["com_margins_m"]) == 2
+        assert row.max_center_distance_m == max(m["com_center_distances_m"])
+        pick, place = m["gaps"]
+        assert pick["order"] == "L" and place["order"] == "none" and pick["achieved"] == place["achieved"]
+        assert len(pick["commands"]) == 1 and len(pick["final_xy_error_m"]) == 2
+        assert sum(k.endswith("_ik_reference") for k in row.particle) == 2
