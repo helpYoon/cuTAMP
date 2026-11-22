@@ -129,3 +129,18 @@ def test_a_refresh_follows_the_commands(stepped_call):
 def test_an_expired_budget_stops_the_start(stepped_call):
     with pytest.raises(TimeoutError):
         make_plan(stepped_call, deadline=monotonic() - 1.0)
+
+
+@needs_cuda
+def test_a_diverged_row_leaves_its_neighbours_alone(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    plan.refresh(p)
+    kept, ok = {k: v.clone() for k, v in p.items()}, plan.tests_ok.clone()
+    state = plan._first.state  # the first gap's cached hold, reused by every refresh
+    state.tensors = tuple(t.clone() for t in state.tensors)  # the observed state's rows are expanded views
+    state.tensors[0][3] = state.tensors[4][3] = float("nan")  # body position and joints of row 3
+    plan.refresh(p)
+    others = torch.arange(16, device="cuda") != 3
+    assert not plan.tests_ok[3] and torch.equal(plan.tests_ok[others], ok[others])
+    assert all(torch.equal(v[others], kept[k][others]) for k, v in p.items())

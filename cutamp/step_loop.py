@@ -2,7 +2,7 @@
 and controller, and the helpers the stepped route shares with the motion stage."""
 
 import math
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from functools import partial
 from time import monotonic
 
@@ -249,6 +249,16 @@ def _gap_stances(standin, j, before, u):
     return after[0], final[0]
 
 
+def _finite_rows(state):
+    """``[B]`` bool: the rows of a physical state (p, R, v, w, q, qd) whose every value is finite."""
+    return torch.stack([t.reshape(len(t), -1).isfinite().all(-1) for t in state]).all(0)
+
+
+def _zero_unless(finite, state):
+    """``state`` with the rows not ``finite`` set to zero, so a diverged row cannot make a batched solve raise."""
+    return tuple(torch.where(finite.reshape(-1, *[1] * (t.ndim - 1)), t, 0) for t in state)
+
+
 def _write(particles, key, value):
     """A new key takes a copy of ``value``; an existing one is written in place, so the loop's tensor stays the same
     object."""
@@ -404,17 +414,25 @@ class SteppedPlan:
         refreshed = refresh_gap(self.predictor, start.state, order, u, anchor, self.standin.slope[j])
         self.standin.set(j, refreshed)
         prediction = refreshed.prediction
+        # A diverged row (a state not finite anywhere in its rollout) is garbage and fails the tests. It is zeroed where
+        # the planner's batched solve reads it, so the solve still answers for the other rows.
+        finite = torch.stack([_finite_rows(s.trajectory) & _finite_rows(s.terminal.tensors[:6])
+                              for s in prediction.steps]).all(0)
+        checked = replace(prediction, steps=tuple(replace(s, trajectory=_zero_unless(finite, s.trajectory))
+                                                  for s in prediction.steps))
         for k, step in enumerate(steps):
             landed = prediction.steps[k]
-            _write(particles, step.arg("q_land"), self.adapter.planner(landed.terminal.tensors[:6])[0])
+            q_land = self.adapter.planner(_zero_unless(finite, landed.terminal.tensors[:6]))[0]
+            _write(particles, step.arg("q_land"), q_land)
             _write(particles, step.arg("sole_to"), landed.achieved[:, "LR".index(order[k])])
         self.last[j] = (start.state, refreshed.commands, prediction, start.preparation)
         feet = self.predictor.model.feet(start.state.tensors[:6])[0]
         rows, hard, _ = landing_constraint_rows(self.predictor, feet, order, refreshed.commands, prediction)
         passed = start.compatible & hard & (torch.cat([v.reshape(len(u), -1) for v in rows.values()], 1) <= 0).all(1)
-        passed &= validate_step_geometry(self.world, self.adapter, prediction, object_poses=objects, held=held)["valid"]
+        passed &= validate_step_geometry(self.world, self.adapter, checked, object_poses=objects, held=held)["valid"]
         _, after = _gap_stances(self.standin, j, before, u)
-        return passed, after, prediction.terminal.tensors[4][:, self.adapter.columns]
+        head = prediction.terminal.tensors[4][:, self.adapter.columns]
+        return passed & finite, after, torch.where(finite[:, None], head, 0)  # a diverged row hands on a zero head
 
     def refresh(self, particles: dict) -> None:
         """One refresh (design 6) at the particles' current commands, retract postures, placements and grasps: every gap
