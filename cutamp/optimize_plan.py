@@ -113,6 +113,26 @@ def _adam_param_groups(params: List[Tuple[torch.Tensor, bool]], conf_lr: float) 
     return [g for g in ({"params": non_confs}, {"params": confs, "lr": conf_lr}) if g["params"]]
 
 
+def _finite_step(optimizer: Adam, params: List[torch.Tensor]) -> torch.Tensor:
+    """``optimizer.step()`` for a stepped plan (design 4): a particle (a row, the first dimension) whose gradient is not
+    finite in any parameter keeps its values, so a refresh never receives a command that is not a number. Its gradient
+    rows are zeroed, so Adam's moments take no NaN, and its values are put back after the step, which the moments
+    still move. A parameter without a gradient is left alone. Returns the held rows, ``[B]`` bool; no host sync."""
+    graded = [p for p in params if p.grad is not None]
+    held = torch.zeros(params[0].shape[0], dtype=torch.bool, device=params[0].device)
+    for p in graded:
+        held |= ~p.grad.reshape(p.shape[0], -1).isfinite().all(1)
+    with torch.no_grad():
+        rows = [held.view((-1,) + (1,) * (p.ndim - 1)) for p in graded]
+        saved = [p.detach().clone() for p in graded]
+        for p, row in zip(graded, rows):
+            p.grad.masked_fill_(row, 0)
+        optimizer.step()
+        for p, row, value in zip(graded, rows, saved):
+            p.copy_(torch.where(row, value, p))
+    return held
+
+
 class _FeasibleArchive:
     """Keep each particle's best complete feasible state across fixed-stance Adam proposals."""
 
@@ -180,19 +200,25 @@ class _StepBody:
     grad_masks: Dict[int, torch.Tensor]
     keep_vis: bool
     archive: _FeasibleArchive | None = None
+    #: Whether the archive reads this step: a stepped plan's particles are judged only right after a refresh (call 11).
+    judge: bool = True
+    #: A stepped plan: a row whose refresh diverged holds NaN costs, and the min cost skips it.
+    stepped: bool = False
 
     def __call__(self) -> Tuple[torch.Tensor, Optional[tuple]]:
         rollout = self.rollout_fn(self.particles)
         cost_dict = self.cost_fn(rollout, self.particles)
         costs = self.cost_reducer(cost_dict, consider_types=self.consider_types)
         satisfying_mask = self.get_mask(cost_dict, verbose=False)
-        if self.archive is not None:
+        if self.archive is not None and self.judge:
             centers = cost_dict["soft"]["max_center_distance_m"]
             self.archive.observe(self.particles, satisfying_mask, centers, self.cost_reducer.secondary_effort(cost_dict))
         loss = costs.mean()
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
         scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
+        if self.stepped:  # else one diverged row makes the min NaN, and the stop rule's loss clock never resets
+            scalars[2] = costs.nan_to_num(nan=float("inf")).min()
         soft_costs = self.cost_reducer.soft_costs(cost_dict)
         scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
         packed = torch.stack(scalars).detach()
@@ -505,11 +531,16 @@ class ParticleOptimizer:
         """Optimize particles for the plan skeleton.
 
         Returns ``(solution_found, opt_metrics, time_exceeded)``.
+
+        ``plan_info["steps"]``, when given, is a stepped plan (:class:`~cutamp.step_loop.SteppedPlan`, design 4 and 6):
+        its commands are Adam variables, no posture goes to the re-solve, it refreshes every ``reik_interval`` steps,
+        its particles are judged only on the step right after a refresh, and it refreshes once more after the loop.
         """
         plan_skeleton = plan_info["plan_skeleton"]
         particles = plan_info["particles"]
         rollout_fn = plan_info["rollout_fn"]
         cost_fn = plan_info["cost_fn"]
+        steps = plan_info.get("steps")
         opt_metrics = {
             "plan_skeleton": [str(op) for op in plan_skeleton],
             "num_particles": self.config.num_particles,
@@ -529,7 +560,8 @@ class ParticleOptimizer:
         # Confs from the optimizer (they're refreshed by IK every K steps
         # instead of trained by gradient descent).
         world = rollout_fn.world
-        ik_deps: List[IKDep] = _build_ik_deps(plan_skeleton, world)
+        # A stepped plan hands no posture to the re-solve: Adam moves every one (design 4).
+        ik_deps: List[IKDep] = _build_ik_deps(plan_skeleton, world) if steps is None else []
         dropped_conf_names = {dep.q_name for dep in ik_deps}
         # Refresh instrumentation + the GN merge-gate tolerances, taken from
         # the live checker so the gate tracks whatever the run enforces.
@@ -542,6 +574,9 @@ class ParticleOptimizer:
         # Initial configurations that we don't optimize
         initial_confs = {"q0", "left_q0", "right_q0"}
         for param, val in particles.items():
+            if steps is not None and param in steps.landing_confs:
+                val.requires_grad = False  # the posture a step lands in is the world model's, written by a refresh
+                continue
             # Skip particles that aren't used in this plan (e.g., right_q0 in a left-arm only plan)
             if param not in param_to_type:
                 continue
@@ -557,6 +592,10 @@ class ParticleOptimizer:
                 continue
             pairs.append((val, param_type == Conf))
             val.requires_grad = True
+        if steps is not None:
+            for name in steps.command_names.values():  # the commands, in the placements' group (call 15)
+                pairs.append((particles[name], False))
+                particles[name].requires_grad = True
 
         if not pairs:
             # A pick-only skeleton can bind every configuration through grasp IK. Its
@@ -583,7 +622,7 @@ class ParticleOptimizer:
         # this operator (e.g., base + inactive arm during arm operations).
         # See cutamp/conf_locking.py for the policy.
         grad_masks = build_grad_masks(
-            plan_skeleton, particles, param_to_type, Conf, world.model,
+            plan_skeleton, particles, param_to_type, Conf, world.model, stepped=steps is not None,
         )
 
         indices = torch.arange(self.config.num_particles, device="cuda")
@@ -633,8 +672,10 @@ class ParticleOptimizer:
             # The no-op Visualizer skips the vis block, and with it the block's syncs.
             keep_vis=type(visualizer) is not Visualizer, archive=archive,
         )
+        if steps is not None:
+            body.stepped = True
         step_graph = refresh_graph = None
-        use_graphs = self.config.cuda_graphs
+        use_graphs = self.config.cuda_graphs and steps is None  # a stepped plan's step is not captured (design 4)
         if use_graphs:
             opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
         try:
@@ -643,6 +684,8 @@ class ParticleOptimizer:
                     time_exceeded = True
                     break
                 timer.start("optimization_step")  # a capture's cost lands in its step
+                if steps is not None:  # judged only right after a refresh; the first ran before the loop (call 11)
+                    body.judge = step % self.config.reik_interval == 0
                 if use_graphs and step_graph is None:
                     step_graph = self._capture_step(body, world)
                     opt_metrics["capture_s"], opt_metrics["capture_step"] = step_graph.capture_s, step
@@ -656,7 +699,7 @@ class ParticleOptimizer:
                 num_satisfying = int(num_satisfying)
                 opt_metrics["num_satisfying"].append(num_satisfying)
 
-                if num_satisfying > 0 and not found_solution:
+                if num_satisfying > 0 and not found_solution and body.judge:
                     torch.cuda.synchronize()
                     opt_metrics["opt_start_to_first_sol"] = time.perf_counter() - start_time
                     found_solution = True
@@ -671,8 +714,9 @@ class ParticleOptimizer:
 
                 # Best-seen snapshot + early-stop bookkeeping. Measured state is
                 # pre-step, so the clone is consistent with num_satisfying.
-                best_snapshot.update(step, num_satisfying, min_cost, particles)
-                if best_snapshot.should_stop(step, self.config.early_stop_patience, archive):
+                if body.judge:
+                    best_snapshot.update(step, num_satisfying, min_cost, particles)
+                if body.judge and best_snapshot.should_stop(step, self.config.early_stop_patience, archive):
                     _log.info(
                         f"Early stop at step {step}: no meaningful progress for "
                         f"{self.config.early_stop_patience} steps (best "
@@ -689,9 +733,14 @@ class ParticleOptimizer:
                         self._visualize_step(visualizer, step, vis, num_satisfying, loss_val, indices)
 
                 # The body already ran the backward and the grad masks.
-                optimizer.step()
+                if steps is not None:
+                    _finite_step(optimizer, body.params)
+                else:
+                    optimizer.step()
                 # Counts from 1 so the first refresh lands at step K-1 (after
                 # the first batch of pose updates), not step 0.
+                if steps is not None and (step + 1) % self.config.reik_interval == 0:
+                    steps.refresh(particles)  # the world model at the current commands (call 7)
                 if ik_deps and (step + 1) % self.config.reik_interval == 0:
                     if refresh_graph is not None:
                         refresh_graph(step)
@@ -717,7 +766,18 @@ class ParticleOptimizer:
 
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).
-        if archive is None:
+        if steps is not None:
+            # The current state was last judged on a stand-in, so every archived state goes back; without an archive
+            # the snapshot is weighed against the last judged step, every reik_interval-th from 0 (call 11).
+            if archive is None:
+                counts, k = opt_metrics["num_satisfying"], self.config.reik_interval
+                last_judged = counts[(len(counts) - 1) // k * k] if counts else 0
+                restored = best_snapshot.restore_if_better(particles, last_judged)
+            else:
+                unjudged = torch.zeros_like(archive.center, dtype=torch.bool)
+                restored = archive.restore(particles, unjudged, archive.center, archive.effort)
+            steps.refresh(particles)  # the last refresh: the final check below reads the world model's values
+        elif archive is None:
             restored = best_snapshot.restore_if_better(
                 particles, opt_metrics["num_satisfying"][-1] if opt_metrics["num_satisfying"] else 0
             )
@@ -764,7 +824,10 @@ class ParticleOptimizer:
         opt_metrics.update({k: float(v[best_idx]) if num_satisfying else None for k, v in quality.items()})
         if num_satisfying and "max_center_distance_m" not in quality:
             opt_metrics["best_cost"] = float(costs[satisfying_mask].min())
-        opt_metrics["best_com_margin"] = particle_com_margin(world, {k: v[best_idx] for k, v in particles.items()})
+        if steps is None:
+            opt_metrics["best_com_margin"] = particle_com_margin(world, {k: v[best_idx] for k, v in particles.items()})
+        else:  # best_com_margin measures against the starting stance
+            opt_metrics["steps"] = steps.stats
 
         # Log initial state
         timer.start("visualize_rollout")
