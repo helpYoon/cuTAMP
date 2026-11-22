@@ -3,11 +3,21 @@ with respect to the commands is measured by nudged rows of the same call (design
 
 from dataclasses import dataclass, fields, is_dataclass
 
+import math
+
 import torch
 from torch import Tensor
 
-from cutamp.landing_predictor import LandingPrediction, LandingState, _intended_pair, _wrap, prediction_precision
-from cutamp.stance import abs_pose, rel_pose
+from cutamp.landing_predictor import (
+    LandingPrediction,
+    LandingState,
+    _intended_pair,
+    _wrap,
+    landing_errors,
+    prediction_precision,
+)
+from cutamp.stance import STEP_TRAVEL, STEP_X_MAX, STEP_Y_RANGE, STEP_YAW_RANGE, abs_pose, rel_pose
+from cutamp.step_bound import planner_step_bound, travel
 
 NUDGE = 1.0e-3  # m and rad: the distance over which the slope is measured (design 6, call 8)
 
@@ -117,3 +127,99 @@ class StandIn:
             final.append(after[-1][:, -1])
             before = final[-1]
         return after, final
+
+
+REDRAW_ROUNDS = 1000  # a programming safeguard on the rejection draw, not a planner limit (design 4)
+
+
+def as_commanded(orders, incoming: Tensor, commands: list[Tensor | None]) -> tuple[list[Tensor | None], list[Tensor]]:
+    """:meth:`StandIn.stances`'s return shape for landings exactly where commanded: each step's pair is the intended
+    pair of its command on the pair before it, through the steps and the gaps."""
+    after, final, before = [], [], incoming
+    for order, u in zip(orders, commands):
+        if not order:
+            after.append(None)
+        else:
+            pairs = []
+            for k, foot in enumerate(order):
+                before = _intended_pair(before, "LR".index(foot), u[:, k])
+                pairs.append(before)
+            after.append(torch.stack(pairs, 1))
+        final.append(before)
+    return after, final
+
+
+def draw_commands(orders, incoming: Tensor, n: int, generator: torch.Generator) -> list[Tensor | None]:
+    """Per gap ``[n, s, 3]`` float32 on ``incoming``'s device (``None`` where no step): each step uniform over the
+    trained box (mirrored for a right swing), kept where the step bound allows it and its travel from the sole's pose
+    before the step is within ``STEP_TRAVEL``, refused particles redrawn. A later step and a later gap start from the
+    earlier draws taken as landed. Drawn on the generator's device."""
+    device, dtype = generator.device, torch.float32
+    bound = planner_step_bound(device, dtype)
+    lo = torch.tensor([-STEP_X_MAX, STEP_Y_RANGE[0], STEP_YAW_RANGE[0]], device=device, dtype=dtype)
+    hi = torch.tensor([STEP_X_MAX, STEP_Y_RANGE[1], STEP_YAW_RANGE[1]], device=device, dtype=dtype)
+    mirror = torch.tensor([1.0, -1.0, -1.0], device=device, dtype=dtype)
+    before, out = incoming.to(device, dtype), []
+    for j, order in enumerate(orders):
+        if not order:
+            out.append(None)
+            continue
+        steps = []
+        for k, foot in enumerate(order):
+            side = "LR".index(foot)
+            left = side == 0
+            start = rel_pose(before[:, 1 - side], before[:, side])
+            swing_left = torch.full((n,), left, device=device)
+            c = torch.empty(n, 3, device=device, dtype=dtype)
+            todo = torch.ones(n, dtype=torch.bool, device=device)
+            for _ in range(REDRAW_ROUNDS):
+                cand = lo + torch.rand(n, 3, generator=generator, device=device, dtype=dtype) * (hi - lo)
+                cand = cand if left else cand * mirror
+                t = travel(start, cand)
+                ok = (bound.g(cand, swing_left) <= 0) & (t >= STEP_TRAVEL[0]) & (t <= STEP_TRAVEL[1])
+                take = todo & ok
+                c[take] = cand[take]
+                todo &= ~ok
+                if not todo.any():
+                    break
+            else:
+                raise ValueError(f"gap {j} step {k + 1}: {int(todo.sum())} particles still refused after {REDRAW_ROUNDS} rounds")
+            steps.append(c)
+            before = _intended_pair(before, side, c)
+        out.append(torch.stack(steps, 1).to(incoming.device))
+    return out
+
+
+def command_rows(orders, incoming: Tensor, commands: list[Tensor | None], after_steps: list[Tensor | None]) -> dict[str, Tensor]:
+    """The commands' cost rows: per gap ``j`` and step ``k`` (1-based) ``gap{j}_step{k}_`` ``min_travel``,
+    ``max_travel``, ``command_bound``, ``achieved_bound``, ``xy_precision`` and ``yaw_precision``, and for a two-step gap
+    ``gap{j}_final_xy_precision`` and ``_yaw_precision``. Each is the positive part of the row of the same name in
+    :func:`cutamp.step_refinement.landing_constraint_rows`, so 0 where the requirement is met; the landed pairs come
+    from ``after_steps``, a step's reference from the intended pair on the pair before it."""
+    rows, before = {}, incoming
+    for j, order in enumerate(orders):
+        if not order:
+            continue
+        u, landed, intended = commands[j], after_steps[j], before
+        bounds = planner_step_bound(u.device, u.dtype)
+        for k, foot in enumerate(order):
+            name, side = f"gap{j}_step{k + 1}_", "LR".index(foot)
+            c = u[:, k]
+            foot_left = torch.full((len(c),), side == 0, device=c.device)
+            t = travel(rel_pose(before[:, 1 - side], before[:, side]), c)
+            reference = _intended_pair(before, side, c)
+            intended = _intended_pair(intended, side, c)
+            achieved = landed[:, k]
+            xy, yaw, _ = landing_errors(achieved, reference)
+            rows[name + "min_travel"] = (STEP_TRAVEL[0] - t) / STEP_TRAVEL[0]
+            rows[name + "max_travel"] = t / STEP_TRAVEL[1] - 1
+            rows[name + "command_bound"] = bounds.g(c, foot_left) / 0.02
+            rows[name + "achieved_bound"] = bounds.g(rel_pose(achieved[:, 1 - side], achieved[:, side]), foot_left) / 0.02
+            rows[name + "xy_precision"] = xy.square() / 0.020**2 - 1
+            rows[name + "yaw_precision"] = yaw.square() / math.radians(1) ** 2 - 1
+            before = achieved
+        if len(order) > 1:
+            xy, yaw, _ = landing_errors(before, intended)
+            rows[f"gap{j}_final_xy_precision"] = xy.square() / 0.020**2 - 1
+            rows[f"gap{j}_final_yaw_precision"] = yaw.square() / math.radians(1) ** 2 - 1
+    return {key: value.clamp_min(0) for key, value in rows.items()}
