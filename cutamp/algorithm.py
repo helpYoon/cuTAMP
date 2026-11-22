@@ -18,9 +18,8 @@ from functools import lru_cache
 from pathlib import Path
 from threading import local
 from time import monotonic
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 from curobo.types import DeviceCfg
 
@@ -35,13 +34,13 @@ from cutamp.grasps import GRASP_SCORE_CUTOFF, grasp_sets, start_sampler_load, wa
 from cutamp.motion_solver import build_motion_planner, play_curobo_motion, solve_curobo
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import (
-    IKTol, NoGraspCandidates, ParticleInitializer, choice_stats, pick_place_confs, worst_posture,
+    IKTol, NoGraspCandidates, ParticleInitializer, pick_place_confs, worst_posture,
 )
 from cutamp.robots import REAL_LEGS, load_t1_container
 from cutamp.rollout import RolloutFunction
 from cutamp.t1_domain import all_t1_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
-from cutamp.task_planning import PlanSkeleton, task_plan_generator
+from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import RerunVisualizer, Visualizer
 
@@ -49,70 +48,6 @@ _log = logging.getLogger(__name__)
 # setup_cutamp freezes the heap. Unfrozen at exit, the interpreter's collection before module teardown frees what frozen
 # garbage still holds: a MotionPlanner, whose __del__ raises ImportError ("Exception ignored") once teardown has begun.
 atexit.register(gc.unfreeze)
-
-
-def heuristic_fn(
-    plan_skeleton: PlanSkeleton, cost_dict: dict, constraint_checker: ConstraintChecker, verbose: bool = True
-) -> float:
-    """
-    Get a single heuristic value for a cost dict corresponding to a rollout.
-
-    We first compute the success rate of each constraint. If the constraint has zero success, we assign it a penalty
-    of -num_particles. We then compute the mean success rate across all constraints, and use the failure rate as the
-    heuristic (lower the better).
-    """
-    full_mask = constraint_checker.get_full_mask(cost_dict)
-    successes = []
-    num_particles = None
-    for con_type, con_info in full_mask.items():
-        for name, mask in con_info.items():
-            num_particles = mask.shape[0]
-            satisfying = mask.reshape(num_particles, -1).sum(0)
-            satisfying[satisfying == 0] = -num_particles
-            successes.extend(satisfying.tolist())
-            if verbose:
-                _log.debug(f"{con_type} {name} {satisfying.tolist()}")
-    success_mean = sum(successes) / len(successes)
-    success_rate = success_mean / num_particles
-    failure_rate = 1 - success_rate
-    heuristic = 100 * failure_rate
-
-    # We have a preference for shorter plans
-    heuristic += len(plan_skeleton)
-    return heuristic
-
-
-def make_arm_affinity_priority_fn(world) -> Callable[[object], float]:
-    """Build a priority function for BFS sibling ordering.
-
-    For pick operators, returns the 3D Euclidean distance from the arm's
-    home end-effector position to the block's world pose. Closer = lower
-    priority = explored first by biased BFS. For non-pick operators or
-    pick operators whose block doesn't resolve (e.g., placeholder name
-    not yet bound to a real scene object), returns ``float("inf")`` so they
-    sort AFTER all resolved picks in the ascending BFS order.
-
-    Same-side picks bubble to the top of the BFS exploration order, so
-    the first satisfying plan skeleton tends to be the same-side assignment.
-    Cross-body groundings are still enumerated (just later); BFS naturally
-    backtracks if same-side fails feasibility.
-    """
-    def priority(ground_op) -> float:
-        meta = ground_op.operator.metadata
-        if meta.action_type != "pick" or meta.arm is None:
-            return float("inf")
-        # LeftPick/RightPick parameter order is (obj, grasp, q). Block is values[0].
-        block_name = ground_op.values[0]
-        try:
-            obj = world.get_object(block_name)
-        except (KeyError, ValueError):
-            return float("inf")
-        if obj is None or obj.pose is None:
-            return float("inf")
-        block_xyz = np.asarray(obj.pose[:3], dtype=np.float64)
-        arm_home_xyz = world.arm_home_ee_world[meta.arm].cpu().numpy().astype(np.float64)
-        return float(np.linalg.norm(block_xyz - arm_home_xyz))
-    return priority
 
 
 def grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n: int) -> List[int]:
@@ -181,58 +116,6 @@ def get_top_satisfying_particles(
             order = grasp_group_order(pool_idx, soft, all_hi, tilt, travel, margin, n)
     candidates = [{k: v[i].detach().clone() for k, v in sat.items()} for i in order]
     return candidates, satisfying_mask.nonzero(as_tuple=True)[0][order].tolist()
-
-
-def sample_plan_skeleton(
-    plan_gen,
-    world: TAMPWorld,
-    config: TAMPConfiguration,
-    timer: TorchTimer,
-    plan_count: int,
-    constraint_checker: ConstraintChecker,
-    particle_initializer: ParticleInitializer,
-) -> Tuple[dict, bool]:
-    """
-    Try sampling a plan skeleton (if any remain), then its particles and compute the heuristic.
-    Returns the plan_info dict and whether any satisfying particles were found upon initialization.
-    """
-    plan_skeleton = next(plan_gen)
-    plan_str = [op.name for op in plan_skeleton]
-    _log.debug(f"[Plan {plan_count + 1}] Sampled plan {plan_str}")
-
-    # Sample particles
-    with timer.time("initialize_particles"):
-        plan_particles = particle_initializer(plan_skeleton)
-
-    # Rollout particles and compute costs
-    rollout_fn = RolloutFunction(plan_skeleton, world)
-    cost_fn = CostFunction(plan_skeleton, world, config)
-    with timer.time("measure_heuristic"), torch.no_grad():
-        rollout = rollout_fn(plan_particles)
-        cost_dict = cost_fn(rollout, plan_particles)
-        heuristic = heuristic_fn(plan_skeleton, cost_dict, constraint_checker)
-
-    # Number of satisfying particles
-    with timer.time("get_satisfying_mask"):
-        satisfying_mask = constraint_checker.get_mask(cost_dict)
-    num_satisfying = satisfying_mask.sum().item()
-
-    plan_info = {
-        "idx": plan_count,
-        "plan_skeleton": plan_skeleton,
-        "particles": plan_particles,
-        "rollout_fn": rollout_fn,
-        "cost_fn": cost_fn,
-        "heuristic": heuristic,
-        "num_satisfying": num_satisfying,
-        "grasp_choice": particle_initializer.grasp_choice,
-    }
-
-    _log.debug(
-        f"[Plan {plan_count + 1}] {plan_info['num_satisfying']}/{config.num_particles} satisfying, "
-        f"heuristic = {plan_info['heuristic']}"
-    )
-    return plan_info, num_satisfying > 0
 
 
 # Start plan_cspace with two attempts per segment. Allow twenty after a budget-limited failure.
@@ -392,7 +275,7 @@ def setup_cutamp(
         )
         check_tamp_world_not_in_collision(world)
     gc.collect()
-    gc.freeze()  # the world too, before run_cutamp's planner thread starts capturing graphs
+    gc.freeze()  # the world too, before the first graph capture
 
     # Setup visualizer (doesn't count towards timing)
     visualizer = (
@@ -418,220 +301,16 @@ def run_cutamp(
 
     Keyframe-only searches can compare feasible solutions across skeletons.
     """
-    if config.step_mode != "off":
-        preload = config.curobo_plan
+    preload = config.curobo_plan
+    if preload:
+        # Only sampler construction overlaps world setup and search. Grasp generation itself
+        # changes process-wide CUDA settings and runs synchronously for the selected objects.
+        start_sampler_load()
+    try:
+        return _run_step_planner(env, config, cost_reducer, constraint_checker, q_init, experiment_id, step_inputs)
+    finally:
         if preload:
-            # Only sampler construction overlaps world setup and search. Grasp generation itself
-            # changes process-wide CUDA settings and runs synchronously for the selected objects.
-            start_sampler_load()
-        try:
-            return _run_step_planner(env, config, cost_reducer, constraint_checker, q_init, experiment_id, step_inputs)
-        finally:
-            if preload:
-                wait_for_sampler_load()  # also when no skeleton was reached or setup raised
-    if step_inputs is not None:
-        raise ValueError("Explicit step inputs require step_mode model")
-    # GraspGenX's model loads on a background thread while the robot and the world load and the task planner runs.
-    start_sampler_load()
-    exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id=experiment_id)
-    # The fixed-feet baseline has no centring: for_refinement resolves its weight to 0. Resolved after setup_cutamp,
-    # which validates and logs the configuration as given.
-    config = config.for_refinement(stepped=False)
-    particle_initializer = ParticleInitializer(world, config, constraint_checker)
-
-    # Task plan generator
-    _log.info(f"Initial State: {world.initial_state}")
-    _log.info(f"Goal State: {world.goal_state}")
-    all_operators = all_t1_operators
-    with timer.time("get_plan_generator", log_callback=_log.info):
-        arm_affinity_priority = make_arm_affinity_priority_fn(world)
-        skeletons = task_plan_generator(
-            world.initial_state,
-            world.goal_state,
-            operators=all_operators,
-            ground_op_priority_fn=arm_affinity_priority,
-        )
-        first = next(skeletons, None)
-
-    # GraspGenX's grasps, for the objects a skeleton picks and for no other: once per object shape and process, timed
-    # apart from planning (the timer covers the wait for the model's background load, then the sampling). grasp_sets
-    # turns process-wide settings on while it runs, so the first skeleton's grasps are made here, before the motion
-    # planner's warmup thread starts, and a later skeleton's wait for that thread to end.
-    planner_thread = None
-    grasp_counts = {}
-
-    def make_grasps(plan_skeleton: PlanSkeleton) -> None:
-        objs = ungrasped(world, plan_skeleton)
-        if not objs:
-            return
-        if planner_thread is not None:
-            planner_thread.join()
-        with timer.time("generate_grasps", log_callback=_log.info):
-            world.grasps.update(grasp_sets(objs, world.device, counts=grasp_counts))  # the full reference pool
-        gc.collect()
-        gc.freeze()  # GraspGenX's import and the grasps (setup_cutamp), before the next graph capture
-
-    def plan_skeletons():
-        if first is not None:
-            yield first
-        for plan_skeleton in skeletons:
-            make_grasps(plan_skeleton)
-            yield plan_skeleton
-
-    if first is not None:
-        make_grasps(first)
-    wait_for_sampler_load()  # also when the first skeleton picks nothing: a capture fails on another thread's CUDA work
-    plan_gen = plan_skeletons()
-
-    # Build the trajopt planner on a background thread, overlapped with
-    # particle init and the Adam loop. The build runs no solves, so no CUDA graph
-    # capture overlaps the main thread (see build_motion_planner). Concurrent
-    # cuRobo use is only safe with the per-stream warp wrapper cache
-    # (_curobo_internals._patch_warp_streams): warp's stream registry is unlocked, and a
-    # fresh wrapper per launch from two threads corrupts the heap. solve_curobo
-    # joins via get_planner; its warmup timer then measures only the residual wait.
-    # CUDA graphs capture only after this thread ends (planner_busy): a capture fails on another thread's CUDA work.
-    get_planner = None
-    planner_busy = None
-    if config.curobo_plan:
-        import threading
-
-        planner_box: dict = {}
-
-        def _build_planner_bg():
-            try:
-                planner_box["planner"] = build_motion_planner(world)
-            except BaseException as e:  # noqa: BLE001 — surfaced at join time
-                planner_box["error"] = e
-
-        planner_thread = threading.Thread(
-            target=_build_planner_bg, daemon=True, name="motion-planner-warmup",
-        )
-        planner_thread.start()
-        planner_busy = planner_thread.is_alive
-
-        def get_planner():
-            planner_thread.join()
-            if "error" in planner_box:
-                raise planner_box["error"]
-            return planner_box["planner"]
-
-    # Sample initial plans and particles
-    found_solution_initially = False
-    plan_count = 0
-
-    def initialized_skeletons():
-        nonlocal plan_count
-        for idx in range(config.num_initial_plans):
-            try:
-                plan_info, has_solution = sample_plan_skeleton(
-                    plan_gen, world, config, timer, idx, constraint_checker, particle_initializer
-                )
-            except StopIteration:
-                return
-            plan_count += 1
-            yield plan_info, has_solution
-
-    pending_plans = initialized_skeletons()
-    with timer.time("sample_initial_plans", log_callback=_log.info):
-        plan_queue: List[dict] = []
-        for plan_info, has_solution in pending_plans:
-            plan_queue.append(plan_info)
-            if has_solution:
-                found_solution_initially = True
-                break
-
-    with timer.time("sort_plans"):
-        plan_queue.sort(key=lambda x: x["heuristic"])
-    _log.info(f"Num plans: {len(plan_queue)}")
-    overall_metrics = {
-        "grasp_proposals_by_object": grasp_counts,
-        "num_optimized_plans": 0,
-        "num_initial_plans": plan_count,
-        "num_satisfying_final": 0,
-        "num_particles": config.num_particles,
-        "best_cost": float("inf"),
-        "best_soft_cost": float("inf"),
-    }
-    if config.curobo_plan:
-        # Default to False so a run that never reaches motion planning
-        # (e.g. no satisfying particles found for any skeleton) still
-        # reports motion_plan_success=False instead of an absent key, so
-        # every curobo_plan run reports it. Runs without curobo_plan never
-        # had a chance to plan, so the key stays absent for them.
-        overall_metrics["motion_plan_success"] = False
-        overall_metrics["motion_plan_failures"] = []  # every failed candidate's message, over the skeletons planned
-    curobo_plan = None
-    found_solution = False
-    particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker, planner_busy=planner_busy)
-    timer.start("first_solution")
-    if found_solution_initially:
-        found_solution = not config.curobo_plan
-        timer.stop("first_solution")
-
-    # Optimization loop for each skeleton and its particles
-    timer.start("start_optimization")
-    # Only the Adam loop checks max_loop_dur (time since start_optimization): the search ends after the skeleton whose
-    # loop runs out.
-    for idx, plan_info in enumerate(plan_queue):
-        opt_iter = idx + 1
-        should_break = False
-        plan_skeleton = plan_info["plan_skeleton"]
-        _log.info(
-            f"[Opt {opt_iter}] Optimizing plan {[op.name for op in plan_skeleton]}, plan idx = {plan_info['idx']}, "
-            f"heuristic = {plan_info['heuristic']:.2f}"
-        )
-        has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
-        if metrics["best_cost"] is not None:
-            overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
-        if metrics["best_soft_cost"] is not None:
-            overall_metrics["best_soft_cost"] = min(overall_metrics["best_soft_cost"], metrics["best_soft_cost"])
-        if time_exceeded:
-            _log.info(f"Max loop duration reached, stopping optimization")
-            should_break = True
-        exp_logger.log_dict(f"optimization/opt_{opt_iter:04d}", metrics)
-
-        overall_metrics["num_optimized_plans"] += 1
-        overall_metrics["grasp_choice"] = [choice_stats(c) for c in plan_info["grasp_choice"]]
-        if has_satisfying:
-            if config.curobo_plan:
-                candidates, _ = get_top_satisfying_particles(
-                    plan_info, constraint_checker, cost_reducer, n=config.motion_plan_max_retries,
-                )
-                curobo_plan, traj_metrics, attempts, rank, failures = _motion_plan_with_retries(
-                    plan_info, candidates, world, config, timer, visualizer,
-                    get_planner=get_planner, ik_tol=particle_initializer.ik_tol,
-                )
-                overall_metrics["motion_plan_attempts"] = overall_metrics.get("motion_plan_attempts", 0) + attempts
-                overall_metrics["motion_plan_failures"] += failures
-                if curobo_plan is None:
-                    continue
-                overall_metrics.update(traj_metrics)
-                overall_metrics.update(_planned_metrics(world, plan_skeleton, candidates, rank))
-                overall_metrics["motion_plan_success"] = True
-            overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
-            overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
-            found_solution = True
-            should_break = True
-
-        if should_break:
-            break
-
-    opt_elapsed = timer.stop("start_optimization")
-    _log.debug(f"Optimization loop took roughly {opt_elapsed:.2f}s")
-    if not found_solution:
-        _log.warning("No satisfying particles found after optimizing all plans")
-    _log.debug(f"Best cost: {overall_metrics['best_cost']:.4f}, soft cost: {overall_metrics['best_soft_cost']:.4f}")
-
-    # Dump metrics out
-    overall_metrics["found_solution"] = found_solution
-    exp_logger.log_dict("overall_metrics", overall_metrics)
-    exp_logger.log_dict("timer_metrics", timer.get_summaries())
-
-    # Log constraint and cost multipliers
-    exp_logger.log_dict("multipliers", cost_reducer.cost_config)
-    exp_logger.log_dict("tolerances", constraint_checker.constraint_config)
-    return curobo_plan, overall_metrics["num_satisfying_final"], overall_metrics
+            wait_for_sampler_load()  # also when no skeleton was reached or setup raised
 
 
 _PREDICTOR_CACHE = local()  # A captured graph's mutable replay buffers belong to its worker.
@@ -710,7 +389,7 @@ def _load_predictor(config):
 
 
 def _refine_step_schedule(proposal, world, config, *args, **kwargs):
-    # The model and its CUDA deployment are optional for fixed-feet runs.
+    # The model and its CUDA deployment are optional for searches whose plans take no step.
     from cutamp.step_ik import stance_ik_graphs
     from cutamp.step_particles import refine_step_particles
 
@@ -726,9 +405,12 @@ def _refine_standing_schedule(
 
     plan = proposal.skeleton
     try:
-        info, _ = sample_plan_skeleton(iter((plan,)), world, config, timer, 0, checker, initializer)
+        with timer.time("initialize_particles"):
+            particles = initializer(plan)
     except NoGraspCandidates as e:
         return StepResult([], None, "initialization_failed", str(e))
+    info = {"plan_skeleton": plan, "particles": particles, "rollout_fn": RolloutFunction(plan, world),
+            "cost_fn": CostFunction(plan, world, config), "grasp_choice": initializer.grasp_choice}
     if deadline is not None and monotonic() >= deadline:
         return StepResult([], None, "budget_exhausted", "standing initialization reached the time limit")
     optimizer(info, timer, visualizer, deadline=deadline)
@@ -812,7 +494,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
 
     def proposals():
         nonlocal incoming
-        from cutamp.task_planning.arm_step_search import arm_step_skeletons
+        from cutamp.task_planning.search import arm_step_skeletons
 
         load_start = monotonic()
         search, cache_info = _load_step_search(config, applicable=inputs.matches_accuracy_context(config.step_lag))
@@ -874,7 +556,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         if objs:
             try:
                 with timer.time("generate_grasps"):
-                    world.grasps.update(grasp_sets(objs, world.device, max_grasps=min(64, config.num_particles),
+                    world.grasps.update(grasp_sets(objs, world.device, max_grasps=config.num_particles,
                                                   counts=metrics["grasp_proposals_by_object"]))
                 metrics["grasp_generation_calls"] += 1
             finally:
@@ -904,13 +586,13 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
             "rank_seconds": monotonic() - rank_start,
         }
         attempt["arm_approach_m"] = proposal.arm_approach_m
-        distances = [e.distance_m for e in proposal.seed.schedule.edges]
+        distances = [e.distance_m for e in proposal.schedule.edges]
         attempt["missing_reach_evidence"] = None in distances
         worst_gap = max((distance for distance in distances if distance is not None), default=0.)
         attempt["search_priority"] = [proposal.arm_approach_m + worst_gap, *proposal.cost]
         attempt["gaps"] = [
             {
-                "incoming_soles": incoming if i == 0 else proposal.seed.schedule.edges[i - 1].soles,
+                "incoming_soles": incoming if i == 0 else proposal.schedule.edges[i - 1].soles,
                 "commands": e.commands,
                 "outgoing_soles": e.soles,
                 "posture": e.posture,
@@ -920,7 +602,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 "trials": e.trials,
                 "cost": e.cost,
             }
-            for i, e in enumerate(proposal.seed.schedule.edges)
+            for i, e in enumerate(proposal.schedule.edges)
         ]
         metrics["step_attempts"].append(attempt)
         if proposal.step_count and predictor is None and unavailable is None:

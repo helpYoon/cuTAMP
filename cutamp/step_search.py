@@ -1,20 +1,18 @@
-"""Grasp-free A* search over ordered foot commands and nominal hand-map evidence.
+"""Landing options for one pick or place: every menu step sequence from the current feet that lands legally and off
+the pick object, with the hand reach map's distance to the target and the landing-accuracy evidence. The A* in
+``cutamp.task_planning.search`` chooses among them.
 
 World geometry uses meters and radians, with left/right sole poses in that order.
-An edge's cost is (unresolved manipulation, number of steps). A complete result
-is a skeleton seed; the landing and the shared grasp are refined afterwards.
+An edge's cost is (unresolved manipulation, number of steps).
 """
 
 from __future__ import annotations
 
-import heapq
 import json
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import count, product
-from math import inf
+from itertools import product
 from pathlib import Path
-from time import monotonic
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -290,46 +288,3 @@ class StepSearch:
             evidence = self._accuracy(order, commands, exact_start, target.loaded)
             candidates.append(LandingEdge(order, commands, feet, steps, gap, posture, q, *evidence))
         return tuple(candidates)
-
-    def schedules(self, incoming_soles, targets, *, orders=None, deadline=None, prefer_reach=False):
-        """Yield complete endpoint paths in lexicographic A* order, preserving alternatives.
-
-        Defer one-action lookahead until a partial path reaches the top of the
-        queue at its optimistic zero bound. It is then requeued at its true
-        one-action bound before expansion. No future gap is evaluated from home
-        unless this particular path actually returns to it.
-        """
-        targets = tuple(targets)
-        if orders is not None:
-            orders = tuple(orders)
-            if len(orders) != len(targets) or any(order not in ORDERS for order in orders):
-                raise ValueError("supply one exact foot order per manipulation")
-        start = _tuples(_soles_array(incoming_soles))
-        queue = []
-        serial = count()
-
-        def push(path, cost, gap, children=None):
-            h = min(e.cost for e in children) if children else (0, 0)
-            f = (cost[0] + h[0], cost[1] + h[1])
-            # With prefer_reach (the joint A*), a missing load profile should not outrank a
-            # measured miss of the hand map.
-            # Worst reach miss is monotone along the path and lower-bounds the completed plan.
-            priority = (gap, *f) if prefer_reach else (*f, gap)
-            heapq.heappush(queue, (priority, gap, next(serial), path, cost, children))
-
-        push((), (0, 0), 0.0)
-        while queue and (deadline is None or monotonic() < deadline):
-            _, gap, _, path, cost, children = heapq.heappop(queue)
-            if len(path) == len(targets):
-                yield Schedule(path, cost)
-            elif children is None:
-                edges = self.edges(path[-1].soles if path else start, targets[len(path)])
-                if orders is not None:
-                    edges = tuple(e for e in edges if e.order == orders[len(path)])
-                if edges:
-                    push(path, cost, gap, edges)
-            else:
-                for edge in children:
-                    distance = edge.distance_m if edge.distance_m is not None else inf
-                    new_cost = (cost[0] + edge.cost[0], cost[1] + edge.cost[1])
-                    push((*path, edge), new_cost, max(gap, distance))

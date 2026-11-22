@@ -28,9 +28,8 @@ upgrade audit catches them):
   a solver whose call structure changes after its first solve must run
   without them; the motion planner sees one fixed call shape and uses them.
   cuRobo captures in CUDA's global mode, where another thread's allocations
-  and syncs fail mid-capture, so captures
-  run only on the main thread while the planner-build thread is not running
-  (``motion_solver.build_motion_planner``).
+  and syncs fail mid-capture, so captures run only on the main thread, after
+  GraspGenX's background load has ended (``grasps.wait_for_sampler_load``).
 * cspace.velocity_scale is applied twice (open PR NVlabs/curobo#729), so build_planner_model.py writes the square
   root of each cap's scale, and the planner reads joint limits back from cuRobo.
 * timeopt (on by default) bounds torque on its own RNEA, without the floor's push, so get_t1_motion_planner turns it
@@ -163,8 +162,8 @@ def _patch_warp_streams() -> None:
     """One ``wp.Stream`` per CUDA stream. cuRobo calls ``wp.stream_from_torch`` on every kernel launch
     (``get_warp_device_stream``), and in warp 1.16.0 each call makes a new wrapper that registers its stream in the
     process-global native map ``g_streams`` (warp.cu), which has no lock, and whose ``__del__`` erases it; warp's
-    ctypes calls release the GIL, so the planner-build thread launching beside the main thread races on that map (heap
-    corruption: "malloc(): unaligned tcache chunk detected", SIGSEGV). Kept wrappers are never erased mid-run."""
+    ctypes calls release the GIL, so two threads launching at once race on that map (heap corruption: "malloc():
+    unaligned tcache chunk detected", SIGSEGV). Kept wrappers are never erased mid-run."""
     import warp as wp
 
     stream_from_torch = wp.stream_from_torch

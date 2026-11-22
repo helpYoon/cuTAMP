@@ -60,7 +60,7 @@ def main():
     cfg.update({key: value for key, value in overrides.items() if value is not None})
     cfg.update(step_adam_plateau_patience=args.patience)
     cfg = TAMPConfiguration(**cfg)
-    solver = cfg.for_refinement(stepped=True)
+    solver = cfg.for_refinement()
     plateau = solver.adam_plateau()
     reports = []
     for i in range(args.runs):

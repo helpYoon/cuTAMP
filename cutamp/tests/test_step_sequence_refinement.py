@@ -7,6 +7,14 @@ from cutamp import step_particles
 from cutamp.step_ik import _IK_TOLERANCE
 
 
+def test_every_particle_starts_at_the_landing_commands_the_astar_chose():
+    stepped = ((0.32, -0.21, 0.0), (0.0, 0.21, 0.0))  # the A*'s RL edge before a pick
+    edges = (SimpleNamespace(commands=()), SimpleNamespace(commands=stepped))
+    starts = step_particles._landing_starts(SimpleNamespace(schedule=SimpleNamespace(edges=edges)), 4, torch.zeros(33))
+    assert starts[0].shape == (4, 0, 3)
+    assert torch.equal(starts[1], torch.tensor(stepped).expand(4, -1, -1))
+
+
 def test_adam_verification_refits_with_original_tolerance_and_no_warm_history(monkeypatch):
     # Keep the actual Adam loop and replace only its recursive particle evaluations.
     outer = step_particles._refine_batch
@@ -16,7 +24,6 @@ def test_adam_verification_refits_with_original_tolerance_and_no_warm_history(mo
     initial = torch.full((3, 1, 3), 0.1)
     monkeypatch.setattr(step_particles, "CostFunction", lambda *args: None)
     monkeypatch.setattr(step_particles, "_placements_and_grasps", lambda *a: ({}, {}, [], []))
-    monkeypatch.setattr(step_particles, "_command_inputs", lambda *args: initial)
     histories = []
     verified = []
 
@@ -35,7 +42,7 @@ def test_adam_verification_refits_with_original_tolerance_and_no_warm_history(mo
     cfg = SimpleNamespace(step_adam_plateau_mm=None, step_refine_iterations=2, lr=0.007)
     world = SimpleNamespace(q_init=initial)
     for _ in range(2):
-        result = outer(proposal, world, cfg, None, None, None, None, None, None, 0, 3, None, None)
+        result = outer(proposal, world, cfg, None, None, None, None, None, [initial], 0, 3, None, None)
         assert result.diagnostics["adam"]["iterations"] == 2
     assert len(verified) == 2 and (verified[0] < initial).all()
     assert len(histories) == 6

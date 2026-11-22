@@ -22,9 +22,8 @@ SUPPORTED_SOFT_COSTS = (
 
 @dataclass(frozen=True)
 class TAMPConfiguration:
-    # Number of particles to initialize and optimize over. None resolves in __post_init__ to 256 for
-    # step_mode off (the fixed-feet baseline) and 128 for the step route.
-    num_particles: int | None = None
+    # Number of particles to initialize and optimize over.
+    num_particles: int = 128
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
@@ -40,7 +39,7 @@ class TAMPConfiguration:
     lr: float = 7e-3  # default LR for optimizer
     conf_lr: float = 2.226e-2  # LR for robot configurations
 
-    # Maximum time for optimization in seconds before breaking
+    # The whole search's budget in seconds, timed from planner entry (_run_step_planner's deadline). None: no cap.
     max_loop_dur: Optional[float] = None
 
     ## Soft Costs
@@ -66,9 +65,8 @@ class TAMPConfiguration:
     cuda_graphs: bool = True
 
     ## Task Planning
-    # Number of initial plans to sample
+    # The most distinct symbolic skeletons the step search admits (arm_step_skeletons' max_base_plans)
     num_initial_plans: int = 30
-    step_mode: str = "model"  # off (fixed feet) or model (learned steps)
     step_lag: int = 2  # actuator delay in physics substeps
     # Learned step Adam's CoM plateau stop (adam_plateau): stop after `patience` updates without a cumulative `mm`
     # gain in the best feasible worst-endpoint CoM distance, not before `min_updates` (None: 5). mm None resolves
@@ -82,9 +80,10 @@ class TAMPConfiguration:
 
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
-    curobo_plan: bool | None = None
-    # On RuntimeError from solve_curobo, retry on the next satisfying particle, going round the grasp groups,
-    # up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
+    curobo_plan: bool = True
+    # On RuntimeError from solve_curobo, retry on the next satisfying particle in get_top_satisfying_particles' order
+    # (_validate_motion_rows' when stepped): worst CoM centre distance, then effort; round the grasp groups with
+    # com_center_weight 0. Up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
     # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first plans on its 6th candidate.
     # It also sets how many grasps each pick chooses at init (choose_grasps, G5).
@@ -103,21 +102,15 @@ class TAMPConfiguration:
     experiment_root: str = "/tmp/cutamp-experiments"
 
     # Minimum projected CoM clearance from the physical sole hull at each pick and place.
-    # The fixed-feet baseline (step_mode off) does not apply it.
     com_comfort_margin_m: float = 0.05
     # Positive values enable centered pick/place stance IK and center-first plan selection.
     # Their magnitude weights the outer Adam objective. IK uses its own calibrated pose/CoM ratio.
-    # Zero restores step-count/effort selection. None resolves in for_refinement: 0 for step_mode off,
-    # 1 for the step route. step_mode off, the fixed-feet baseline, takes no positive weight.
-    com_center_weight: float | None = None
+    # Zero restores step-count/effort selection.
+    com_center_weight: float = 1.0
 
     def __post_init__(self):
-        if self.num_particles is None:
-            object.__setattr__(self, "num_particles", 256 if self.step_mode == "off" else 128)
         if self.step_particle_batch_size is None:
             object.__setattr__(self, "step_particle_batch_size", min(128, self.num_particles))
-        if self.curobo_plan is None:
-            object.__setattr__(self, "curobo_plan", self.step_mode == "model")
         if self.soft_cost is None:
             default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
             object.__setattr__(self, "soft_cost", default)
@@ -131,17 +124,15 @@ class TAMPConfiguration:
             minimum = 5
         return PlateauStop(self.step_adam_plateau_mm / 1000., self.step_adam_plateau_patience, minimum)
 
-    def for_refinement(self, *, stepped: bool) -> "TAMPConfiguration":
-        """Resolve optional overrides once a candidate's actual footstep count is known."""
-        weight = 0.0 if self.step_mode == "off" else 1.0  # the fixed-feet baseline keeps its first satisfying plan
+    def for_refinement(self) -> "TAMPConfiguration":
+        """Resolve learned step Adam's optional overrides for a candidate that takes a step."""
         plateau = self.step_adam_plateau_mm
-        if stepped and plateau is None and self.com_center_weight != 0:
+        if plateau is None and self.com_center_weight != 0:
             plateau = 1.0
         return replace(
             self,
             step_adam_plateau_mm=plateau,
             step_refine_iterations=48 if self.step_refine_iterations is None else self.step_refine_iterations,
-            com_center_weight=weight if self.com_center_weight is None else self.com_center_weight,
         )
 
 
@@ -175,15 +166,10 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"com_comfort_margin_m must be finite and >= 0, got {config.com_comfort_margin_m}")
 
     weight = config.com_center_weight
-    if weight is not None and (not math.isfinite(weight) or weight < 0):
+    if weight is None or not math.isfinite(weight) or weight < 0:
         raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
-    if config.step_mode not in ("off", "model"):
-        raise ValueError("step_mode must be off or model")
-    if config.step_mode == "off" and weight:
-        raise ValueError("com_center_weight applies only to the step route: step_mode off is the fixed-feet baseline")
-    if config.adam_plateau() is not None:
-        if config.step_mode != "model" or config.com_center_weight == 0:
-            raise ValueError("CoM plateau tracking requires step Adam (step_mode model) and a positive centering weight")
+    if config.adam_plateau() is not None and weight == 0:
+        raise ValueError("CoM plateau tracking requires a positive centering weight")
     updates = config.step_refine_iterations
     if (updates is not None and (type(updates) is not int or updates < 0)) or config.step_particle_batch_size < 1:
         raise ValueError("Invalid step refinement iteration or batch count")

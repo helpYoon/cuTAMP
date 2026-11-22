@@ -1,7 +1,8 @@
 """Grasps (design 7.8). ``grasp_sets`` makes each object shape's grasps with GraspGenX, in this process, when a
-skeleton first picks the object; the model loads once, on a background thread (``start_sampler_load``). Init chooses
-among them, after ``drop_grasps`` removes those the hand can't take. The motion solver's grasp geometry: each pick and
-place approaches along the grasp's axis and leaves the same way, or lifts and comes in from above.
+skeleton first picks the object; the model loads once, on a background thread (``start_sampler_load``) when motion
+planning is on, else on the first call. Init chooses among them, after ``drop_grasps`` removes those the hand can't
+take. The motion solver's grasp geometry: each pick and place approaches along the grasp's axis and leaves the same
+way, or lifts and comes in from above.
 
 ``world_from_ee`` is the hand's tool frame (``*_base_link``, ``robots/t1.py``), whose +x is GraspGenX's approach axis
 (G's +z). The knobs are search settings, not robot limits (design section 12).
@@ -261,13 +262,6 @@ def wait_for_sampler_load() -> None:
         _LOAD.join()
 
 
-def _z_offsets_cm(mesh: trimesh.Trimesh) -> Tuple[int, ...]:
-    """The box grasps' depths into each face: 0, -1, ..., -m cm, with m = min(8, floor(the smallest extent in cm) - 1),
-    so the fingertips stop at least 1 cm short of the far side. Upstream's -8 cm would put them below a 5 cm block."""
-    m = min(8, math.floor(100 * min(mesh.extents) + 1e-9) - 1)  # 1e-9: 0.29 m is 28.999999999999996 cm in floats
-    return tuple(range(0, -m - 1, -1))
-
-
 def _bounded_grasp_proposals(points, sampler, budget):
     """Budget both source generators before the discriminator scores their outputs."""
     from graspgenx.samplers.planner import run_planner_on_batch
@@ -284,21 +278,20 @@ def _bounded_grasp_proposals(points, sampler, budget):
 
 
 def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str], *,
-               max_grasps: int | None = None, counts: dict | None = None) -> Dict[str, GraspSet]:
+               max_grasps: int, counts: dict | None = None) -> Dict[str, GraspSet]:
     """Each object's GraspGenX grasps, keyed by name, made in this process.
 
     Same-shaped objects (``mesh_sha256``) share one ``GraspSet``, and each shape is made once per process
     (``_SETS``). A new shape samples 3,000 points of its unit-pose mesh, in the object frame.
-    With max_grasps set, diffusion and geometric generation share that limit before scoring.
-    Without a limit the reference route draws 500 diffusion grasps and a dense five-face box sweep.
+    Diffusion and geometric generation share ``max_grasps`` (the planner passes its particle count) before scoring.
 
     The grasps repeat bit for bit across calls and processes: each run is seeded with ``GRASP_SEED`` and runs in FP32,
     with PTv3's segment reduction deterministic. The caller's random state (Python's, numpy's, torch's CPU and every
     CUDA generator) and both TF32 flags are restored afterwards.
 
-    Call it only from ``run_cutamp``, which makes a skeleton's grasps before the motion planner's warmup thread starts
-    or after it ends, and in tests: deterministic mode and the TF32 pin are process-wide, which is safe only while no
-    other CUDA work runs. The sampler is loaded once per process: by ``start_sampler_load``'s background thread when
+    Call it only from ``run_cutamp``, which makes a skeleton's grasps on the main thread with no other CUDA work
+    running, and in tests: deterministic mode and the TF32 pin are process-wide, which is safe only while no other CUDA
+    work runs. The sampler is loaded once per process: by ``start_sampler_load``'s background thread when
     one was started, which a call that needs the sampler waits for, else by the first such call.
 
     Every call first checks that GraspGenX is installed, which it is on x86_64 only (``pyproject.toml``), and then its
@@ -311,7 +304,7 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str], *,
             f"(cutamp/grasps.py). uv sync installs it on x86_64 only, and this machine is {platform.machine()}. "
             "See README.md, Installation, the GraspGenX paragraph."
         )
-    if max_grasps is not None and (type(max_grasps) is not int or max_grasps < 1):
+    if type(max_grasps) is not int or max_grasps < 1:
         raise ValueError("max_grasps must be a positive integer")
     ckpt = _checked_model_dir()
     shape_of = {obj.name: (mesh_sha256(obj), ckpt, str(device), max_grasps) for obj in objs}
@@ -323,8 +316,6 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str], *,
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
         try:
             sampler = _load_sampler(ckpt)
-            from graspgenx.samplers.planner import run_planner_on_object
-
             for shape, obj in new.items():
                 mesh = obj.get_trimesh_mesh()
                 points = trimesh.sample.sample_surface(mesh, 3000, seed=GRASP_SEED)[0]  # not centred
@@ -332,17 +323,9 @@ def grasp_sets(objs: Sequence[Obstacle], device: Union[torch.device, str], *,
                 random.seed(GRASP_SEED)
                 np.random.seed(GRASP_SEED)
                 torch.manual_seed(GRASP_SEED)  # and every CUDA generator
-                if max_grasps is None:
-                    grasps, scores, tags, _ = run_planner_on_object(
-                        points, sampler, planner="graspmoe", num_grasps=500, grasp_threshold=-1.0, topk_num_grasps=-1,
-                        moe_obb_density="dense-topandside", moe_z_offsets_cm=_z_offsets_cm(mesh), moe_num_yaws=36,
-                        moe_obb_mode="advanced", moe_skip_obb_rule="auto", moe_obb_position_spacing_cm=1.0,
-                        moe_outlier_threshold=0.014, moe_outlier_k=20,
-                    )
-                else:
-                    grasps, scores, tags, _ = _bounded_grasp_proposals(points, sampler, max_grasps)
-                    if len(grasps) > max_grasps:
-                        raise RuntimeError(f"GraspGenX returned {len(grasps)} poses for a budget of {max_grasps}")
+                grasps, scores, tags, _ = _bounded_grasp_proposals(points, sampler, max_grasps)
+                if len(grasps) > max_grasps:
+                    raise RuntimeError(f"GraspGenX returned {len(grasps)} poses for a budget of {max_grasps}")
                 candidates = GraspSet(
                     mat4x4_to_grasp_7dof(torch.from_numpy(grasps).to(device)), torch.from_numpy(scores).to(device)
                 )

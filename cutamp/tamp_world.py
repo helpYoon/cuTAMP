@@ -93,11 +93,9 @@ class TAMPWorld:
         self._obj_to_aabb: Dict[str, torch.Tensor] = {}
 
         # Arm-home end-effector positions in world frame. Used by the
-        # arm-affinity priority function in plan-skeleton search to rank
-        # which arm should pick which object. Uses palm frames (*_base_link)
-        # because they're already in tool_frames per t1_29dof.yml;
-        # exact frame doesn't affect ranking, only LEFT-vs-RIGHT direction
-        # matters.
+        # A* (task_planning/search.py) for each palm's home
+        # position. Uses palm frames (*_base_link) because they're already in
+        # tool_frames per t1_29dof.yml.
         home_js = JointState.from_position(
             self._q_init.to(self.kinematics.device_cfg.device).unsqueeze(0)
         )

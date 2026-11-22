@@ -145,8 +145,3 @@ def test_default_cost_checks_the_same_particle_at_each_fixed_stance_wrist():
     for i, grad in enumerate(torch.autograd.grad(reduced.sum(), [particles[n] for n in wrist_confs]), start=1):
         assert grad[i, REAL_LEGS.joint_names.index("base_j_x")] > 0
         assert torch.count_nonzero(grad[mask[:, i - 1]]) == 0
-
-    # The fixed-feet baseline keeps the keyframe rectangle (ComPolygon) and neither the margin nor the centring.
-    baseline = CostFunction(skeleton, world, TAMPConfiguration(step_mode="off"))(rollout, particles)
-    assert "ComComfort" not in baseline and "ComPolygon" in baseline
-    assert "max_center_distance_m" not in baseline["soft"]

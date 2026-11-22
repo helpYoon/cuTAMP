@@ -109,8 +109,8 @@ def entrypoint():
     )
 
     parser.add_argument(
-        "-n", "--num_particles", type=int, default=None,
-        help="Number of plan particles per skeleton (default 256 with --step_mode off, 128 on the step route)."
+        "-n", "--num_particles", type=int, default=_defaults.num_particles,
+        help="Number of plan particles per skeleton."
     )
     parser.add_argument(
         "--surface_height", type=float, default=0.0,
@@ -159,17 +159,13 @@ def entrypoint():
     )
     parser.add_argument(
         "--com_comfort_margin_m", type=float, default=_defaults.com_comfort_margin_m,
-        help="Requested CoM clearance from the physical support polygon at pick and place, in meters "
-             "(step routes; --step_mode off does not apply it).",
+        help="Requested CoM clearance from the physical support polygon at pick and place, in meters.",
     )
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
         help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the squared "
-             "centering term (default 1). Zero disables centering. Step route only: --step_mode off, the "
-             "fixed-feet baseline, has no centering.",
+             "centering term. Zero disables centering.",
     )
-    parser.add_argument("--step_mode", choices=("off", "model"), default=_defaults.step_mode,
-                        help="Plan on fixed feet (off) or step with the frozen T1 landing model (model).")
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
     parser.add_argument("--step_refine_iterations", type=int, default=_defaults.step_refine_iterations,
                         help="Override learned step Adam's maximum updates (default 48).")
@@ -178,15 +174,12 @@ def entrypoint():
         "--max_duration",
         type=float,
         default=_defaults.max_loop_dur,
-        help="Cooperative search budget in seconds. The step route runs uncapped by default; an explicit "
-             "duration controls its entire search, timed from planner entry. With --step_mode off it is one "
-             "budget timed from the end of initial sampling: the "
-             "optimization that runs out stops, and the search ends after its skeleton.",
+        help="Cooperative search budget in seconds, timed from planner entry; uncapped by default.",
     )
     parser.add_argument(
         "--motion_plan",
-        action=argparse.BooleanOptionalAction, default=None,
-        help="Generate a complete motion (default for model). Use --no-motion_plan for keyframes.",
+        action=argparse.BooleanOptionalAction, default=_defaults.curobo_plan,
+        help="Generate a complete motion. Use --no-motion_plan for keyframes.",
     )
     parser.add_argument(
         "--env", type=str, default="blocks_t1",
@@ -236,7 +229,6 @@ def entrypoint():
         com_comfort_margin_m=args.com_comfort_margin_m,
         com_center_weight=args.com_center_weight,
         max_loop_dur=args.max_duration,
-        step_mode=args.step_mode,
         step_lag=args.step_lag,
         step_refine_iterations=args.step_refine_iterations,
         step_particle_batch_size=args.step_particle_batch_size,

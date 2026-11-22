@@ -190,12 +190,11 @@ def test_retract_collision_grads_match_per_conf():
     from cutamp.cost_function import CostFunction
     from cutamp.particle_initialization import ParticleInitializer
     from cutamp.rollout import RolloutFunction
-    from cutamp.t1_domain import all_t1_operators
-    from cutamp.task_planning import task_plan_generator
+    from cutamp.tests.conftest import BLOCKS_T1_ACTIONS, skeleton_through
 
     world = make_blocks_t1_world()
     config = TAMPConfiguration(num_particles=8)
-    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+    skeleton = skeleton_through(world.initial_state, world.goal_state, *BLOCKS_T1_ACTIONS)
     particles = ParticleInitializer(world, config, default_checker())(skeleton)
     cost_fn = CostFunction(skeleton, world, config)
     retract_info = list(cost_fn.retract_info)

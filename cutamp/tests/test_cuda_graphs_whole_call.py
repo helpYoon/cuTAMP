@@ -1,7 +1,6 @@
 """``--cuda_graphs`` against eager, one whole optimize call at a time: nothing eager runs in a graph
 call, and the recorded calls must match as raw bytes."""
 
-import itertools
 import random
 import sys
 
@@ -46,7 +45,7 @@ def test_graph_calls_give_the_eager_result(real_world, real_plan, monkeypatch):
     box = _install_recorder(monkeypatch)
     rng = torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate()
 
-    def call(cuda_graphs, planner_busy=None) -> dict:
+    def call(cuda_graphs) -> dict:
         """One optimize call on a fresh copy of the init, from the same RNG states."""
         torch.set_rng_state(rng[0])
         torch.cuda.set_rng_state_all(rng[1])
@@ -55,7 +54,7 @@ def test_graph_calls_give_the_eager_result(real_world, real_plan, monkeypatch):
         config = _graph_config(num_opt_steps=100, cuda_graphs=cuda_graphs)
         box["rec"] = rec = {"steps": []}
         info = make_plan_info(world, skeleton, clone_particles(base), config)
-        optimizer = make_optimizer(config, planner_busy=planner_busy)
+        optimizer = make_optimizer(config)
         found, m, exceeded = optimizer(info, TorchTimer(), Visualizer(config, None))
         rec.update(final=clone_particles(info["particles"]), found=found, exceeded=exceeded,
                    metrics={k: v for k, v in m.items() if k not in _TIMING + _CAPTURE})
@@ -64,13 +63,10 @@ def test_graph_calls_give_the_eager_result(real_world, real_plan, monkeypatch):
         return rec
 
     e1, g1, e2, g2 = call(False), call(True), call(False), call(True)
-    busy = itertools.count()
-    gd = call(True, planner_busy=lambda: next(busy) < 7)    # as test_deferred_capture_after_planner_ends
-    assert [c["capture"] for c in (e1, g1, e2, g2, gd)] == [("absent",) * 2, (0, 4), ("absent",) * 2, (0, 4), (7, 9)]
-    assert next(busy) == 8 and all(len(c["steps"]) == 100 for c in (e1, g1, e2, g2, gd))
+    assert [c["capture"] for c in (e1, g1, e2, g2)] == [("absent",) * 2, (0, 4), ("absent",) * 2, (0, 4)]
+    assert all(len(c["steps"]) == 100 for c in (e1, g1, e2, g2))
     assert bitwise_diffs(e1["steps"][0]["particles"], e1["steps"][-1]["particles"])  # the recording isn't vacuous
     for name, got, want in (("G1 vs E1", g1, e1),       # the claim
                             ("E2 vs E1", e2, e1),       # the graph call leaves no state behind
-                            ("G2 vs G1", g2, g1),       # a recaptured call gives the same result
-                            ("Gd vs E1", gd, e1)):      # so does a capture deferred to mid-call
+                            ("G2 vs G1", g2, g1)):      # a recaptured call gives the same result
         assert_bitwise(*({k: v for k, v in c.items() if k != "capture"} for c in (got, want)), name, raw=True)

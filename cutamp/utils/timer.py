@@ -24,20 +24,11 @@ class TorchTimer:
         self._metrics: Dict[str, List[float]] = defaultdict(list)
         self._start_time: Dict[str, float] = {}
 
-    def has_timer(self, metric: str) -> bool:
-        return metric in self._start_time
-
     def start(self, metric: str) -> None:
         if metric in self._start_time:
             raise ValueError(f"Timer already started for {metric}")
         torch.cuda.synchronize()
         self._start_time[metric] = time.perf_counter()
-
-    def elapsed(self, metric: str) -> float:
-        if metric not in self._start_time:
-            raise ValueError(f"Timer not started for {metric}")
-        torch.cuda.synchronize()
-        return time.perf_counter() - self._start_time[metric]
 
     def stop(self, metric: str) -> float:
         if metric not in self._start_time:

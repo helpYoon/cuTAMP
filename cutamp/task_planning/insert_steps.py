@@ -2,7 +2,7 @@
 
 from cutamp.t1_domain import all_t1_operators, all_t1_step_operators
 from cutamp.task_planning.base_structs import State
-from cutamp.task_planning.search import _Node, get_valid_ground_operators
+from cutamp.task_planning.grounding import _Node, get_valid_ground_operators
 from cutamp.task_planning.tamp_structs import PlanSkeleton
 
 GAP_CHOICES = {

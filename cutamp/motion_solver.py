@@ -94,8 +94,9 @@ def _plan_arm_to_conf(
     the same trajectory (blocks_t1: 54 of 54 repeats bit-identical, none succeeded).
     """
     target_js = JointState.from_position(conf.reshape(1, -1), joint_names=list(planner.kinematics.joint_names))
-    # _disabled_world_obstacle no-ops on name=None.
-    with _disabled_world_obstacle(planner, disable_obstacle):
+    # _disabled_world_obstacle no-ops on name=None. cuRobo's trajopt differentiates its cost with autograd and never
+    # turns grad on itself; the stepped preview calls this under no_grad (step_preview.plan_predicted_step_motion).
+    with _disabled_world_obstacle(planner, disable_obstacle), torch.enable_grad():
         result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
     if not _cspace_plan_succeeded(result):
         error = RuntimeError(f"cspace-anchored plan failed for {ground_op}")
@@ -370,17 +371,13 @@ def _held_obj_poses(world: TAMPWorld, planner, held: dict, plan: JointState) -> 
 
 def build_motion_planner(world: TAMPWorld, use_cuda_graph: bool = True, *, initial_soles=None, robot_cfg=None) -> MotionPlanner:
     """Build the trajopt planner on ``world.model``, colliding with the world's Scene with the movables included
-    (so attached objects are part of the collision world during planning). Safe to run on a background
-    thread concurrently with the Adam loop because it runs no solves.
+    (so attached objects are part of the collision world during planning).
 
-    No ``planner.warmup()``: its solves would capture CUDA graphs on this
-    thread, and cuRobo captures in CUDA's global mode, where the main thread's
-    allocations and syncs fail mid-capture. The first ``plan_cspace`` captures
-    instead (~1 s), on the main thread after the join; every later segment has
-    the same shape and replays. The RRT captures its own (always, whatever
-    ``use_cuda_graph``) on its first graph-seeded attempts, also on the main thread:
-    ~0.9 s, plus ~20 s the first time a machine compiles its kernels, which Warp
-    caches on disk.
+    No ``planner.warmup()``: the first ``plan_cspace`` captures its CUDA graphs
+    instead (~1 s); every later segment has the same shape and replays. The RRT
+    captures its own (always, whatever ``use_cuda_graph``) on its first
+    graph-seeded attempts: ~0.9 s, plus ~20 s the first time a machine compiles
+    its kernels, which Warp caches on disk.
     """
     return get_t1_motion_planner(
         world.model,
@@ -571,11 +568,8 @@ def solve_curobo(
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
-    ``get_planner`` returns a pre-built planner — the
-    overlap path: algorithm.py starts ``build_motion_planner`` on a thread
-    when the optimization loop starts, and the timer below then measures
-    only the residual wait. It does not warm it up
-    (``build_motion_planner``).
+    ``get_planner`` returns the planner: on a standing plan ``_run_step_planner``'s, which builds
+    ``build_motion_planner`` (no warmup) on its first call; on a stepped preview ``PredictedSteppedMotion.get_planner``.
     ``ik_tol``: the tolerances the run's checker holds every IK conf to, which the pre and post confs of the picks and
     places meet too (``_approach_confs``).
     ``max_attempts`` is each segment's plan_cspace budget (``_plan_arm_to_conf``).
@@ -594,9 +588,7 @@ def solve_curobo(
     # disabled movable, and blocks at its placements, all of which corrupt the
     # retry attempt.
     _reset_attachment_state(planner, world)
-    # The fixed-feet baseline (step_mode off) keeps cuRobo's arm paths and checks the balance gate and the palm line only.
-    baseline = config.step_mode == "off"
-    self_collision = None if baseline else SelfCollisionCost(SelfCollisionCostCfg(
+    self_collision = SelfCollisionCost(SelfCollisionCostCfg(
         weight=world.device_cfg.to_device([1.0]), device_cfg=world.device_cfg,
         self_collision_kin_config=planner.kinematics.get_self_collision_config(),
     ))
@@ -645,9 +637,8 @@ def solve_curobo(
                 if not compatible_boundary(boundary_errors(start.position[0], start.velocity[0],
                             last_js.position.reshape(-1), last_js.velocity.reshape(-1))).all():
                     raise _gate_error("handoff", "Supported trajectory cannot connect to the arriving state and velocity")
-            if not baseline:
-                _check_supported_path_geometry(planner, world, self_collision, accepted, dt)
-                _check_path_rates(planner, accepted)
+            _check_supported_path_geometry(planner, world, self_collision, accepted, dt)
+            _check_path_rates(planner, accepted)
             if line:
                 palm = _hand_poses(world, _full_positions(world, accepted), arm)[:, :3, 3]
                 check_line(palm, palm[0], _hand_poses(world, conf.reshape(1, -1), arm)[0, :3, 3])
@@ -679,7 +670,7 @@ def solve_curobo(
                             )
                     path = _interp_plan(result)
                     opposite = "right" if arm == "left" else "left"
-                    if not baseline and opposite not in held:
+                    if opposite not in held:
                         idle = getattr(world.model, opposite + "_arm")
                         def collides(candidate):
                             q = _full_positions(world, candidate)

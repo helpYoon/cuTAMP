@@ -2,15 +2,15 @@
 the coupled-reIK feature TypeErrors on first refresh."""
 import pytest
 
-from cutamp.tests.conftest import needs_cuda, needs_graspgenx
+from cutamp.tests.conftest import BLOCKS_T1_ACTIONS, needs_cuda, needs_graspgenx, standing_skeleton
 
 
 @needs_cuda
 @needs_graspgenx
 @pytest.mark.parametrize("cuda_graphs", [False, True])
 def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
-    """Run cutamp_demo with coupled re-IK for a few Adam steps: no exception, and the balance-first
-    refresh runs on the run's world."""
+    """Run cutamp_demo with coupled re-IK for a few Adam steps, on blocks_t1's standing plan (``BLOCKS_T1_ACTIONS``):
+    no exception, and the balance-first refresh runs on the run's world."""
     # Lazy import inside the test so pytest collection doesn't pull in torch/cuda.
     from cutamp.config import TAMPConfiguration
     import os
@@ -31,9 +31,17 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
         monkeypatch.setattr(optimize_plan, name, counted)
 
     spy("_refresh_balanced", 2)  # (particles, ik_deps, world, gate, step)
+    calls, optimize = [], optimize_plan.ParticleOptimizer.__call__
+
+    def optimize_spy(self, *args, **kwargs):
+        result = optimize(self, *args, **kwargs)
+        calls.append(result[1])
+        return result
+
+    monkeypatch.setattr(optimize_plan.ParticleOptimizer, "__call__", optimize_spy)
+    standing_skeleton(monkeypatch, *BLOCKS_T1_ACTIONS)  # the Adam loop that owns coupled re-IK
 
     config = TAMPConfiguration(
-        step_mode="off",  # Exercise the fixed-feet Adam loop that owns coupled re-IK.
         num_particles=8,
         num_opt_steps=5,
         reik_interval=2,
@@ -47,11 +55,8 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     # cutamp_demo returns without raising if the coupled re-IK path is healthy.
     cutamp_demo(env, config)
 
-    import glob, json
-
-    opt_files = sorted(glob.glob(str(tmp_path / "**" / "optimization" / "opt_*.json"), recursive=True))
-    assert opt_files, "no optimization metrics written"
-    opt_metrics = json.load(open(opt_files[-1]))
+    assert calls, "no optimize call ran"
+    opt_metrics = calls[-1]
 
     # Measure-only metric, recorded in every run.
     assert "best_com_margin" in opt_metrics
@@ -60,8 +65,7 @@ def test_coupled_reik_runs_without_error(tmp_path, monkeypatch, cuda_graphs):
     assert opt_metrics["adam_gain"] == opt_metrics["best_num_satisfying"] - opt_metrics["num_satisfying"][0] >= 0
     assert isinstance(opt_metrics["restored"], bool)
 
-    # Without --motion_plan there is no planner thread, so G_step is captured at step 0, and
-    # G_refresh right after refresh #1 (reik_interval=2, so step 1).
+    # G_step is captured at step 0, and G_refresh right after refresh #1 (reik_interval=2, so step 1).
     if cuda_graphs:
         assert opt_metrics["capture_step"] == 0
         assert opt_metrics["refresh_capture_step"] == 1

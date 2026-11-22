@@ -1,205 +1,22 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+"""A* over object-bound arm choices and nominal landing sequences. ``ManipulationPrefix`` grounds the moves from one
+pick or place to the next; ``cutamp.step_search`` offers the foot landings before each."""
 
-import re
-import itertools
-from collections import defaultdict, deque
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from functools import cache
+from heapq import heappop, heappush
+from itertools import count
 from time import monotonic
-from typing import Callable, Generator, List, Optional, Sequence
 
-from .base_structs import Atom, GroundOperator, Operator, State
+import numpy as np
 
-# Maps parameter types to the base string used when sampling literal names (e.g. "q0", "left_q1").
-_BASE_NAMES = {"conf": "q", "traj": "traj", "pose": "pose", "grasp": "grasp", "sole": "sole"}
-
-
-@dataclass(frozen=True)
-class _Node:
-    state: frozenset[Atom]
-    parent: Optional["_Node"]
-    operator: Optional[GroundOperator]
-
-    def parameters(self) -> dict[str, set[str]]:
-        """Returns all the parameters ever encountered"""
-        param_type_to_literals = self.parent.parameters() if self.parent else defaultdict(set)
-
-        # All the literals in the state
-        for atom in self.state:
-            param_types = [param.type for param in atom.fluent.parameters]
-            literals = atom.values
-            for param_type, literal in zip(param_types, literals):
-                param_type_to_literals[param_type].add(literal)
-
-        # All the literals in the operator
-        if self.operator is not None:
-            for param, values in zip(self.operator.operator.parameters, self.operator.values):
-                param_type_to_literals[param.type].add(values)
-
-        return param_type_to_literals
-
-    def extract_solution(self) -> list[GroundOperator]:
-        """Extract the solution path from this node."""
-        solution = []
-        node = self
-        while node.parent is not None:
-            assert node.operator is not None
-            solution.append(node.operator)
-            node = node.parent
-        return list(reversed(solution))
-
-def _extract_number(s: str) -> int:
-    """Extract the trailing number from a string like 'q0', 'left_q5', 'grasp12'."""
-    match = re.search(r'(\d+)$', s)
-    return int(match.group(1)) if match else 0
-
-def _extract_prefix(s: str, param_type: str) -> str:
-    """Extract the prefix before the base name. E.g., 'left_q0' -> 'left_', 'q0' -> ''"""
-    base = _BASE_NAMES.get(param_type, param_type)
-
-    # Find where base name starts
-    idx = s.find(base)
-    return s[:idx] if idx > 0 else ""
-
-def get_valid_ground_operators(
-    node: _Node,
-    operators: Sequence[Operator],
-    priority_fn: Optional["Callable[[GroundOperator], float]"] = None,
-    *,
-    deadline: float | None = None,
-) -> list[GroundOperator]:
-    """
-    Get all valid ground operators by testing the operators, binding samples for the unspecified variables, and
-    checking preconditions are satisfied.
-
-    When ``priority_fn`` is provided, the returned ground operators are
-    sorted ascending by priority (smaller = explored first by BFS). This
-    biases BFS exploration without changing search correctness — all valid
-    ground ops are still returned, just in a different order.
-    """
-    ground_ops = []
-    state = node.state
-
-    # Fluent names to their corresponding atoms
-    fluent_to_atoms: dict[str, set[Atom]] = defaultdict(set)
-    for atom in state:
-        fluent_to_atoms[atom.name].add(atom)
-
-    # Walk the node chain once; each operator below gets a fresh copy so the placeholder
-    # names sampled for one operator don't leak into the next.
-    base_param_type_to_literals = node.parameters()
-
-    # For each operator, we try to ground it given the current state
-    for operator in operators:
-        param_type_to_literals: dict[str, set[str]] = defaultdict(set)
-        for param_type, literals in base_param_type_to_literals.items():
-            param_type_to_literals[param_type] = set(literals)
-
-        # Sample new parameter names, handling both prefixed (left_q0) and unprefixed (q0) formats.
-        # Determine arm prefix
-        op_name = operator.name
-        arm_prefix = ""
-        if op_name.startswith("Left"):
-            arm_prefix = "left_"
-        elif op_name.startswith("Right"):
-            arm_prefix = "right_"
-        
-        def _sample_param_type(param_type: str) -> str:
-            if param_type not in param_type_to_literals:
-                # For dual-arm operators, use arm prefix for conf parameters.
-                if arm_prefix and param_type == "conf":
-                    return f"{arm_prefix}{_BASE_NAMES.get(param_type, param_type)}1"
-                return f"{_BASE_NAMES.get(param_type, param_type)}1"
-
-            literals = param_type_to_literals[param_type]
-            base = _BASE_NAMES.get(param_type)
-            if base is None:
-                raise NotImplementedError(f"Unknown param type: {param_type}")
-            
-            # Group literals by prefix and find max number for each prefix
-            prefix_to_max = defaultdict(lambda: -1)
-            for lit in literals:
-                prefix = _extract_prefix(lit, param_type)
-                num = _extract_number(lit)
-                prefix_to_max[prefix] = max(prefix_to_max[prefix], num)
-            
-            # For dual-arm operators with conf parameters, use the arm-specific prefix
-            if arm_prefix and param_type == "conf":
-                max_num = prefix_to_max.get(arm_prefix, -1)
-                return f"{arm_prefix}{base}{max_num + 1}"
-            
-            # Find the prefix with the highest max number and increment it
-            # This ensures we generate unique names across all prefixes
-            best_prefix = ""
-            best_max = -1
-            for prefix, max_num in prefix_to_max.items():
-                if max_num > best_max:
-                    best_max = max_num
-                    best_prefix = prefix
-            
-            return f"{best_prefix}{base}{best_max + 1}"
-
-        def sample_param_type(param_type: str) -> str:
-            new_sample = _sample_param_type(param_type)
-            param_type_to_literals[param_type].add(new_sample)
-            return new_sample
-
-        # 1. Check all preconditions are satisfied, and map each parameter to it's associated values in the ground atom
-        param_to_literals: dict[str, set[str]] = defaultdict(set)
-        pre_check = True
-        for pre_fluent in operator.preconditions:
-            if pre_fluent.name not in fluent_to_atoms:
-                pre_check = False
-                break
-
-            # Bind the operator parameters to their values in the ground atom
-            atoms = fluent_to_atoms[pre_fluent.name]
-            for atom in atoms:
-                if len(atom.values) != len(pre_fluent.parameters):
-                    raise RuntimeError(
-                        f"Number of values in atom {atoms} does not match number of parameters in {pre_fluent}"
-                    )
-                for param, value in zip(pre_fluent.parameters, atom.values):
-                    param_to_literals[param.name].add(value)
-
-        if not pre_check:
-            continue
-
-        # 2. Since we're dealing with funny planning, some of the parameters might not be bound. We need to check and
-        # sample placeholder values for them.
-        for param in operator.parameters:
-            if param.name not in param_to_literals:
-                sampled_value = sample_param_type(param.type)
-                param_to_literals[param.name].add(sampled_value)
-
-        if len(param_to_literals) != len(operator.parameters) + len(operator.context_defaults):
-            raise RuntimeError(
-                f"Number of parameter bindings {len(param_to_literals)} "
-                f"does not match number of parameters in {operator}"
-            )
-
-        # 3. Generate all combinations of the parameter bindings, so we ground the operator
-        param_names = list(param_to_literals.keys())
-        for combo in itertools.product(*param_to_literals.values()):
-            if deadline is not None and monotonic() >= deadline:
-                return []
-            substitutions = dict(zip(param_names, combo))
-            ground_op = operator.ground(substitutions)
-
-            # Check preconditions are satisfied
-            if ground_op.preconditions.issubset(state):
-                ground_ops.append(ground_op)
-
-    if priority_fn is not None:
-        # Stable sort: equal-priority groundings preserve declaration order.
-        ground_ops.sort(key=priority_fn)
-    return ground_ops
+from cutamp.reachability import _rot, canonical_stance
+from cutamp.step_search import Schedule, TargetRegion
+from cutamp.task_planning.base_structs import GroundOperator, Operator, State
+from cutamp.task_planning.grounding import _Node, get_valid_ground_operators
+from cutamp.task_planning.insert_steps import with_steps
+from cutamp.task_planning.tamp_structs import PlanSkeleton
 
 
 def _search_key(state: State) -> State:
@@ -207,65 +24,180 @@ def _search_key(state: State) -> State:
     return frozenset(atom for atom in state if atom.fluent.tells_states_apart)
 
 
-def breadth_first_search(
-    initial_state: State,
-    goal_state: State,
-    operators: Sequence[Operator],
-    ground_op_priority_fn: Optional[Callable[[GroundOperator], float]] = None,
-    *,
-    deadline: float | None = None,
-) -> Generator[List[GroundOperator], None, None]:
-    """
-    Performs a breadth-first search to find a solution to the given planning problem.
+class ManipulationPrefix:
+    """A symbolic prefix shared by the different foot landings for its last action."""
 
-    Parameters
-    ----------
-    initial_state: State
-    goal_state: State
-    operators: List[Operator]
-        The possible operators for the given search problem.
-    ground_op_priority_fn: Optional[Callable[[GroundOperator], float]]
-        Optional priority function for biased BFS sibling ordering.
-        When provided, ground operators returned at each expansion are
-        sorted ascending by priority. Used by the arm-affinity feature
-        to prefer same-side picks. Does not affect search correctness —
-        all valid ground ops are still enumerated, just in priority order.
+    def __init__(self, initial: State | _Node, goal: State, operators: Sequence[Operator], *, deadline=None):
+        self._node = initial if isinstance(initial, _Node) else _Node(initial, None, None)
+        self._goal = goal
+        self._operators = operators
+        self._deadline = deadline
+        self._children = None
+        op = self._node.operator
+        self.action = op if op and op.operator.metadata.is_actionable else None
+        self.complete = goal.issubset(self._node.state)
+        incoming = self._node.parent.state if self.action else self._node.state
+        self.loaded = any(fact.name in ("LeftHolding", "RightHolding") for fact in incoming)
 
-    Returns
-    -------
-    Generator[List[GroundOperator], None, None]
-        A generator that yields plans which are lists of ground operators.
-    """
-    # Sanity check, make sure the initial and goal state contain atoms only
-    for elem in initial_state:
-        if not isinstance(elem, Atom):
-            raise ValueError(f"Initial state must contain only atoms, got {elem.__class__.__name__} {elem}")
-    for elem in goal_state:
-        if not isinstance(elem, Atom):
-            raise ValueError(f"Goal state must contain only atoms, got {elem.__class__.__name__} {elem}")
+    def skeleton(self) -> list[GroundOperator]:
+        return self._node.extract_solution()
 
-    initial_node = _Node(state=initial_state, parent=None, operator=None)
-    frontier: deque[_Node] = deque([initial_node])
-    explored: set[State] = {_search_key(initial_node.state)}
+    def choices(self) -> tuple["ManipulationPrefix", ...]:
+        """Ground intermediate motions up to the next task action or satisfied goal."""
+        if self.complete or (self._deadline is not None and monotonic() >= self._deadline):
+            return ()
+        if self._children is None:
+            children = []
+            frontier = deque([self._node])
+            seen = {_search_key(self._node.state)}
+            while frontier:
+                if self._deadline is not None and monotonic() >= self._deadline:
+                    return ()
+                node = frontier.popleft()
+                ops = get_valid_ground_operators(node, self._operators, deadline=self._deadline)
+                for op in sorted(ops, key=lambda op: op.name):
+                    if self._deadline is not None and monotonic() >= self._deadline:
+                        return ()
+                    state = op.apply(node.state)
+                    child = _Node(state, node, op)
+                    if op.operator.metadata.is_actionable or self._goal.issubset(state):
+                        children.append(ManipulationPrefix(child, self._goal, self._operators, deadline=self._deadline))
+                    else:
+                        key = _search_key(state)
+                        if key not in seen:
+                            seen.add(key)
+                            frontier.append(child)
+            self._children = tuple(children)
+        return self._children
 
-    while frontier and (deadline is None or monotonic() < deadline):
-        node = frontier.popleft()
 
-        # Check if goal is satisfied
-        if goal_state.issubset(node.state):
-            plan = node.extract_solution()
-            yield plan
-            continue  # stop exploring this branch as we already satisfied the goal
+@dataclass
+class RankedStepSkeleton:
+    """A task plan with its steps inserted, the foot order (``none``, ``L``, ``R``, ``LR`` or ``RL``) before each pick
+    and place, and the landing path the A* ranked it by. Every particle starts its landings at the path's commands
+    (:func:`cutamp.step_particles._landing_starts`)."""
 
-        # Get successor and add to frontier
-        ground_ops = get_valid_ground_operators(node, operators, priority_fn=ground_op_priority_fn, deadline=deadline)
-        for ground_op in ground_ops:
-            successor_state = ground_op.apply(node.state)
+    skeleton: PlanSkeleton
+    orders: tuple[str, ...]
+    schedule: Schedule
+    arm_approach_m: float | None = None
 
-            # If the successor state hasn't been explored, add it to the frontier.
-            # Also if successor is a goal state (we want different ways of getting to the goal)
-            key = _search_key(successor_state)
-            if key not in explored or goal_state.issubset(successor_state):
-                child = _Node(state=successor_state, parent=node, operator=ground_op)
-                frontier.append(child)
-                explored.add(key)
+    @property
+    def cost(self) -> tuple[int, int]:
+        return self.schedule.cost
+
+    @property
+    def step_count(self) -> int:
+        return sum(len(order) for order in self.orders if order != "none")
+
+
+@dataclass(frozen=True, slots=True)
+class _Branch:
+    prefix: ManipulationPrefix
+    feet: tuple
+    edges: tuple = ()
+    targets: tuple = ()
+    pending: bool = False
+    approach: float = 0.
+    gap: float = 0.
+    missing_reach: bool = False
+    unresolved: int = 0
+    steps: int = 0
+    remaining: float = 0.
+
+    @property
+    def priority(self):
+        return self.missing_reach, self.approach + self.gap + self.remaining, self.unresolved, self.steps
+
+
+def arm_step_skeletons(search, world, operators, incoming, *, max_base_plans, admitted, deadline=None):
+    """Score a bound pick before querying its step edges."""
+    root = ManipulationPrefix(world.initial_state, world.goal_state, operators, deadline=deadline)
+    feet = tuple(tuple(row) for row in incoming)
+    _, initial_frame = canonical_stance(feet)
+    palms = {}
+    for arm, position in world.arm_home_ee_world.items():
+        xyz = position.detach().cpu().numpy().astype(float)
+        palms[arm] = ((xyz[:2] - initial_frame[:2]) @ _rot(-initial_frame[2]), xyz[2])
+
+    # A known object origin can still guide the approach when bounds for a reach query are missing.
+    @cache
+    def pick_point(name):
+        obj = world.get_object(name)
+        point = TargetRegion.pick("left", obj).center
+        if point is None and getattr(obj, "pose", None) is not None:
+            point = tuple(obj.pose[:3])
+        return point
+
+    # Planar footsteps cannot reduce the vertical component of a future pick.
+    unpicked = {a.values[0] for a in world.initial_state if a.name == "HasNotPickedUp"}
+    required = {a.values[0] for a in world.goal_state - world.initial_state
+                if a.name in ("On", "LeftHolding", "RightHolding")}
+    vertical = {}
+    for obj in sorted(unpicked & required):
+        center = pick_point(obj)
+        if center is not None:
+            vertical[obj] = min(abs(z - center[2]) for _, z in palms.values())
+
+    # Many different landing paths lead to the same symbolic choice.
+    @cache
+    def target_for(prefix):
+        op = prefix.action
+        meta = op.operator.metadata
+        obj = world.get_object(op.arg("obj"))
+        if meta.action_type == "pick":
+            return TargetRegion.pick(meta.arm, obj, loaded=prefix.loaded)
+        return TargetRegion.place(meta.arm, obj, world.get_object(op.arg("surface")))
+
+    serial = count()
+    queue = []
+
+    def push(branch):
+        heappush(queue, (branch.priority, next(serial), branch))
+
+    push(_Branch(root, feet, remaining=sum(vertical.values())))
+    while queue and (deadline is None or monotonic() < deadline):
+        _, _, node = heappop(queue)
+        if node.pending:
+            for edge in search.edges(node.feet, node.targets[-1]):
+                unresolved, steps = edge.cost
+                push(replace(
+                    node, feet=edge.soles, edges=(*node.edges, edge), pending=False,
+                    gap=max(node.gap, edge.distance_m or 0.),
+                    missing_reach=node.missing_reach or edge.distance_m is None,
+                    unresolved=node.unresolved + unresolved, steps=node.steps + steps,
+                ))
+            continue
+
+        if node.prefix.complete:
+            skeleton = node.prefix.skeleton()
+            identity = tuple(op.name for op in skeleton)
+            if identity not in admitted and len(admitted) >= max_base_plans:
+                continue
+            orders = tuple(e.order for e in node.edges)
+            if identity not in admitted:
+                admitted[identity] = skeleton, set()
+            _, seen = admitted[identity]
+            if orders not in seen:
+                seen.add(orders)
+                gaps = {i: order for i, order in enumerate(orders) if order != "none"}
+                stepped = with_steps(skeleton, gaps, world.initial_state, world.goal_state)
+                yield RankedStepSkeleton(stepped, orders, Schedule(node.edges, (node.unresolved, node.steps)), node.approach)
+            continue
+
+        for child in node.prefix.choices():
+            if child.action is None:
+                push(replace(node, prefix=child))
+                continue
+            target = target_for(child)
+            approach = node.approach
+            remaining = node.remaining
+            point = pick_point(child.action.arg("obj")) if child.action.operator.metadata.action_type == "pick" else None
+            if point is not None:
+                _, frame = canonical_stance(node.feet)
+                local_palm, z = palms[target.arm]
+                xy = frame[:2] + local_palm @ _rot(frame[2])
+                approach += float(np.linalg.norm(np.r_[xy, z] - point))
+                remaining = max(0., remaining - vertical.get(child.action.arg("obj"), 0.))
+            push(replace(node, prefix=child, targets=(*node.targets, target), pending=True,
+                         approach=approach, remaining=remaining))

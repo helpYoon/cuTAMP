@@ -67,7 +67,7 @@ class CostFunction:
         require_fixed_stance(plan_skeleton)
         self.plan_skeleton = plan_skeleton
         self.world = world
-        self.config = config.for_refinement(stepped=False)
+        self.config = config
 
         self.retract_info = get_retract_parameters(plan_skeleton)
         # The same target soles used for the wrist pose's sole-lock check.
@@ -469,13 +469,12 @@ class CostFunction:
         com_polygon_cost = self.com_polygon_constraint(achieved_stances)
         add_cost(ComPolygon.type, com_polygon_cost)
 
-        if self.config.step_mode != "off":  # the fixed-feet baseline has ComPolygon only
-            margin = (
-                margin_from_support_planes(rollout["com_xy"], *self.support_planes) if stances is None
-                else physical_support_margin(rollout["com_xy"], stances, self.world.model.sole_box)
-            )
-            shortfall = (self.config.com_comfort_margin_m - margin).clamp_min(0)
-            add_cost(ComComfort.type, {"type": "constraint", "values": {"margin_shortfall_squared": shortfall.square()}})
+        margin = (
+            margin_from_support_planes(rollout["com_xy"], *self.support_planes) if stances is None
+            else physical_support_margin(rollout["com_xy"], stances, self.world.model.sole_box)
+        )
+        shortfall = (self.config.com_comfort_margin_m - margin).clamp_min(0)
+        add_cost(ComComfort.type, {"type": "constraint", "values": {"margin_shortfall_squared": shortfall.square()}})
 
         # Soft costs
         if self.config.soft_cost or self.config.com_center_weight:

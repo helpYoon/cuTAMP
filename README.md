@@ -17,9 +17,9 @@ from tag `paper-g1-comfix`. Both need the cuRobo fork helpYoon/curobo (with
 > - a URDF link with no inertial weighs 0, not cuRobo's 0.01 kg (the T1 has
 >   11: `world` and the 10 gripper links);
 > - one warp stream wrapper per CUDA stream: warp 1.16.0 registers every new
->   wrapper in a native stream map with no lock, so the background
->   motion-planner build thread, launching beside the main thread, would
->   corrupt the heap (`malloc(): unaligned tcache chunk detected`);
+>   wrapper in a native stream map with no lock, so two threads launching
+>   cuRobo kernels at once would corrupt the heap (`malloc(): unaligned tcache
+>   chunk detected`);
 > - trajopt's transitions compute the CoM and run RNEA a second time with the
 >   floor's push on the soles (`set_external_wrench_fn`, installed by
 >   `floor_wrench.install_floor_wrench`);
@@ -139,9 +139,10 @@ export GRASPGENX_CHECKPOINT_DIR=$M GRASPGENX_GRIPPER_CFG_DIR=~/graspgenx-model/n
 
 The planner runs GraspGenX in its own process, and there is no grasp server or
 grasp file. Its model loads once per process, on a background thread that
-starts when planning starts (`start_sampler_load`). When a plan skeleton first
-picks an object, `grasp_sets` ([`cutamp/grasps.py`](cutamp/grasps.py)) waits
-for that load and makes that object shape's 6-DoF grasps once
+starts when planning starts with motion planning on (`start_sampler_load`);
+with `--no-motion_plan` the first `grasp_sets` call loads it. When a plan
+skeleton first picks an object, `grasp_sets` ([`cutamp/grasps.py`](cutamp/grasps.py))
+waits for that load and makes that object shape's 6-DoF grasps once
 (`generate_grasps`, about 1.6 s: the rest of the load, then the sampling;
 timed apart from the planning time). An object that no skeleton picks gets no
 grasps. It
@@ -172,8 +173,7 @@ graph LR
 1. **Task planning** — Automatic stepping A* with a nominal hand map puts arm,
    object and foot choices in one queue. It charges the nominal palm-to-object
    distance when a pick chooses its hand, then scores reach and landing evidence
-   for the candidate steps. Fixed-stance planning uses breadth-first symbolic
-   search with a pick-distance preference.
+   for the candidate steps.
 2. **Particle initialization** — `ParticleInitializer`
    (`particle_initialization.py`) seeds a batch of candidate grasps / placements
    / configs and solves each pick / place conf with GN IK
@@ -203,7 +203,11 @@ graph LR
    (`place_4dof_sampler`), its yaw turned so the held grasp approaches from the
    robot's side. The rows whose IK fails draw again, up to
    `GRASP_REDRAW_ROUNDS` times, a pick from its chosen grasps. Grasps are never
-   optimized.
+   optimized. A plan with steps starts its particles in `step_particles.py`
+   instead: every particle starts each step's landing at the command the A*
+   chose for it (a `reachability.COMMANDS` entry, mirrored for a right swing),
+   takes the pick's grasps in score order and starts its IK from the posture
+   held before the gap's steps; Adam then moves each particle's landings.
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic — the hand's pose and both soles on the stance — motion,
@@ -222,13 +226,16 @@ graph LR
    best-seen particles. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
    up to `motion_plan_max_retries` satisfying particles, first success wins,
-   taken round their grasp groups (`get_top_satisfying_particles`: groups
+   in `get_top_satisfying_particles`' order: the worst pick or place CoM
+   distance to the support centroid first, then secondary effort. Each
+   candidate gets 2 `plan_cspace` attempts per segment and, if it ran out of
+   them, cuRobo's 20, before the next candidate is tried. With
+   `--com_center_weight 0` the candidates go round their grasp groups (groups
    whose grasps all score 0.7 or more first, then upright first on each
-   group's best particle by soft cost), through `motion_solver.py`: one
-   `MotionPlanner` over the model's cspace, built on a background thread while
-   the optimizer runs, and planned to each particle conf with `plan_cspace` (2
-   attempts per segment; if no particle plans, those that ran out of attempts
-   get cuRobo's 20), so a pick or place
+   group's best particle by soft cost), and every candidate gets its 2-attempt
+   pass before any gets 20. They plan through `motion_solver.py`: one
+   `MotionPlanner` over the model's cspace, built on the first motion-plan
+   attempt, and planned to each particle conf with `plan_cspace`, so a pick or place
    ends exactly at the conf the optimizer approved and cuRobo can't
    re-resolve the redundancy at the endpoint. Each pick and place is three
    segments: an approach to a pre conf, a straight insert to the particle conf
@@ -494,9 +501,11 @@ provenance.
   (`grasps.py`).
 
 - [`task_planning/`](cutamp/task_planning/) — the symbolic layer:
-  `task_plan_generator` runs breadth-first search (`search.py`) over the domain
-  structs (`tamp_structs.py`, `base_structs.py`, `constraints.py`, `costs.py`)
-  to emit plan skeletons.
+  `search.py` (the A* over hands, objects and footsteps, `arm_step_skeletons`,
+  whose `ManipulationPrefix` grounds the moves between picks and places),
+  `grounding.py` (the actions whose preconditions hold in a state) and
+  `insert_steps.py`, over the domain structs (`tamp_structs.py`,
+  `base_structs.py`, `constraints.py`, `costs.py`).
 
 - [`t1_domain.py`](cutamp/t1_domain.py) — TAMP domain (fluents + operators)
   for T1, built per arm by one factory for the fluents and one for the
@@ -506,8 +515,7 @@ provenance.
   `Right…` twins.
 
 - [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
-  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 128 for
-  learned step Adam (256 with `step_mode="off"`);
+  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 128;
   `soft_cost=["place_close_to_base", "joint_limit_margin",
   "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
   balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
@@ -650,8 +658,8 @@ live `--cuda_graphs` runs in
 ## Usage
 
 The default T1 planner uses A* to choose a hand and an ordered footstep sequence
-for each pick and place. It requests 64 grasps per object from GraspGen-X and
-refines 128 particles with Adam. Grasp and placement costs reach the foot
+for each pick and place. It requests one GraspGen-X grasp per particle for each
+object (128 by default) and refines the particles with Adam. Grasp and placement costs reach the foot
 commands through stance IK and the trained whole-step model. The place cost
 also differentiates through the 50 post-retract controller ticks. A batch stops
 after five updates without a cumulative 1 mm improvement in its best feasible
@@ -673,54 +681,40 @@ seed is 641. The planner generates fresh grasp candidates and chooses the footst
 on each invocation. Use `--seed` to try another draw. Select the `curobo` timeline
 in Rerun to play the complete motion.
 
-The fixed-feet route (`--step_mode off`) is the planner from before stepping,
-on the current robot model: 256 particles by default, GraspGenX's full grasp
-pool, no CoM-centring cost or 5 cm comfort margin, the first satisfying skeleton,
-and the soft costs `place_close_to_base`, `joint_limit_margin` and
-`minimize_body_movement`, optimized under re-IK-coupled Adam with the
-balance-first GN refresh replayed as CUDA graphs, and balance-first GN IK, so
-placements stay near the base, the body stays near its home, and every
-arrival lands with its CoM inside the keyframe rectangle
-(`joint_limit_margin` has no band: the limits are already bfm_wm's soft
-limits). With `--motion_plan`, every trajectory frame also keeps both soles
-on the stance and its CoM and ZMP inside the soles shrunk 2 cm: the gate slows
-each segment as needed, up to 4×, and a candidate that still fails is dropped
-(`motion_solver._balance_gate`).
-
 ```bash
 # Right-side four-step benchmark, with a complete motion in Rerun
 uv run python -m cutamp.scripts.run_cutamp --env two_steps_right_transfer --motion_plan
 
-# Fixed-feet smoke test (keyframes)
-uv run python -m cutamp.scripts.run_cutamp --step_mode off -n 16 --num_opt_steps 50
-
 # Full run with motion planning, no visualizer
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --disable_visualizer
+uv run python -m cutamp.scripts.run_cutamp -n 64 --disable_visualizer
 
 # With Rerun visualizer
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64
+uv run python -m cutamp.scripts.run_cutamp -n 64
 
 # Save the raw plan (stage4-raw) next to the run's metrics
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --save_plan auto
+uv run python -m cutamp.scripts.run_cutamp -n 64 --save_plan auto
 
 # Another scene: the shelf (at height 0), or the cylinder or the cup on a 0.5 m table top
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --env shelf_t1
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --env cylinder_t1 --surface_height 0.5
+uv run python -m cutamp.scripts.run_cutamp -n 64 --env shelf_t1
+uv run python -m cutamp.scripts.run_cutamp -n 64 --env cylinder_t1 --surface_height 0.5
 
 # Different soft costs (replaces the default list)
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan \
+uv run python -m cutamp.scripts.run_cutamp \
     --soft_cost retract_close_to_home minimize_body_movement
 
 # Eager Adam steps and refreshes (no CUDA graphs)
-uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan --no_cuda_graphs
+uv run python -m cutamp.scripts.run_cutamp --no_cuda_graphs
 
 # Several runs, each saving its plan, then the real-leg report over them
 for s in 0 1 2; do
-    uv run python -m cutamp.scripts.run_cutamp --step_mode off --motion_plan -n 64 --save_plan auto \
+    uv run python -m cutamp.scripts.run_cutamp -n 64 --save_plan auto \
         --disable_visualizer --seed $s --experiment_root /tmp/study --experiment_id run_s$s
 done
 uv run python -m cutamp.scripts.real_legs_report --study /tmp/study --out /tmp/study/real_legs
 ```
+
+The report measures sole drift from the home stance, so its sole-drift columns
+mean something only for plans that take no step.
 
 `uv run python -m cutamp.scripts.run_cutamp -h` lists every option.
 
@@ -762,7 +756,7 @@ skips the robot's meshes; both cut bandwidth.
 ## Troubleshooting
 
 - **`torch.OutOfMemoryError: CUDA out of memory`** — use fewer particles
-  (default 128, or 256 with `--step_mode off`),
+  (default 128),
   e.g. `-n 32`.
 
 ## Key Design Decisions

@@ -103,8 +103,7 @@ def test_drops_run_per_arm(real_world):
         assert torch.equal(candidates.grasps, grasps.grasps[keeps[arm]]), arm
         assert torch.equal(candidates.scores, grasps.scores[keeps[arm]]), arm
         assert world.grasp_candidates(obj, arm) is candidates, arm  # made once, then kept
-    # The left hand keeps 242 of blocks_t1's 4,100 grasps and the right 241; 7 are kept for one hand only (2026-11-07).
-    assert int((keeps["left"] ^ keeps["right"]).sum()) > 0
+    assert not torch.equal(world.hand_spheres("left"), world.hand_spheres("right"))
 
 
 @needs_cuda
@@ -125,11 +124,10 @@ def test_pick_pool_is_every_grasp_the_hand_can_take(real_world):
 
 
 def _first_plan(world):
-    """``(skeleton, obj, arm)``: blocks_t1's first task plan, and its first pick's object and arm."""
-    from cutamp.t1_domain import all_t1_operators
-    from cutamp.task_planning import task_plan_generator
+    """``(skeleton, obj, arm)``: blocks_t1's task plan (``BLOCKS_T1_ACTIONS``), and its first pick's object and arm."""
+    from cutamp.tests.conftest import BLOCKS_T1_ACTIONS, skeleton_through
 
-    skeleton = next(task_plan_generator(world.initial_state, world.goal_state, all_t1_operators))
+    skeleton = skeleton_through(world.initial_state, world.goal_state, *BLOCKS_T1_ACTIONS)
     pick = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     return skeleton, pick.values[0], pick.operator.metadata.arm
 
@@ -270,8 +268,9 @@ def test_a_moved_placement_rechecks_the_later_steps(monkeypatch):
 
 @needs_cuda
 def test_floor_picks_choose_upright_grasps(real_world):
-    # blocks_t1 on the floor (real_world), n 64, seed 0. Each pick chooses ten balanced grasps at 0.7 or more (G2,
-    # G5; test_grasp_choice pins their order), and every particle holds one of them. The first pick's scene is the pool
+    # blocks_t1 on the floor (real_world), n 64, seed 0. Each pick chooses ten balanced grasps: those at 0.7 or more
+    # first, then the best-scoring ones below it (G2, G5; test_grasp_choice pins their order), and every particle
+    # holds one of them. The first pick's scene is the pool
     # walk's, so its particles take the ten in turn with the pool walk's confs, accepted as they are (G4).
     import cutamp.particle_initialization as pi
     from cutamp.config import TAMPConfiguration
@@ -284,7 +283,9 @@ def test_floor_picks_choose_upright_grasps(real_world):
     picks = [op for op in skeleton if op.operator.metadata.action_type == "pick"]
     assert [c.grasp for c in init.grasp_choice] == [op.values[1] for op in picks]
     for c in init.grasp_choice:
-        assert len(c.chosen) == 10 and c.ok[c.chosen].all() and (c.scores[c.chosen] >= GRASP_SCORE_CUTOFF).all()
+        high = min(10, int((c.ok & (c.scores >= GRASP_SCORE_CUTOFF)).sum()))
+        assert len(c.chosen) == 10 and c.ok[c.chosen].all()
+        assert (c.scores[c.chosen] >= GRASP_SCORE_CUTOFF).tolist() == [True] * high + [False] * (10 - high)
         assert (particles[c.grasp][:, None] == c.grasps[c.chosen][None]).all(-1).any(-1).all()
     first, q = init.grasp_choice[0], picks[0].values[2]
     rank = first.chosen[torch.arange(64, device=first.chosen.device) % 10]

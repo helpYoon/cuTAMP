@@ -5,13 +5,16 @@ from itertools import product
 import pytest
 
 from cutamp import t1_domain as domain
-from cutamp.task_planning import task_plan_generator
+from cutamp.tests.conftest import skeleton_through
 
 
 def scene(objects=("block",)):
+    """Each object picked by its own hand (left, then right), then placed on the table in the same order."""
     initial = domain.get_initial_state(objects, ["table"])
     goal = frozenset(domain.On.ground(obj, "table") for obj in objects)
-    skeleton = next(task_plan_generator(initial, goal, domain.all_t1_operators))
+    hands = ("Left", "Right")[:len(objects)]
+    skeleton = skeleton_through(initial, goal, *[(h + "Pick", o) for h, o in zip(hands, objects)],
+                                *[(h + "Place", o) for h, o in zip(hands, objects)])
     return skeleton, initial, goal
 
 
@@ -69,7 +72,7 @@ def test_illegal_order_or_gap(gaps):
 
 
 def test_steps_obey_domain_preconditions_even_when_requested_directly():
-    from cutamp.task_planning.search import _Node, get_valid_ground_operators
+    from cutamp.task_planning.grounding import _Node, get_valid_ground_operators
 
     _, initial, _ = scene()
     root = _Node(initial, None, None)

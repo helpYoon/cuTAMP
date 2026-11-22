@@ -132,7 +132,7 @@ def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
         REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8
     )
     target = TargetRegion("left", (0.48, 0.18, 0.025), (0.05,) * 3, solid_pick=True)
-    edge = next(search.schedules(search.home, [target])).edges[0]
+    edge = min(search.edges(search.home, target), key=lambda e: e.cost)
     assert edge.order == "L" and edge.commands == ((0.24, 0.21, 0.0),)
     dynamics = torch.zeros(1, 38, device=predictor.device)
     dynamics[:, 0] = (1.0 - 0.75) / 0.45

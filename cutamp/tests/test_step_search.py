@@ -95,7 +95,7 @@ def passing(*orders):
     return records
 
 
-def test_carry_incoming_feet_and_rank_complete_paths_against_enumeration():
+def test_carry_incoming_feet_and_reset_foot_flags():
     search = StepSearch(atlas(), accuracy=passing("L", "R"), lag=8, commands=(FWD,))
     goals = (target(0.065), target(0.065))
     initial = search.edges(HOME, goals[0])
@@ -104,16 +104,7 @@ def test_carry_incoming_feet_and_rank_complete_paths_against_enumeration():
     second = search.edges(initial[1].soles, goals[1])
     assert second[0].cost == (0, 0)
     assert second[0].posture == "crouch" and second[0].witness == (42.0,)
-    exhaustive = []
-    for pick in initial:
-        for place in search.edges(pick.soles, goals[1]):
-            exhaustive.append(tuple(a + b for a, b in zip(pick.cost, place.cost)))
-    plans = list(search.schedules(HOME, goals))
-    assert [p.cost for p in plans] == sorted(exhaustive)
-    assert [e.order for e in plans[0].edges] == ["L", "none"]
-    assert (
-        any(p.edges[0].order == "L" and p.edges[1].order == "LR" for p in plans) is False
-    )  # identical first landing is illegal
+    assert "LR" not in [e.order for e in second]  # identical first landing is illegal
     another = StepSearch(atlas(), commands=(FWD, (0.24, 0.20, 0)))
     first = another.edges(HOME, goals[0])
     a = next(e for e in first if e.order == "L")
@@ -123,14 +114,12 @@ def test_carry_incoming_feet_and_rank_complete_paths_against_enumeration():
 def test_missing_map_or_region_is_finite_and_floor_collision_excludes_endpoint():
     search = StepSearch(atlas(), commands=(FWD,))
     unknown = TargetRegion("right", None, None)
-    assert next(search.schedules(HOME, [unknown])).cost == (1, 0)
+    assert min(e.cost for e in search.edges(HOME, unknown)) == (1, 0)
     assert search.edges(HOME, TargetRegion("right", (0.0, 0.0, 0.5), (0.01, 0.01, 0.01)))[0].distance_m is None
     floor = TargetRegion("left", (0.0, 0.1, 0.025), (0.05, 0.05, 0.05), solid_pick=True)
     assert "none" not in [e.order for e in search.edges(HOME, floor)]
     huge = TargetRegion("left", (0.0, 0.0, 0.025), (5.0, 5.0, 0.05), solid_pick=True)
-    assert list(search.schedules(HOME, [huge])) == []
-    (goal,) = search.schedules(HOME, [])
-    assert goal.cost == (0, 0) and goal.edges == ()
+    assert search.edges(HOME, huge) == ()
 
 
 def test_only_objects_that_intersect_the_sole_height_band_block_a_landing():
@@ -167,18 +156,6 @@ def test_matching_signed_commands_only_and_transferred_prior():
     assert moved.cost == l.cost and moved.accuracy == "transferred"
     assert search.edges(HOME, target(0.065, loaded=True))[1].cost == (1, 1)
     assert StepSearch(atlas(), commands=(FWD,), lag=8).edges(HOME, query)[1].cost == (1, 1)
-
-
-def test_prefer_reach_ranks_loaded_reach_over_a_known_miss():
-    search = StepSearch(atlas(), commands=(FWD,), lag=2)
-    # From the starting feet the grasp-independent place query misses by 6 cm.
-    # A step overlaps the reach map but has no controller prior with this payload.
-    region = target(0.065, loaded=True)
-    reference = list(search.schedules(HOME, [region]))
-    preferred = list(search.schedules(HOME, [region], prefer_reach=True))
-    assert reference[0].edges[0].order == "none"
-    assert preferred[0].edges[0].distance_m == 0 and preferred[0].edges[0].accuracy == "unknown"
-    assert {plan.edges[0] for plan in reference} == {plan.edges[0] for plan in preferred}
 
 
 def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():
@@ -222,17 +199,10 @@ def test_saved_low_pick_matches_geometric_and_lag8_contributor_counts():
         REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8
     )
     pick = TargetRegion("left", (0.48, 0.18, 0.025), (0.05, 0.05, 0.05), solid_pick=True)
-    place = TargetRegion("left", (0.30, -0.40, 0.65), (0.05, 0.05, 0.05), loaded=True)
     edges = search.edges(search.home, pick)
     assert [sum(e.order == o and e.distance_m == 0 for e in edges) for o in ORDERS] == [0, 4, 4, 25, 22]
     assert [sum(e.order == o and e.cost[0] == 0 for e in edges) for o in ORDERS] == [0, 1, 0, 0, 0]
     assert next(e for e in edges if e.cost == (0, 1)).commands == ((0.24, 0.21, 0.0),)
-    best = next(search.schedules(search.home, (pick, place)))
-    assert [e.order for e in best.edges] == ["L", "none"] and best.cost == (1, 1)
-    assert best.edges[0].commands == ((0.12, 0.21, 0.0),)
-    unloaded = TargetRegion("left", place.center, place.size)
-    alternative = next(search.schedules(search.home, (pick, unloaded)))
-    assert [e.order for e in alternative.edges] == ["L", "none"] and alternative.cost == (1, 1)
 
 
 def test_scene_pick_and_place_geometry_use_each_pose_once():
@@ -258,17 +228,6 @@ def test_scene_pick_and_place_geometry_use_each_pose_once():
     assert TargetRegion.pick("left", cube).solid_pick
     tilt = Rotation.from_euler("x", 20, degrees=True).as_quat()[[3, 0, 1, 2]].tolist()
     assert TargetRegion.place("left", obj, SimpleNamespace(dims=(1, 1, 0.02), pose=[0, 0, 0.5, *tilt])).center is None
-
-
-def test_fixed_order_schedule_keeps_endpoint_alternatives_and_validates_length():
-    s = StepSearch(atlas(), accuracy=passing("L"), lag=8, commands=(FWD, (0.24, 0.20, 0)))
-    targets = (target(0.065), target(0.065))
-    paths = list(s.schedules(HOME, targets, orders=("L", "none")))
-    assert len(paths) == 2 and [p.cost for p in paths] == [(0, 1), (2, 1)]
-    with pytest.raises(ValueError):
-        list(s.schedules(HOME, targets, orders=("LL", "none")))
-    with pytest.raises(ValueError):
-        list(s.schedules(HOME, targets, orders=("L",)))
 
 
 def test_nominal_build_samples_one_stance_for_both_arms_and_crouch(tmp_path, monkeypatch):

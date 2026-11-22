@@ -1,55 +1,41 @@
 """``--cuda_graphs`` end to end through ``cutamp_demo`` (which builds its own world, so no
-real_world), with the real planner thread and the vis block, every spied replay checked bitwise.
+real_world), on blocks_t1's standing plan, with the vis block, every spied replay checked bitwise.
 Slow: runs only with CUTAMP_SLOW=1."""
 
-import json
 import os
-import threading
 
 import pytest
 
 from cutamp.config import TAMPConfiguration
+from cutamp.tests import conftest
 from cutamp.tests.conftest import SpyVis, install_refresh_spy, install_step_replay_spy, needs_cuda, needs_graspgenx
 
 needs_slow = pytest.mark.skipif(os.environ.get("CUTAMP_SLOW") != "1", reason="slow live test; set CUTAMP_SLOW=1")
 
 
 def _run_demo(tmp_path, monkeypatch, n) -> list:
+    """Each ParticleOptimizer call's metrics."""
     import cutamp.algorithm
     from cutamp.envs.utils import get_env_dir, load_env
-    from cutamp.optimize_plan import _BestSnapshot
+    from cutamp.optimize_plan import ParticleOptimizer
     from cutamp.scripts.run_cutamp import cutamp_demo
 
     monkeypatch.setattr(cutamp.algorithm, "Visualizer", lambda config, q_init: SpyVis(config))  # the vis block runs
-    # Let step zero exercise the real overlap, then give replay comparisons a fixed window
-    # independent of how long the cuRobo build takes or when the objective plateaus.
-    builder = cutamp.algorithm.build_motion_planner
-    started = threading.Event()
-    build_thread = None
+    conftest.standing_skeleton(monkeypatch, *conftest.BLOCKS_T1_ACTIONS)
+    calls, optimize = [], ParticleOptimizer.__call__
 
-    def build(world):
-        nonlocal build_thread
-        build_thread = threading.current_thread()
-        started.set()
-        return builder(world)
-
-    update = _BestSnapshot.update
-
-    def finish_warmup_after_first_step(self, step, *args):
-        result = update(self, step, *args)
-        if step == 0:
-            assert started.wait(timeout=120), "the real planner builder never started"
-            build_thread.join(timeout=120)
-            assert not build_thread.is_alive(), "the real planner builder did not finish"
+    def spy(self, *args, **kwargs):
+        result = optimize(self, *args, **kwargs)
+        calls.append(result[1])
         return result
 
-    monkeypatch.setattr(cutamp.algorithm, "build_motion_planner", build)
-    monkeypatch.setattr(_BestSnapshot, "update", finish_warmup_after_first_step)
-    config = TAMPConfiguration(step_mode="off", num_particles=n, cuda_graphs=True, num_opt_steps=26, early_stop_patience=0,
+    monkeypatch.setattr(ParticleOptimizer, "__call__", spy)
+    # A fixed window of Adam steps for the replay comparisons, whenever the objective plateaus.
+    config = TAMPConfiguration(num_particles=n, cuda_graphs=True, num_opt_steps=26, early_stop_patience=0,
                                soft_cost=["joint_limit_margin", "minimize_body_movement"],
                                enable_visualizer=False, curobo_plan=True, experiment_root=str(tmp_path))
     cutamp_demo(load_env(os.path.join(get_env_dir(), "blocks_t1.yml")), config)
-    return [json.loads(p.read_text()) for p in sorted(tmp_path.glob("*/optimization/opt_*.json"))]
+    return calls
 
 
 @needs_cuda
@@ -59,8 +45,7 @@ def _run_demo(tmp_path, monkeypatch, n) -> list:
 def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
     # The real legs' shapes, with the 12 sole rows and the closing step inside G_refresh and the retract confs'
     # motion FK and self-collision cost inside G_step: every spied replay matches its eager twin (the spies raise), at
-    # the test batch and at 512 particles. curobo_plan=True runs the real planner-build thread, so call 1 captures
-    # only once the build has ended.
+    # the test batch and at 512 particles.
     from cutamp.cost_function import CostFunction
 
     retract_calls, retract_values = [], CostFunction._retract_motion_values
@@ -75,37 +60,3 @@ def test_real_legs_step_and_refresh_replay_bitwise(tmp_path, monkeypatch, n):
     assert any(c["capture_step"] is not None and c["refresh_capture_step"] is not None for c in calls)
     assert max(map(len, replays)) >= 20 and len(eager) >= 1
     assert retract_calls  # the skeleton has retracts, so the replayed G_step holds their motion cost
-
-
-@needs_cuda
-@needs_graspgenx
-@needs_slow
-def test_live_capture_waits_for_the_planner_thread(tmp_path, monkeypatch):
-    # The build waits until call 1 has run a step, so the real build thread is alive at call 1's
-    # first capture checks and planner_busy must defer the capture. An event, not a sleep: the
-    # build's lead over call 1 moves with plan sampling.
-    import cutamp.algorithm
-    from cutamp import optimize_plan
-
-    stepped, builds = threading.Event(), []
-    build, update = cutamp.algorithm.build_motion_planner, optimize_plan._BestSnapshot.update
-
-    def update_spy(self, *args, **kwargs):  # once per Adam step, after that step's capture check
-        stepped.set()
-        return update(self, *args, **kwargs)
-
-    def slow_build(world):
-        assert stepped.wait(timeout=120), "no optimize call ran a step"
-        builds.append(threading.current_thread().name)
-        return build(world)
-
-    monkeypatch.setattr(optimize_plan._BestSnapshot, "update", update_spy)
-    monkeypatch.setattr(cutamp.algorithm, "build_motion_planner", slow_build)
-    replays, eager = install_step_replay_spy(monkeypatch), install_refresh_spy(monkeypatch)
-    call1 = _run_demo(tmp_path, monkeypatch, 64)[0]
-    (overall,) = [json.loads(p.read_text()) for p in tmp_path.glob("*/overall_metrics.json")]
-    assert builds == ["motion-planner-warmup"]
-    assert call1["capture_step"] > 0 and call1["refresh_capture_step"] >= call1["capture_step"]
-    # The spies raise on any mismatch, so every compared replay matched.
-    assert replays and eager
-    assert "found_solution" in overall                  # the run finished

@@ -66,9 +66,9 @@ def _accepted(world, plan, conf):
 
 def _first_pick(world, plan):
     """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the init's GN IK
-    accepted (the others hold its closest balanced iterate). The first skeleton follows PYTHONHASHSEED: on blocks_t1
-    its first pick accepts all 64 rows on both inits (PYTHONHASHSEED 0 and 1, seed 0, 2026-11-08), in 10 distinct
-    confs, every CoM inside the keyframe rectangle."""
+    accepted (the others hold its closest balanced iterate). On blocks_t1 the first pick accepted all 64 rows on both
+    inits measured (block3's and block2's first, PYTHONHASHSEED 0 and 1, seed 0, 2026-11-08), in 10 distinct confs,
+    every CoM inside the keyframe rectangle; real_plan's skeleton now always picks block3 first."""
     skeleton, particles = plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     conf = op.values[-1]
@@ -203,7 +203,7 @@ def test_gn_ik_centres_the_com(real_world, monkeypatch):
     ]
     with torch.random.fork_rng(devices=[real_world.device]):
         torch.manual_seed(0)
-        init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64, step_mode="off"), default_checker())
+        init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())
         particles = init(skeleton)
         for dep in _build_ik_deps(skeleton, real_world):
             args = (real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles), init.ik_tol)

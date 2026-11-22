@@ -1,6 +1,5 @@
 """Tests for the next-best-particle motion-plan retry
 (algorithm._motion_plan_with_retries, motion_solver._reset_attachment_state)."""
-import contextlib
 import math
 from types import SimpleNamespace
 
@@ -11,7 +10,6 @@ import cutamp.algorithm as alg
 import cutamp.com_polygon_cost as cpc
 import cutamp.motion_solver as ms
 from cutamp.config import TAMPConfiguration
-from cutamp.particle_initialization import PickChoice
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 
 
@@ -83,56 +81,6 @@ def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch, centering
     assert failures == ["pick failed", "place failed"]
 
 
-def _run_skeletons(monkeypatch, results, *, initial_witness=False, skeleton_budget=30) -> dict:
-    """run_cutamp's overall_metrics, on the CPU, over one skeleton per entry of ``results``, in order: ``None`` where
-    no particle satisfies, else ``(planned, attempts)``: its motion plan tries ``attempts`` candidates, each failing
-    but the last if ``planned``. Everything else run_cutamp calls is a stand-in."""
-
-    timer = SimpleNamespace(time=lambda *a, **k: contextlib.nullcontext(), start=lambda m: None,
-                            stop=lambda m: 0.0, get_summaries=dict)  # TorchTimer syncs CUDA
-
-    def sample(plan_gen, world, config, timer, idx, *args):
-        if idx == len(results):
-            raise StopIteration
-        choice = PickChoice(f"block{idx}", "grasp1", torch.zeros(1, 7), torch.ones(1), torch.ones(1, dtype=torch.bool),
-                            torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1, dtype=torch.long))
-        return {"idx": idx, "plan_skeleton": [], "heuristic": float(idx), "grasp_choice": [choice]}, initial_witness
-
-    def optimize(plan_info, timer, visualizer):
-        satisfying = results[plan_info["idx"]] is not None
-        metrics = {"best_cost": 0.0, "best_soft_cost": 0.0, "num_satisfying_final": int(satisfying)}
-        return satisfying, metrics, False
-
-    def plan(plan_info, *args, **kwargs):
-        planned, attempts = results[plan_info["idx"]]
-        failures = [f"skeleton {plan_info['idx']}, candidate {i}" for i in range(attempts - planned)]
-        return (f"plan-{plan_info['idx']}", {}, attempts, attempts - 1, failures) if planned else (None, None, attempts, None, failures)
-
-    logger, world = SimpleNamespace(log_dict=lambda name, d: None), SimpleNamespace(initial_state=None, goal_state=None)
-    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, timer, world))
-    monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: SimpleNamespace(ik_tol=None))
-    monkeypatch.setattr(alg, "build_motion_planner", lambda world: None)
-    monkeypatch.setattr(alg, "start_sampler_load", lambda: None)  # no model in a stand-in run
-    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda world: None)
-    monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: iter(()))
-    monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
-    monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: optimize)
-    monkeypatch.setattr(alg, "get_top_satisfying_particles", lambda *args, **kwargs: ([], []))
-    monkeypatch.setattr(alg, "_motion_plan_with_retries", plan)
-    monkeypatch.setattr(alg, "_planned_metrics", lambda world, plan, candidates, rank: {"motion_plan_rank": rank})
-    config = TAMPConfiguration(step_mode="off", curobo_plan=True, enable_visualizer=False, num_initial_plans=skeleton_budget)
-    return alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
-                          experiment_id="fake")[2]
-
-
-def test_baseline_motion_plans_only_the_queued_skeletons(monkeypatch):
-    """As before stepping, a motion failure on the queue ends the run: no further skeleton is initialized, even with
-    skeleton budget left."""
-    metrics = _run_skeletons(monkeypatch, [(False, 2), (True, 1)], initial_witness=True, skeleton_budget=2)
-    assert metrics["found_solution"] is False and metrics["motion_plan_success"] is False
-    assert metrics["num_initial_plans"] == metrics["num_optimized_plans"] == 1
-
-
 def test_motion_playback_starts_at_original_scene_and_replays_held_object():
     class Recording(alg.Visualizer):
         def __init__(self):
@@ -190,19 +138,6 @@ def test_rerun_segment_returns_native_end_for_the_next_segment(monkeypatch):
     assert start == 1.375
 
 
-@pytest.mark.parametrize("results, attempts", [
-    ([(True, 2)], 2),  # one skeleton: its own count
-    ([(False, 3), (True, 2)], 5),  # the first skeleton's candidates all fail: both skeletons' count
-    ([None, (False, 1), (True, 1)], 2),  # a skeleton with no satisfying particle plans nothing
-    ([None], None),  # nothing planned: no count
-])
-def test_motion_plan_attempts_add_up_over_skeletons(monkeypatch, results, attempts):
-    # As the failures do: every planned candidate either fails or gives the plan.
-    metrics = _run_skeletons(monkeypatch, results)
-    assert metrics.get("motion_plan_attempts") == attempts
-    assert (attempts or 0) == len(metrics["motion_plan_failures"]) + metrics["motion_plan_success"]
-
-
 def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_attempts(monkeypatch):
     # The balance gate rejects candidate 0's plan, which no budget changes; candidate 1's pick needs more than 2
     # plan_cspace attempts (out_of_attempts, as _plan_arm_to_conf sets it). The cheap pass fails both; the full pass
@@ -234,7 +169,7 @@ def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_atte
 
 
 @pytest.mark.parametrize("weight, expected_calls, winner", [
-    (None, [(0, 2), (0, 20)], 0),
+    (1.0, [(0, 2), (0, 20)], 0),
     (0.0, [(0, 2), (1, 2)], 1),
 ])
 def test_centered_candidate_gets_full_budget_before_trying_a_worse_posture(monkeypatch, weight, expected_calls, winner):
@@ -282,14 +217,6 @@ def test_planned_metrics_describe_the_planned_particle(monkeypatch):
     assert alg._planned_metrics(_fake_world(), skeleton, candidates, 1) == {
         "motion_plan_rank": 1, "planned_com_margin": pytest.approx(0.1),
         "planned_trunk_tilt_deg": pytest.approx(math.degrees(0.2)), "planned_trunk_travel": pytest.approx(0.2)}
-
-
-def test_metrics_report_the_last_optimized_skeletons_grasp_choice(monkeypatch):
-    # The first skeleton's tries all fail and the second plans: its choice is the one reported. A run that never
-    # plans reports the last skeleton it optimized (G12).
-    objects = lambda results: [s["object"] for s in _run_skeletons(monkeypatch, results)["grasp_choice"]]
-    assert objects([(False, 3), (True, 2)]) == ["block1"]
-    assert objects([None]) == ["block0"]
 
 
 @needs_cuda

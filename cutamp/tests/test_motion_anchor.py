@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import cutamp.motion_solver as ms
-from cutamp.tests.conftest import needs_cuda, needs_graspgenx
+from cutamp.tests.conftest import BLOCKS_T1_ACTIONS, needs_cuda, needs_graspgenx, standing_skeleton
 
 
 _NAMES = [f"j{i}" for i in range(33)]
@@ -43,12 +43,15 @@ def test_plan_arm_to_conf_targets_the_conf(monkeypatch):
             calls["target_js"] = target_js
             calls["last_js"] = last_js
             calls["max_attempts"] = max_attempts
+            calls["grad"] = torch.is_grad_enabled()
             return "FAKE_RESULT"
 
     conf = torch.arange(33.0)
-    res = ms._plan_arm_to_conf(FakePlanner(), conf, last_js="LAST", disable_obstacle=None, ground_op="OP",
-                               max_attempts=2)
+    with torch.no_grad():  # as the stepped preview calls it (step_preview.plan_predicted_step_motion)
+        res = ms._plan_arm_to_conf(FakePlanner(), conf, last_js="LAST", disable_obstacle=None, ground_op="OP",
+                                   max_attempts=2)
     assert res == "FAKE_RESULT"
+    assert calls["grad"]  # cuRobo's trajopt differentiates its cost and never turns grad on itself
     # planned to the conf, at rest, in the planner's joint order, not to a pose
     target = calls["target_js"]
     assert torch.equal(target.position, conf[None]) and not target.velocity.any()
@@ -89,13 +92,14 @@ def _sole_errors(world, q: torch.Tensor):
 @needs_cuda
 @needs_graspgenx
 def test_real_legs_plan_audit(tmp_path, monkeypatch):
-    # One real-legs plan end to end (blocks_t1, seed 0, 64 particles, the surface at 0.5 m, the motion plan saved
-    # raw): setup_cutamp builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the
-    # spies only record. The metrics the gate records hold for the exported segments, and the CoM and the multibody
-    # ZMP re-measured on those frames stay inside the gate's rectangle (support.gate_half). On the real legs the
-    # gate sets each segment's pace, never faster than the planner's. Each pick and place plans an approach, a straight
-    # insert and a leave, and each retract one segment: 16 in skeleton order, each tagged with its op, phase and
-    # gripper event, and every straight segment saved still on its line.
+    # One real-legs plan end to end (blocks_t1, seed 0, 64 particles, the surface at 0.5 m, the motion plan saved raw),
+    # on its standing plan (BLOCKS_T1_ACTIONS, which picks both blocks before placing either): setup_cutamp
+    # builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the spies only record. The
+    # metrics the gate records hold for the exported segments, and the CoM and the multibody ZMP re-measured on those
+    # frames stay inside the gate's rectangle (support.gate_half). On the real legs the gate sets each segment's pace,
+    # never faster than the planner's. Each pick and place plans an approach, a straight insert and a leave, and each
+    # retract one segment: 16 in skeleton order, each tagged with its op, phase and gripper event, and every straight
+    # segment saved still on its line.
     import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
     from curobo.types import JointState
@@ -130,10 +134,11 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     monkeypatch.setattr(rc, "run_cutamp", run_spy)
     monkeypatch.setattr(alg, "solve_curobo", solve_spy)
     monkeypatch.setattr(alg, "get_top_satisfying_particles", top_spy)
+    standing_skeleton(monkeypatch, *BLOCKS_T1_ACTIONS)
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, 0.5)
     torch.manual_seed(0)  # run_cutamp's --seed 0
-    config = TAMPConfiguration(step_mode="off", num_particles=64, curobo_plan=True, enable_visualizer=False,
+    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False,
                                experiment_root=str(tmp_path))
     rc.cutamp_demo(env, config, experiment_id="audit", save_plan="auto")
 

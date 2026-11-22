@@ -49,13 +49,36 @@ def link_kinematics(world):
     return kin
 
 
+#: blocks_t1's task plan: block3 in the left hand, block2 in the right, both picked before either is placed (the
+#: plan the tests' hash-seed notes were measured on, PYTHONHASHSEED 0).
+BLOCKS_T1_ACTIONS = (("LeftPick", "block3"), ("RightPick", "block2"), ("LeftPlace", "block3"), ("RightPlace", "block2"))
+
+
+def skeleton_through(initial, goal, *actions):
+    """The T1 task plan from ``initial`` to ``goal`` whose picks and places are ``actions`` in order, each an
+    ``(operator name, object)`` pair, with the motions ``ManipulationPrefix`` grounds before, between and after them."""
+    from cutamp.t1_domain import all_t1_operators
+    from cutamp.task_planning.search import ManipulationPrefix
+
+    prefix = ManipulationPrefix(initial, goal, all_t1_operators)
+    for name, obj in actions:
+        (prefix,) = [p for p in prefix.choices()
+                     if p.action is not None and (p.action.operator.name, p.action.arg("obj")) == (name, obj)]
+    if not prefix.complete:
+        (prefix,) = prefix.choices()  # the closing motions, when the goal also asks for free hands
+    assert prefix.complete
+    return prefix.skeleton()
+
+
 def make_blocks_t1_world():
     """Build the standard blocks_t1 TAMPWorld used by GPU integration tests, on ``REAL_LEGS``, starting at its home,
-    with its GraspGenX grasps (the first build in a process loads the model, which then stays). Without GraspGenX it
-    skips the calling test, or every test of the calling fixture."""
+    with the GraspGenX grasps the planner would request at the default particle count (the first build in a process
+    loads the model, which then stays). Without GraspGenX it skips the calling test, or every test of the calling
+    fixture."""
     if not HAS_GRASPGENX:
         pytest.skip(_NO_GRASPGENX)
     from curobo.types import DeviceCfg
+    from cutamp.config import TAMPConfiguration
     from cutamp.envs.utils import get_env_dir, load_env
     from cutamp.grasps import grasp_sets
     from cutamp.robots import load_t1_container
@@ -64,7 +87,8 @@ def make_blocks_t1_world():
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     robot = load_t1_container(REAL_LEGS, dc)
     q_init = torch.as_tensor(REAL_LEGS.home, dtype=torch.float32, device=dc.device)
-    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, grasps=grasp_sets(env.movables, dc.device))
+    grasps = grasp_sets(env.movables, dc.device, max_grasps=TAMPConfiguration().num_particles)
+    return TAMPWorld(env=env, device_cfg=dc, robot=robot, q_init=q_init, grasps=grasps)
 
 
 @pytest.fixture(autouse=True)
@@ -103,14 +127,12 @@ def real_world(_real_world_slot):
 
 @pytest.fixture(scope="module")
 def real_plan(real_world):
-    """``[skeleton, particles]``: blocks_t1's first task plan (which follows PYTHONHASHSEED) and its seeded 64-particle
+    """``[skeleton, particles]``: blocks_t1's task plan (``BLOCKS_T1_ACTIONS``) and its seeded 64-particle
     init on ``real_world``. Read-only: tests run on ``clone_particles(particles)``. A list, so teardown can free the
     particles while pytest still holds the yielded object; ``real_world``'s slot then empties the cache."""
     from cutamp.particle_initialization import ParticleInitializer
-    from cutamp.t1_domain import all_t1_operators
-    from cutamp.task_planning import task_plan_generator
 
-    skeleton = next(task_plan_generator(real_world.initial_state, real_world.goal_state, all_t1_operators))
+    skeleton = skeleton_through(real_world.initial_state, real_world.goal_state, *BLOCKS_T1_ACTIONS)
     torch.manual_seed(0)
     particles = ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())(skeleton)
     plan = [skeleton, particles]
@@ -121,27 +143,44 @@ def real_plan(real_world):
 
 def only_schedule(monkeypatch, orders, arm):
     """Pass on only the joint A*'s skeletons whose picks and places all use ``arm`` with these foot ``orders``."""
-    from cutamp.task_planning import arm_step_search
+    from cutamp.task_planning import search
 
-    search = arm_step_search.arm_step_skeletons
+    skeletons = search.arm_step_skeletons
 
     def matching(*args, **kwargs):
-        for proposal in search(*args, **kwargs):
+        for proposal in skeletons(*args, **kwargs):
             arms = {op.operator.metadata.arm for op in proposal.skeleton if op.operator.metadata.is_actionable}
             if proposal.orders == tuple(orders) and arms == {arm}:
                 yield proposal
 
-    monkeypatch.setattr(arm_step_search, "arm_step_skeletons", matching)
+    monkeypatch.setattr(search, "arm_step_skeletons", matching)
+
+
+def standing_skeleton(monkeypatch, *actions):
+    """In place of the joint A*'s proposals, propose one plan that takes no step: the world's task plan whose picks and
+    places are ``actions`` (:func:`skeleton_through`), with an empty footstep schedule. Filtering the A* for such a plan
+    walks every stepped schedule its reach evidence ranks ahead first: on blocks_t1's floor it was still in
+    ``StepSearch.edges`` after 11 minutes (2026-11-21)."""
+    from cutamp.step_search import Schedule
+    from cutamp.task_planning import search
+    from cutamp.task_planning.insert_steps import with_steps
+
+    def propose(step_search, world, operators, incoming, **kwargs):
+        initial, goal = world.initial_state, world.goal_state
+        skeleton = with_steps(skeleton_through(initial, goal, *actions), {}, initial, goal)
+        yield search.RankedStepSkeleton(skeleton, ("none",) * len(actions), Schedule((), (0, 0)), 0.0)
+
+    monkeypatch.setattr(search, "arm_step_skeletons", propose)
 
 
 def first_schedules(monkeypatch, count):
     """Pass on only the first ``count`` skeletons of the joint A* (after any earlier :func:`only_schedule`)."""
     from itertools import islice
 
-    from cutamp.task_planning import arm_step_search
+    from cutamp.task_planning import search
 
-    search = arm_step_search.arm_step_skeletons
-    monkeypatch.setattr(arm_step_search, "arm_step_skeletons", lambda *a, **kw: islice(search(*a, **kw), count))
+    skeletons = search.arm_step_skeletons
+    monkeypatch.setattr(search, "arm_step_skeletons", lambda *a, **kw: islice(skeletons(*a, **kw), count))
 
 
 def clone_particles(particles: dict) -> dict:
@@ -169,21 +208,21 @@ def default_checker():
     return ConstraintChecker(default_constraint_to_tol.copy())
 
 
-def make_optimizer(config, **kw):
+def make_optimizer(config):
     """A ``ParticleOptimizer`` on the default multipliers and tolerances, as
     ``run_cutamp.py`` builds it."""
     from cutamp.cost_reduction import CostReducer
     from cutamp.optimize_plan import ParticleOptimizer
     from cutamp.scripts.utils import default_constraint_to_mult
-    return ParticleOptimizer(config, CostReducer(default_constraint_to_mult.copy()), default_checker(), **kw)
+    return ParticleOptimizer(config, CostReducer(default_constraint_to_mult.copy()), default_checker())
 
 
-def run_optimizer(plan_info: dict, config, optimizer=None, visualizer=None, timer=None, **kw) -> tuple:
-    """One optimize call: ``(opt_metrics, timer)``; without ``optimizer``, ``kw`` goes to :func:`make_optimizer`."""
+def run_optimizer(plan_info: dict, config, optimizer=None, visualizer=None, timer=None) -> tuple:
+    """``(opt_metrics, timer)`` of one optimize call."""
     from cutamp.utils.timer import TorchTimer
     from cutamp.utils.visualizer import Visualizer
     timer = timer or TorchTimer()
-    _, opt_metrics, _ = (optimizer or make_optimizer(config, **kw))(
+    _, opt_metrics, _ = (optimizer or make_optimizer(config))(
         plan_info, timer, visualizer or Visualizer(config, None),
     )
     return opt_metrics, timer

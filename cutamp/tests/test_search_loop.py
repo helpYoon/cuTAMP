@@ -8,7 +8,6 @@ import torch
 
 import cutamp.algorithm as alg
 from cutamp import t1_domain
-from cutamp.algorithm import make_arm_affinity_priority_fn
 from cutamp.config import TAMPConfiguration
 from cutamp.step_planner import StepInputs, StepResult, StepRow, furthest_endpoint
 from cutamp.tests.conftest import first_schedules
@@ -82,11 +81,11 @@ def test_learned_predictor_cache_tracks_both_bundles(tmp_path, monkeypatch):
 
 def test_standing_feedback_locates_scene_and_placement_failures_at_their_actions():
     from cutamp.step_planner import standing_endpoint_flags
-    from cutamp.task_planning import task_plan_generator
+    from cutamp.tests.conftest import skeleton_through
 
     init = t1_domain.get_initial_state(["block"], ["table"])
     goal = frozenset([t1_domain.On.ground("block", "table")])
-    plan = next(task_plan_generator(init, goal, t1_domain.all_t1_operators))
+    plan = skeleton_through(init, goal, ("LeftPick", "block"), ("LeftPlace", "block"))
     ops = [op for op in plan if op.operator.metadata.is_actionable]
     placement = ops[1].arg("placement")
     mask = torch.ones(2, 2, dtype=torch.bool)
@@ -134,7 +133,6 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(
         alg, "setup_cutamp", lambda *a, **kw: (SimpleNamespace(log_dict=lambda *a: None), None, timer, world)
     )
-    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda w: None)
     monkeypatch.setattr(alg, "ParticleInitializer", lambda *a, **kw: object())
     monkeypatch.setattr(alg, "ParticleOptimizer", lambda *a, **kw: object())
     monkeypatch.setattr(alg, "grasp_sets", lambda objs, dev, **kw: seen.append("generate") or {"block": object()})
@@ -153,7 +151,6 @@ def harness(monkeypatch, tmp_path):
     cfg = {
         "num_initial_plans": 1,
         "enable_visualizer": False,
-        "step_mode": "model",
         "curobo_plan": False,  # exercise the keyframe search unless a test requests motion
         "experiment_root": str(tmp_path),
     }
@@ -178,17 +175,6 @@ def _no_refinement(monkeypatch):
     monkeypatch.setattr(alg, "_load_predictor", lambda config: object())
     monkeypatch.setattr(alg, "_refine_standing_schedule", unresolved)
     monkeypatch.setattr(alg, "_refine_step_schedule", unresolved)
-
-
-def test_base_symbolic_expansion_obeys_the_same_search_deadline(monkeypatch):
-    import cutamp.task_planning.search as symbolic
-
-    now = iter((0.0, 2.0))
-    monkeypatch.setattr(symbolic, "monotonic", lambda: next(now))
-    initial = t1_domain.get_initial_state(["block"], ["table"])
-    goal = frozenset([t1_domain.On.ground("block", "table")])
-    plans = symbolic.breadth_first_search(initial, goal, t1_domain.all_t1_operators, deadline=1.0)
-    assert list(plans) == []
 
 
 def test_standing_motion_respects_an_expired_requested_search_budget():
@@ -270,7 +256,6 @@ def test_step_search_charges_arm_choice_before_planning_the_pick(harness, monkey
     run, seen, world = harness
     homes = {"left": torch.tensor([0., .2, .5]), "right": torch.tensor([0., -.2, .5])}
     world.arm_home_ee_world = homes
-    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", make_arm_affinity_priority_fn)
     far_arm = "left" if near_arm == "right" else "right"
     pick = (.8, side, .5)
     pad = (.85, side, .45)
@@ -329,7 +314,6 @@ def test_arm_approach_accumulates_only_picks_in_their_incoming_stances(harness, 
     world.goal_state = frozenset(t1_domain.On.ground(obj, "pad") for obj in ("a", "b"))
     world.get_object = lambda name: SimpleNamespace(name=name, dims=(.02,) * 3, pose=(*points[name], 1., 0., 0., 0.))
     world.arm_home_ee_world = {arm: torch.tensor([0., y, .50]) for arm, y in (("left", .2), ("right", -.2))}
-    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", make_arm_affinity_priority_fn)
     soles = ((0., .1, 0.), (0., -.1, 0.))
     atlas = ReachMap(.01, {"home_soles": soles})
     samples = [(.76, y, .50) for y in (.12, -.12, 0.)]
@@ -453,7 +437,7 @@ def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypa
     assert not m["time_limit_reached"]
 
 
-@pytest.mark.parametrize("weight,winning_id", [(None, 2), (0.1, 2), (0.0, 1)])
+@pytest.mark.parametrize("weight,winning_id", [(1.0, 2), (0.1, 2), (0.0, 1)])
 def test_motion_feasibility_then_worst_center_then_effort_in_successful_skeleton(harness, monkeypatch, weight, winning_id):
     run, _, _ = harness
     viewer, displayed = object(), []
@@ -547,7 +531,7 @@ def test_default_centroid_preference_and_zero_weight_ablation():
     from cutamp.scripts.utils import default_constraint_to_mult
 
     cfg = TAMPConfiguration()
-    assert cfg.for_refinement(stepped=False).com_center_weight == 1
+    assert cfg.com_center_weight == cfg.for_refinement().com_center_weight == 1
     assert default_constraint_to_mult["soft"]["com_center_distance_squared"] == 1
     validate_tamp_config(replace(cfg, com_center_weight=0))
     for invalid in (-1.0, float("nan"), float("inf")):
@@ -558,39 +542,22 @@ def test_default_centroid_preference_and_zero_weight_ablation():
 def test_refinement_defaults_and_overrides():
     from dataclasses import replace
 
-    from cutamp.config import validate_tamp_config
+    model = TAMPConfiguration()
 
-    model = TAMPConfiguration(step_mode="model")
-
-    def settings(cfg, stepped):
-        resolved = cfg.for_refinement(stepped=stepped)
+    def settings(cfg):
+        resolved = cfg.for_refinement()
         return resolved.step_refine_iterations, resolved.com_center_weight, resolved.step_adam_plateau_mm
 
-    assert settings(model, True) == (48, 1.0, 1.0)
-    assert settings(model, False) == (48, 1.0, None)
+    assert settings(model) == (48, 1.0, 1.0)
     for weight in (0.0, 1.0, 3.0):
         custom = replace(model, step_refine_iterations=0, com_center_weight=weight)
-        assert settings(custom, True)[:2] == settings(custom, False)[:2] == (0, weight)
-    for mode in ("rank", "geometric"):
-        with pytest.raises(ValueError, match="step_mode"):
-            validate_tamp_config(replace(model, step_mode=mode))
+        assert settings(custom)[:2] == (0, weight)
 
 
-def test_particle_and_motion_defaults_follow_the_route():
+def test_particle_and_motion_defaults():
     assert TAMPConfiguration().num_particles == TAMPConfiguration().step_particle_batch_size == 128
     assert TAMPConfiguration().curobo_plan
-    assert TAMPConfiguration(step_mode="off").num_particles == 256
-    assert not TAMPConfiguration(step_mode="off").curobo_plan
-    assert TAMPConfiguration(step_mode="off").for_refinement(stepped=False).com_center_weight == 0
-    assert TAMPConfiguration(step_mode="model", num_particles=8).num_particles == 8
-
-
-def test_step_mode_off_rejects_a_centering_weight():
-    from cutamp.config import validate_tamp_config
-
-    validate_tamp_config(TAMPConfiguration(step_mode="off", com_center_weight=0))
-    with pytest.raises(ValueError, match="fixed-feet baseline"):
-        validate_tamp_config(TAMPConfiguration(step_mode="off", com_center_weight=2.0))
+    assert TAMPConfiguration(num_particles=8).num_particles == 8
 
 
 @pytest.mark.parametrize("limit,expire,expected", [(1, False, [5]), (5, False, [5, 2]), (5, True, [5])])
@@ -642,18 +609,18 @@ def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatc
     from cutamp import step_particles, step_preview
 
     cfg = TAMPConfiguration(
-        step_mode="model", num_particles=4, step_particle_batch_size=2, motion_plan_max_retries=1, curobo_plan=True,
+        num_particles=4, step_particle_batch_size=2, motion_plan_max_retries=1, curobo_plan=True,
     )
     pools = {"grasp1": (torch.eye(7)[:2], torch.tensor([0.9, 0.5]))}
     op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="pick")), values=("q1",))
-    proposal = SimpleNamespace(skeleton=[op], seed=None, alternative_seeds=iter(()))
+    proposal = SimpleNamespace(skeleton=[op], schedule=SimpleNamespace(edges=(SimpleNamespace(commands=()),)))
     world = SimpleNamespace(q_init=torch.zeros(33))
     monkeypatch.setattr(step_particles, "ParticleInitializer", lambda *a: SimpleNamespace(_pick_pools=lambda p: pools))
     monkeypatch.setattr(step_particles, "worst_posture", lambda w, qs: (torch.zeros(len(qs[0])),) * 3)
     monkeypatch.setattr(step_particles.IKTol, "from_checker", lambda c: None)
     chunks, attempted = [], []
 
-    def feasible_chunk(proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop,
+    def feasible_chunk(proposal, world, config, reducer, checker, inputs, predictor, pools, starts, first, stop,
                        motion_inputs, deadline):
         chunks.append(first)
         rows = []
@@ -750,7 +717,7 @@ def test_real_pick_only_checks_bound_configuration_and_returns_its_row(tmp_path,
     block = next(obj for obj in env.movables if obj.name == "block3")
     block.pose[:3] = [0.38, 0.23, 0.73]
     cfg = TAMPConfiguration(
-        step_mode="model", curobo_plan=False,
+        curobo_plan=False,
         num_initial_plans=1,
         num_particles=16,
         num_opt_steps=20,
@@ -778,7 +745,7 @@ def test_unmatched_dynamics_never_receive_reference_tracking_credit():
     from cutamp.landing_predictor import LandingState
     from cutamp.step_search import TargetRegion
 
-    cfg = TAMPConfiguration(step_mode="model", step_lag=8)
+    cfg = TAMPConfiguration(step_lag=8)
     d = torch.zeros(1, 38)
     d[:, 0] = 0.25 / 0.45
     d[:, -5:] = 1.0

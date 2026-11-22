@@ -14,7 +14,6 @@ from cutamp.tests.paired_grasp_scene import paired_setup
 
 def paired_case(label, output):
     cfg = TAMPConfiguration(
-        step_mode="model",
         enable_visualizer=False,
         curobo_plan=False,
         experiment_root=str(output),

@@ -18,23 +18,25 @@ import torch
 from curobo.scene import Cuboid
 
 import cutamp.grasps as g
+from cutamp.config import TAMPConfiguration
 from cutamp.envs.utils import get_env_dir, load_env
 from cutamp.tests.conftest import assert_bitwise, needs_cuda, needs_graspgenx
 from cutamp.utils.common import grasp_7dof_to_mat4x4
 
 DEVICE = torch.device("cuda", 0)
+N = TAMPConfiguration().num_particles  # the planner requests one grasp per particle
 README = "README.md, Installation, the GraspGenX paragraph"
 
 
-@pytest.mark.parametrize("budget", [1, 4, 8, 17, 63, 64])
+@pytest.mark.parametrize("budget", [1, 4, 8, 17, 63, 64, 128])
 def test_learned_and_geometric_proposals_share_the_raw_generation_budget(monkeypatch, budget):
     def run(clouds, sampler, *, planner, num_grasps, moe_num_yaws, moe_obb_position_spacing_cm, moe_z_offsets_cm, **kw):
         assert len(clouds) == 1 and num_grasps >= 1
         assert moe_obb_position_spacing_cm == 0 and moe_z_offsets_cm == (0.0,)
         n_box = 5 * moe_num_yaws if planner == "graspmoe" else 0
         assert num_grasps + n_box == budget
-        if budget == 64:
-            assert (num_grasps, n_box) == (24, 40)
+        if budget == 128:  # the default particle count
+            assert (num_grasps, n_box) == (48, 80)
         return [(None, None, ["diff"] * num_grasps + ["obb"] * n_box, None)]
     monkeypatch.setitem(sys.modules, "graspgenx.samplers.planner", SimpleNamespace(run_planner_on_batch=run))
     _, _, tags, _ = g._bounded_grasp_proposals(np.zeros((10, 3)), object(), budget)
@@ -102,59 +104,20 @@ def test_mesh_hash_is_shared_by_shape():
     assert g.mesh_sha256(big) != g.mesh_sha256(blocks["block2"])
 
 
-def test_grasps_are_made_for_the_objects_a_skeleton_picks(monkeypatch):
-    # A sampler runs for a skeleton's parameters: block3 is in the scene and gets no grasps until a skeleton picks it,
-    # and block4, which none picks, never does. grasp_sets turns process-wide settings on while it runs, so the first
-    # skeleton's grasps are made before the planner's warmup thread starts and a later skeleton's after it ends. The
-    # model's background load starts before anything else and has ended before that thread starts.
-    import contextlib
-    import time
-    from types import SimpleNamespace
-
+def test_grasps_are_made_for_the_objects_a_skeleton_picks():
+    # A sampler runs for a skeleton's parameters: each picked object without grasps, once, in plan order. block4,
+    # which no skeleton picks, never gets any.
     import cutamp.algorithm as alg
-    from cutamp.config import TAMPConfiguration
 
     def op(kind, *values):
         return SimpleNamespace(values=values, operator=SimpleNamespace(metadata=SimpleNamespace(action_type=kind)))
 
-    skeletons = [
-        [op(None, "q0", "traj1", "q1"), op("pick", "block2", "grasp1", "q1"), op("place", "block2", "grasp1", "q2")],
-        [op("pick", "block2", "grasp1", "q1"), op("pick", "block3", "grasp2", "q2"), op("pick", "block3", "grasp3")],
-    ]
-    events = []
-
-    def warmup(world):
-        events.append("warmup starts")
-        time.sleep(0.2)
-        events.append("warmup ends")
-
-    def fake_grasp_sets(objs, device, *, counts):  # the fixed-feet route asks for the full pool
-        events.append(list(objs))
-        return dict.fromkeys(objs, "grasps")
-
-    def sample(plan_gen, *args):
-        list(plan_gen)  # draws both skeletons, then the planner has none left
-        raise StopIteration
-
-    timer = SimpleNamespace(time=lambda *a, **k: contextlib.nullcontext(), start=lambda m: None,
-                            stop=lambda m: 0.0, get_summaries=dict)  # TorchTimer syncs CUDA
-    world = SimpleNamespace(initial_state=None, goal_state=None, grasps={}, device="cpu", get_object=lambda name: name)
-    logger = SimpleNamespace(log_dict=lambda name, d: None)
-    monkeypatch.setattr(alg, "setup_cutamp", lambda *args, **kwargs: (logger, None, timer, world))
-    monkeypatch.setattr(alg, "ParticleInitializer", lambda *args: None)
-    monkeypatch.setattr(alg, "ParticleOptimizer", lambda *args, **kwargs: None)
-    monkeypatch.setattr(alg, "make_arm_affinity_priority_fn", lambda world: None)
-    monkeypatch.setattr(alg, "task_plan_generator", lambda *args, **kwargs: iter(skeletons))
-    monkeypatch.setattr(alg, "build_motion_planner", warmup)
-    monkeypatch.setattr(alg, "grasp_sets", fake_grasp_sets)
-    monkeypatch.setattr(alg, "start_sampler_load", lambda: events.append("model load starts"))
-    monkeypatch.setattr(alg, "wait_for_sampler_load", lambda: events.append("model load ended"))
-    monkeypatch.setattr(alg, "sample_plan_skeleton", sample)
-    config = TAMPConfiguration(step_mode="off", curobo_plan=True, enable_visualizer=False)
-    alg.run_cutamp(None, config, SimpleNamespace(cost_config={}), SimpleNamespace(constraint_config={}),
-                   experiment_id="fake")
-    assert events == ["model load starts", ["block2"], "model load ended", "warmup starts", "warmup ends", ["block3"]]
-    assert sorted(world.grasps) == ["block2", "block3"]
+    skeleton = [op(None, "q0", "traj1", "q1"), op("pick", "block3", "grasp1", "q1"), op("place", "block3", "grasp1"),
+                op("pick", "block2", "grasp2", "q2"), op("pick", "block3", "grasp3", "q3")]
+    world = SimpleNamespace(grasps={}, get_object=lambda name: name)
+    assert alg.ungrasped(world, skeleton) == ["block3", "block2"]
+    world.grasps["block3"] = "grasps"
+    assert alg.ungrasped(world, skeleton) == ["block2"]
 
 
 def test_missing_graspgenx_names_the_platform(monkeypatch, tmp_path):
@@ -166,7 +129,7 @@ def test_missing_graspgenx_names_the_platform(monkeypatch, tmp_path):
     before = _trap_graspgenx(monkeypatch)
     _graspgenx_installed(monkeypatch, False)
     with pytest.raises(RuntimeError) as err:
-        g.grasp_sets(blocks, "cpu")
+        g.grasp_sets(blocks, "cpu", max_grasps=N)
     message = str(err.value)
     assert "GraspGenX is not installed, and planning needs it" in message
     assert f"x86_64 only, and this machine is {platform.machine()}" in message and README in message
@@ -182,7 +145,7 @@ def test_missing_model_names_the_readme(monkeypatch, tmp_path):
     before = _trap_graspgenx(monkeypatch)
     _graspgenx_installed(monkeypatch, True)  # past the install check, on any machine
     with pytest.raises(RuntimeError) as err:
-        g.grasp_sets(blocks, "cpu")
+        g.grasp_sets(blocks, "cpu", max_grasps=N)
     assert "model folders are missing" in str(err.value) and README in str(err.value)
     assert _graspgenx_modules() == before
 
@@ -213,22 +176,22 @@ def test_setup_check_names_the_readme_without_a_readme_folder(monkeypatch, tmp_p
 @needs_graspgenx
 def test_block_grasps(monkeypatch):
     blocks = _blocks()
-    g.grasp_sets(blocks, DEVICE)  # imports graspgenx, if this process hasn't yet
+    g.grasp_sets(blocks, DEVICE, max_grasps=N)  # imports graspgenx, if this process hasn't yet
     planner = sys.modules["graspgenx.samplers.planner"]
-    run, tags = planner.run_planner_on_object, []
+    run, tags = planner.run_planner_on_batch, []
 
     def spy(*args, **kwargs):
         out = run(*args, **kwargs)
-        tags.append(out[2])  # "diff" or "obb" per grasp
+        tags.append(out[0][2])  # "diff" or "obb" per grasp
         return out
 
-    monkeypatch.setattr(planner, "run_planner_on_object", spy)
+    monkeypatch.setattr(planner, "run_planner_on_batch", spy)
     monkeypatch.setattr(g, "_SETS", {})
-    sets = g.grasp_sets(blocks, DEVICE)
+    sets = g.grasp_sets(blocks, DEVICE, max_grasps=N)
     assert sets["block2"] is sets["block3"] and len(tags) == 1  # one shape, one generation
-    assert (len(tags[0]), tags[0].count("diff"), tags[0].count("obb")) == (4100, 500, 3600)
+    assert (len(tags[0]), tags[0].count("diff"), tags[0].count("obb")) == (N, N - 5 * (N // 8), 5 * (N // 8))
     grasps, scores = sets["block2"]
-    assert grasps.shape == (4100, 7) and scores.shape == (4100,)
+    assert grasps.shape == (N, 7) and scores.shape == (N,)
     assert grasps.dtype == scores.dtype == torch.float32 and grasps.device == scores.device == DEVICE
     assert ((grasps[:, 3:].norm(dim=-1) - 1).abs() <= 1e-6).all()
     assert ((scores >= 0) & (scores <= 1)).all()
@@ -248,7 +211,7 @@ def test_generation_repeats_and_keeps_the_run_rng(monkeypatch):
         if cold:
             g._load_sampler.cache_clear()  # the model is built again, drawing from torch's CPU generator
         rng, flags = _rng_states(), _flags()
-        made.append(g.grasp_sets(blocks, DEVICE)["block2"])
+        made.append(g.grasp_sets(blocks, DEVICE, max_grasps=N)["block2"])
         assert _rng_states() == rng, f"cold={cold} tf32={tf32}: a generator's state changed"
         assert _flags() == flags, f"cold={cold} tf32={tf32}: {_flags()} != {flags}"
     assert_bitwise(made[1], made[0], "warm vs cold", raw=True)
@@ -262,7 +225,7 @@ def test_a_background_load_is_the_only_load(monkeypatch):
     # one load, a foreground load's grasps bit for bit, and every generator as the caller left it.
     blocks = _blocks()
     monkeypatch.setattr(g, "_SETS", {})
-    want = g.grasp_sets(blocks, DEVICE)["block2"]  # a foreground load, if this process has no sampler yet
+    want = g.grasp_sets(blocks, DEVICE, max_grasps=N)["block2"]  # a foreground load, if this process has no sampler yet
     server, loads = sys.modules["graspgenx.grasp_server"], []
     load = server.load_grasp_gen_model
     monkeypatch.setattr(
@@ -273,7 +236,7 @@ def test_a_background_load_is_the_only_load(monkeypatch):
     g._load_sampler.cache_clear()
     rng = _rng_states()
     g.start_sampler_load()
-    got = g.grasp_sets(blocks, DEVICE)["block2"]
+    got = g.grasp_sets(blocks, DEVICE, max_grasps=N)["block2"]
     assert loads == ["graspgenx-load"]
     assert _rng_states() == rng, "a generator's state changed"
     assert_bitwise(got, want, "background vs foreground load", raw=True)
@@ -284,13 +247,14 @@ _CHILD = """
 import logging, os, sys
 import torch
 import cutamp
+from cutamp.config import TAMPConfiguration
 from cutamp.envs.utils import get_env_dir, load_env
 from cutamp.grasps import grasp_sets
 assert os.path.realpath(cutamp.__file__).startswith(os.getcwd() + os.sep), cutamp.__file__
 blocks = load_env(os.path.join(get_env_dir(), "blocks_t1.yml")).movables
 root = logging.getLogger()
 before = root.level, list(root.handlers)
-grasps, scores = grasp_sets(blocks, torch.device("cuda", 0))["block2"]
+grasps, scores = grasp_sets(blocks, torch.device("cuda", 0), max_grasps=TAMPConfiguration().num_particles)["block2"]
 assert (root.level, list(root.handlers)) == before, (root.level, root.handlers)
 torch.save({"grasps": grasps.cpu(), "scores": scores.cpu()}, sys.argv[1])
 """
@@ -302,6 +266,6 @@ def test_fresh_process_matches(tmp_path):
     out = tmp_path / "grasps.pt"
     subprocess.run([sys.executable, "-B", "-c", _CHILD, str(out)], cwd=Path(__file__).resolve().parents[2],
                    check=True, timeout=300)
-    grasps, scores = g.grasp_sets(_blocks(), DEVICE)["block2"]
+    grasps, scores = g.grasp_sets(_blocks(), DEVICE, max_grasps=N)["block2"]
     assert_bitwise({"grasps": grasps.cpu(), "scores": scores.cpu()}, torch.load(out), "this process vs a fresh one",
                    raw=True)

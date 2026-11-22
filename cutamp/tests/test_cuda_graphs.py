@@ -2,7 +2,6 @@
 as G_step and G_refresh and replayed, each replay against its eager counterpart bitwise."""
 
 import gc
-import itertools
 import subprocess
 import sys
 import weakref
@@ -139,19 +138,6 @@ def test_refresh_graph_lockstep(real_world, real_plan, monkeypatch):
     assert eager == list(range(1, 12))
 
 
-@needs_cuda
-def test_deferred_capture_after_planner_ends(real_world, real_plan, monkeypatch):
-    # SpyVis on: the loop's vis = None must drop an eager step's graph before a later capture.
-    world, (skeleton, base) = real_world, real_plan
-    config = _graph_config(num_opt_steps=20)
-    replays = install_step_replay_spy(monkeypatch)
-    busy = itertools.count()
-    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
-                         visualizer=SpyVis(config), planner_busy=lambda: next(busy) < 7)
-    assert m["capture_step"] == 7 and replays == [list(range(13))]
-    assert next(busy) == 8                           # consulted once per step, until the capture
-
-
 # The leak check is the bytes the tensors request, which is exact. memory_allocated is not compared: the caching
 # allocator counts each request at the size of the block it lands in, so memory_allocated can move between calls with
 # nothing new held. (test_cuda_graphs_whole_call compares the calls' results bitwise, not their memory.)
@@ -190,24 +176,21 @@ def test_second_optimize_call_recaptures(real_world, real_plan, monkeypatch):
 
 
 @needs_cuda
-def test_uncaptured_and_short_calls(real_world, real_plan, monkeypatch):
+def test_short_and_early_stopped_calls(real_world, real_plan, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
     world, (skeleton, base) = real_world, real_plan
     released, orig = [], CapturedGraph.release
     monkeypatch.setattr(CapturedGraph, "release", lambda self: released.append(self.name) or orig(self))
-    keys = ("capture_s", "capture_step", "refresh_capture_s", "refresh_capture_step")
 
-    def run(planner_busy=None, **kw):
+    def run(**kw):
         config = _graph_config(**kw)
         info = make_plan_info(world, skeleton, clone_particles(base), config)
-        return (*run_optimizer(info, config, planner_busy=planner_busy), info["particles"])
-    m, _, _ = run(planner_busy=lambda: True, num_opt_steps=8)          # planner busy all loop
-    assert [m[k] for k in keys] == [None] * 4 and released == []
+        return (*run_optimizer(info, config), info["particles"])
     m, _, _ = run(num_opt_steps=3)                                     # ends before refresh #1
     assert m["capture_step"] == 0 and released == ["G_step"]
     assert m["refresh_capture_step"] is None
     m, timer, parts = run(num_opt_steps=50, early_stop_patience=1)     # early stop
-    assert m.get("early_stopped_at") is not None and not timer.has_timer("optimization_step")
+    assert m.get("early_stopped_at") is not None and "optimization_step" not in timer._start_time
     assert timer.get_summaries()["optimization_step"]["count"] == len(m["elapsed"])  # the stopping step is timed too
     assert len(released) == 1 + sum(m[k] is not None for k in ("capture_step", "refresh_capture_step"))
     assert all(v.grad is None for v in parts.values())

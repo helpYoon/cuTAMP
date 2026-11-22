@@ -53,7 +53,6 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     first_schedules(monkeypatch, 1)
     torch.manual_seed(641)  # the placement is drawn
     cfg = TAMPConfiguration(
-        step_mode="model",
         max_loop_dur=60,
         enable_visualizer=False,
         experiment_root=str(tmp_path),

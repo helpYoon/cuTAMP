@@ -40,27 +40,6 @@ def test_below_cutoff_fills_by_score_then_posture():
     assert _choose(rows, 3) == [0, 2, 1]
 
 
-def test_generated_grasps_match_the_witness_orientation_and_keep_the_pool():
-    from cutamp.robots.t1 import REAL_LEGS
-    from cutamp.step_ik import _kinematics
-    from cutamp.step_particles import _generated_grasp_indices
-
-    posture = torch.tensor(REAL_LEGS.home, dtype=torch.double)
-    hand = _kinematics(posture.device).fk(posture[None], "left", False)[0][0, -12:]
-    obj = torch.eye(4, dtype=posture.dtype)
-    obj[:3, 3] = hand[:3]
-    obj[:3, :3] = hand[3:].reshape(3, 3).T / 0.2
-    seed, unwitnessed = (SimpleNamespace(schedule=SimpleNamespace(edges=[
-        SimpleNamespace(soles=[[0, .1, 0], [0, -.1, 0]], witness=witness)
-    ])) for witness in (posture.tolist(), None))
-    # The highest score points backward. The two other grasps match the witness, one below cutoff.
-    pool = torch.tensor([[0, 0, 0, 0, 0, 0, 1], [0, 0, 0, 1, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]], dtype=obj.dtype)
-    scores = pool.new_tensor([.98, .8, .5])
-    indices = _generated_grasp_indices(pool, scores, obj.expand(4, 4, 4), torch.eye(4, dtype=obj.dtype),
-                                       "left", [seed, seed, seed, unwitnessed], 0, torch.tensor([0, 1, 2, 0]))
-    assert indices.tolist() == [1, 0, 2, 0]
-
-
 def test_free_placement_projection_matches_the_final_rotated_footprint_and_support_checks():
     from cutamp.cost_function import CostFunction
     from cutamp.samplers import PLACEMENT_SUPPORT_GAP_M, project_supported_placement

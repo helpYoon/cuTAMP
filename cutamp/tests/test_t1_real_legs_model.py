@@ -134,20 +134,18 @@ def _cli_config(monkeypatch, *argv) -> TAMPConfiguration:
 
 def test_cli_defaults_to_predicted_motion_and_allows_keyframes(monkeypatch):
     cfg = _cli_config(monkeypatch)
-    assert cfg.step_mode == "model" and cfg.curobo_plan
+    assert cfg.curobo_plan
     assert not _cli_config(monkeypatch, "--no-motion_plan").curobo_plan
-    assert not _cli_config(monkeypatch, "--step_mode", "off").curobo_plan
 
 
 def test_main_cli_selects_the_learned_plateau_and_honors_particle_and_solver_overrides(monkeypatch):
-    cfg = _cli_config(monkeypatch).for_refinement(stepped=True)
+    cfg = _cli_config(monkeypatch).for_refinement()
     assert (cfg.num_particles, cfg.step_particle_batch_size) == (128, 128)
     assert (cfg.step_refine_iterations, cfg.adam_plateau().tolerance_m,
             cfg.adam_plateau().patience, cfg.adam_plateau().min_updates) == (48, 0.001, 5, 5)
     assert cfg.max_loop_dur is None
-    limited = _cli_config(monkeypatch, "-n", "32", "--step_refine_iterations", "3").for_refinement(stepped=True)
+    limited = _cli_config(monkeypatch, "-n", "32", "--step_refine_iterations", "3").for_refinement()
     assert (limited.num_particles, limited.step_refine_iterations) == (32, 3)
-    assert _cli_config(monkeypatch, "--step_mode", "off").num_particles == 256
 
 
 def test_soft_cost_default_and_choice(monkeypatch):

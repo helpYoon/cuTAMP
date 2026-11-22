@@ -2,10 +2,8 @@
 
 from dataclasses import fields, is_dataclass
 from functools import partial
-from itertools import islice
 from time import monotonic
 
-import roma
 import torch
 
 from cutamp.cost_function import CostFunction
@@ -14,7 +12,7 @@ from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, pre
 from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
 from cutamp.rollout import RolloutFunction
 from cutamp.samplers import project_supported_placement
-from cutamp.stance import abs_pose, stance_joint_limits
+from cutamp.stance import stance_joint_limits
 from cutamp.step_ik import solve_stance_ik, stance_ik_tolerance
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refinement import _check_deadline, refine_gap, stance_center_residual, stance_ik_rows
@@ -78,27 +76,6 @@ def _planar(soles):
     return torch.cat((soles[..., :2, 3], torch.atan2(soles[..., 1, 0], soles[..., 0, 0]).unsqueeze(-1)), dim=-1)
 
 
-def _carry_witness(q, soles):
-    # Offline hand maps store the representative configuration in its mid-sole frame.
-    mid = soles[:, :, :2].mean(1)
-    half = (soles[:, 1, 2] - soles[:, 0, 2]) / 2
-    yaw = soles[:, 0, 2] + torch.atan2(torch.sin(2 * half), torch.cos(2 * half)) / 2
-    R = roma.euler_to_rotmat("Z", yaw[:, None])
-    out = q.clone()
-    out[:, :2] = (R[:, :2, :2] @ q[:, :2, None]).squeeze(-1) + mid
-    out[:, 3:6] = roma.rotmat_to_euler("YXZ", R @ roma.euler_to_rotmat("YXZ", q[:, 3:6]))
-    return out
-
-
-def _nominal(incoming, order, commands):
-    feet = incoming
-    for j, side in enumerate(order if order != "none" else ""):
-        index = "LR".index(side)
-        swing = abs_pose(feet[:, 1 - index], commands[:, j])
-        feet = torch.stack((swing, feet[:, 1]) if index == 0 else (feet[:, 0], swing), dim=1)
-    return feet
-
-
 def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None, kinematics=None):
     """Project the post-manipulation rest onto planted soles and planner joint limits.
 
@@ -119,74 +96,19 @@ def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None,
     return solve_stance_ik(soles, wrist, bounded, arm, other_arm_reference=other_arm_reference, kinematics=kinematics)
 
 
-def _inputs_for_gap(seeds, gap, op, incoming, cmds, q_rest):
-    by_order = {}
-    has_fallback = False
-    for i, seed in enumerate(seeds):
-        edge = seed.schedule.edges[gap] if seed.schedule.edges else None
-        if edge is None or edge.witness is None:
-            has_fallback = True
-        else:
-            by_order.setdefault(edge.order, []).append((i, edge.witness))
-    if not by_order:
-        return q_rest.clone()
-    # A grounded skeleton normally gives all particles the same foot order.
-    # Keep the original row bindings for mixed orders and missing reach witnesses.
-    if len(by_order) == 1 and not has_fallback:
-        order, group = next(iter(by_order.items()))
-        witnesses = q_rest.new_tensor([pose for _, pose in group])
-        return _carry_witness(witnesses, _nominal(incoming, order, cmds))
-    out = q_rest.clone() if has_fallback else q_rest.new_empty(q_rest.shape)
-    for order, group in by_order.items():
-        rows, poses = zip(*group)
-        witnesses = q_rest.new_tensor(poses)
-        indices = torch.tensor(rows, device=q_rest.device)
-        nominal = _nominal(incoming[indices], order, cmds[indices])
-        out[indices] = _carry_witness(witnesses, nominal)
-    return out
+def _landing_starts(proposal, n, like):
+    """Per pick or place, ``[n, steps, 3]``: every particle starts each step at the landing command the A* chose for it
+    (:class:`cutamp.step_search.LandingEdge`: the swung sole's x, y, yaw in the planted sole's frame, a menu entry)."""
+    return [like.new_tensor(e.commands).reshape(1, len(e.commands), 3).repeat(n, 1, 1) for e in proposal.schedule.edges]
 
 
-def _command_inputs(seeds, steps, like):
-    if not steps:
-        return like.new_empty(len(seeds), 0, 3)
-    return like.new_tensor([[seed.commands[step.arg("sole_to")] for step in steps] for seed in seeds])
-
-
-def _generated_grasp_indices(pool, scores, objects, tool, arm, seeds, gap, ranks):
-    """Bind generated grasps to the particle's approximate pick posture before running landing rollouts."""
-    by_score = scores.argsort(descending=True, stable=True)
-    choice = by_score[ranks].clone()
-    rows, poses, soles = [], [], []
-    for i, seed in enumerate(seeds):
-        edges = seed.schedule.edges
-        if edges and edges[gap].witness is not None:
-            rows.append(i)
-            poses.append(edges[gap].witness)
-            soles.append(edges[gap].soles)
-    if not rows:
-        return choice
-    from cutamp.step_ik import _kinematics
-
-    # Both translations and rotations use the same units/weight as the grasp-and-stance IK objective.
-    witness = _carry_witness(pool.new_tensor(poses), pool.new_tensor(soles))
-    hand = _kinematics(pool.device).fk(witness.double(), arm, False)[0][:, -12:]
-    targets = objects[rows, None] @ (grasp_7dof_to_mat4x4(pool) @ tool)[None]
-    desired = torch.cat((targets[..., :3, 3], 0.2 * targets[..., :3, :3].mT.flatten(-2)), dim=-1)
-    error = (desired - hand[:, None]).square().sum(-1)
-    # Higher confidence wins ties. Every below-cutoff grasp stays available in score order.
-    error = error.masked_fill(scores < GRASP_SCORE_CUTOFF, torch.inf)
-    order = by_score[error[:, by_score].argsort(stable=True)]
-    choice[rows] = order.gather(1, ranks[rows, None]).squeeze(1)
-    return choice
-
-
-def _placements_and_grasps(groups, world, pools, first, stop, seeds, bindings=None, grasp_indices=None):
+def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, grasp_indices=None):
     n = stop - first
     like = world.q_init
     particles = {k: like.expand(n, -1).clone() for k in ("left_q0", "right_q0")}
     objects = {obj.name: world.get_object_pose(obj).expand(n, -1, -1) for obj in world.movables}
     snapshots, wrists, held, held_before = [], [], {}, []
-    for gap, (_, op) in enumerate(groups):
+    for _, op in groups:
         arm = op.operator.metadata.arm
         obj, grasp = op.arg("obj"), op.arg("grasp")
         snapshots.append(objects.copy())
@@ -197,8 +119,8 @@ def _placements_and_grasps(groups, world, pools, first, stop, seeds, bindings=No
             if grasp_indices is not None:
                 choice = grasp_indices[grasp + "_idx"]
             else:
-                tool = world.tool_from_ee[world.tool_frame_for_arm(arm)]
-                choice = _generated_grasp_indices(pool, scores, objects[obj], tool, arm, seeds, gap, idx)
+                # Each particle takes the next of the pick's grasps in score order.
+                choice = scores.argsort(descending=True, stable=True)[idx]
             particles[grasp], particles[grasp + "_idx"] = pool[choice], choice
         g = grasp_7dof_to_mat4x4(particles[grasp])
         if op.operator.metadata.action_type == "place":
@@ -284,7 +206,7 @@ def _summary(result, commands, order, initial, validation, i, *, incoming, wrist
 
 
 def _refine_batch(
-    proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first, stop, motion_inputs, deadline,
+    proposal, world, config, reducer, checker, inputs, predictor, pools, starts, first, stop, motion_inputs, deadline,
     *, bindings=None, grasp_indices=None, objective=False, ik_starts=None,
 ):
     _check_deadline(deadline)
@@ -294,7 +216,7 @@ def _refine_batch(
     n = stop - first
     like = world.q_init
     particles, objects, wrists, held_before = _placements_and_grasps(
-        groups, world, pools, first, stop, seeds, bindings, grasp_indices
+        groups, world, pools, first, stop, bindings, grasp_indices
     )
     placement_seeds = {
         op.arg("placement"): particles[op.arg("placement")].clone()
@@ -308,10 +230,10 @@ def _refine_batch(
         bound_grasps = {key: value for key, value in particles.items() if key.endswith("_idx")}
         for j, (steps, _) in enumerate(groups):
             if steps:
-                initial[f"foot{j}"] = _command_inputs(seeds, steps, like)
+                initial[f"foot{j}"] = starts[j]
 
         def evaluate(values, objective=True, *, ik_starts=None):
-            return _refine_batch(proposal, world, config, reducer, checker, inputs, predictor, pools, seeds, first,
+            return _refine_batch(proposal, world, config, reducer, checker, inputs, predictor, pools, starts, first,
                                  stop, motion_inputs, deadline, bindings=values, grasp_indices=bound_grasps,
                                  objective=objective, ik_starts=ik_starts)
 
@@ -382,16 +304,16 @@ def _refine_batch(
     solve_endpoint = partial(solve_stance_ik, center_posture=bool(config.com_center_weight))
     posture_references = {}
 
-    def endpoint_solver(k, previous, witness):
+    def endpoint_solver(k, previous, seed):
         action = groups[k][1]
         carrying = occupied_reference(k, previous)
         if carrying is not None:
             solve = partial(solve_endpoint, other_arm_reference=carrying)
         else:
             idle = world.model.right_arm if action.operator.metadata.arm == "left" else world.model.left_arm
-            nominal = witness.new_tensor(world.model.home[idle]).expand_as(witness[:, idle])
+            nominal = seed.new_tensor(world.model.home[idle]).expand_as(seed[:, idle])
             # The coupled scene rows below already check the nominal idle arm.
-            solve = (solve_endpoint if torch.equal(witness[:, idle], nominal)
+            solve = (solve_endpoint if torch.equal(seed[:, idle], nominal)
                      else partial(solve_endpoint, collides=partial(endpoint_collisions, k)))
         if ik_starts is None:
             return solve
@@ -428,8 +350,8 @@ def _refine_batch(
     for j, (steps, op) in enumerate(groups):
         _check_deadline(deadline)
         order = proposal.orders[j]
-        cmds = bindings[f"foot{j}"] if steps else _command_inputs(seeds, steps, like)
-        seed = _inputs_for_gap(seeds, j, op, incoming, cmds, rest)
+        cmds = bindings[f"foot{j}"] if steps else starts[j]
+        seed = rest.clone()  # IK starts from the posture held before this gap's steps
         arm = op.operator.metadata.arm
         held = held_before[j]
         other = occupied_reference(j, rest)
@@ -478,7 +400,7 @@ def _refine_batch(
                     after = _retract_on_stance(ik.soles, after, arm, world.joint_limits, other_arm_reference=other).q
                 for k in range(j + 1, last):
                     future_op = groups[k][1]
-                    prior = _inputs_for_gap(seeds, k, future_op, ik.soles, like.new_empty(n, 0, 3), after)
+                    prior = after.clone()
                     future = endpoint_solver(k, ik.q, prior)(ik.soles, wrists[k], prior, future_op.operator.metadata.arm)
                     rows.update({f"future_{k}_{key}": v for key, v in stance_ik_rows(future, margin).items()})
                     centers.append(stance_center_residual(future))
@@ -693,25 +615,18 @@ def refine_step_particles(
 ):
     if predictor is None:
         return StepResult([], None, "unavailable", "missing trained landing predictor")
-    config = config.for_refinement(stepped=True)
+    config = config.for_refinement()
     try:
         pools = ParticleInitializer(world, config, constraint_checker)._pick_pools(proposal.skeleton)
     except ValueError as e:
         return StepResult([], None, "unresolved", str(e))
     n = config.num_particles
-    seeds = [proposal.seed]
-    seeds.extend(islice(proposal.alternative_seeds, n - 1))
+    starts = _landing_starts(proposal, n, world.q_init)
     rows, feedback, diagnostic = [], [], {}
     status, reason = "unresolved", "no particle met all applicable constraints"
-    attempted_seeds, motion_inputs, adam_batches = [], {}, []
-    groups = _groups(proposal.skeleton)
+    motion_inputs, adam_batches = {}, []
     for first in range(0, n, config.step_particle_batch_size):
         stop = min(first + config.step_particle_batch_size, n)
-        batch_seeds = [seeds[i % len(seeds)] for i in range(first, stop)]
-        commands = [_list(_command_inputs(batch_seeds, steps, world.q_init)) for steps, _ in groups]
-        for signature in zip(*commands):
-            if signature not in attempted_seeds:
-                attempted_seeds.append(signature)
         try:
             batch = _refine_batch(
                 proposal,
@@ -722,7 +637,7 @@ def refine_step_particles(
                 inputs,
                 predictor,
                 pools,
-                batch_seeds,
+                [s[first:stop] for s in starts],
                 first,
                 stop,
                 motion_inputs,
@@ -758,7 +673,6 @@ def refine_step_particles(
         diagnostic.update(
             _validate_motion_rows(eligible, pools, proposal.skeleton, world, config, attempt, deadline=deadline)
         )
-    diagnostic["attempted_seed_commands"] = attempted_seeds
     if adam_batches:
         diagnostic["adam_batches"] = adam_batches
     return StepResult(rows, torch.cat(feedback) if feedback else None, status, reason, diagnostic)

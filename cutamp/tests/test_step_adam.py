@@ -64,7 +64,6 @@ def test_plateau_needs_a_feasible_particle_and_respects_minimum(feasible, minimu
     {"step_adam_plateau_mm": 1., "step_adam_plateau_patience": 0},
     {"step_adam_plateau_mm": 1., "step_adam_plateau_min_updates": -1},
     {"step_adam_plateau_mm": 1., "com_center_weight": 0},
-    {"step_adam_plateau_mm": 1., "step_mode": "off"},
 ])
 def test_invalid_plateau_controls(options):
     from cutamp.config import TAMPConfiguration, validate_tamp_config

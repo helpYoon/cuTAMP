@@ -203,8 +203,8 @@ class _StepBody:
         return packed, ((rollout, cost_dict, costs, satisfying_mask) if self.keep_vis else None)
 
     def clear_autograd(self) -> None:
-        """Drop every param's ``.grad``: before a capture, so a deferred one's first warm-up doesn't accumulate
-        into the last eager step's grads, and after G_step's release, when they hold its pool."""
+        """Drop every param's ``.grad``: before a capture, so its first warm-up starts from no grads, and after
+        G_step's release, when they hold its pool."""
         for p in self.params:
             p.grad = None
 
@@ -214,7 +214,6 @@ class PlanContainer(TypedDict):
     particles: Particles
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
-    heuristic: float
 
 
 class _BestSnapshot:
@@ -441,15 +440,11 @@ class _StaticRefresh:
 class ParticleOptimizer:
     """Attempts to optimize particles for a plan skeleton."""
 
-    def __init__(self, config: TAMPConfiguration, cost_reducer: CostReducer, constraint_checker: ConstraintChecker,
-                 planner_busy: Optional[Callable[[], bool]] = None):
+    def __init__(self, config: TAMPConfiguration, cost_reducer: CostReducer, constraint_checker: ConstraintChecker):
         self.config = config
         self.cost_reducer = cost_reducer
         self.constraint_checker = constraint_checker
         self.get_satisfying_mask = self.constraint_checker.get_mask
-        # True while the motion-planner build thread runs (None: no thread). Nothing is captured until it
-        # returns False: a global-mode capture fails on another thread's CUDA work.
-        self.planner_busy = planner_busy
 
         # Types to optimize
         self.types_to_optimize = {Pose, Conf}
@@ -618,8 +613,6 @@ class ParticleOptimizer:
         if init_num > 0:
             # First-solution timing semantics: we already have a solution
             # from IK init, so stamp 0.0 even though Adam is about to run.
-            if timer.has_timer("first_solution"):
-                timer.stop("first_solution")
             opt_metrics["opt_start_to_first_sol"] = 0.0
             found_solution = True
 
@@ -649,14 +642,9 @@ class ParticleOptimizer:
                 if deadline is not None and time.monotonic() >= deadline:
                     time_exceeded = True
                     break
-                if (self.config.max_loop_dur is not None
-                        and timer.elapsed("start_optimization") >= self.config.max_loop_dur):
-                    _log.warning(f"Optimization exceeded max time of {self.config.max_loop_dur:.2f}s")
-                    time_exceeded = True
-                    break
                 timer.start("optimization_step")  # a capture's cost lands in its step
-                if use_graphs and step_graph is None and not (self.planner_busy and self.planner_busy()):
-                    step_graph = self._capture_step(body, world)  # the planner thread has ended
+                if use_graphs and step_graph is None:
+                    step_graph = self._capture_step(body, world)
                     opt_metrics["capture_s"], opt_metrics["capture_step"] = step_graph.capture_s, step
                 if step_graph is not None:
                     step_graph.replay()  # never zero_grad after the capture: the graph owns .grad
@@ -669,10 +657,6 @@ class ParticleOptimizer:
                 opt_metrics["num_satisfying"].append(num_satisfying)
 
                 if num_satisfying > 0 and not found_solution:
-                    if timer.has_timer("first_solution"):
-                        time_to_first_sol = timer.stop("first_solution")
-                        _log.info(f"Found first solution in {time_to_first_sol:.2f}s after sampling plans")
-
                     torch.cuda.synchronize()
                     opt_metrics["opt_start_to_first_sol"] = time.perf_counter() - start_time
                     found_solution = True
@@ -713,7 +697,7 @@ class ParticleOptimizer:
                         refresh_graph(step)
                     else:
                         _refresh_balanced(particles, ik_deps, world, reik_gate, step)
-                        # G_step exists only once the planner thread has ended for good.
+                        # Captured at the first refresh after G_step exists.
                         if step_graph is not None:
                             refresh_graph = _StaticRefresh(particles, ik_deps, world, reik_gate)
                             opt_metrics["refresh_capture_s"] = refresh_graph.graph.capture_s
@@ -723,7 +707,7 @@ class ParticleOptimizer:
                     f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, "
                     f"{num_satisfying}/{self.config.num_particles} satisfying"
                 )
-                vis = None  # no eager step leaves an autograd graph alive for a later capture
+                vis = None  # drop this step's rollout (and in eager mode its autograd graph) before the next step
         finally:  # also on early stop and on errors: no graph outlives the loop
             if step_graph is not None:
                 step_graph.release()
