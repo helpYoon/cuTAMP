@@ -1,5 +1,6 @@
-"""A plan with steps inside the Adam loop (design sections 4 to 6): its starting values, its refresh on the world model
-and controller, and the helpers the stepped route shares with the motion stage."""
+"""A plan with steps inside the Adam loop (design sections 4 to 7): its starting values, its refresh on the world model
+and controller, the route that runs it through the loop, and the helpers the stepped route shares with the motion
+stage."""
 
 import math
 from dataclasses import fields, is_dataclass, replace
@@ -14,7 +15,8 @@ from cutamp.cost_function import CostFunction
 from cutamp.costs import curobo_pose_error
 from cutamp.grasps import GRASP_SCORE_CUTOFF
 from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, prediction_precision
-from cutamp.particle_initialization import _draw_placements, pick_place_confs, worst_posture
+from cutamp.optimize_plan import ParticleOptimizer
+from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.rollout import RolloutFunction
 from cutamp.samplers import project_supported_placement
@@ -629,5 +631,63 @@ class SteppedPlan:
         best = int((ep.sum(1) * -1e6 + hard.nan_to_num(1e6)).argmin())
         failures = [f"{kind}.{key}" for kind, items in masks.items() for key, mask in items.items()
                     if not mask[best].all()]
+        # How many particles fail each requirement, the requirements every particle meets left out.
+        counts = {f"{kind}.{key}": int((~mask.reshape(n, -1).all(1)).sum()) for kind, items in masks.items()
+                  for key, mask in items.items()}
         return StepResult(rows, ep, "unresolved", "no particle met all applicable constraints",
-                          {"row": best, "failed_constraints": failures})
+                          {"row": best, "failed_constraints": failures,
+                           "failure_counts": {key: count for key, count in counts.items() if count}})
+
+
+def refine_stepped_plan(proposal, world, config, cost_reducer, constraint_checker, *, inputs, predictor, timer,
+                        visualizer, deadline) -> StepResult:
+    """A plan with steps through the Adam loop (design 4 to 7): its starting values, the loop with its refreshes, the
+    rows its last refresh passes and, with ``curobo_plan``, the motion stage on them.
+
+    ``diagnostics["adam"]`` holds the Adam steps run, their rate over the optimizer's call, the step the loop stopped
+    early at (None: it did not) and the plan's ``stats``. A deadline that passes before the loop, or during it with no
+    row passing, answers ``budget_exhausted``."""
+    if predictor is None:
+        return StepResult([], None, "unavailable", "missing trained landing predictor")
+    config = config.for_steps()
+    try:
+        pools = ParticleInitializer(world, config, constraint_checker)._pick_pools(proposal.skeleton)
+    except ValueError as e:
+        return StepResult([], None, "unresolved", str(e))
+    try:
+        plan = SteppedPlan(proposal, world, config, predictor, inputs, pools, constraint_checker, deadline=deadline)
+    except TimeoutError as e:
+        return StepResult([], None, "budget_exhausted", str(e))
+    except ValueError as e:
+        return StepResult([], None, "unresolved", str(e))
+    info = {"plan_skeleton": plan.arm_skeleton, "particles": plan.particles, "rollout_fn": plan.rollout_fn,
+            "cost_fn": plan, "steps": plan}
+    began = monotonic()
+    _, opt_metrics, time_exceeded = ParticleOptimizer(config, cost_reducer, constraint_checker)(
+        info, timer, visualizer, deadline=deadline
+    )
+    seconds = monotonic() - began
+    result = plan.result(plan.particles, cost_reducer, constraint_checker)
+    if time_exceeded and not result.rows:
+        result.status, result.reason = "budget_exhausted", "the Adam loop reached the planner deadline"
+    run = len(opt_metrics["num_satisfying"])
+    result.diagnostics["adam"] = {"steps_run": run, "seconds": seconds, "steps_per_s": run / seconds,
+                                  "early_stopped_at": opt_metrics.get("early_stopped_at"), **plan.stats}
+    if config.curobo_plan and result.rows:
+        from cutamp.step_preview import plan_predicted_step_motion
+
+        # Plans chosen by their centring show their motion after the search, as on the standing route.
+        shown = None if config.com_center_weight != 0 else visualizer
+        ik_tol = IKTol.from_checker(constraint_checker)
+
+        def attempt(row):
+            adapter, saved = plan.motion_inputs[row.index]
+            traces = {gap: _take(trace, 0, world.q_init.device) for gap, trace in saved.items()}
+            return plan_predicted_step_motion(proposal.skeleton, row, traces, adapter, world, config, timer=timer,
+                                              visualizer=shown, ik_tol=ik_tol, deadline=deadline)
+
+        with prediction_precision():  # the precision the motion stage ran at before the loop took stepped plans
+            result.diagnostics.update(
+                _validate_motion_rows(result.rows, pools, proposal.skeleton, world, config, attempt, deadline=deadline)
+            )
+    return result

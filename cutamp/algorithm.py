@@ -391,10 +391,10 @@ def _load_predictor(config):
 def _refine_step_schedule(proposal, world, config, *args, **kwargs):
     # The model and its CUDA deployment are optional for searches whose plans take no step.
     from cutamp.step_ik import stance_ik_graphs
-    from cutamp.step_particles import refine_step_particles
+    from cutamp.step_loop import refine_stepped_plan
 
     with stance_ik_graphs(config.cuda_graphs):
-        return refine_step_particles(proposal, world, config, *args, **kwargs)
+        return refine_stepped_plan(proposal, world, config, *args, **kwargs)
 
 
 def _refine_standing_schedule(
@@ -632,7 +632,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                         inputs=inputs,
                         predictor=predictor,
                         timer=timer,
-                        visualizer=None if center_first else visualizer,
+                        visualizer=visualizer,
                         deadline=deadline,
                     )
                 except NoGraspCandidates as e:

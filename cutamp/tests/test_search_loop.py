@@ -451,8 +451,7 @@ def test_motion_feasibility_then_worst_center_then_effort_in_successful_skeleton
     monkeypatch.setattr(alg, "_refine_standing_schedule", lambda *a, **kw: StepResult([], None, "unresolved"))
 
     def refine(proposal, *args, **kwargs):
-        if weight != 0:
-            assert kwargs["visualizer"] is None
+        assert kwargs["visualizer"] is viewer  # the Adam loop's; the route keeps it from the motion stage when centring
         candidates = [
             (1, [.0, .0495], .01, .0, ["worse at place"]),
             (2, [.049, .049], 8., 1., ["selected"]),

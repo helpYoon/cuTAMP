@@ -25,7 +25,7 @@ def test_composed_stance_miss_is_rejected_even_if_the_two_individual_steps_track
 
 @needs_cuda
 def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landings(tmp_path, monkeypatch):
-    """A fixed grasp and foot order isolate motion compilation. Learned step Adam selects the foot commands, postures
+    """A fixed grasp and foot order isolate motion compilation. The Adam loop optimizes the foot commands, postures
     and placement on this GPU."""
     from curobo.scene import Cuboid
 

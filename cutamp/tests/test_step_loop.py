@@ -207,3 +207,32 @@ def test_result_rows(stepped_call):
         assert pick["order"] == "L" and place["order"] == "none" and pick["achieved"] == place["achieved"]
         assert len(pick["commands"]) == 1 and len(pick["final_xy_error_m"]) == 2
         assert sum(k.endswith("_ik_reference") for k in row.particle) == 2
+
+
+from cutamp.step_loop import refine_stepped_plan
+
+
+@needs_cuda
+def test_expired_budget_is_reported(stepped_call):
+    c = stepped_call
+    res = refine_stepped_plan(c["proposal"], c["world"], c["config"], c["reducer"], c["checker"], inputs=c["inputs"],
+                              predictor=c["predictor"], timer=c["timer"], visualizer=c["visualizer"],
+                              deadline=monotonic() - 1.0)
+    assert res.status == "budget_exhausted" and res.rows == []
+
+
+@needs_cuda
+def test_a_missing_predictor_is_reported(stepped_call):
+    c = stepped_call
+    res = refine_stepped_plan(c["proposal"], c["world"], c["config"], c["reducer"], c["checker"], inputs=c["inputs"],
+                              predictor=None, timer=c["timer"], visualizer=c["visualizer"], deadline=None)
+    assert res.status == "unavailable"
+
+
+@needs_cuda
+def test_an_unresolved_result_counts_the_particles_each_requirement_fails(stepped_call):
+    plan = make_plan(stepped_call)
+    res = plan.result(plan.particles, stepped_call["reducer"], stepped_call["checker"])
+    assert res.status == "unresolved"  # no particle is feasible at the start on this scene
+    counts = res.diagnostics["failure_counts"]
+    assert set(res.diagnostics["failed_constraints"]) <= set(counts) and all(0 < v <= 16 for v in counts.values())
