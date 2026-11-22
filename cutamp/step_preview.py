@@ -13,7 +13,7 @@ from cutamp import motion_solver as ms
 from cutamp.com_polygon_cost import physical_support_centroid
 from cutamp.robots.t1 import MOTION_INTERPOLATION_DT, get_t1_kinematics, t1_curobo_cfg
 from cutamp.step_ik import _Kinematics
-from cutamp.step_refinement import _check_deadline, landing_constraint_rows
+from cutamp.step_loop import _check_deadline, landing_constraint_rows
 from cutamp.step_validation import (
     HEAD_JOINTS,
     StepStateAdapter,
@@ -222,7 +222,7 @@ class PredictedSteppedMotion(SteppedMotion):
         return segments
 
     def approach(self, idx, op, particle, object_poses, cfg, ik_tol):
-        from cutamp.step_particles import _retract_on_stance
+        from cutamp.step_loop import _retract_on_stance
 
         arm = op.operator.metadata.arm
         self.check_supported_start()
@@ -250,7 +250,7 @@ def plan_predicted_step_motion(
     skeleton, row, predictions, adapter, world, config, *, timer, visualizer, ik_tol, deadline
 ):
     """Return and label a model-only preview after actual handoff, geometry and supported motion checks."""
-    from cutamp.step_particles import _evidence
+    from cutamp.step_loop import _evidence
 
     bindings = dict(row.particle)
     motion = PredictedSteppedMotion(skeleton, bindings, predictions, adapter, world, deadline)

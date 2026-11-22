@@ -1,150 +1,41 @@
 """Refine the shared grasps, placements and commanded landings of a grounded T1 skeleton."""
 
-from dataclasses import fields, is_dataclass
 from functools import partial
 from time import monotonic
 
 import torch
 
 from cutamp.cost_function import CostFunction
-from cutamp.grasps import GRASP_SCORE_CUTOFF
 from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, prediction_precision
-from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
+from cutamp.particle_initialization import IKTol, ParticleInitializer
 from cutamp.rollout import RolloutFunction
-from cutamp.samplers import project_supported_placement
-from cutamp.stance import stance_joint_limits
 from cutamp.step_ik import solve_stance_ik, stance_ik_tolerance
+from cutamp.step_loop import (
+    _batch,
+    _check_deadline,
+    _evidence,
+    _groups,
+    _placements_and_grasps,
+    _planar,
+    _retract_on_stance,
+    _take,
+    _validate_motion_rows,
+    stance_center_residual,
+)
 from cutamp.step_planner import StepResult, StepRow
-from cutamp.step_refinement import _check_deadline, refine_gap, stance_center_residual, stance_ik_rows
+from cutamp.step_refinement import refine_gap, stance_ik_rows
 from cutamp.step_sequence import predict_sequence
 from cutamp.step_validation import StepStateAdapter, sweep_constraint_rows, sweep_penetration_rows, validate_step_geometry
-from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
-
-
-def _batch(value, first, stop, tail, like):
-    x = torch.as_tensor(value, dtype=like.dtype, device=like.device)
-    if x.shape[1:] != tail or (len(x) != 1 and len(x) < stop):
-        raise ValueError(f"Expected particle rows of shape {tail}; got {tuple(x.shape)}")
-    return x.expand(stop - first, *tail) if len(x) == 1 else x[first:stop]
-
-
-def _take(value, i, device):
-    """Detach a selected trajectory, retaining its batch axis and metadata."""
-    if torch.is_tensor(value):
-        return value[i : i + 1].detach().to(device)
-    if is_dataclass(value):
-        return type(value)(**{f.name: _take(getattr(value, f.name), i, device) for f in fields(value)})
-    if isinstance(value, tuple):
-        return tuple(_take(v, i, device) for v in value)
-    return value
-
-
-def _evidence(adapter, predictions):
-    from cutamp.step_validation import model_step_record
-
-    def render():
-        gaps = {}
-        for j, (start, commands, pred, preparation) in predictions.items():
-            gaps[str(j)] = []
-            for k, step in enumerate(pred.steps):
-                gaps[str(j)].append(model_step_record(adapter, start, step, commands[:, k], preparation=preparation))
-                start, preparation = step.terminal, None
-        return gaps
-
-    return render
 
 
 def _list(x):
     return x.detach().cpu().tolist()
 
 
-def _groups(skeleton):
-    steps, groups = [], []
-    for op in skeleton:
-        kind = op.operator.metadata.action_type
-        if kind == "step":
-            steps.append(op)
-        elif kind in ("pick", "place"):
-            groups.append((steps, op))
-            steps = []
-    if steps:
-        raise ValueError("Dangling step after final manipulation")
-    return groups
-
-
-def _planar(soles):
-    return torch.cat((soles[..., :2, 3], torch.atan2(soles[..., 1, 0], soles[..., 0, 0]).unsqueeze(-1)), dim=-1)
-
-
-def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None, kinematics=None):
-    """Project the post-manipulation rest onto planted soles and planner joint limits.
-
-    A learned handoff may lie between the planner's soft limit and the physical
-    joint stop. Preserve that handoff. The subsequent retract gets its own
-    supported keyframe and the motion planner must connect the two poses.
-    """
-    from cutamp.step_ik import _kinematics
-
-    bounds = stance_joint_limits(soles, *limits) if kinematics is None else limits
-    bounded = arrived.clamp(*bounds)
-    kin = _kinematics(arrived.device) if kinematics is None else kinematics
-    fk, _ = kin.fk(bounded.double(), arm, jacobian=False)
-    hand = fk.reshape(len(arrived), 3, 12)[:, -1]
-    wrist = torch.eye(4, device=arrived.device, dtype=hand.dtype).repeat(len(arrived), 1, 1)
-    wrist[:, :3, 3] = hand[:, :3]
-    wrist[:, :3, :3] = (hand[:, 3:] / 0.2).reshape(-1, 3, 3).mT
-    return solve_stance_ik(soles, wrist, bounded, arm, other_arm_reference=other_arm_reference, kinematics=kinematics)
-
-
 def _landing_starts(proposal, n, like):
     """Per pick or place, ``[n, steps, 3]``: every particle starts each step at the landing command the A* chose for it
     (:class:`cutamp.step_search.LandingEdge`: the swung sole's x, y, yaw in the planted sole's frame, a menu entry)."""
     return [like.new_tensor(e.commands).reshape(1, len(e.commands), 3).repeat(n, 1, 1) for e in proposal.schedule.edges]
-
-
-def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, grasp_indices=None):
-    n = stop - first
-    like = world.q_init
-    particles = {k: like.expand(n, -1).clone() for k in ("left_q0", "right_q0")}
-    objects = {obj.name: world.get_object_pose(obj).expand(n, -1, -1) for obj in world.movables}
-    snapshots, wrists, held, held_before = [], [], {}, []
-    for _, op in groups:
-        arm = op.operator.metadata.arm
-        obj, grasp = op.arg("obj"), op.arg("grasp")
-        snapshots.append(objects.copy())
-        held_before.append(held.copy())
-        if op.operator.metadata.action_type == "pick":
-            pool, scores = pools[grasp]
-            idx = torch.arange(first, stop, device=like.device) % len(pool)
-            if grasp_indices is not None:
-                choice = grasp_indices[grasp + "_idx"]
-            else:
-                # Each particle takes the next of the pick's grasps in score order.
-                choice = scores.argsort(descending=True, stable=True)[idx]
-            particles[grasp], particles[grasp + "_idx"] = pool[choice], choice
-        g = grasp_7dof_to_mat4x4(particles[grasp])
-        if op.operator.metadata.action_type == "place":
-            key = op.arg("placement")
-            if bindings is not None and key in bindings:
-                particles[key] = project_supported_placement(bindings[key], world.get_collision_spheres(obj),
-                                                            world.get_aabb(op.arg("surface")))
-            else:
-                particles[key] = _draw_placements(
-                    world,
-                    world.get_object(obj),
-                    world.get_collision_spheres(obj),
-                    world.get_object(op.arg("surface")),
-                    g,
-                    surface_bounds=world.get_aabb(op.arg("surface")),
-                )
-            objects[obj] = action_4dof_to_mat4x4(particles[key])
-        tool = g @ world.tool_from_ee[world.tool_frame_for_arm(arm)]
-        wrists.append(objects[obj] @ tool)
-        if op.operator.metadata.action_type == "pick":
-            held[arm] = (obj, torch.linalg.inv(tool))
-        else:
-            held.pop(arm)
-    return particles, snapshots, wrists, held_before
 
 
 def _summary(result, commands, order, initial, validation, i, *, incoming, wrist, initialization,
@@ -568,45 +459,6 @@ def _refine_batch(
     diagnostics = {"row": first + best, "gaps": records(best), "failed_constraints": failures}
     status = "model_feasible" if rows else "unresolved"
     return StepResult(rows, ep, status, None if rows else "no particle met all applicable constraints", diagnostics)
-
-
-def _validate_motion_rows(rows, pools, skeleton, world, config, attempt, *, deadline):
-    """Spend one retry budget across all particle chunks of this grounded schedule."""
-    from cutamp.algorithm import grasp_group_order
-
-    diagnostics = {"motion_plan_attempts": 0, "motion_plan_failures": []}
-    if not rows or (deadline is not None and monotonic() >= deadline):
-        return diagnostics
-    if config.com_center_weight != 0:
-        ranked = sorted(rows, key=lambda row: (row.max_center_distance_m, row.effort))
-        candidates = ranked[:config.motion_plan_max_retries]
-    else:
-        if pools:
-            indices = torch.stack([torch.stack([r.particle[name + "_idx"] for name in pools]) for r in rows])
-            hi = torch.stack([
-                scores.to(indices.device)[indices[:, j]] >= GRASP_SCORE_CUTOFF
-                for j, (_, scores) in enumerate(pools.values())
-            ]).all(0)
-        else:
-            indices = torch.empty(len(rows), 0, dtype=torch.long)
-            hi = torch.ones(len(rows), dtype=torch.bool)
-        soft = torch.tensor([r.soft_cost for r in rows], dtype=torch.float64)
-        margin = torch.tensor([r.metrics["best_com_margin"] for r in rows], dtype=torch.float64)
-        confs = [torch.stack([r.particle[q] for r in rows]) for q in pick_place_confs(skeleton)]
-        tilt, travel, _ = worst_posture(world, confs)
-        order = grasp_group_order(indices, soft, hi, tilt, travel, margin, config.motion_plan_max_retries)
-        candidates = [rows[i] for i in order]
-    for rank, row in enumerate(candidates):
-        if deadline is not None and monotonic() >= deadline:
-            break
-        row.motion_plan, info = attempt(row)
-        row.metrics.update(info)
-        diagnostics["motion_plan_attempts"] += 1
-        if row.motion_plan is not None:
-            row.metrics["motion_plan_rank"] = rank
-            break
-        diagnostics["motion_plan_failures"].append(info.get("reason", info["motion_validation"]))
-    return diagnostics
 
 
 @prediction_precision()

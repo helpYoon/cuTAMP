@@ -562,7 +562,7 @@ def test_particle_and_motion_defaults():
 
 @pytest.mark.parametrize("limit,expire,expected", [(1, False, [5]), (5, False, [5, 2]), (5, True, [5])])
 def test_stepped_motion_honors_global_retry_order_and_deadline(monkeypatch, limit, expire, expected):
-    from cutamp import step_particles
+    from cutamp import step_loop
 
     # Row 5 is the best of three rows sharing a grasp, row 2 has a distinct grasp.
     rows = [
@@ -571,8 +571,8 @@ def test_stepped_motion_honors_global_retry_order_and_deadline(monkeypatch, limi
     ]
     pools = {"grasp1": (torch.zeros(2, 7), torch.ones(2))}
     calls = []
-    monkeypatch.setattr(step_particles, "monotonic", lambda: 1.0 if expire and calls else 0.0)
-    monkeypatch.setattr(step_particles, "worst_posture", lambda world, confs: (torch.zeros(4),) * 3)
+    monkeypatch.setattr(step_loop, "monotonic", lambda: 1.0 if expire and calls else 0.0)
+    monkeypatch.setattr(step_loop, "worst_posture", lambda world, confs: (torch.zeros(4),) * 3)
     op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="pick")), values=("q1",))
 
     def attempt(row):
@@ -582,7 +582,7 @@ def test_stepped_motion_honors_global_retry_order_and_deadline(monkeypatch, limi
         return None, {"motion_validation": "rejected", "reason": "connection failed"}
 
     cfg = TAMPConfiguration(motion_plan_max_retries=limit, com_center_weight=0)
-    report = step_particles._validate_motion_rows(rows, pools, [op], None, cfg, attempt, deadline=0.5)
+    report = step_loop._validate_motion_rows(rows, pools, [op], None, cfg, attempt, deadline=0.5)
     assert calls == expected
     assert report["motion_plan_attempts"] == len(calls)
     assert report["motion_plan_failures"] == ["connection failed"]
@@ -593,12 +593,12 @@ def test_stepped_motion_honors_global_retry_order_and_deadline(monkeypatch, limi
 
 
 def test_stepped_motion_with_no_grasp_columns_uses_particle_cost(monkeypatch):
-    from cutamp import step_particles
+    from cutamp import step_loop
 
     op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="place")), values=("q1",))
     rows = [StepRow(i, {"q1": torch.zeros(33)}, cost, {"best_com_margin": 0.08}) for i, cost in enumerate((2., 1.))]
-    monkeypatch.setattr(step_particles, "worst_posture", lambda w, qs: (torch.zeros(2),) * 3)
-    report = step_particles._validate_motion_rows(
+    monkeypatch.setattr(step_loop, "worst_posture", lambda w, qs: (torch.zeros(2),) * 3)
+    report = step_loop._validate_motion_rows(
         rows, {}, [op], None, TAMPConfiguration(com_center_weight=0), lambda r: ([r.index], {"motion_validation": "accepted"}),
         deadline=None,
     )
@@ -606,7 +606,7 @@ def test_stepped_motion_with_no_grasp_columns_uses_particle_cost(monkeypatch):
 
 
 def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatch):
-    from cutamp import step_particles, step_preview
+    from cutamp import step_loop, step_particles, step_preview
 
     cfg = TAMPConfiguration(
         num_particles=4, step_particle_batch_size=2, motion_plan_max_retries=1, curobo_plan=True,
@@ -616,7 +616,7 @@ def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatc
     proposal = SimpleNamespace(skeleton=[op], schedule=SimpleNamespace(edges=(SimpleNamespace(commands=()),)))
     world = SimpleNamespace(q_init=torch.zeros(33))
     monkeypatch.setattr(step_particles, "ParticleInitializer", lambda *a: SimpleNamespace(_pick_pools=lambda p: pools))
-    monkeypatch.setattr(step_particles, "worst_posture", lambda w, qs: (torch.zeros(len(qs[0])),) * 3)
+    monkeypatch.setattr(step_loop, "worst_posture", lambda w, qs: (torch.zeros(len(qs[0])),) * 3)
     monkeypatch.setattr(step_particles.IKTol, "from_checker", lambda c: None)
     chunks, attempted = [], []
 

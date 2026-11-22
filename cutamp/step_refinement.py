@@ -7,16 +7,14 @@ IK on the resulting stance. Returned masks describe individual rows.
 
 import math
 from dataclasses import dataclass
-from time import monotonic
 
 import torch
 
-from cutamp.com_polygon_cost import margin_from_support_planes, physical_support_centroid, support_region_planes
+from cutamp.com_polygon_cost import margin_from_support_planes, support_region_planes
 from cutamp.landing_predictor import LandingPrediction, LandingState, prediction_precision
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.stance import STEP_TRAVEL, abs_pose, rel_pose
-from cutamp.step_bound import planner_step_bound, travel
 from cutamp.step_ik import StanceIK, solve_stance_ik
+from cutamp.step_loop import _check_deadline, landing_constraint_rows, stance_center_residual
 
 
 @dataclass
@@ -64,62 +62,6 @@ def stance_ik_rows(ik: StanceIK, margin_m: float) -> dict[str, torch.Tensor]:
     return rows
 
 
-def stance_center_residual(ik: StanceIK) -> torch.Tensor:
-    """Signed xy displacement of the projected robot CoM from the physical hull's area centroid."""
-    return ik.com[:, :2] - physical_support_centroid(ik.soles.double(), REAL_LEGS.sole_box)
-
-
-def landing_constraint_rows(predictor, incoming, order, u, pred):
-    """Command domain, phase, per-landing and composed-stance checks on this actual issue state."""
-    before = incoming
-    rows = {}
-    hard = torch.ones(len(u), dtype=torch.bool, device=u.device)
-    if order:
-        bounds = planner_step_bound(u.device, u.dtype)
-    for j, side in enumerate(order):
-        prefix = f"step{j + 1}_"
-        c = u[:, j]
-        s = "LR".index(side)
-        foot = torch.full((len(c),), s == 0, device=c.device)
-        start = rel_pose(before[:, 1 - s], before[:, s])
-        t = travel(start, c)
-        rows[prefix + "min_travel"] = (STEP_TRAVEL[0] - t) / STEP_TRAVEL[0]
-        rows[prefix + "max_travel"] = t / STEP_TRAVEL[1] - 1
-        rows[prefix + "command_bound"] = bounds.g(c, foot) / 0.02
-        dest = abs_pose(before[:, 1 - s], c)
-        pair = torch.stack((dest, before[:, 1]) if s == 0 else (before[:, 0], dest), dim=1)
-        if pred is not None:
-            step = pred.steps[j]
-            pair = step.achieved
-            ph = step.phases
-            profile = predictor.profile
-            rows[prefix + "xy_precision"] = step.xy_error.square() / 0.020**2 - 1
-            rows[prefix + "yaw_precision"] = step.yaw_error.square() / math.radians(1) ** 2 - 1
-            for key in (
-                "deadline_xy",
-                "deadline_yaw",
-                "deadline_height",
-                "support_xy",
-                "support_yaw",
-                "hold_xy",
-                "hold_yaw",
-            ):
-                threshold = getattr(profile, key)
-                rows[prefix + key] = (getattr(ph, key) - threshold) / max(threshold, 1e-6)
-            rows[prefix + "terminal_sole_height"] = step.sole_height[:, -1].abs() / 0.02 - 1
-            rows[prefix + "terminal_sole_tilt"] = step.sole_tilt[:, -1] / 0.10 - 1
-            hard = hard & ph.deadline_ok & ph.hold_ok & ph.support_ok
-        actual = rel_pose(pair[:, 1 - s], pair[:, s])
-        rows[prefix + "achieved_bound"] = bounds.g(actual, foot) / 0.02
-        before = pair
-    if pred is not None:
-        hard = hard & pred.tracking_ok
-        if len(order) > 1:
-            rows["final_xy_precision"] = pred.final_xy_error.square() / 0.020**2 - 1
-            rows["final_yaw_precision"] = pred.final_yaw_error.square() / math.radians(1) ** 2 - 1
-    return rows, hard, before
-
-
 def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, extra_rows,
               *, solve_ik=solve_stance_ik, prediction=None):
     pred = prediction
@@ -142,11 +84,6 @@ def _evaluate(predictor, initial, incoming, order, u, arm, wrist, seed, margin, 
         hard = hard & torch.isfinite(r.reshape(len(u), -1)).all(-1) & (r.reshape(len(u), -1) <= 0).all(-1)
     center = torch.stack(centers, dim=1)
     return _Evaluation(pred, ik, rows, hard & center.isfinite().all(dim=(1, 2)), center)
-
-
-def _check_deadline(deadline):
-    if deadline is not None and monotonic() >= deadline:
-        raise TimeoutError("T1 step refinement exceeded the planner deadline")
 
 
 @prediction_precision()
