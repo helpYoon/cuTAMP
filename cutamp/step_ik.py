@@ -197,7 +197,7 @@ def _graph_pose(kin, target, seed, arm, lower, upper, prior, center_weight, iter
     def setup(t, s, lo, hi, p):
         key = (len(s), arm, center_weight, fixed_idle, stream.cuda_stream, torch.is_inference_mode_enabled(), _IK_TOLERANCE.get())
         if key not in cache:
-            if len(cache) >= 16:
+            if len(cache) >= 64:
                 cache.pop(next(iter(cache)))
             cache[key] = _StanceIterationGraph(kin, t, s, arm, lo, hi, p, center_weight, fixed_idle)
         op = cache[key]

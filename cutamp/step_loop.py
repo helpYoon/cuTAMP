@@ -441,7 +441,7 @@ class SteppedPlan:
             start = self._first
         else:
             self.adapter.head = head
-            start = self.adapter.initialize(particles[self._start_of[j]], self._dynamics, world=self.world,
+            start = self.adapter.initialize(particles[self._start_of[j]].detach(), self._dynamics, world=self.world,
                                             object_poses=objects, held=held)
         u = particles[self.command_names[j]]
         anchor = before[:, 1 - "LR".index(order[0])]

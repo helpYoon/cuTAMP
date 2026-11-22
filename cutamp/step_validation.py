@@ -392,7 +392,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
     sphere_count = sum(s.shape[-2] for s in local_spheres.values())
     max_pairs = max(1, world.kinematics.get_self_collision_config().collision_pairs.shape[0],
                     kp.link_sphere_idx_map.numel() * sphere_count, sphere_count ** 2)
-    validation_chunk = max(1, min(2048, (4 << 20) // max_pairs))
+    validation_chunk = max(1, min(16384, (32 << 20) // max_pairs))
     totals = {}
     history = []
     for idx, step in enumerate(prediction.steps):
