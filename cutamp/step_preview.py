@@ -10,7 +10,6 @@ from curobo.kinematics import Kinematics
 from curobo.types import JointState, Pose, ToolPoseCriteria
 
 from cutamp import motion_solver as ms
-from cutamp.com_polygon_cost import physical_support_centroid
 from cutamp.robots.t1 import MOTION_INTERPOLATION_DT, get_t1_kinematics, t1_curobo_cfg
 from cutamp.step_ik import _Kinematics
 from cutamp.step_loop import _check_deadline, landing_constraint_rows
@@ -162,41 +161,35 @@ class PredictedSteppedMotion(SteppedMotion):
         )
 
     def step_segments(self, idx, last, object_poses, held):
+        """Step ``idx``'s segments from the hold and rollout of the loop's last refresh (design 7); the world model is
+        not run again. A gap's first step starts with its stored hold, when it has one, once the stored start is
+        checked to join ``last``, the state the arm motion arrives in."""
         _check_deadline(self.deadline)
         gap, j = self.by_op[idx]
-        initial, commands, saved, prep = self.inputs[gap]
         segments = []
         if j == 0:
+            start, commands, prediction, prep = self.inputs[gap]
+            first = tuple(x[:, 0] for x in prep.steps[0].trajectory) if prep is not None else start.tensors[:6]
+            q, v = self.adapter.planner(first)
+            arriving = last.velocity if last.velocity is not None else torch.zeros_like(last.position)
+            if not compatible_boundary(boundary_errors(q, v, last.position, arriving)).all():
+                raise ValueError("Stored step does not start where the arm motion ended")
             bound = {
                 arm: (name, torch.linalg.inv(self.world.tool_from_ee[self.world.tool_frame_for_arm(arm)]) @ tf)
                 for arm, (name, tf) in held.items()
             }
-            velocity = last.velocity if last.velocity is not None else torch.zeros_like(last.position)
-            observed = initial if gap == 0 and prep is None else None
-            start = self.adapter.initialize(
-                last.position,
-                initial.dynamics,
-                velocity,
-                observed=observed,
-                world=self.neutral_world,
-                object_poses=object_poses,
-                held=bound,
-            )
-            if not start.compatible.all():
-                raise ValueError("Controller history cannot be issued from the actual arriving configuration")
-            if start.preparation is not None:
-                segments.append(self._segment(start.preparation.steps[0].trajectory, last, "model_preparation"))
-                q, v = self.adapter.planner(start.state.tensors[:6])
+            if prep is not None:
+                segments.append(self._segment(prep.steps[0].trajectory, last, "model_preparation"))
+                q, v = self.adapter.planner(start.tensors[:6])
                 last = JointState(position=q, velocity=v, joint_names=list(self.world.model.joint_names))
-            order = "".join(s.side for s in saved.steps)
-            prediction = self.adapter.predictor.rollout(start.state, order, commands)
-            _check_issued_landings(self.adapter.predictor, start.state, order, commands, prediction)
+            order = "".join(s.side for s in prediction.steps)
+            _check_issued_landings(self.adapter.predictor, start, order, commands, prediction)
             geometry = validate_step_geometry(
                 self.neutral_world, self.adapter, prediction, object_poses=object_poses, held=bound
             )
             if not geometry["valid"].all():
                 raise ValueError("Predicted step trajectory violates collision or support constraints")
-            self.replayed[gap] = (start.state, commands, prediction, start.preparation)
+            self.replayed[gap] = self.inputs[gap]
         start, commands, prediction, _ = self.replayed[gap]
         state = self.last_state if j else start
         step = prediction.steps[j]
@@ -222,27 +215,8 @@ class PredictedSteppedMotion(SteppedMotion):
         return segments
 
     def approach(self, idx, op, particle, object_poses, cfg, ik_tol):
-        from cutamp.step_loop import _retract_on_stance
-
-        arm = op.operator.metadata.arm
         self.check_supported_start()
-        approach = super().approach(idx, op, particle, object_poses, cfg, ik_tol)
-        if self.last_state is not None and idx + 1 < len(self.skeleton):
-            following = self.skeleton[idx + 1]
-            if following.operator.metadata.action_type == "retract":
-                rest, _ = self.adapter.planner(self.last_state.tensors[:6])
-                ik = _retract_on_stance(
-                    self.stance[None],
-                    rest,
-                    arm,
-                    torch.stack((self.supported_kinematics.lower, self.supported_kinematics.upper)).to(rest),
-                    other_arm_reference=self.occupied_arm,
-                    kinematics=self.supported_kinematics,
-                )
-                if not ik.ok.all():
-                    raise ValueError("Cannot retract on the reached support")
-                particle[following.arg("q_retract")] = ik.q[0]
-        return approach
+        return super().approach(idx, op, particle, object_poses, cfg, ik_tol)
 
 
 @torch.no_grad()
@@ -268,20 +242,12 @@ def plan_predicted_step_motion(
         )
     except (ValueError, RuntimeError, TimeoutError) as exc:
         return None, {"motion_validation": "rejected", "reason": str(exc)}
-    centers, margins = [], []
-    for ik in motion.planned_endpoints.values():
-        centers.append(float((ik.com[:, :2] - physical_support_centroid(ik.soles, world.model.sole_box)).norm()))
-        margins.append(float(ik.margin[0]))
+    # The postures are the loop's, so their balance is the one its last refresh measured.
+    centers, margins = row.metrics["com_center_distances_m"], row.metrics["com_margins_m"]
+    places = [idx for idx, op in enumerate(skeleton) if op.operator.metadata.action_type in ("pick", "place")]
     connected = []
-    for i, (idx, ik) in enumerate(motion.planned_endpoints.items()):
-        gap = dict(
-            op_idx=idx,
-            center_distance_m=centers[i],
-            margin_m=margins[i],
-            com_xy=ik.com[0, :2].tolist(),
-            achieved=ik.soles[0].tolist(),
-            steps=[],
-        )
+    for i, (idx, record) in enumerate(zip(places, row.metrics["gaps"], strict=True)):
+        gap = dict(record, op_idx=idx, center_distance_m=centers[i], margin_m=margins[i], steps=[])
         if i in motion.replayed:
             _, commands, pred, _ = motion.replayed[i]
             gap.update(

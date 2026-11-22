@@ -704,16 +704,7 @@ def solve_curobo(
         # the whole robot (the grasped block, or the support surface; _plan_arm_to_conf).
         try:
             if step_motion is not None and metadata.action_type in ("pick", "place"):
-                opposite = "right" if arm == "left" else "left"
-                idle = getattr(world.model, opposite + "_arm")
-                step_motion.occupied_arm = last_js.position[..., idle] if opposite in held else None
-                def collides(q):
-                    robot, scene = _motion_collisions(planner, world, self_collision, q)
-                    return robot | scene
-                step_motion.endpoint_collides = collides
-                contact = ground_op.arg("obj" if metadata.action_type == "pick" else "surface")
-                with _disabled_world_obstacle(planner, contact):
-                    approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
+                approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
             if metadata.action_type == "step":
                 if step_motion is None:
                     raise RuntimeError("A step requires a stepped motion")

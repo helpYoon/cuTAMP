@@ -630,10 +630,7 @@ class SteppedMotion:
         self.by_op = {}
         self.last_state = None
         self.stance = None
-        self.occupied_arm = None
         self.supported_kinematics = None
-        self.planned_endpoints = {}
-        self.endpoint_collides = None
         gap, offset = 0, 0
         for idx, op in enumerate(skeleton):
             typ = op.operator.metadata.action_type
@@ -650,26 +647,15 @@ class SteppedMotion:
         return self.adapter.planner(source.tensors[:6])[1]
 
     def approach(self, idx, op, particle, object_poses, cfg, ik_tol):
-        from cutamp.com_polygon_cost import margin_from_support_planes, support_region_planes
+        """The pre and post postures of pick or place ``op`` on ``stance``, solved from its posture ``particle[q]``,
+        which the loop's last refresh left on that stance and which is taken as it is (design 7)."""
         from cutamp.grasps import approach_targets, is_vertical
         from cutamp.motion_solver import _hand_poses
         from cutamp.step_ik import solve_stance_ik
-        from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
 
         kind, arm = op.operator.metadata.action_type, op.operator.metadata.arm
-        key = op.arg("q")
-        # Replay the same posture prior even when the reissued steps change the stance.
-        seed = particle.get(key + "_ik_reference", particle[key]).reshape(1, -1)
-        obj = object_poses[op.arg("obj")] if kind == "pick" else action_4dof_to_mat4x4(particle[op.arg("placement")])
-        wrist = (
-            obj
-            @ grasp_7dof_to_mat4x4(particle[op.arg("grasp")])
-            @ self.world.tool_from_ee[self.world.tool_frame_for_arm(arm)]
-        ).reshape(1, 4, 4)
+        q = particle[op.arg("q")].reshape(1, -1)
         s = self.stance.reshape(1, 2, 3)
-        fitted = solve_stance_ik(s, wrist, seed, arm, other_arm_reference=self.occupied_arm,
-                                 collides=self.endpoint_collides, kinematics=self.supported_kinematics,
-                                 center_posture=bool(cfg.com_center_weight))
 
         def pose_ok(ik):
             return (
@@ -680,24 +666,11 @@ class SteppedMotion:
                 & (ik.sole_rot_error <= ik_tol.sole_rot)
             )
 
-        if (
-            not pose_ok(fitted).item()
-            or float(fitted.margin[0]) < cfg.com_comfort_margin_m
-            or not (
-                margin_from_support_planes(
-                    fitted.com[:, :2], *support_region_planes(s.double(), self.world.model.sole_box, True)
-                )
-                >= 0
-            ).all()
-        ):
-            raise ValueError("Actual landing cannot support the bound full wrist pose with the required margin")
-        particle[op.arg("q")] = fitted.q[0].to(seed).detach()
-        self.planned_endpoints[idx] = fitted
-        hand = _hand_poses(self.world, particle[op.arg("q")][None], arm)[0]
+        hand = _hand_poses(self.world, q, arm)[0]
         targets = torch.stack(approach_targets(hand, kind))
         idle = self.world.model.right_arm if arm == "left" else self.world.model.left_arm
-        linked = solve_stance_ik(s.expand(2, -1, -1), targets, fitted.q.expand(2, -1), arm,
-                                 other_arm_reference=fitted.q[:, idle].expand(2, -1), kinematics=self.supported_kinematics)
+        linked = solve_stance_ik(s.expand(2, -1, -1), targets, q.expand(2, -1), arm,
+                                 other_arm_reference=q[:, idle].expand(2, -1), kinematics=self.supported_kinematics)
         if not pose_ok(linked).all():
             raise ValueError("Actual stance cannot reach manipulation pre/post keyframes")
-        return linked.q[0].to(seed).detach(), linked.q[1].to(seed).detach(), is_vertical(hand)
+        return linked.q[0].to(q).detach(), linked.q[1].to(q).detach(), is_vertical(hand)

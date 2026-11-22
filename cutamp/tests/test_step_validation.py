@@ -214,7 +214,7 @@ def test_supported_motion_optimizer_moves_cost_with_realized_stance(rollout_scen
 
 
 @needs_cuda
-def test_rebind_grasp_and_approach_to_achieved_soles(rollout_scene):
+def test_approach_takes_the_posture_and_solves_its_approach_postures_on_the_landing(rollout_scene):
     from cutamp.config import TAMPConfiguration
     from cutamp.motion_solver import _hand_poses
     from cutamp.particle_initialization import IKTol
@@ -226,10 +226,8 @@ def test_rebind_grasp_and_approach_to_achieved_soles(rollout_scene):
     with torch.no_grad():
         step = predictor.rollout(start, "L", command).steps[0]
     motion = SteppedMotion([], {}, adapter, world)
-    # The observed swing sole lands 1 cm ahead of its model prediction. Keep
-    # the world wrist target and the planted sole fixed when replanning.
+    # The loop's last refresh leaves the pick or place posture on the landing; the motion stage takes it as it is.
     motion.stance = step.achieved[0].clone()
-    motion.stance[0, 0] += 0.01
     q = adapter.planner(step.terminal.tensors[:6])[0]
     tool = world.tool_from_ee[world.tool_frame_for_arm("left")]
     wrist = _hand_poses(world, q, "left")[0]
@@ -237,15 +235,15 @@ def test_rebind_grasp_and_approach_to_achieved_soles(rollout_scene):
     grasp = mat4x4_to_grasp_7dof(wrist @ torch.linalg.inv(tool))
     for op in (LeftPick, LeftPlace):
         action = op.ground({p.name: p.name for p in op.parameters})
-        particle = {"q": q[0], "grasp": grasp.clone(), "placement": q.new_zeros(4)}
+        posture = q[0].clone()
+        particle = {"q": posture, "grasp": grasp.clone(), "placement": q.new_zeros(4)}
         pre, post, _ = motion.approach(
             0, action, particle, objects, TAMPConfiguration(), IKTol(0.005, 0.05, 0.005, 0.05)
         )
-        for pose in (pre, particle["q"], post):
+        assert particle["q"] is posture and torch.equal(posture, q[0])
+        for pose in (pre, post):
             soles = predictor.model.feet(adapter.physical(pose[None]))[0][0]
             torch.testing.assert_close(soles, motion.stance, atol=0.002, rtol=0)
-        actual = _hand_poses(world, particle["q"][None], "left")[0]
-        assert torch.linalg.vector_norm(actual[:3, 3] - wrist[:3, 3]) < 0.005
         torch.testing.assert_close(particle["grasp"], grasp)
 
 

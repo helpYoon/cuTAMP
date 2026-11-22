@@ -57,6 +57,32 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
         enable_visualizer=False,
         experiment_root=str(tmp_path),
     )
+    from cutamp.landing_predictor import LandingPredictor
+    from cutamp.step_preview import PredictedSteppedMotion
+    from cutamp.step_validation import StepStateAdapter
+
+    in_motion, rollouts, real = [False], [], LandingPredictor.rollout
+    holds, real_hold = [], StepStateAdapter.initialize
+    real_segments = PredictedSteppedMotion.step_segments
+
+    def segments(self, *a, **k):
+        in_motion[0] = True
+        try:
+            return real_segments(self, *a, **k)
+        finally:
+            in_motion[0] = False
+
+    def counted(self, *a, **k):
+        rollouts.append(in_motion[0])
+        return real(self, *a, **k)
+
+    def held(self, *a, **k):
+        holds.append(in_motion[0])
+        return real_hold(self, *a, **k)
+
+    monkeypatch.setattr(PredictedSteppedMotion, "step_segments", segments)
+    monkeypatch.setattr(LandingPredictor, "rollout", counted)
+    monkeypatch.setattr(StepStateAdapter, "initialize", held)
     path, _, metrics = run_cutamp(
         env,
         cfg,
@@ -80,6 +106,25 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
         assert s["head"].shape == (len(s["position"]), 2)
         if s["phase"].startswith("model_"):
             assert s["step"]["source"] == "frozen_policy_world_model"
+    # The world model ran in the loop, never in the motion stage.
+    assert rollouts and not any(rollouts) and not any(holds)
+
+
+def test_a_stored_step_must_start_where_the_arm_motion_ended():
+    from cutamp import step_preview
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_validation import StepStateAdapter
+
+    adapter = StepStateAdapter(SimpleNamespace(metadata={"joint_names": ["AAHead_yaw", "Head_pitch",
+                                                                         *REAL_LEGS.joint_names[6:]]}))
+    q = torch.tensor(REAL_LEGS.home).double()[None]
+    preview = object.__new__(step_preview.PredictedSteppedMotion)
+    preview.adapter, preview.deadline, preview.by_op = adapter, None, {0: (0, 0)}
+    preview.inputs = {0: (SimpleNamespace(tensors=adapter.physical(q)), None, None, None)}  # a stored start, no hold
+    arrived = q.clone()
+    arrived[0, 0] += 0.006  # 6 mm from the stored start, past the 5 mm join
+    with pytest.raises(ValueError, match="Stored step does not start where the arm motion ended"):
+        preview.step_segments(0, SimpleNamespace(position=arrived, velocity=None), {}, {})
 
 
 def test_fallback_uses_current_scene_and_attachments_at_each_solve(monkeypatch):
