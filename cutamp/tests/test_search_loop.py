@@ -16,21 +16,17 @@ from cutamp.tests.conftest import first_schedules
 def test_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from dataclasses import replace
-    from cutamp import landing_accuracy, landing_predictor, step_sequence_model
+    from cutamp import landing_accuracy, landing_predictor
 
     bundle = tmp_path / "landing.pt"
     bundle.write_bytes(b"deployment")
-    sequence = tmp_path / "sequence.pt"
-    sequence.write_bytes(b"student")
     monkeypatch.setattr(landing_accuracy, "LANDING_BUNDLE", bundle)
-    monkeypatch.setattr(step_sequence_model, "DEFAULT_STEP_SEQUENCE_MODEL", sequence)
     config = TAMPConfiguration()
     stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=0)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(landing_predictor, "LandingPredictor", lambda path, **kw: SimpleNamespace(
         device=stream.device, metadata={"deployment_sha256": "deployment"}, **kw
     ))
-    monkeypatch.setattr(step_sequence_model, "load_step_sequence_model", lambda *a, **kw: object())
 
     model = alg._load_predictor(config)
     assert alg._load_predictor(config) is model and model.use_cuda_graph
@@ -46,37 +42,6 @@ def test_predictor_cache_is_scoped_to_deployment_stream_and_worker(tmp_path, mon
     bundle.unlink()
     with pytest.raises(FileNotFoundError):
         alg._load_predictor(config)
-
-
-def test_learned_predictor_cache_tracks_both_bundles(tmp_path, monkeypatch):
-    from cutamp import landing_accuracy, landing_predictor, step_sequence_model
-
-    teacher = tmp_path / "landing.pt"
-    teacher.write_bytes(b"teacher")
-    student = tmp_path / "sequence.pt"
-    student.write_bytes(b"student")
-    device = torch.device("cuda:0")
-    stream = SimpleNamespace(device=device, cuda_stream=1)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
-    monkeypatch.setattr(landing_predictor, "LandingPredictor", lambda *a, **kw: SimpleNamespace(
-        device=device, metadata={"deployment_sha256": "teacher-deployment"}
-    ))
-    loaded = []
-
-    def load(path, dev, *, expected_deployment):
-        assert dev == device and expected_deployment == "teacher-deployment"
-        loaded.append(path)
-        return object()
-
-    monkeypatch.setattr(step_sequence_model, "load_step_sequence_model", load)
-    monkeypatch.setattr(landing_accuracy, "LANDING_BUNDLE", teacher)
-    monkeypatch.setattr(step_sequence_model, "DEFAULT_STEP_SEQUENCE_MODEL", student)
-    cfg = TAMPConfiguration()
-    first = alg._load_predictor(cfg)
-    assert alg._load_predictor(cfg) is first and loaded == [student]
-    student.write_bytes(b"updated model")
-    assert alg._load_predictor(cfg).sequence_model is not first.sequence_model
-    assert loaded == [student, student]
 
 
 def test_standing_feedback_locates_scene_and_placement_failures_at_their_actions():
@@ -530,7 +495,7 @@ def test_default_centroid_preference_and_zero_weight_ablation():
     from cutamp.scripts.utils import default_constraint_to_mult
 
     cfg = TAMPConfiguration()
-    assert cfg.com_center_weight == cfg.for_refinement().com_center_weight == 1
+    assert cfg.com_center_weight == cfg.for_steps().com_center_weight == 1
     assert default_constraint_to_mult["soft"]["com_center_distance_squared"] == 1
     validate_tamp_config(replace(cfg, com_center_weight=0))
     for invalid in (-1.0, float("nan"), float("inf")):
@@ -538,23 +503,8 @@ def test_default_centroid_preference_and_zero_weight_ablation():
             validate_tamp_config(replace(cfg, com_center_weight=invalid))
 
 
-def test_refinement_defaults_and_overrides():
-    from dataclasses import replace
-
-    model = TAMPConfiguration()
-
-    def settings(cfg):
-        resolved = cfg.for_refinement()
-        return resolved.step_refine_iterations, resolved.com_center_weight, resolved.step_adam_plateau_mm
-
-    assert settings(model) == (48, 1.0, 1.0)
-    for weight in (0.0, 1.0, 3.0):
-        custom = replace(model, step_refine_iterations=0, com_center_weight=weight)
-        assert settings(custom)[:2] == (0, weight)
-
-
 def test_particle_and_motion_defaults():
-    assert TAMPConfiguration().num_particles == TAMPConfiguration().step_particle_batch_size == 128
+    assert TAMPConfiguration().num_particles == 128
     assert TAMPConfiguration().curobo_plan
     assert TAMPConfiguration(num_particles=8).num_particles == 8
 
@@ -602,54 +552,6 @@ def test_stepped_motion_with_no_grasp_columns_uses_particle_cost(monkeypatch):
         deadline=None,
     )
     assert report["motion_plan_attempts"] == 1 and rows[1].motion_plan == [1]
-
-
-def test_motion_planning_uses_the_globally_ranked_particles_own_trace(monkeypatch):
-    from cutamp import step_loop, step_particles, step_preview
-
-    cfg = TAMPConfiguration(
-        num_particles=4, step_particle_batch_size=2, motion_plan_max_retries=1, curobo_plan=True,
-    )
-    pools = {"grasp1": (torch.eye(7)[:2], torch.tensor([0.9, 0.5]))}
-    op = SimpleNamespace(operator=SimpleNamespace(metadata=SimpleNamespace(action_type="pick")), values=("q1",))
-    proposal = SimpleNamespace(skeleton=[op], schedule=SimpleNamespace(edges=(SimpleNamespace(commands=()),)))
-    world = SimpleNamespace(q_init=torch.zeros(33))
-    monkeypatch.setattr(step_particles, "ParticleInitializer", lambda *a: SimpleNamespace(_pick_pools=lambda p: pools))
-    monkeypatch.setattr(step_loop, "worst_posture", lambda w, qs: (torch.zeros(len(qs[0])),) * 3)
-    monkeypatch.setattr(step_particles.IKTol, "from_checker", lambda c: None)
-    chunks, attempted = [], []
-
-    def feasible_chunk(proposal, world, config, reducer, checker, inputs, predictor, pools, starts, first, stop,
-                       motion_inputs, deadline):
-        chunks.append(first)
-        rows = []
-        for i in range(first, stop):
-            if i != 2:
-                motion_inputs[i] = (predictor, {0: torch.tensor([[i]])})
-            particle = {"grasp1_idx": torch.tensor(i % 2), "grasp1": pools["grasp1"][0][i % 2],
-                        "q1": torch.full((33,), float(i))}
-            distances = ((.001, .09), (.08, .08), (.01, .01), (.07, .07))[i]
-            effort = (0.1, .2, .01, 4.)[i]
-            metrics = {"best_com_margin": .06, "secondary_effort": effort,
-                       "gaps": [{"center_distance_m": d} for d in distances]}
-            rows.append(StepRow(i, particle, effort + 4 * sum(d ** 2 for d in distances), metrics))
-        return StepResult(rows, torch.ones(len(rows), 1, dtype=torch.bool), "model_feasible")
-
-    def plan(skeleton, row, traces, adapter, world, config, **kwargs):
-        i = int(row.particle["q1"][0])
-        assert traces[0].item() == i
-        attempted.append(i)
-        return ["path"], {"motion_validation": "model_predicted"}
-
-    monkeypatch.setattr(step_particles, "_refine_batch", feasible_chunk)
-    monkeypatch.setattr(step_preview, "plan_predicted_step_motion", plan)
-    result = step_particles.refine_step_particles(
-        proposal, world, cfg, None, None, inputs=StepInputs(), predictor=object(),
-        timer=None, visualizer=None, deadline=None,
-    )
-    assert chunks == [0, 2] and attempted == [3]
-    assert [row.index for row in result.rows if row.motion_plan] == [3]
-    assert result.diagnostics["motion_plan_attempts"] == 1 and result.diagnostics["motion_plan_failures"] == []
 
 
 def test_rank_assets_are_reused_and_regeneration_invalidates_cache(tmp_path, monkeypatch):

@@ -364,24 +364,17 @@ def _step_tables(map_version, accuracy_version, lag):
 def _load_predictor(config):
     from cutamp.landing_accuracy import LANDING_BUNDLE
     from cutamp.landing_predictor import LandingPredictor
-    from cutamp.step_sequence_model import DEFAULT_STEP_SEQUENCE_MODEL, load_step_sequence_model
 
-    path, sequence_path = LANDING_BUNDLE, DEFAULT_STEP_SEQUENCE_MODEL
+    path = LANDING_BUNDLE
     version = _file_version(path)
     if version[1] is None or not path.is_file():
         raise FileNotFoundError(f"Landing bundle is unavailable at {path}")
-    sequence_version = _file_version(sequence_path)
-    if sequence_version[1] is None or not sequence_path.is_file():
-        raise FileNotFoundError(f"Step sequence bundle is unavailable at {sequence_path}")
     if config.cuda_graphs:
         stream = torch.cuda.current_stream()
-        key = (version, sequence_version, stream.device, stream.cuda_stream)
+        key = (version, stream.device, stream.cuda_stream)
         if getattr(_PREDICTOR_CACHE, "key", None) == key:
             return _PREDICTOR_CACHE.model
     predictor = LandingPredictor(path, use_cuda_graph=config.cuda_graphs)
-    predictor.sequence_model = load_step_sequence_model(
-        sequence_path, predictor.device, expected_deployment=predictor.metadata["deployment_sha256"]
-    )
     if config.cuda_graphs:
         _PREDICTOR_CACHE.model = predictor
         _PREDICTOR_CACHE.key = key

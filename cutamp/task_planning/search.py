@@ -74,8 +74,8 @@ class ManipulationPrefix:
 @dataclass
 class RankedStepSkeleton:
     """A task plan with its steps inserted, the foot order (``none``, ``L``, ``R``, ``LR`` or ``RL``) before each pick
-    and place, and the landing path the A* ranked it by. Every particle starts its landings at the path's commands
-    (:func:`cutamp.step_particles._landing_starts`)."""
+    and place, and the landing path the plan search ranked it by. The particles' commands do not start at the path's:
+    they are drawn uniformly inside the controller's limit (:func:`cutamp.step_refresh.draw_commands`)."""
 
     skeleton: PlanSkeleton
     orders: tuple[str, ...]

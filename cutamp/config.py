@@ -68,15 +68,6 @@ class TAMPConfiguration:
     # The most distinct symbolic skeletons the step search admits (arm_step_skeletons' max_base_plans)
     num_initial_plans: int = 30
     step_lag: int = 2  # actuator delay in physics substeps
-    # Learned step Adam's CoM plateau stop (adam_plateau): stop after `patience` updates without a cumulative `mm`
-    # gain in the best feasible worst-endpoint CoM distance, not before `min_updates` (None: 5). mm None resolves
-    # in for_refinement to 1 for a stepped candidate unless com_center_weight is 0.
-    step_adam_plateau_mm: float | None = None
-    step_adam_plateau_patience: int = 5
-    step_adam_plateau_min_updates: int | None = None
-    # None caps learned step Adam at 48 updates (see for_refinement).
-    step_refine_iterations: int | None = None
-    step_particle_batch_size: int | None = None
 
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
@@ -109,20 +100,9 @@ class TAMPConfiguration:
     com_center_weight: float = 1.0
 
     def __post_init__(self):
-        if self.step_particle_batch_size is None:
-            object.__setattr__(self, "step_particle_batch_size", min(128, self.num_particles))
         if self.soft_cost is None:
             default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
             object.__setattr__(self, "soft_cost", default)
-
-    def adam_plateau(self):
-        if self.step_adam_plateau_mm is None:
-            return None
-        from cutamp.step_adam import PlateauStop
-        minimum = self.step_adam_plateau_min_updates
-        if minimum is None:
-            minimum = 5
-        return PlateauStop(self.step_adam_plateau_mm / 1000., self.step_adam_plateau_patience, minimum)
 
     def for_steps(self) -> "TAMPConfiguration":
         """This configuration for a plan with steps in the Adam loop; every other setting is kept."""
@@ -131,17 +111,6 @@ class TAMPConfiguration:
         # 2.1 mm. soft_cost [] (call 5): each listed soft cost pulls its variables at Adam's full step and the hand
         # leaves its target; a stepped plan stays near its starting postures instead (soft "stay_near_start").
         return replace(self, conf_lr=7e-3, soft_cost=[])
-
-    def for_refinement(self) -> "TAMPConfiguration":
-        """Resolve learned step Adam's optional overrides for a candidate that takes a step."""
-        plateau = self.step_adam_plateau_mm
-        if plateau is None and self.com_center_weight != 0:
-            plateau = 1.0
-        return replace(
-            self,
-            step_adam_plateau_mm=plateau,
-            step_refine_iterations=48 if self.step_refine_iterations is None else self.step_refine_iterations,
-        )
 
 
 def validate_tamp_config(config: TAMPConfiguration):
@@ -176,10 +145,5 @@ def validate_tamp_config(config: TAMPConfiguration):
     weight = config.com_center_weight
     if weight is None or not math.isfinite(weight) or weight < 0:
         raise ValueError(f"com_center_weight must be finite and nonnegative, got {config.com_center_weight}")
-    if config.adam_plateau() is not None and weight == 0:
-        raise ValueError("CoM plateau tracking requires a positive centering weight")
-    updates = config.step_refine_iterations
-    if (updates is not None and (type(updates) is not int or updates < 0)) or config.step_particle_batch_size < 1:
-        raise ValueError("Invalid step refinement iteration or batch count")
     if type(config.step_lag) is not int or config.step_lag < 0:
         raise ValueError("step_lag must be a nonnegative integer physics-step count")

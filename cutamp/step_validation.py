@@ -10,7 +10,6 @@ from torch import Tensor
 
 from cutamp.landing_predictor import LandingState, _hold_trace, near_rest, prediction_precision
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.step_hold_graph import terminal_hold
 
 #: The controller's two head joints, which the planner's model does not have.
 HEAD_JOINTS = ("AAHead_yaw", "Head_pitch")
@@ -146,13 +145,6 @@ class StepStateAdapter:
         )
         hist = raw[:, None, :].repeat(1, self.predictor.metadata["history_ticks"], 1)
         return (*physical, previous, hist, joints.new_zeros(len(joints), 8))
-
-    @prediction_precision()
-    def objective_state(self, q, dynamics, qd):
-        """Exact terminal history for a particle cost. Dense certification also checks preparation geometry."""
-        physical = self.physical(q, qd)
-        final = terminal_hold(self.predictor, self._hold_start(physical), dynamics)
-        return LandingState(final, dynamics, "synthetic_supported_hold_50")
 
     @prediction_precision()
     def initialize(self, q, dynamics, qd=None, *, observed=None, world=None, object_poses=None, held=None):

@@ -167,9 +167,6 @@ def entrypoint():
              "centering term. Zero disables centering.",
     )
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
-    parser.add_argument("--step_refine_iterations", type=int, default=_defaults.step_refine_iterations,
-                        help="Override learned step Adam's maximum updates (default 48).")
-    parser.add_argument("--step_particle_batch_size", type=int, help="Maximum particles optimized together (default 128).")
     parser.add_argument(
         "--max_duration",
         type=float,
@@ -230,8 +227,6 @@ def entrypoint():
         com_center_weight=args.com_center_weight,
         max_loop_dur=args.max_duration,
         step_lag=args.step_lag,
-        step_refine_iterations=args.step_refine_iterations,
-        step_particle_batch_size=args.step_particle_batch_size,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
         soft_cost=args.soft_cost,

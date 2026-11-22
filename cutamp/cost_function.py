@@ -279,9 +279,9 @@ class CostFunction:
         return {"type": "constraint", "values": coll_values}
 
     def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None, *, include_self=True,
-                            site: str | None = None):
-        """Check selected postures against the other links, loose objects and carried objects. ``site``: run the FK
-        on that FK site (TAMPWorld.site_kinematics), as the Adam loop does; None as the direct callers do."""
+                            site: str = "stepped_scene"):
+        """Check selected postures against the other links, loose objects and carried objects, with the FK run on
+        the FK site ``site`` (TAMPWorld.site_kinematics)."""
         from cutamp.gn_refresh import self_sphere_overlaps
         from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
         from cutamp.step_set import _facts
@@ -292,14 +292,7 @@ class CostFunction:
         key = {"step": "q_land", "retract": "q_retract", "pick": "q", "place": "q"}
         q = torch.stack([particles[op.arg(key[op.operator.metadata.action_type])] for op in ops], dim=1)
         b, h = q.shape[:2]
-        if site is not None:
-            kin = self.world.site_kinematics(site)
-        elif q.requires_grad:
-            # cuRobo reuses the backward buffers of one FK instance on the next call.
-            from curobo.kinematics import Kinematics
-            kin = Kinematics(self.world.kinematics.config)
-        else:
-            kin = self.world.kinematics
+        kin = self.world.site_kinematics(site)
         fk = kin.compute_kinematics(JointState.from_position(q.flatten(0, 1).contiguous()))
         robot = fk.robot_spheres.reshape(b, h, -1, 4)
         values = {"robot_to_world": self.world.collision_fn(robot)}

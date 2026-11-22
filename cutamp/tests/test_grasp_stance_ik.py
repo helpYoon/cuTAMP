@@ -121,28 +121,6 @@ def test_posture_reference_gradient_on_free_and_joint_limited_branches(one_cpu_t
     torch.testing.assert_close(g[:, 1], (high.margin - low.margin) / 0.0002, rtol=0.02, atol=0.001)
 
 
-@pytest.mark.parametrize("expired_on_entry", [False, True])
-def test_expired_budget_interrupts_the_next_gap_evaluation(monkeypatch, one_cpu_thread, expired_on_entry):
-    from cutamp import step_loop, step_refinement
-
-    now = [3.0 if expired_on_entry else 1.0]
-    monkeypatch.setattr(step_loop, "monotonic", lambda: now[0])
-    wrist, seed = paired_inputs("cpu", torch.float32)
-    soles = seed.new_tensor([[[0.154, 0.094, 0.022], [0.042, -0.118, 0.029]]]).repeat(2, 1, 1)
-    calls = []
-
-    def observed(prediction, ik):
-        calls.append(1)
-        now[0] = 3.0
-        return {}
-
-    with pytest.raises(TimeoutError, match="refinement"):
-        step_refinement.refine_gap(
-            None, soles, "", seed.new_empty(2, 0, 3), "left", wrist, seed, deadline=2.0, extra_rows=observed
-        )
-    assert len(calls) == (0 if expired_on_entry else 1)
-
-
 @pytest.mark.parametrize("arm", ["left", "right"])
 @pytest.mark.parametrize("center_posture", [False, True])
 def test_other_arm_stays_home_or_moves_only_to_clear_collision(arm, center_posture, one_cpu_thread):
@@ -197,7 +175,7 @@ def test_batched_com_jacobian_matches_perturbing_all_joints(one_cpu_thread):
 def test_centered_stance_ik_differentiates_through_wrist_soles_and_held_arm(one_cpu_thread):
     from cutamp.robots.t1 import REAL_LEGS
     from cutamp.step_ik import solve_stance_ik
-    from cutamp.step_refinement import stance_center_residual
+    from cutamp.step_loop import stance_center_residual
 
     wrist, seed = paired_inputs("cpu", torch.float64)
     feet = seed.new_tensor([[[0.154, 0.094, 0.022], [0.042, -0.118, 0.029]]]).repeat(2, 1, 1)

@@ -252,7 +252,7 @@ def test_rebind_grasp_and_approach_to_achieved_soles(rollout_scene):
 @needs_cuda
 def test_selected_model_evidence_replays_synthetic_preparation_from_its_true_first_frame(rollout_scene):
     from cutamp.landing_predictor import prediction_precision
-    from cutamp.step_particles import _evidence, _take
+    from cutamp.step_loop import _evidence, _take
 
     predictor, adapter, world, context, _, command = rollout_scene
     q = world.q_init.repeat(2, 1)

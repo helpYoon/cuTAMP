@@ -194,7 +194,7 @@ def command_rows(orders, incoming: Tensor, commands: list[Tensor | None], after_
     """The commands' cost rows: per gap ``j`` and step ``k`` (1-based) ``gap{j}_step{k}_`` ``min_travel``,
     ``max_travel``, ``command_bound``, ``achieved_bound``, ``xy_precision`` and ``yaw_precision``, and for a two-step gap
     ``gap{j}_final_xy_precision`` and ``_yaw_precision``. Each is the positive part of the row of the same name in
-    :func:`cutamp.step_refinement.landing_constraint_rows`, so 0 where the requirement is met; the landed pairs come
+    :func:`cutamp.step_loop.landing_constraint_rows`, so 0 where the requirement is met; the landed pairs come
     from ``after_steps``, a step's reference from the intended pair on the pair before it."""
     rows, before = {}, incoming
     for j, order in enumerate(orders):

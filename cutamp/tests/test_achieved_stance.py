@@ -31,12 +31,6 @@ def test_stepped_pick_reports_signed_self_collision_and_its_gradient(real_world)
     delta[joint] = 1e-4
     plus, minus = self_overlap(torch.stack([crossed + delta, crossed - delta]))
     torch.testing.assert_close((plus - minus) / 2e-4, grad[joint], rtol=0.02, atol=2e-4)
-    particles = {"q": q, "g": grasp.expand(len(q), -1)}
-    plain = costs.stepped_scene_costs(particles, [pick])["values"]
-    sited = costs.stepped_scene_costs(particles, [pick], site="stepped_scene")["values"]
-    assert sited.keys() == plain.keys()
-    for name, value in plain.items():
-        torch.testing.assert_close(sited[name], value, rtol=0, atol=0)
 
 
 def test_guard_transports_physical_stance_and_matches_home_region():

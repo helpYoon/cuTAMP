@@ -70,20 +70,20 @@ Run commands with `uv run` (`uv run python -m cutamp.scripts.run_cutamp ...`,
 `uv run pytest`) or after `source .venv/bin/activate`. Both put `.venv/bin`,
 which holds the Rerun viewer that `run_cutamp` spawns, on `PATH`.
 
-The checkout includes the four T1 stepping inputs the default planner uses.
-The learned step models have their own folder, [`models/t1_landing/`](models/t1_landing/):
-`step-sequence-v1.pt` is the exported step-sequence model that Adam
-differentiates through; `landing-seed3.pt` is the frozen bfm_wm step policy and
-world model, which produce the post-retract history and verify the landings on
-logical CUDA device 0; and `home-model.json` is its measured landing accuracy.
+The checkout includes the three T1 stepping inputs the default planner uses.
+The learned step model has its own folder, [`models/t1_landing/`](models/t1_landing/):
+`landing-seed3.pt` is the frozen bfm_wm controller and world model, run on
+logical CUDA device 0 every `reik_interval` Adam steps on the particles'
+commands, where its landings and their slope enter the costs; and
+`home-model.json` is its measured landing accuracy.
 With the nominal hand reach map,
 `cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz`, the accuracy table
 guides task search.
 
-> **bfm_wm is not public yet.** The step models are frozen exports from bfm_wm,
-> the repository that trains the T1 controller and its world model. That code
-> is not released, so the models cannot be retrained or re-exported from this
-> repository; cuTAMP loads the exports without importing bfm_wm
+> **bfm_wm is not public yet.** The step model and its accuracy table are frozen
+> exports from bfm_wm, the repository that trains the T1 controller and its world
+> model. That code is not released, so neither can be rebuilt or re-exported
+> from this repository; cuTAMP loads the exports without importing bfm_wm
 > ([`models/t1_landing/README.md`](models/t1_landing/README.md)). The scripts
 > in `experiments/` that measured the models need bfm_wm and local data.
 
@@ -94,7 +94,6 @@ sha256sum -c <<'EOF'
 047174fe321ccdb3711dd88581a51142576b09a742b7a46f4c9784c4454d8bf7  cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz
 61413e2a0c8ecbbd398803a9466d3aafea2c66fe8f2acf404726a1af8ad5f686  models/t1_landing/home-model.json
 2f8002e1dcf16957a7f64d37aacb89ca10e3a579cfc1c1756d154381b90f6c47  models/t1_landing/landing-seed3.pt
-e6558a4779e89c0ed68ae29a87a3668e2db95d214355741eb0d8e9d1526615fb  models/t1_landing/step-sequence-v1.pt
 EOF
 ```
 
@@ -203,11 +202,13 @@ graph LR
    (`place_4dof_sampler`), its yaw turned so the held grasp approaches from the
    robot's side. The rows whose IK fails draw again, up to
    `GRASP_REDRAW_ROUNDS` times, a pick from its chosen grasps. Grasps are never
-   optimized. A plan with steps starts its particles in `step_particles.py`
-   instead: every particle starts each step's landing at the command the A*
-   chose for it (a `reachability.COMMANDS` entry, mirrored for a right swing),
-   takes the pick's grasps in score order and starts its IK from the posture
-   held before the gap's steps; Adam then moves each particle's landings.
+   optimized. A plan with steps starts its particles in `step_loop.py`
+   instead: every step's command starts uniformly inside the controller's
+   limit (`step_refresh.draw_commands`: the step bound and the travel range,
+   mirrored for a right swing), the pick's grasps are taken in score order,
+   and each pick, place and retract posture starts from one stance IK solve on
+   the stance it stands on at the first refresh; the Adam loop then moves the
+   commands with the placements and postures.
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic — the hand's pose and both soles on the stance — motion,
@@ -317,8 +318,8 @@ confs. The visualizer tracks both arms' held objects through every trajectory
 
 ### 📁 [`models/t1_landing/`](models/t1_landing/)
 
-The frozen learned step models (`step-sequence-v1.pt`, `landing-seed3.pt`),
-the measured landing accuracy (`home-model.json`) and bfm_wm's third-party
+The frozen learned step model (`landing-seed3.pt`, the controller and world
+model), the measured landing accuracy (`home-model.json`) and bfm_wm's third-party
 notices, exported from bfm_wm, which is not public yet; its README gives the
 provenance.
 
@@ -657,21 +658,24 @@ live `--cuda_graphs` runs in
 
 ## Usage
 
-The default T1 planner uses A* to choose a hand and an ordered footstep sequence
-for each pick and place. It requests one GraspGen-X grasp per particle for each
-object (128 by default) and refines the particles with Adam. Grasp and placement costs reach the foot
-commands through stance IK and the trained whole-step model. The place cost
-also differentiates through the 50 post-retract controller ticks. A batch stops
-after five updates without a cumulative 1 mm improvement in its best feasible
-centering, with at least five and at most 48 updates.
+The default T1 planner's plan search chooses a hand and an ordered footstep
+sequence for each pick and place. It requests one GraspGen-X grasp per particle
+for each object (128 by default) and optimizes the particles in the Adam loop.
+A plan with steps is optimized in the same loop: each step's command (where the
+swung sole lands, x, y and yaw in the planted sole's frame) is an Adam variable,
+and the commands start uniformly inside the controller's limit. Every
+`reik_interval` Adam steps a refresh runs `landing-seed3.pt`, the controller and
+world model, on every particle's commands; its landings and their slope enter
+the costs, and the pick, place and retract postures are re-solved on the
+landings. The loop stops as it does for plans without steps.
 
-The original controller and world model replay the optimized commands. Both feet
-must pass the 2 cm XY and 1° yaw limits. The planner tries validated particles in
-order of their worst pick/place CoM distance to the support polygon centroid,
-then secondary effort. It returns the first connected motion on the first
-successful skeleton. If refinement or motion planning fails, A* supplies the
-next skeleton; when A* runs out, the planner reports failure. Use `--max_duration`
-to bound this search.
+Nothing is run after the loop: the particles feasible at its last refresh go to
+arm motion planning. Both feet must pass the 2 cm XY and 1° yaw limits. The
+planner tries feasible particles in order of their worst pick/place CoM
+distance to the support polygon centroid, then secondary effort. It returns the
+first connected motion on the first successful skeleton. If optimization or
+motion planning fails, the plan search supplies the next skeleton; when it runs
+out, the planner reports failure. Use `--max_duration` to bound this search.
 A connected prediction carries the status `model_predicted_motion`.
 
 The `two_steps_floor_transfer` demo starts the learned-step planner from a
