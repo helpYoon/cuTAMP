@@ -123,6 +123,7 @@ def test_a_refresh_follows_the_commands(stepped_call):
     assert p[land] is kept and not torch.equal(p[land], before)
     assert torch.equal(plan.standin.at[0], p["step_commands_0"])
     assert len(plan.stats["refresh_s"]) == len(plan.stats["standin_error_m"]) == 2  # the first refresh, then this one
+    assert len(plan.stats["resolve_s"]) == 2
 
 
 @needs_cuda
@@ -133,17 +134,22 @@ def test_an_expired_budget_stops_the_start(stepped_call):
 
 @needs_cuda
 def test_a_diverged_row_leaves_its_neighbours_alone(stepped_call):
-    plan = make_plan(stepped_call)
-    p = plan.particles
-    plan.refresh(p)
-    kept, ok = {k: v.clone() for k, v in p.items()}, plan.tests_ok.clone()
-    state = plan._first.state  # the first gap's cached hold, reused by every refresh
+    rng = torch.get_rng_state(), torch.cuda.get_rng_state()
+    a = make_plan(stepped_call)
+    torch.set_rng_state(rng[0])
+    torch.cuda.set_rng_state(rng[1])
+    b = make_plan(stepped_call)  # the same draws
+    assert all(torch.equal(v, b.particles[k]) for k, v in a.particles.items())
+    a.refresh(a.particles)
+    state = b._first.state  # the first gap's cached hold, reused by every refresh
     state.tensors = tuple(t.clone() for t in state.tensors)  # the observed state's rows are expanded views
     state.tensors[0][3] = state.tensors[4][3] = float("nan")  # body position and joints of row 3
-    plan.refresh(p)
+    b.refresh(b.particles)
     others = torch.arange(16, device="cuda") != 3
-    assert not plan.tests_ok[3] and torch.equal(plan.tests_ok[others], ok[others])
-    assert all(torch.equal(v[others], kept[k][others]) for k, v in p.items())
+    assert not b.tests_ok[3] and torch.equal(b.tests_ok[others], a.tests_ok[others])
+    assert all(torch.equal(v[others], a.particles[k][others]) for k, v in b.particles.items())
+    # Row 3 stands on a pair that is not finite: its postures stay as they were.
+    assert all(torch.equal(b.particles[k][3], start[3]) for k, start in b.start_postures.items())
 
 
 from cutamp.com_polygon_cost import physical_support_margin
@@ -236,3 +242,26 @@ def test_an_unresolved_result_counts_the_particles_each_requirement_fails(steppe
     assert res.status == "unresolved"  # no particle is feasible at the start on this scene
     counts = res.diagnostics["failure_counts"]
     assert set(res.diagnostics["failed_constraints"]) <= set(counts) and all(0 < v <= 16 for v in counts.values())
+
+
+@needs_cuda
+def test_a_refresh_puts_drifted_postures_back_on_the_landing(stepped_call):
+    """Adam slid each posture's base 3 cm (as measured in the loop); the refresh's re-solve puts feet and hand back."""
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    names = list(plan.start_postures)
+    kept = {k: p[k] for k in names}
+    for k in names:
+        p[k].requires_grad_()
+    with torch.no_grad():
+        for k in names:
+            p[k][:, :2] += 0.03  # base x and y
+    drifted = plan(plan.rollout_fn(p), p)["KinematicConstraint"]["values"]
+    assert drifted["sole_pos_err"].median() > SOLE_POS_TOL
+    plan.refresh(p)
+    assert all(p[k] is kept[k] and p[k].requires_grad for k in names)
+    values = plan(plan.rollout_fn(p), p)["KinematicConstraint"]["values"]
+    assert values["sole_pos_err"].median() <= SOLE_POS_TOL
+    assert values["retract_sole_pos_err"].median() <= SOLE_POS_TOL
+    assert values["pos_err"].median() <= 0.005
+    assert len(plan.stats["resolve_s"]) == len(plan.stats["refresh_s"]) == 2

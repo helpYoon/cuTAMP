@@ -101,7 +101,8 @@ def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None,
     return solve_stance_ik(soles, wrist, bounded, arm, other_arm_reference=other_arm_reference, kinematics=kinematics)
 
 
-def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, grasp_indices=None):
+def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, grasp_indices=None, project=True):
+    """``project`` False takes the ``bindings`` placements as they are, without the support projection."""
     n = stop - first
     like = world.q_init
     particles = {k: like.expand(n, -1).clone() for k in ("left_q0", "right_q0")}
@@ -124,7 +125,9 @@ def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, gra
         g = grasp_7dof_to_mat4x4(particles[grasp])
         if op.operator.metadata.action_type == "place":
             key = op.arg("placement")
-            if bindings is not None and key in bindings:
+            if bindings is not None and key in bindings and not project:
+                particles[key] = bindings[key]
+            elif bindings is not None and key in bindings:
                 particles[key] = project_supported_placement(bindings[key], world.get_collision_spheres(obj),
                                                             world.get_aabb(op.arg("surface")))
             else:
@@ -265,13 +268,15 @@ def _zero_unless(finite, state):
     return tuple(torch.where(finite.reshape(-1, *[1] * (t.ndim - 1)), t, 0) for t in state)
 
 
-def _write(particles, key, value):
+def _write(particles, key, value, rows=None):
     """A new key takes a copy of ``value``; an existing one is written in place, so the loop's tensor stays the same
-    object."""
-    if key in particles:
+    object: only its rows ``rows`` (``[n]`` bool) when given."""
+    if key not in particles:
+        particles[key] = value.clone()
+    elif rows is None:
         particles[key].copy_(value)
     else:
-        particles[key] = value.clone()
+        particles[key][rows] = value
 
 
 class SteppedPlan:
@@ -280,8 +285,8 @@ class SteppedPlan:
     A particle's commands, ``[n, s, 3]`` per gap with steps, are Adam variables drawn uniformly inside the controller's
     limit; its pick, place and retract postures are Adam variables that start from one solve on the stance the first
     refresh gives. A refresh runs the world model and controller on every particle's commands, gap by gap, writes the
-    landing postures (never optimized) and sets the stand-in the costs read until the next refresh. The starting pass is
-    the first refresh.
+    landing postures (never optimized), sets the stand-in the costs read until the next refresh and re-solves the pick,
+    place and retract postures on the pairs they stand on (design 13). The starting pass is the first refresh.
     """
 
     def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, deadline=None, generator=None):
@@ -298,7 +303,7 @@ class SteppedPlan:
         empty = [None] * len(self.groups)
         self.standin = StandIn(self.orders, list(empty), list(empty), list(empty))
         self.last, self.motion_inputs, self.references, self.start_postures = {}, {}, {}, {}
-        self.stats = {"refresh_s": [], "standin_error_m": [], "command_move_m": []}
+        self.stats = {"refresh_s": [], "resolve_s": [], "standin_error_m": [], "command_move_m": []}
         # Each pick, place and retract posture's gap; the posture each gap starts from: the plan's start for the first,
         # else the retract after the gap before it (without one, the posture the robot stood in at that pick or place).
         self.gap_of, retract_of, gap = {}, {}, -1
@@ -343,65 +348,88 @@ class SteppedPlan:
                 if u is not None:
                     particles[self.command_names[j]] = u
 
-            self.cost_function = cost_function = CostFunction(self.arm_skeleton, world, config)
-            groups = self.groups
-
-            def occupied_reference(k, previous):
-                opposite = "right" if groups[k][1].operator.metadata.arm == "left" else "left"
-                return previous[:, getattr(world.model, opposite + "_arm")] if opposite in held_before[k] else None
-
-            solve_endpoint = partial(solve_stance_ik, center_posture=bool(config.com_center_weight))
-
-            def endpoint_solver(k, previous, seed):
-                action = groups[k][1]
-                carrying = occupied_reference(k, previous)
-                if carrying is not None:
-                    return partial(solve_endpoint, other_arm_reference=carrying)
-                idle = world.model.right_arm if action.operator.metadata.arm == "left" else world.model.left_arm
-                nominal = seed.new_tensor(world.model.home[idle]).expand_as(seed[:, idle])
-                # A nominal idle arm is left to the loop's collision costs.
-                return (solve_endpoint if torch.equal(seed[:, idle], nominal)
-                        else partial(solve_endpoint, collides=partial(endpoint_collisions, k)))
-
-            def endpoint_collisions(k, q, owners=None):
-                action = groups[k][1]
-
-                def select(value):
-                    return value if owners is None else value[owners]
-
-                binding = action.arg("grasp" if action.operator.metadata.action_type == "pick" else "placement")
-                variables = {action.arg("q"): q, binding: select(particles[binding])}
-                scene = {name: select(value) for name, value in objects[k].items()}
-                carried = {obj: (arm, select(transform)) for arm, (obj, transform) in held_before[k].items()}
-                values = cost_function.stepped_scene_costs(variables, [action], scene, carried)["values"]
-                blocked = values.pop("self_collision").reshape(len(q), -1).amax(1) > 0
-                for key, value in values.items():
-                    blocked |= value.reshape(len(q), -1).amax(1) > checker._get_tol("Collision", key)
-                return blocked
-
+            self.cost_function = CostFunction(self.arm_skeleton, world, config)
+            self.checker, self._retract_of, resolve = checker, retract_of, 0.0
             ok, head, before = torch.ones(n, dtype=torch.bool, device=like.device), None, self.incoming
             for j, (steps, op) in enumerate(self.groups):
                 _check_deadline(deadline)
-                rest, arm = particles[self._start_of[j]], op.operator.metadata.arm
-                seed = rest  # the posture the robot stands in at this pick or place: the start, or where it landed
+                seed = particles[self._start_of[j]]  # the posture the robot stands in here: the start, or its landing
                 if steps:
                     passed, before, head = self._run_gap(j, particles, head, before, objects[j], held_before[j])
                     ok &= passed
                     seed = particles[steps[-1].arg("q_land")]
-                ik = endpoint_solver(j, rest, seed)(before, wrists[j], seed, arm)
-                particles[op.arg("q")] = ik.q
+                solving = monotonic()
+                self._solve_postures(j, particles, before, wrists[j], objects[j], held_before[j], seed)
+                resolve += monotonic() - solving
                 self.references[op.arg("q") + "_ik_reference"] = seed.clone()
-                self.start_postures[op.arg("q")] = ik.q.clone()
+                self.start_postures[op.arg("q")] = particles[op.arg("q")].clone()
                 if j in retract_of:
-                    other = occupied_reference(j, rest)
-                    retract = _retract_on_stance(before, seed, arm, world.joint_limits, other_arm_reference=other).q
-                    particles[retract_of[j]] = retract
-                    self.start_postures[retract_of[j]] = retract.clone()
+                    self.start_postures[retract_of[j]] = particles[retract_of[j]].clone()
             self.tests_ok = ok
         self.particles = particles
         self.stats["standin_error_m"].append(None)  # no stand-in before the first refresh
         self.stats["command_move_m"].append(None)
+        self.stats["resolve_s"].append(resolve)
         self.stats["refresh_s"].append(monotonic() - began)
+
+    def _solve_postures(self, j, particles, before, wrist, objects, held, seed=None):
+        """Gap ``j``'s pick or place posture on the pair ``before`` ``[n, 2, 3]`` it stands on, by
+        :func:`solve_stance_ik` with ``wrist`` ``[n, 4, 4]`` as the hand target, then its retract on the same pair by
+        :func:`_retract_on_stance` (design 4 and 13). An arm holding an object keeps the pose it has in the posture the
+        gap starts from; an idle arm away from home makes the solve check collisions in ``objects`` with ``held``
+        carried, the scene before gap ``j``.
+
+        ``seed`` given (the start): it seeds both solves and their keys are made. ``seed`` None (a refresh): each
+        posture is seeded by its current value and written in place; a row whose pair is not finite is not handed to
+        the solves and keeps its postures."""
+        world, op = self.world, self.groups[j][1]
+        arm, name, retract = op.operator.metadata.arm, op.arg("q"), self._retract_of.get(j)
+        rows = None  # every row
+        if seed is None:
+            finite = before.isfinite().all((1, 2))
+            if not finite.any():
+                return
+            rows = None if finite.all() else finite
+
+        def take(value):
+            return value if rows is None else value[rows]
+
+        before, wrist, rest = take(before), take(wrist), take(particles[self._start_of[j]])
+        posture_seed = take(particles[name]) if seed is None else seed
+        opposite = "right" if arm == "left" else "left"
+        carrying = rest[:, getattr(world.model, opposite + "_arm")] if opposite in held else None
+        solve = partial(solve_stance_ik, center_posture=bool(self.config.com_center_weight))
+        if carrying is not None:
+            solve = partial(solve, other_arm_reference=carrying)
+        else:
+            idle = world.model.right_arm if arm == "left" else world.model.left_arm
+            nominal = posture_seed.new_tensor(world.model.home[idle]).expand_as(posture_seed[:, idle])
+            # A nominal idle arm is left to the loop's collision costs.
+            if not torch.equal(posture_seed[:, idle], nominal):
+                solve = partial(solve, collides=partial(self._collides, op, particles, objects, held, owners=rows))
+        _write(particles, name, solve(before, wrist, posture_seed, arm).q, rows)
+        if retract is not None:
+            arrived = take(particles[retract]) if seed is None else seed
+            q = _retract_on_stance(before, arrived, arm, world.joint_limits, other_arm_reference=carrying).q
+            _write(particles, retract, q, rows)
+
+    def _collides(self, action, particles, objects, held, q, owners=None):
+        """``[len(q)]`` bool: posture ``q`` of ``action`` collides, by the loop's collision costs against the checker's
+        tolerances, in the scene ``objects`` with ``held`` carried; ``owners`` (``[n]`` bool, None: all) the rows of
+        the scene ``q`` is for."""
+
+        def select(value):
+            return value if owners is None else value[owners]
+
+        binding = action.arg("grasp" if action.operator.metadata.action_type == "pick" else "placement")
+        variables = {action.arg("q"): q, binding: select(particles[binding])}
+        scene = {name: select(value) for name, value in objects.items()}
+        carried = {obj: (arm, select(transform)) for arm, (obj, transform) in held.items()}
+        values = self.cost_function.stepped_scene_costs(variables, [action], scene, carried)["values"]
+        blocked = values.pop("self_collision").reshape(len(q), -1).amax(1) > 0
+        for key, value in values.items():
+            blocked |= value.reshape(len(q), -1).amax(1) > self.checker._get_tol("Collision", key)
+        return blocked
 
     def _run_gap(self, j, particles, head, before, objects, held):
         """Gap ``j``'s hold, its rollout and slope at the current commands, the stand-in set, its landing postures and
@@ -441,9 +469,11 @@ class SteppedPlan:
         return passed & finite, after, torch.where(finite[:, None], head, 0)  # a diverged row hands on a zero head
 
     def refresh(self, particles: dict) -> None:
-        """One refresh (design 6) at the particles' current commands, retract postures, placements and grasps: every gap
-        with steps in order, values only. ``q_land`` and ``sole_to`` are written in place; ``standin``, ``last``,
-        ``tests_ok`` and ``stats`` follow."""
+        """One refresh (design 6 and 13) at the particles' current commands, postures, placements and grasps, values
+        only, gap by gap in order: its hold and rollout if it has steps, then its pick or place and retract postures
+        re-solved on the pair it stands on, so the next gap's hold starts from the re-solved retract. ``q_land``,
+        ``sole_to`` and the postures are written in place; ``standin``, ``last``, ``tests_ok`` and ``stats``
+        follow."""
         began = monotonic()
         n = len(particles["left_q0"])
         with torch.no_grad(), prediction_precision():
@@ -454,19 +484,25 @@ class SteppedPlan:
                                  for j, u in enumerate(commands) if u is not None]).amax()
             _, objects, _, held_before = _placements_and_grasps(self.groups, self.world, self.pools, 0, n,
                                                                 bindings=particles, grasp_indices=particles)
+            # The re-solve's hand target and scene: the placements as Adam holds them, which the hand cost reads.
+            _, scene, wrists, _ = _placements_and_grasps(self.groups, self.world, self.pools, 0, n, bindings=particles,
+                                                         grasp_indices=particles, project=False)
             ok, head, before = torch.ones(n, dtype=torch.bool, device=self.incoming.device), None, self.incoming
-            errors = {}
+            errors, resolve = {}, 0.0
             for j, (steps, _) in enumerate(self.groups):
-                if not steps:
-                    continue  # it stands on the pair before it
-                passed, before, head = self._run_gap(j, particles, head, before, objects[j], held_before[j])
-                ok &= passed
-                landed = torch.stack([step.achieved for step in self.last[j][2].steps], 1)
-                distance = (read[j][..., :2] - landed[..., :2]).norm(dim=-1).amax((1, 2))
-                errors[j] = torch.stack((distance.nanmedian(), distance.nanquantile(0.9)))
+                if steps:  # else it stands on the pair before it
+                    passed, before, head = self._run_gap(j, particles, head, before, objects[j], held_before[j])
+                    ok &= passed
+                    landed = torch.stack([step.achieved for step in self.last[j][2].steps], 1)
+                    distance = (read[j][..., :2] - landed[..., :2]).norm(dim=-1).amax((1, 2))
+                    errors[j] = torch.stack((distance.nanmedian(), distance.nanquantile(0.9)))
+                solving = monotonic()
+                self._solve_postures(j, particles, before, wrists[j], scene[j], held_before[j])
+                resolve += monotonic() - solving
             self.tests_ok = ok
             self.stats["standin_error_m"].append({j: e.tolist() for j, e in errors.items()})
             self.stats["command_move_m"].append(moved.item())
+            self.stats["resolve_s"].append(resolve)
         self.stats["refresh_s"].append(monotonic() - began)
 
     def _commands(self, particles):
