@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from cutamp.landing_predictor import LandingPrediction, LandingState, _intended_pair, _wrap, prediction_precision
-from cutamp.stance import rel_pose
+from cutamp.stance import abs_pose, rel_pose
 
 NUDGE = 1.0e-3  # m and rad: the distance over which the slope is measured (design 6, call 8)
 
@@ -25,7 +25,7 @@ class GapRefresh:
 def _first(value, n):
     """``value`` cut to its first ``n`` rows, through dataclasses and tuples; strings and ``None`` pass through."""
     if torch.is_tensor(value):
-        return value[:n]
+        return value[:n].clone()
     if is_dataclass(value):
         return type(value)(**{f.name: _first(getattr(value, f.name), n) for f in fields(value)})
     if isinstance(value, tuple):
@@ -83,4 +83,37 @@ def refresh_gap(predictor, start: LandingState, order: str, commands: Tensor, an
                 pairs.append(pair)
             fallback = _slope(_relative(big_anchor, torch.stack(pairs, 1)), rows)
         slope = torch.where(ticks_changed[:, None, None, None], fallback, slope)
-    return GapRefresh(_first(out, n), landed[:n], relative[:n], slope, u, ticks_changed)
+    return GapRefresh(_first(out, n), landed[:n].clone(), relative[:n].clone(), slope, u, ticks_changed)
+
+
+@dataclass
+class StandIn:
+    """Every gap's landings between two refreshes: relative pose at the refresh plus slope times the commands' movement,
+    placed on the sole that stays planted in the gap's first step (design 6, call 10)."""
+    orders: tuple[str, ...]          # per pick or place: "", "L", "R", "LR" or "RL" ("" where it takes no step)
+    relative: list[Tensor | None]    # per gap [n, s, 2, 3]
+    slope: list[Tensor | None]       # per gap [n, s, 2, 3, 3 * s]
+    at: list[Tensor | None]          # per gap [n, s, 3]
+
+    def set(self, gap: int, refresh: GapRefresh) -> None:
+        self.relative[gap], self.slope[gap], self.at[gap] = refresh.relative, refresh.slope, refresh.commands
+
+    def stances(self, incoming: Tensor, commands: list[Tensor | None]) -> tuple[list[Tensor | None], list[Tensor]]:
+        """``(after_steps, final)``: ``after_steps[j]`` ``[n, s, 2, 3]`` is the world pair after each step of gap ``j``
+        (``None`` where it takes no step); ``final[j]`` ``[n, 2, 3]`` is the pair pick or place ``j`` stands on.
+        Differentiable in every gap's commands and in ``incoming``."""
+        after, final, before = [], [], incoming
+        for j, order in enumerate(self.orders):
+            if not order:
+                after.append(None)
+                final.append(before)
+                continue
+            n, s = commands[j].shape[:2]
+            moved = (commands[j] - self.at[j]).reshape(n, 3 * s)
+            relative = self.relative[j] + torch.einsum("nsabk,nk->nsab", self.slope[j], moved)
+            anchor = before[:, 1 - "LR".index(order[0])]
+            world = abs_pose(anchor[:, None, None].expand_as(relative).reshape(-1, 3), relative.reshape(-1, 3))
+            after.append(world.reshape(relative.shape))
+            final.append(after[-1][:, -1])
+            before = final[-1]
+        return after, final
