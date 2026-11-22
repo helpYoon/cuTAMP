@@ -12,6 +12,9 @@ from cutamp.landing_predictor import LandingState, _hold_trace, near_rest, predi
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.step_hold_graph import terminal_hold
 
+#: The controller's two head joints, which the planner's model does not have.
+HEAD_JOINTS = ("AAHead_yaw", "Head_pitch")
+
 
 @dataclass
 class StepStart:
@@ -65,7 +68,13 @@ class StepStateAdapter:
     actuates two additional head joints, the planner pins them at zero. Its two
     sole offsets differ from the planner's rounded offsets by at most 0.05 mm.
     No re-centering of the measured feet or base is applied.
+
+    ``head`` (``[2]`` or ``[B, 2]``, None: zero) carries the two head angles an
+    earlier step's rollout ended with into the next issue state, since the
+    planner's postures do not hold the head; ``columns`` are their columns.
     """
+
+    head: Tensor | None = None
 
     def __init__(self, predictor, model=REAL_LEGS):
         self.predictor = predictor
@@ -77,6 +86,7 @@ class StepStateAdapter:
         if set(self.names) - set(model.joint_names) != {"AAHead_yaw", "Head_pitch"}:
             raise ValueError("Unsupported T1 head/actuator mapping")
         self.bfm_columns = [self.names.index(n) for n in model.joint_names[6:]]
+        self.columns = [self.names.index(n) for n in HEAD_JOINTS]
 
     def physical(self, q, qd=None):
         """Convert (...,33) generalized coordinates and rates to p,R,v,w,q29,qd29."""
@@ -87,6 +97,8 @@ class StepStateAdapter:
         joint_vel = torch.zeros_like(joint)
         joint[..., self.bfm_columns] = q[..., 6:]
         joint_vel[..., self.bfm_columns] = qd[..., 6:]
+        if self.head is not None:
+            joint[..., self.columns] = self.head.to(joint)
         angle = q[..., 3:6]
         R = roma.euler_to_rotmat("YXZ", angle)
         w = (_angular_axes(angle) @ qd[..., 3:6, None]).squeeze(-1)

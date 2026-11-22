@@ -32,6 +32,10 @@ def test_named_state_and_noncommuting_angular_velocity():
     skew = drdt @ rot.transpose(-1, -2)
     w_fd = skew[:, [2, 0, 1], [1, 2, 0]]
     torch.testing.assert_close(w_fd, physical[3])
+    adapter.head = torch.tensor([0.1, -0.2])
+    torch.testing.assert_close(adapter.physical(q)[4][..., adapter.columns], adapter.head.to(q).expand(len(q), -1))
+    adapter.head = None
+    assert torch.count_nonzero(adapter.physical(q)[4][..., adapter.columns]) == 0
 
 
 @needs_cuda

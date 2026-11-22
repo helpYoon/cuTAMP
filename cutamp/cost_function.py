@@ -278,8 +278,10 @@ class CostFunction:
 
         return {"type": "constraint", "values": coll_values}
 
-    def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None, *, include_self=True):
-        """Check selected postures against the other links, loose objects and carried objects."""
+    def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None, *, include_self=True,
+                            site: str | None = None):
+        """Check selected postures against the other links, loose objects and carried objects. ``site``: run the FK
+        on that FK site (TAMPWorld.site_kinematics), as the Adam loop does; None as the direct callers do."""
         from cutamp.gn_refresh import self_sphere_overlaps
         from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
         from cutamp.step_set import _facts
@@ -290,7 +292,9 @@ class CostFunction:
         key = {"step": "q_land", "retract": "q_retract", "pick": "q", "place": "q"}
         q = torch.stack([particles[op.arg(key[op.operator.metadata.action_type])] for op in ops], dim=1)
         b, h = q.shape[:2]
-        if q.requires_grad:
+        if site is not None:
+            kin = self.world.site_kinematics(site)
+        elif q.requires_grad:
             # cuRobo reuses the backward buffers of one FK instance on the next call.
             from curobo.kinematics import Kinematics
             kin = Kinematics(self.world.kinematics.config)
@@ -449,7 +453,7 @@ class CostFunction:
 
         # motion_costs below already checks robot self-collision for the final particle.
         collision_cost = (self.collision_costs(rollout, obj_to_spheres) if achieved_stances is None
-                          else self.stepped_scene_costs(particles, include_self=False))
+                          else self.stepped_scene_costs(particles, include_self=False, site="stepped_scene"))
         add_cost(Collision.type, collision_cost)
 
         stable_placement_cost = self.stable_placement_costs(rollout, obj_to_spheres)

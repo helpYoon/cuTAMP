@@ -28,6 +28,8 @@ Per-operator locking policy for T1, on the planning model's slices
 * Retract (RetractHolding, RetractFree): a retract conf stands where its reach
   stood (design 7.3), so its base and body are locked too, at home, where
   particle init puts them, beside the inactive arm. Only its active arm moves.
+  In a plan with steps (``stepped=True``) a retract stands on the landed stance, so only its inactive arm is
+  locked and the feet cost holds the rest (design 2026-11-22-adam-alone-steps, call 14).
 """
 
 from __future__ import annotations
@@ -47,13 +49,14 @@ def _indices(s: slice) -> List[int]:
 
 
 def get_conf_locked_dofs(
-    plan_skeleton: PlanSkeleton, conf_name: str, model: "T1Model"
+    plan_skeleton: PlanSkeleton, conf_name: str, model: "T1Model", *, stepped: bool = False
 ) -> List[int]:
     """Return the DOF indices that should be gradient-locked for ``conf_name``.
 
     Locking is determined by the metadata of the first operator in the plan
     skeleton that references the conf as one of its parameters. Indices are
-    into ``model``'s cspace.
+    into ``model``'s cspace. ``stepped``: the plan has steps, and a retract
+    locks its idle arm only.
     """
     left_arm = _indices(model.left_arm)
     right_arm = _indices(model.right_arm)
@@ -65,7 +68,7 @@ def get_conf_locked_dofs(
         if meta.arm not in ("left", "right"):
             return []
         idle_arm = right_arm if meta.arm == "left" else left_arm
-        if meta.action_type == "retract":
+        if meta.action_type == "retract" and not stepped:
             return _indices(model.base) + _indices(model.body) + idle_arm
         return idle_arm
     return []
@@ -77,18 +80,20 @@ def build_grad_masks(
     param_to_type: Dict[str, str],
     conf_type: str,
     model: "T1Model",
+    *,
+    stepped: bool = False,
 ) -> Dict[int, torch.Tensor]:
     """Build a tensor mask per Conf parameter; index = ``id(tensor)``.
 
     The mask has the same shape as the parameter and contains 1.0 at free
     DOFs and 0.0 at locked DOFs. Apply by ``param.grad.mul_(mask)`` after
-    ``loss.backward()``.
+    ``loss.backward()``. ``stepped`` as in :func:`get_conf_locked_dofs`.
     """
     masks: Dict[int, torch.Tensor] = {}
     for param_name, tensor in particles.items():
         if param_to_type.get(param_name) != conf_type:
             continue
-        locked = get_conf_locked_dofs(plan_skeleton, param_name, model)
+        locked = get_conf_locked_dofs(plan_skeleton, param_name, model, stepped=stepped)
         if not locked:
             continue
         dof = tensor.shape[-1]

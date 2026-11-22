@@ -44,8 +44,9 @@ from cutamp.utils.shapes import sample_greedy_surface_spheres
 _log = logging.getLogger(__name__)
 
 #: The Adam loop's FK sites, each on its own Kinematics (TAMPWorld.site_kinematics). "retract_motion" is the real
-#: legs' retract confs for the motion constraints (cost_function.motion_costs).
-FK_SITES = ("rollout", "retract", "com", "gate", "retract_motion")
+#: legs' retract confs for the motion constraints (cost_function.motion_costs). A plan with steps adds two:
+#: "stepped_scene" (cost_function.stepped_scene_costs in the loop) and "retract_soles" (its retract confs' soles).
+FK_SITES = ("rollout", "retract", "com", "gate", "retract_motion", "stepped_scene", "retract_soles")
 
 
 class TAMPWorld:

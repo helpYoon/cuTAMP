@@ -24,7 +24,11 @@ from cutamp.com_polygon_cost import COM_TOL, SOLE_POS_TOL, SOLE_ROT_TOL
 
 default_constraint_to_mult = {
     # sole_*: the soles against the stance at every conf (design 7.4), weighted as the hand is.
-    KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0},
+    # retract_sole_*: a stepped plan's retract confs against their landed stance, weighted as the sole_* rows.
+    KinematicConstraint.type: {
+        "pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0,
+        "retract_sole_pos_err": 1.0, "retract_sole_rot_err": 5.0,
+    },
     StablePlacement.type: {"*_support": 2.0},
     TrajectoryLength.type: {"traj_length": 1e-3},
     # ComPolygon penalty values are O(1e-4 to 1e-3) in m²; multiplier 10
@@ -32,7 +36,14 @@ default_constraint_to_mult = {
     # pos_err (mult 1.0 × value O(1e-2)). "default" applies to every
     # per-conf name — relies on CostReducer's (type, "default") fallback.
     ComPolygon.type: {"default": 10.0},
-    ComComfort.type: {"margin_shortfall_squared": 10.0},
+    # margin_shortfall: a stepped plan's balance row, the shortfall itself (its square never reaches the zero
+    # tolerance; design 2026-11-22-adam-alone-steps, call 4).
+    ComComfort.type: {"margin_shortfall_squared": 10.0, "margin_shortfall": 10.0},
+    # A stepped plan's commands: the travel range, step bound and landing accuracy rows (step_refresh.command_rows).
+    "StepCommand": {"default": 1.0},
+    # The pass-or-fail tests read from the world model's rollout at each refresh (call 12): read by the checker,
+    # nothing added to the loss.
+    "StepTests": {"refresh_tests": 0.0},
     "soft": {
         "com_center_distance_squared": 1.0,  # CostFunction applies the configured coefficient.
         "retract_close_to_home": 1e-1,
@@ -43,6 +54,8 @@ default_constraint_to_mult = {
         # nothing more, 1e5 distorted particle selection). The band is now
         # zero, so it weights limit violations only; kept at 1e3.
         "joint_limit_margin": 1e3,
+        # A stepped plan's postures near their starting values (call 5): the weight measured on the cup scene.
+        "stay_near_start": 1.0,
     },
 }
 
@@ -56,6 +69,7 @@ default_constraint_to_tol = {
     # every trajectory frame to the same two.
     KinematicConstraint.type: {
         "pos_err": 0.005, "rot_err": 0.05, "sole_pos_err": SOLE_POS_TOL, "sole_rot_err": SOLE_ROT_TOL,
+        "retract_sole_pos_err": SOLE_POS_TOL, "retract_sole_rot_err": SOLE_ROT_TOL,
     },
     # retract_*: the retract confs, which join the motion constraints (design 7.3).
     Motion.type: {
@@ -76,7 +90,9 @@ default_constraint_to_tol = {
     # excursion past an edge fails. "default" applies to every per-conf name
     # (left_q0, right_q1, ...).
     ComPolygon.type: {"default": COM_TOL},
-    ComComfort.type: {"margin_shortfall_squared": 0.0},
+    ComComfort.type: {"margin_shortfall_squared": 0.0, "margin_shortfall": 0.0},
+    "StepCommand": {"default": 0.0},
+    "StepTests": {"refresh_tests": 0.0},
 }
 
 

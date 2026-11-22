@@ -15,6 +15,7 @@ from cutamp.robots.t1 import MOTION_INTERPOLATION_DT, get_t1_kinematics, t1_curo
 from cutamp.step_ik import _Kinematics
 from cutamp.step_refinement import _check_deadline, landing_constraint_rows
 from cutamp.step_validation import (
+    HEAD_JOINTS,
     StepStateAdapter,
     SteppedMotion,
     boundary_errors,
@@ -23,9 +24,6 @@ from cutamp.step_validation import (
 )
 from cutamp.supported_posture import set_stance_base_limits
 from cutamp.utils.common import get_world_cfg
-
-
-_HEAD = ("AAHead_yaw", "Head_pitch")
 
 
 def _check_issued_landings(predictor, initial, order, commands, prediction):
@@ -38,21 +36,6 @@ def _check_issued_landings(predictor, initial, order, commands, prediction):
         raise ValueError("Reissued commands violate the controller domain, phase or landing limits")
 
 
-class _HandoffAdapter(StepStateAdapter):
-    """Carry the supported planner's two locked head angles into its next controller issue state."""
-
-    def __init__(self, predictor, model):
-        super().__init__(predictor, model)
-        self.head = None
-        self.columns = [self.names.index(n) for n in _HEAD]
-
-    def physical(self, q, qd=None):
-        state = super().physical(q, qd)
-        if self.head is not None:
-            state[4][..., self.columns] = self.head
-        return state
-
-
 class PredictedSteppedMotion(SteppedMotion):
     """One model-only attempt. All mutable FK and obstacle state belongs to this attempted trajectory."""
 
@@ -61,7 +44,7 @@ class PredictedSteppedMotion(SteppedMotion):
     def __init__(self, skeleton, particle, inputs, adapter, world, deadline):
         private_world = copy(world)
         private_world._site_kinematics = {}
-        super().__init__(skeleton, inputs, _HandoffAdapter(adapter.predictor, world.model), private_world)
+        super().__init__(skeleton, inputs, StepStateAdapter(adapter.predictor, world.model), private_world)
         self.neutral_world = world
         self.skeleton = skeleton
         self.bindings = particle
@@ -122,7 +105,7 @@ class PredictedSteppedMotion(SteppedMotion):
         angles = self.last_state.tensors[4][0, self.adapter.columns]
         cfg = deepcopy(self.charts)
         kin_cfg = cfg["robot_cfg"]["kinematics"]
-        kin_cfg["lock_joints"].update(dict(zip(_HEAD, angles.tolist())))
+        kin_cfg["lock_joints"].update(dict(zip(HEAD_JOINTS, angles.tolist())))
         set_stance_base_limits(kin_cfg, self.stance.tolist())
         self.supported_cfg = kin_cfg
         self.supported_kinematics = _Kinematics(q.device, kin_cfg)
