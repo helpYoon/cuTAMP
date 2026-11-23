@@ -615,8 +615,6 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                 break
             metrics["num_optimized_plans"] += 1
             if proposal.step_count:
-                from cutamp.step_refresh import NoStartingPath
-
                 try:
                     result = _refine_step_schedule(
                         proposal,
@@ -630,7 +628,7 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                         visualizer=visualizer,
                         deadline=deadline,
                     )
-                except (NoGraspCandidates, NoStartingPath) as e:
+                except NoGraspCandidates as e:
                     result = StepResult([], None, "initialization_failed", str(e))
             else:
                 if initializer is None:

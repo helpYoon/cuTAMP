@@ -202,14 +202,15 @@ graph LR
    (`place_4dof_sampler`), its yaw turned so the held grasp approaches from the
    robot's side. The rows whose IK fails draw again, up to
    `GRASP_REDRAW_ROUNDS` times, a pick from its chosen grasps. Grasps are never
-   optimized. A plan with steps starts its particles in `step_loop.py`
-   instead: the step commands start on half-foot grid paths over the task
-   planner's foot orders that reach each target and keep the feet off objects,
-   with noise within half a cell (`step_refresh.draw_grid_paths`; a right
-   swing mirrored), the pick's grasps are taken in score order, and each pick,
-   place and retract posture starts from one stance IK solve on the stance it
-   stands on at the first refresh; the Adam loop then moves the commands with
-   the placements and postures.
+   optimized. A plan with steps starts its particles in `step_loop.py` instead:
+   the step commands start on half-foot grid paths over the task planner's foot
+   orders that reach each target and keep the feet off objects, with noise
+   within half a cell (`step_refresh.draw_grid_paths`; a right swing mirrored);
+   when no grid path reaches, they start on legal, feet-clear paths that do not
+   reach. The pick's grasps are taken in score order, and each pick, place and
+   retract posture starts from one stance IK solve on the stance it stands on at
+   the first refresh; the Adam loop then moves the commands with the placements
+   and postures.
 3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
    particles against `CostFunction` (`cost_function.py`): hard constraints
    (kinematic — the hand's pose and both soles on the stance — motion,
@@ -666,11 +667,12 @@ A plan with steps is optimized in the same loop: each step's command (where the
 swung sole lands, x, y and yaw in the planted sole's frame) is an Adam variable,
 and the commands start on half-foot grid paths over the task planner's foot
 orders that reach each target and keep the feet off objects, with noise within
-half a cell (`step_refresh.draw_grid_paths`). Every `reik_interval` Adam steps
-a refresh runs `landing-seed3.pt`, the controller and
-world model, on every particle's commands; its landings and their slope enter
-the costs, and the pick, place and retract postures are re-solved on the
-landings. The loop stops as it does for plans without steps.
+half a cell (`step_refresh.draw_grid_paths`); when no grid path reaches, they
+start on legal, feet-clear paths that do not reach. Every `reik_interval` Adam
+steps a refresh runs `landing-seed3.pt`, the controller and world model, on
+every particle's commands; its landings and their slope enter the costs, and the
+pick, place and retract postures are re-solved on the landings. The loop stops
+as it does for plans without steps.
 
 Nothing is run after the loop: the particles feasible at its last refresh go to
 arm motion planning. Both feet must pass the 2 cm XY and 1° yaw limits. The

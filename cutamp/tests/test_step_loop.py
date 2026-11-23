@@ -56,7 +56,7 @@ from cutamp.constraint_checker import ConstraintChecker
 from cutamp.particle_initialization import ParticleInitializer
 from cutamp.step_loop import SteppedPlan
 from cutamp.step_planner import StepResult
-from cutamp.step_refresh import as_commanded, command_rows
+from cutamp.step_refresh import NoStartingPath, as_commanded, command_rows
 from cutamp.tests.conftest import first_schedules, needs_cuda, only_schedule
 from cutamp.tests.paired_grasp_scene import paired_setup
 
@@ -236,6 +236,19 @@ def test_a_missing_predictor_is_reported(stepped_call):
     res = refine_stepped_plan(c["proposal"], c["world"], c["config"], c["reducer"], c["checker"], inputs=c["inputs"],
                               predictor=None, timer=c["timer"], visualizer=c["visualizer"], deadline=None)
     assert res.status == "unavailable"
+
+
+@needs_cuda
+def test_a_plan_without_a_starting_path_fails_its_initialization(stepped_call, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise NoStartingPath("16 of 16 particles found no legal, feet-clear grid path in 1000 rounds")
+
+    monkeypatch.setattr("cutamp.step_loop.draw_grid_paths", refuse)
+    c = stepped_call
+    res = refine_stepped_plan(c["proposal"], c["world"], c["config"], c["reducer"], c["checker"], inputs=c["inputs"],
+                              predictor=c["predictor"], timer=c["timer"], visualizer=c["visualizer"], deadline=None)
+    assert res.status == "initialization_failed" and res.rows == []
+    assert res.reason == "16 of 16 particles found no legal, feet-clear grid path in 1000 rounds"
 
 
 @needs_cuda

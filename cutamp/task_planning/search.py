@@ -76,8 +76,8 @@ class RankedStepSkeleton:
     """A task plan with its steps inserted, the foot order (``none``, ``L``, ``R``, ``LR`` or ``RL``) before each pick
     and place, and the landing path the plan search ranked it by. The particles' commands do not start at the path's:
     they start on grid paths over these foot orders that reach the ``targets``, one ``TargetRegion`` per pick and place
-    aligned with ``schedule.edges``, by the reach test of ``search``, the ``StepSearch`` that ranked the plan
-    (:func:`cutamp.step_refresh.draw_grid_paths`)."""
+    aligned with ``schedule.edges``, by the reach test of ``search``, the ``StepSearch`` that ranked the plan; when no
+    grid path reaches, on legal, feet-clear paths that do not reach (:func:`cutamp.step_refresh.draw_grid_paths`)."""
 
     skeleton: PlanSkeleton
     orders: tuple[str, ...]

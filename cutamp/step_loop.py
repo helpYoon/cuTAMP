@@ -24,7 +24,7 @@ from cutamp.stance import STEP_TRAVEL, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
-from cutamp.step_refresh import StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
+from cutamp.step_refresh import NoStartingPath, StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
 from cutamp.step_validation import StepStateAdapter, _foot_half_extents, _object_box, validate_step_geometry
 from cutamp.task_planning.constraints import ComComfort, KinematicConstraint
 from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
@@ -150,10 +150,11 @@ def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, gra
 
 
 def _foot_scene(world, poses: dict, held: dict, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The scene the starting draw keeps the feet clear of, built as the refresh's foot rule builds its own
-    (:func:`cutamp.step_validation._step_geometry`): boxes ``[n, b, 4, 4]`` and half extents ``[b, 3]``, float64 on the
-    CPU, of ``world.movables + world.statics`` except the objects ``held`` (arm -> (name, grasp)) carries, each posed by
-    ``poses`` (name -> ``[n, 4, 4]``) or else ``world.get_object_pose`` and boxed by :func:`_object_box`."""
+    """The refresh's foot scene (:func:`cutamp.step_validation._step_geometry`) without its carried objects, the scene
+    the starting draw keeps the feet clear of: boxes ``[n, b, 4, 4]`` and half extents ``[b, 3]``, float64 on the CPU,
+    of ``world.movables + world.statics`` except the objects ``held`` (arm -> (name, grasp)) carries, each posed by
+    ``poses`` (name -> ``[n, 4, 4]``) or else ``world.get_object_pose`` and boxed by :func:`_object_box`. The refresh
+    also tests the object in the hand; the draw cannot, as the hand's pose is not known there."""
     carried = {name for name, _ in held.values()}
     boxes, halves = [], []
     for obj in world.movables + world.statics:
@@ -303,11 +304,12 @@ class SteppedPlan:
 
     A particle's commands, ``[n, s, 3]`` per gap with steps, are Adam variables that start on a half-foot grid path over
     the task planner's foot orders that reaches each target and keeps the feet off objects, with noise within half a
-    cell (:func:`cutamp.step_refresh.draw_grid_paths`); its pick, place and retract postures are Adam variables that
-    start from one solve on the stance the first refresh gives. A refresh runs the world model and controller on every
-    particle's commands, gap by gap, writes the landing postures (never optimized), sets the stand-in the costs read
-    until the next refresh and re-solves the pick, place and retract postures on the pairs they stand on (design 13).
-    The starting pass is the first refresh.
+    cell (:func:`cutamp.step_refresh.draw_grid_paths`); when no grid path reaches, the particles start on legal,
+    feet-clear paths that do not reach. A particle's pick, place and retract postures are Adam variables that start from
+    one solve on the stance the first refresh gives. A refresh runs the world model and controller on every particle's
+    commands, gap by gap, writes the landing postures (never optimized), sets the stand-in the costs read until the next
+    refresh and re-solves the pick, place and retract postures on the pairs they stand on (design 13). The starting pass
+    is the first refresh.
     """
 
     def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, deadline=None, generator=None):
@@ -732,6 +734,8 @@ def refine_stepped_plan(proposal, world, config, cost_reducer, constraint_checke
         plan = SteppedPlan(proposal, world, config, predictor, inputs, pools, constraint_checker, deadline=deadline)
     except TimeoutError as e:
         return StepResult([], None, "budget_exhausted", str(e))
+    except NoStartingPath as e:
+        return StepResult([], None, "initialization_failed", str(e))
     except ValueError as e:
         return StepResult([], None, "unresolved", str(e))
     info = {"plan_skeleton": plan.arm_skeleton, "particles": plan.particles, "rollout_fn": plan.rollout_fn,
