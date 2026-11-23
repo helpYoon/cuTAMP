@@ -212,6 +212,7 @@ def test_grid_paths_pass_their_tests_and_repeat():
     draws, info = draw()
     assert draws[1] is None and draws[0].shape == (64, 2, 3) and draws[2].shape == (64, 1, 3)
     assert draws[0].dtype == torch.float32 and (info["rounds"], info["own"], info["reached"]) == (1, 64, True)
+    assert info["noisy"] > 0
     assert (draws[0][:, 0, 1] > 0).all() and (draws[0][:, 1, 1] < 0).all()  # a right swing is the mirror image
     assert legal64(orders, inc, draws) and near_grid(draws, grid)
     ends = end_pairs(orders, inc, draws)
@@ -232,6 +233,33 @@ def test_rounds_stop_at_the_first_dry_round_and_share_paths():
     draws, info = draw_grid_paths(("L",), inc, torch.Generator().manual_seed(0), grid, [one_path_once], [None], FOOT_HALF)
     assert info["rounds"] == 2 and 0 < info["own"] < 16 and info["reached"] and info["noisy"] == 0
     assert torch.allclose(draws[0], torch.tensor([0.224868, 0.35, 0.0]).expand(16, 1, 3))
+
+
+def test_a_shared_path_passes_the_receivers_own_tests():
+    inc, grid = incoming()[:1].repeat(16, 1, 1).double(), grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    far, near = inc[0, 1].numpy() + [0.224868, 0.35, 0.0], inc[0, 1].numpy() + [0.0, 0.35, 0.0]  # landings of 2 commands
+    scene = pad_at(16, (5.0, 5.0), (0.03, 0.03))
+    scene[0][8:, 0, :2, 3] = torch.from_numpy(far[:2])  # particles 8-15 have a pad where the far command lands
+    calls = []
+    def two_paths_but_round_two(pairs):  # passes the two landings, except in its second call: round 2 is dry
+        calls.append(len(pairs))
+        hit = (np.abs(pairs[:, 0] - far) < 1e-9).all(1) | (np.abs(pairs[:, 0] - near) < 1e-9).all(1)
+        return hit & (len(calls) != 2)
+    draws, info = draw_grid_paths(("L",), inc, torch.Generator().manual_seed(0), grid, [two_paths_but_round_two],
+                                  [scene], FOOT_HALF)
+    assert info["rounds"] == 2 and 0 < info["own"] < 16 and info["noisy"] == 0
+    feet = landings(("L",), inc, draws)
+    assert (feet[:8, 0, 0] > 0.2).any()  # some kept path is the far one, which fails particles 8-15
+    assert feet_clear(feet, *scene, FOOT_HALF).all()  # so no particle of 8-15 was given it
+
+
+def test_a_later_gaps_incoming_pair_is_feet_tested():
+    orders, inc = ("L", "", "R"), incoming()[:1].repeat(32, 1, 1).double()
+    grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    pad = pad_at(32, (0.22, 0.3), (0.08, 0.08))  # where gap 0's left sole often lands; in gap 2's scene only
+    draws, _ = draw_grid_paths(orders, inc, torch.Generator().manual_seed(0), grid, [None] * 3, [None, None, pad],
+                               FOOT_HALF)
+    assert feet_clear(torch.from_numpy(end_pairs(orders, inc, draws)[0]), *pad, FOOT_HALF).all()
 
 
 def test_a_plan_where_nothing_reaches_starts_on_legal_clear_paths():

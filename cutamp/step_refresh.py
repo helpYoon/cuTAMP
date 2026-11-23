@@ -214,7 +214,8 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
     float64 on the CPU; random numbers come from ``generator`` on its own device.
 
     Rounds draw ``PATH_CANDIDATES`` paths per particle without one and keep each particle's first passing path, until
-    every particle has one or a round keeps none; particles left without one take the kept paths in turn. When the first
+    every particle has one or a round keeps none; particles left without one take the kept paths in turn, each the first
+    from its turn on that passes its own test, else the one its turn names. When the first
     round keeps none, every particle takes a path that passes without the reach test, drawing further rounds up to
     ``REDRAW_ROUNDS`` in all, else :class:`NoStartingPath`. Then each particle keeps the first of ``NOISE_TRIES`` copies
     of its path, each number uniform within half a grid cell cut to the trained box, that passes its own test."""
@@ -294,7 +295,12 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
             keep(todo, candidates(len(todo)), False)
         mine = n
     lacking = (~own).nonzero().squeeze(1)
-    path[lacking] = path[own][torch.arange(len(lacking)) % mine]  # the kept paths, in turn
+    if len(lacking):  # the kept paths in turn: each takes the first from its turn on that passes its own test
+        kept = path[own]
+        queue = (torch.arange(len(lacking))[:, None] + torch.arange(mine)) % mine  # [L, mine] kept rows, search order
+        hit = passes(lacking.repeat_interleave(mine), kept.repeat(len(lacking), 1, 1), True).view(len(lacking), mine)
+        first = hit.gather(1, queue).int().argmax(1, keepdim=True)  # 0 where none passes: the plain turn
+        path[lacking] = kept[queue.gather(1, first).squeeze(1)]
 
     centre = path[:, None].expand(n, NOISE_TRIES, s, 3)
     low, high = torch.maximum(centre - half_cell, lo), torch.minimum(centre + half_cell, hi)
