@@ -212,6 +212,28 @@ def test_a_corner_takes_two_balance_rows():
     torch.testing.assert_close(landed, (torch.tensor(half) - GN_COM_MARGIN).expand(B, 2), rtol=0, atol=1e-4)
 
 
+def _double(x):
+    """``x``, or each item of a tuple ``x``, in float64 where it is a float tensor."""
+    if isinstance(x, tuple):
+        return tuple(_double(y) for y in x)
+    return x.double() if torch.is_tensor(x) and x.is_floating_point() else x
+
+
+def test_a_moved_region_gives_the_same_steps():
+    # Level 1 reads the planes, and levels 3 and 4 the CoM, about the region's centre: a region and a CoM moved
+    # together by a planar offset give the same three steps.
+    # Float64: in float32 the offset rounds the bounds and the CoM by an ulp, which the solves amplify to about 1e-6.
+    offset = torch.tensor([0.3, -0.2], dtype=torch.float64)
+    for seed in range(3):
+        stack = _double(_synthetic(seed, coll=True)[0])
+        region = _double(_rectangle_region(stack[8], len(stack[0])))
+        normals, bounds, _ = region
+        moved = (normals, bounds + (normals * offset).sum(-1), offset.expand(len(bounds), 2))
+        args = stack[:4] + (stack[4] + offset,) + stack[5:]
+        for got, want in zip(_on_region(args, moved), _on_region(stack, region)):
+            torch.testing.assert_close(got, want, rtol=0, atol=1e-6)
+
+
 def test_planes_that_are_not_sides_change_nothing():
     stack, _ = _synthetic(1, coll=True)
     normals, bounds, centre = _rectangle_region(stack[8], len(stack[0]))

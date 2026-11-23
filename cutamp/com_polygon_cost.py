@@ -498,3 +498,31 @@ def support_region_planes(soles: torch.Tensor, sole_box: Tuple[float, float], ke
     b = torch.minimum(h_guard, torch.maximum(hL, hR) - COM_SAFETY_MARGIN) - (COM_DYNAMIC_RESERVE if keyframe else 0.0)
     b = torch.where(ok, b, torch.full_like(b, float("inf")))
     return n.reshape(*lead, -1, 2), b.reshape(*lead, -1)
+
+
+def support_region_sides(normals: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    """``bounds`` ``[..., K]`` with ``+inf`` on every plane of ``(normals [..., K, 2], bounds)`` (unit normals,
+    ``n . p <= b``, as :func:`support_region_planes` gives them) that is not a side of their region: a side touches
+    the region along a segment of positive length. :func:`support_region_planes`' candidates bound the region, but
+    most lie outside it or touch it at a vertex only; the GN solve holds a plane as an equality, which on such a plane
+    drags the CoM out through a side (:func:`cutamp.gn_refresh._balanced_step`'s ``region``).
+
+    On plane k's line ``p(t) = b_k n_k + t d_k``, ``d_k`` its normal turned +90 degrees, every other plane j leaves
+    ``t (n_k x n_j) <= b_j - b_k (n_k . n_j)``: a bound on t from above or below by the sign of the cross product, and
+    a parallel plane leaves the whole line or none of it. Plane k is a side where what is left is a segment of positive
+    length. Tolerances as :func:`physical_support_planes`' (``8 eps`` of the data's scale): on the cross product of
+    unit normals, and in metres on the finite bounds' largest magnitude. Exact duplicates of a side all stay finite.
+    Pairwise over planes: ``[..., K, K]`` per tensor."""
+    finite = bounds.isfinite()
+    b = torch.where(finite, bounds, 0.0)
+    eps = 8 * torch.finfo(normals.dtype).eps
+    tol = eps * b.abs().amax(-1, keepdim=True)                                       # [..., 1], metres
+    n_k, n_j = normals.unsqueeze(-2), normals.unsqueeze(-3)                          # [..., K, 1, 2], [..., 1, K, 2]
+    cross = n_k[..., 0] * n_j[..., 1] - n_k[..., 1] * n_j[..., 0]                   # [..., K, K]: d_k . n_j
+    room = bounds.unsqueeze(-2) - b.unsqueeze(-1) * (n_k * n_j).sum(-1)              # +inf where plane j has no bound
+    parallel = cross.abs() <= eps
+    t = room / torch.where(parallel, 1.0, cross)
+    hi = torch.where(cross > eps, t, torch.inf).amin(-1)
+    lo = torch.where(cross < -eps, t, -torch.inf).amax(-1)
+    shut = (parallel & (room < -tol.unsqueeze(-1))).any(-1)
+    return torch.where(finite & ~shut & (hi - lo > tol), bounds, torch.inf)

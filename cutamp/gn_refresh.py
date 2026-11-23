@@ -201,16 +201,17 @@ def _row_tool_jacobian(state, frames, col_mask, is_left):
 
 
 def _sole_residual_and_jacobian(state, sole_idx: Tuple[int, int], goals: torch.Tensor, col_mask: torch.Tensor):
-    """Both soles' world-frame residual ``[N, 12]`` against ``goals`` ``[2, 4, 4]``, rows [left Δpos, left
-    rotvec, right Δpos, right rotvec] (:func:`_pose_residual_and_jacobian`'s metric), and their column-masked
-    Jacobian ``[N, 12, dof]``. ``sole_idx`` holds the soles' indices among the tool frames."""
+    """Both soles' world-frame residual ``[N, 12]`` against ``goals``, ``[2, 4, 4]`` (one stance for every row) or
+    ``[N, 2, 4, 4]`` (a stance per row), rows [left Δpos, left rotvec, right Δpos, right rotvec]
+    (:func:`_pose_residual_and_jacobian`'s metric), and their column-masked Jacobian ``[N, 12, dof]``. ``sole_idx``
+    holds the soles' indices among the tool frames."""
     N = col_mask.shape[0]
     poses = state.tool_poses
     pos = torch.stack([poses.position[:, 0, i] for i in sole_idx], dim=1)        # [N, 2, 3]
     quat = torch.stack([poses.quaternion[:, 0, i] for i in sole_idx], dim=1)     # [N, 2, 4], wxyz
     rot = roma.unitquat_to_rotmat(quat.roll(-1, dims=-1))
-    r_pos = goals[:, :3, 3] - pos
-    r_rot = _rotmat_to_rotvec(goals[:, :3, :3] @ rot.transpose(-1, -2))
+    r_pos = goals[..., :3, 3] - pos
+    r_rot = _rotmat_to_rotvec(goals[..., :3, :3] @ rot.transpose(-1, -2))
     jacs = state.tool_jacobians[:, 0]
     jac = torch.stack([jacs[:, i] for i in sole_idx], dim=1).reshape(N, 12, -1)
     return torch.cat([r_pos, r_rot], dim=-1).reshape(N, 12), jac * col_mask.unsqueeze(1)
@@ -404,8 +405,9 @@ def _lower_level_blocked(q, above, dq, lower, upper):
 
 def _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask, is_left):
     """The step that ends a call, from a pose-only FK ``state`` at ``q``: the 12 sole rows
-    against ``goals`` as level 1, and the hand rows, held where they are, as level 2 in their null space, so the
-    hand does not ride the correction. Each iteration's level 1 holds the soles only to first order, so a
+    against ``goals`` (:func:`_sole_residual_and_jacobian`'s, one stance or a stance per row, with ``lower`` and
+    ``upper`` ``[dof]`` or ``[N, dof]``) as level 1, and the hand rows, held where they are, as level 2 in their null
+    space, so the hand does not ride the correction. Each iteration's level 1 holds the soles only to first order, so a
     saturated last step leaves a second-order drift that nothing else in the call would correct.
 
     No CoM rows (so no autograd). Joints at a limit are frozen, and one re-solve freezes the
@@ -478,7 +480,11 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
 
     ``region``, ``(normals [N, K, 2], bounds [N, K], centre [N, 2])``, holds the CoM in a convex region instead,
     the planes ``normal . p <= bound`` (``half`` is then ``None``), with ``com``, ``jac_com`` and ``centre`` in the
-    planes' frame; ``lower`` and ``upper`` may then be ``[N, dof]``. Level 1 holds two of its planes
+    planes' frame; ``lower`` and ``upper`` may then be ``[N, dof]``. The normals must be unit length: only then are
+    a plane's violations, and ``GN_COM_MARGIN``, distances. Every plane with a finite bound must be a side of the
+    region (it touches the region along a segment of positive length), and a plane that is not one carries a ``+inf``
+    bound (:func:`~cutamp.com_polygon_cost.support_region_sides`): level 1 holds a plane as an equality, and on a plane
+    outside the region that drags the CoM out through a side. Level 1 holds two of its planes
     (:func:`_region_balance_rows`) by the rectangle's rules, and levels 3 and 4 read the CoM about ``centre``, both
     axes alike, in metres."""
     from cutamp.com_polygon_cost import _half_extents
@@ -595,6 +601,16 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     return torch.where(skip, step3, step4), step3, step12
 
 
+def stance_sole_goals(stances: torch.Tensor) -> torch.Tensor:
+    """``[..., 2, 4, 4]``: each sole of ``stances`` ``[..., 2, 3]`` (left then right, (x, y, yaw) in the world) as its
+    planted sole frame, at height 0 with a pure yaw rotation: the convention of the feet requirement
+    (:meth:`~cutamp.cost_function.CostFunction.kinematic_costs`)."""
+    from cutamp.utils.common import action_4dof_to_mat4x4
+
+    x, y, yaw = stances.unbind(-1)
+    return action_4dof_to_mat4x4(torch.stack((x, y, torch.zeros_like(x), yaw), dim=-1))
+
+
 def gn_project_balanced(
     world,
     q_full: torch.Tensor,
@@ -603,6 +619,7 @@ def gn_project_balanced(
     iters: int = GN_ITERS,
     movables: Optional[torch.Tensor] = None,
     collision: bool = True,
+    stances: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Project ``q_full`` (``[N, dof]`` full-cspace joint positions, not modified) toward
     ``FK(q) == world_from_ee`` (``[N, 4, 4]`` target tool poses), balance first, on ``world.kinematics_jac``.
@@ -658,6 +675,14 @@ def gn_project_balanced(
     ``len(arms)`` equal dep-major blocks, block ``i`` on ``arms[i]``'s tool
     frame, with the other arm's columns frozen, so that hand rides with the trunk (known-bugs B15).
 
+    ``stances`` ``[N, 2, 3]`` (per row the left then the right sole as (x, y, yaw) in the world; ``None``: every row on
+    the world's stance, as above) puts each row on its own stance (design 2026-11-23, section 4): the sole rows and
+    the closing step aim at :func:`stance_sole_goals`, the joint limits are
+    :func:`~cutamp.stance.stance_joint_limits`' (the base box from the row's own soles), and the CoM is read in world
+    x and y, held in the sides (:func:`~cutamp.com_polygon_cost.support_region_sides`) of the planes of
+    :func:`~cutamp.com_polygon_cost.support_region_planes` (keyframe) and pulled by level 3 toward :func:`~cutamp.com_polygon_cost.physical_support_centroid`, in metres (:func:`_balanced_step`'s
+    ``region``). The region and its centre are built once per call, without gradient.
+
     Returns ``[N, dof]`` projected joint positions, clamped to the joint
     limits. Convergence is NOT guaranteed: :func:`gn_gate` measures it.
     """
@@ -669,6 +694,17 @@ def gn_project_balanced(
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
     sole_idx = tuple(list(kin.tool_frames).index(frame) for frame in world.model.sole_frames)
     upright = (joint_names.index("base_j_pitch"), joint_names.index("base_j_roll"))
+    goals, region = world.stance_soles, None
+    if stances is not None:
+        from cutamp.com_polygon_cost import physical_support_centroid, support_region_planes, support_region_sides
+        from cutamp.stance import stance_joint_limits
+
+        with torch.no_grad():
+            goals = stance_sole_goals(stances)
+            lower, upper = stance_joint_limits(stances, lower, upper)
+            normals, bounds = support_region_planes(stances, world.model.sole_box, keyframe=True)
+            region = (normals, support_region_sides(normals, bounds),
+                      physical_support_centroid(stances, world.model.sole_box))
 
     def in_contact_at(q_end):
         spheres = kin.compute_kinematics(JointState.from_position(q_end, joint_names=joint_names)).robot_spheres
@@ -678,14 +714,17 @@ def gn_project_balanced(
         q_g = q.detach().requires_grad_(True)
         with torch.enable_grad():
             state = kin.compute_kinematics(JointState.from_position(q_g, joint_names=joint_names))
-            # The support frame is constant: the stance hangs off the world, not off the free base. Held under
-            # no_grad, so CoM gradients never reach it (design 7.4).
-            with torch.no_grad():
-                base_T = (
-                    state.tool_poses.get_link_pose(support.link, make_contiguous=True)
-                    .get_matrix().reshape(N, 4, 4)
-                )
-            com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
+            if region is None:
+                # The support frame is constant: the stance hangs off the world, not off the free base. Held under
+                # no_grad, so CoM gradients never reach it (design 7.4).
+                with torch.no_grad():
+                    base_T = (
+                        state.tool_poses.get_link_pose(support.link, make_contiguous=True)
+                        .get_matrix().reshape(N, 4, 4)
+                    )
+                com_g = _project_com_to_base(state.robot_com[..., :3].reshape(N, 3), base_T)
+            else:
+                com_g = state.robot_com[..., :2].reshape(N, 2)                  # world x, y: the region's frame
             # Clone: cuRobo's backward writes into a reused buffer, so without
             # it the next grad call overwrites the x row with the y row.
             jcx = torch.autograd.grad(com_g[:, 0].sum(), q_g, retain_graph=True)[0].clone()
@@ -698,15 +737,16 @@ def gn_project_balanced(
             jac_com = torch.stack([jcx, jcy], dim=1) * col_mask.unsqueeze(1)    # [N, 2, dof]
             com = com_g.detach()
             r, jac = _pose_residual_and_jacobian(state, frames, world_from_ee, col_mask, is_left)
-            r_sole, jac_sole = _sole_residual_and_jacobian(state, sole_idx, world.stance_soles, col_mask)
+            r_sole, jac_sole = _sole_residual_and_jacobian(state, sole_idx, goals, col_mask)
             coll = (pen_g.detach().unsqueeze(-1), (jpen * col_mask).unsqueeze(1)) if collision else None
             # Levels 3 and 4 run beside the collision row, whose contact tests below them need, and not on the last
             # iteration: level 3's second-order drift moves the hand (about 3 mm per 0.3 rad step on noisy
             # self-contact confs, 2026-11-06), which the next iteration's level 2 closes and the last would leave.
             centre = collision and it < iters - 1
             step, step3, step12 = _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask,
-                                                 half=support.keyframe_half, jac_sole=jac_sole, r_sole=r_sole,
-                                                 coll=coll, centre=centre, upright=upright)
+                                                 half=support.keyframe_half if region is None else None,
+                                                 jac_sole=jac_sole, r_sole=r_sole, coll=coll, centre=centre,
+                                                 upright=upright, region=region)
             if centre:
                 # Levels 3 and 4 never take a row into contact: where levels 1-3's step ends in contact, levels 1-2's
                 # alone, and where only the full step does, levels 1-3's. Each test is its own FK, read before the
@@ -718,7 +758,7 @@ def gn_project_balanced(
 
     with torch.no_grad():
         state = kin.compute_kinematics(JointState.from_position(q, joint_names=joint_names))
-        q = (q + _sole_closing_step(state, frames, sole_idx, world.stance_soles, q, lower, upper, col_mask,
+        q = (q + _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask,
                                     is_left)).clamp(lower, upper)
     return q.detach()
 
