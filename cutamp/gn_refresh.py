@@ -433,8 +433,33 @@ def _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask
     return _scaled_step(q, dq1, dq2, lower, upper)
 
 
+def _plane_violations(normals, bounds, p):
+    """``[N, K]``: how far ``p`` ``[N, 2]`` is past each plane ``normal . p <= bound`` of a region (``normals``
+    ``[N, K, 2]``, ``bounds`` ``[N, K]``), positive outside; ``-inf`` on a plane with an infinite bound."""
+    return (normals * p.unsqueeze(-2)).sum(-1) - bounds
+
+
+def _region_balance_rows(normals, bounds, seen, at_com, jac_com):
+    """Level 1's two balance rows on a region (:func:`_balanced_step` with ``region``), ``(rows [N, 2, dof], v
+    [N, 2], held [N, 2])``: each a plane's ``normal . jac_com``, its violation at the CoM (``at_com`` ``[N, K]``) and
+    whether level 1 holds it. ``seen`` ``[N, K]`` is each plane's largest violation so far in the call; a plane is
+    held while it is above 0. The first row is the plane most violated, the second the most violated of the others
+    once the CoM sits ``GN_COM_MARGIN`` inside the first (every violation moved by that shift along the first's
+    normal): two held sides fix the CoM in the plane, as the rectangle's two axes do. Planes are picked by index, so
+    a plane with an infinite bound (``seen`` ``-inf``) is never held and never displaces a finite plane's pick; a row
+    not held has ``v`` 0, as :func:`_prioritized_step` zeroes its target."""
+    k1 = seen.argmax(-1, keepdim=True)                                                       # [N, 1]
+    n1 = normals.gather(1, k1.unsqueeze(-1).expand(-1, -1, 2))                               # [N, 1, 2]
+    shift = (seen.gather(1, k1) + GN_COM_MARGIN).clamp_min(0)                                # [N, 1]
+    rest = (seen - shift * (normals * n1).sum(-1)).scatter(1, k1, float("-inf"))
+    k = torch.cat([k1, rest.argmax(-1, keepdim=True)], 1)                                    # [N, 2]
+    held = seen.gather(1, k) > 0
+    rows = normals.gather(1, k.unsqueeze(-1).expand(-1, -1, 2)) @ jac_com                    # [N, 2, dof]
+    return rows, torch.where(held, at_com.gather(1, k), 0.0), held
+
+
 def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_sole, r_sole, coll=None, centre=False,
-                   upright=None):
+                   upright=None, region=None):
     """``(step, step3, step12)``, each ``[N, dof]``: one balance-first step, levels 1-4 of
     :func:`gn_project_balanced` (level 3 only with ``centre``, which needs ``coll``, and level 4 only with level 3
     and ``upright``, the base's pitch and roll columns), levels 1-3's and levels 1-2's alone, on ``jac``,
@@ -449,11 +474,18 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     ``(c [N, 1], jac [N, 1, dof])``, the summed penetration
     (:func:`collision_penetration`) and its Jacobian: level 1 drives a row in collision to ``-GN_COLL_MARGIN``.
     A row out of collision has a zero gradient there, so its row stays off for the call's step: the next
-    iteration catches a step that ends in contact."""
+    iteration catches a step that ends in contact.
+
+    ``region``, ``(normals [N, K, 2], bounds [N, K], centre [N, 2])``, holds the CoM in a convex region instead,
+    the planes ``normal . p <= bound`` (``half`` is then ``None``), with ``com``, ``jac_com`` and ``centre`` in the
+    planes' frame; ``lower`` and ``upper`` may then be ``[N, dof]``. Level 1 holds two of its planes
+    (:func:`_region_balance_rows`) by the rectangle's rules, and levels 3 and 4 read the CoM about ``centre``, both
+    axes alike, in metres."""
     from cutamp.com_polygon_cost import _half_extents
 
-    half = _half_extents(half, q.device, q.dtype)
-    inner = half - GN_COM_MARGIN
+    if region is None:
+        half = _half_extents(half, q.device, q.dtype)
+        inner = half - GN_COM_MARGIN
     damping = (GN_DAMPING + (r * r).sum(-1)).view(-1, 1, 1)
 
     # Two active sets, re-solved three times: CoM axes outside the rectangle
@@ -467,8 +499,21 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     # the step is then scaled inside the limits: scaling alone stalls a level
     # whenever its step pushes a joint at a limit (on blocks_t1's pick confs
     # it left the CoM outside on 16 of 46 rows).
-    active = com.abs() > half
-    com_target = com.sign() * inner
+    if region is None:
+        active = com.abs() > half
+        com_target = com.sign() * inner
+    else:
+        # A plane is active, as an axis is, where the CoM or the CoM a round's step would give (linear) is past it,
+        # and stays so for the call: ``seen`` keeps each plane's largest violation over ``com`` and the earlier
+        # rounds' ``com_lin``. Level 1's two rows drive their violation at ``com`` to ``-GN_COM_MARGIN``. Levels 3 and 4
+        # run on the rectangle's lines with the CoM and the planes about ``centre``, no axis held apart and unit
+        # half-widths, so both rows are ``jac_com`` unweighted toward ``centre``: a held plane's direction is among
+        # level 1's rows, whose null space they move in.
+        normals, bounds, centroid = region
+        bounds = bounds - (normals * centroid.unsqueeze(-2)).sum(-1)
+        com = com - centroid
+        active, half = torch.zeros_like(com, dtype=torch.bool), torch.ones_like(com[0])
+        seen = at_com = _plane_violations(normals, bounds, com)
     if coll is not None:
         pen, jac_pen = coll
         in_contact = pen > 0
@@ -498,8 +543,13 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     for _ in range(3):
         fc = free.unsqueeze(1)
         row_coll = (None, None) if coll is None else (jac_pen * fc, coll_target)
-        dq1, dq2, ja = _prioritized_step(jac_com * fc, com, active, com_target, jac * fc, r, damping,
-                                         jac_sole * fc, r_sole, *row_coll)
+        if region is None:
+            dq1, dq2, ja = _prioritized_step(jac_com * fc, com, active, com_target, jac * fc, r, damping,
+                                             jac_sole * fc, r_sole, *row_coll)
+        else:
+            rows, v, held = _region_balance_rows(normals, bounds, seen, at_com, jac_com)
+            dq1, dq2, ja = _prioritized_step(rows * fc, v, held, -GN_COM_MARGIN, jac * fc, r, damping,
+                                             jac_sole * fc, r_sole, *row_coll)
         dq = dq1 + dq2
         com_lin = com + (jac_com @ dq.unsqueeze(-1)).squeeze(-1)
         if centre:
@@ -509,12 +559,15 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
                 f4c = free4.unsqueeze(1)
                 q3 = q + _scaled_step(q, dq1, dq2, lower, upper, dq3)
                 dq4 = _upright_step(ja * f4c, jac * f4c, jac_com * f4c, active, half, q3, upright, free4)
-        pushed_out = ~active & (com_lin.abs() > half)
         blocked = ((q >= upper - 1e-5) & (dq > 0)) | ((q <= lower + 1e-5) & (dq < 0))
         blocked |= _crossing_joints(q, dq1, dq2, lower, upper)
         blocked &= free.bool()
-        com_target = torch.where(pushed_out, com_lin.sign() * inner, com_target)
-        active = active | pushed_out
+        if region is None:
+            pushed_out = ~active & (com_lin.abs() > half)
+            com_target = torch.where(pushed_out, com_lin.sign() * inner, com_target)
+            active = active | pushed_out
+        else:
+            seen = torch.maximum(seen, _plane_violations(normals, bounds, com_lin))
         free = free * ~blocked
         if centre:
             free3 = free3 * free * ~_lower_level_blocked(q, (dq1, dq2), dq3, lower, upper)
@@ -529,7 +582,12 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     def com_after(s):
         return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
 
-    skip = in_contact | ((com_after(step).abs() > half) & (com_after(step12).abs() <= half)).any(-1, keepdim=True)
+    if region is None:
+        skip = in_contact | ((com_after(step).abs() > half) & (com_after(step12).abs() <= half)).any(-1, keepdim=True)
+    else:
+        past = _plane_violations(normals, bounds, com_after(step)) > 0
+        past &= _plane_violations(normals, bounds, com_after(step12)) <= 0
+        skip = in_contact | past.any(-1, keepdim=True)
     step3 = torch.where(skip, step12, step)
     if upright is None:
         return step3, step3, step12

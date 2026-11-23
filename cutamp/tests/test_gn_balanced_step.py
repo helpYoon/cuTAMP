@@ -5,7 +5,7 @@ import pytest
 import roma
 import torch
 
-from cutamp.gn_refresh import _balanced_step, _rotmat_to_rotvec, _row_layout
+from cutamp.gn_refresh import GN_COM_MARGIN, _balanced_step, _rotmat_to_rotvec, _row_layout
 from cutamp.robots.t1 import REAL_LEGS
 
 #: The base's pitch and roll columns, which level 4 pulls toward upright.
@@ -144,3 +144,78 @@ def test_level3_never_carries_a_free_com_axis_out(monkeypatch):
         _row_layout(REAL_LEGS, ("left", "right"), 5, dof, torch.device("cpu"), torch.float32)
     with pytest.raises(ValueError):  # an arm that is neither left nor right
         _row_layout(REAL_LEGS, ("left", "up"), 4, dof, torch.device("cpu"), torch.float32)
+
+
+def _rectangle_region(half, rows):
+    """The keyframe rectangle as a region: four planes about a centre at 0."""
+    normals = torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]).expand(rows, 4, 2)
+    bounds = torch.tensor([half[0], half[0], half[1], half[1]]).expand(rows, 4)
+    return normals, bounds, torch.zeros(rows, 2)
+
+
+def _on_region(args, region=None):
+    """``_balanced_step`` on ``_synthetic``'s argument tuple with its rectangle handed over as a region."""
+    region = _rectangle_region(args[8], len(args[0])) if region is None else region
+    return _balanced_step(*args[:8], None, *args[9:], upright=UPRIGHT, region=region)
+
+
+def _violation(region, com):
+    normals, bounds, _ = region
+    return ((normals * com.unsqueeze(-2)).sum(-1) - bounds).amax(-1)
+
+
+@pytest.mark.parametrize("coll", [False, True])
+def test_a_rectangles_region_matches_the_rectangle_on_levels_1_and_2(coll):
+    for seed in range(10):
+        stack, _ = _synthetic(seed, coll=coll)
+        want = _balanced_step(*stack, upright=UPRIGHT)[2]
+        torch.testing.assert_close(_on_region(stack)[2], want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("coll", [False, True])
+def test_region_step_stack_matches_per_dep(coll):
+    for seed in range(3):
+        stack, blocks = _synthetic(seed, coll=coll)
+        steps, per_dep = _on_region(stack), [_on_region(b) for b in blocks]
+        for k in range(3):
+            assert torch.equal(steps[k], torch.cat([s[k] for s in per_dep]))
+
+
+def test_region_level3_pulls_toward_the_centre_and_crosses_no_plane():
+    stack, _ = _synthetic(0, coll=True)
+    jac_com, com = stack[3], stack[4]
+    region = _rectangle_region(stack[8], len(com))
+    _, step3, step12 = _on_region(stack, region)
+
+    def after(s):
+        return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
+
+    kept_inside = _violation(region, after(step12)) <= 0
+    assert bool((_violation(region, after(step3))[kept_inside] <= 1e-6).all())
+    moved = (step3 != step12).any(-1)
+    assert bool(moved.any())
+    assert float(after(step3)[moved].norm(dim=-1).median()) < float(after(step12)[moved].norm(dim=-1).median())
+
+
+def test_a_corner_takes_two_balance_rows():
+    g = torch.Generator().manual_seed(0)
+    dof, B = len(REAL_LEGS.joint_names), 32
+    half = REAL_LEGS.support.keyframe_half
+    q, lower, upper = torch.zeros(B, dof), -3 * torch.ones(dof), 3 * torch.ones(dof)
+    jac_com = 0.05 * torch.randn(B, 2, dof, generator=g)
+    com = (torch.tensor(half) * 1.02).expand(B, 2)                # past +x and +y at once
+    region = _rectangle_region(half, B)
+    step12 = _balanced_step(q, torch.zeros(B, 6), 0.4 * torch.randn(B, 6, dof, generator=g), jac_com, com, lower,
+                            upper, torch.ones(B, dof), None, 0.3 * torch.randn(B, 12, dof, generator=g),
+                            torch.zeros(B, 12), region=region)[2]
+    landed = com + (jac_com @ step12.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(landed, (torch.tensor(half) - GN_COM_MARGIN).expand(B, 2), rtol=0, atol=1e-4)
+
+
+def test_planes_that_are_not_sides_change_nothing():
+    stack, _ = _synthetic(1, coll=True)
+    normals, bounds, centre = _rectangle_region(stack[8], len(stack[0]))
+    spare = torch.nn.functional.normalize(torch.randn(len(bounds), 6, 2, generator=torch.Generator().manual_seed(2)), dim=-1)
+    wide = (torch.cat([normals, spare], 1), torch.cat([bounds, torch.full((len(bounds), 6), float("inf"))], 1), centre)
+    for got, want in zip(_on_region(stack, wide), _on_region(stack)):
+        assert torch.equal(got, want)
