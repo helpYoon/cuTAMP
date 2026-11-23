@@ -143,3 +143,118 @@ def test_feet_clear_follows_the_refresh_rule():
     for i, (_, (_, h), clear) in enumerate(cases):
         got = feet_clear(feet[i:i + 1], boxes[i:i + 1], torch.tensor([h], dtype=torch.float64), fh)
         assert got.tolist() == [clear], i
+
+
+import pytest
+
+from cutamp import step_refresh
+from cutamp.landing_predictor import _intended_pair
+from cutamp.stance import STEP_TRAVEL
+from cutamp.step_bound import planner_step_bound, travel
+from cutamp.step_refresh import NoStartingPath, draw_grid_paths
+
+FOOT_HALF = torch.tensor([0.1124, 0.05, 0.0218], dtype=torch.float64)
+
+
+def pad_at(n, xy, half):
+    """``(boxes [n, 1, 4, 4], halves [1, 3])`` float64: a 1 cm tall pad on the floor centred at ``xy``, half extents
+    ``half`` in x and y."""
+    T = torch.eye(4, dtype=torch.float64)
+    T[:2, 3] = torch.tensor(xy, dtype=torch.float64)
+    T[2, 3] = 0.005
+    return T.expand(n, 1, 4, 4).clone(), torch.tensor([[*half, 0.005]], dtype=torch.float64)
+
+
+PAD32 = pad_at(32, (0.25, 0.35), (0.06, 0.06))
+
+
+def legal64(orders, inc, draws):
+    """Every step inside the step limit (``g <= 0``) and its travel within ``STEP_TRAVEL``, in float64, each step from
+    the intended pair of the steps before it."""
+    bound, before, ok = planner_step_bound(torch.device("cpu"), torch.float64), inc.double(), True
+    for order, u in zip(orders, draws):
+        for k, foot in enumerate(order):
+            side, c = "LR".index(foot), u[:, k].double()
+            t = travel(rel_pose(before[:, 1 - side], before[:, side]), c)
+            left = torch.full((len(c),), side == 0)
+            ok &= bool(((bound.g(c, left) <= 0) & (t >= STEP_TRAVEL[0]) & (t <= STEP_TRAVEL[1])).all())
+            before = _intended_pair(before, side, c)
+    return ok
+
+
+def end_pairs(orders, inc, draws):
+    """Per gap the ``[n, 2, 3]`` float64 pair at its end, as numpy."""
+    _, final = as_commanded(orders, inc.double(), [None if u is None else u.double() for u in draws])
+    return [f.numpy() for f in final]
+
+
+def landings(orders, inc, draws):
+    """``[n, k, 3]`` float64: every landed sole of every gap, in step order."""
+    after, _ = as_commanded(orders, inc.double(), [None if u is None else u.double() for u in draws])
+    return torch.stack([after[j][:, k, "LR".index(f)] for j, order in enumerate(orders) for k, f in enumerate(order)], 1)
+
+
+def near_grid(draws, grid):
+    """Every command, as its left-swing equivalent (a right swing's y is negative), within half a cell of some grid row
+    on every axis (+1e-6)."""
+    half = torch.stack([grid[:, a].unique().diff().min() for a in range(3)]) / 2 + 1e-6
+    u = torch.cat([d.reshape(-1, 3) for d in draws if d is not None]).double()
+    u = torch.where(u[:, 1:2] < 0, u * torch.tensor([1.0, -1.0, -1.0], dtype=torch.float64), u)
+    return bool(((u[:, None] - grid[None]).abs() <= half).all(-1).any(-1).all())
+
+
+def test_grid_paths_pass_their_tests_and_repeat():
+    orders, inc = ("LR", "", "R"), incoming().repeat(22, 1, 1)[:64].double()
+    grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)  # incoming()'s soles stand 0.2 m apart
+    pad = pad_at(64, (0.25, 0.35), (0.06, 0.06))
+    reach = [lambda p: p[:, :, 0].mean(1) > 0.05, None, lambda p: p[:, :, 0].mean(1) > 0.10]
+    draw = lambda: draw_grid_paths(orders, inc, torch.Generator().manual_seed(0), grid, reach, [pad, None, pad], FOOT_HALF)
+    draws, info = draw()
+    assert draws[1] is None and draws[0].shape == (64, 2, 3) and draws[2].shape == (64, 1, 3)
+    assert draws[0].dtype == torch.float32 and (info["rounds"], info["own"], info["reached"]) == (1, 64, True)
+    assert (draws[0][:, 0, 1] > 0).all() and (draws[0][:, 1, 1] < 0).all()  # a right swing is the mirror image
+    assert legal64(orders, inc, draws) and near_grid(draws, grid)
+    ends = end_pairs(orders, inc, draws)
+    assert reach[0](ends[0]).all() and reach[2](ends[2]).all()
+    assert feet_clear(landings(orders, inc, draws), pad[0], pad[1], FOOT_HALF).all()
+    again, _ = draw()
+    assert all(torch.equal(a, b) for a, b in zip(draws, again) if a is not None)
+    assert draws[0][:, 0, 0].std() > 0.05  # spread over the grid, not one path
+
+
+def test_rounds_stop_at_the_first_dry_round_and_share_paths():
+    inc, grid = incoming()[:1].repeat(16, 1, 1).double(), grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    calls, target = [], inc[0, 1].numpy() + [0.224868, 0.35, 0.0]  # from the planted right sole, as float32 put it
+    def one_path_once(pairs):  # passes only the landing of grid command (0.224868, 0.35, 0), and only in its first call
+        calls.append(len(pairs))
+        hit = (np.abs(pairs[:, 0] - target) < 1e-9).all(1)
+        return hit & (len(calls) == 1)
+    draws, info = draw_grid_paths(("L",), inc, torch.Generator().manual_seed(0), grid, [one_path_once], [None], FOOT_HALF)
+    assert info["rounds"] == 2 and 0 < info["own"] < 16 and info["reached"] and info["noisy"] == 0
+    assert torch.allclose(draws[0], torch.tensor([0.224868, 0.35, 0.0]).expand(16, 1, 3))
+
+
+def test_a_plan_where_nothing_reaches_starts_on_legal_clear_paths():
+    orders, inc = ("RL",), incoming()[:1].repeat(32, 1, 1).double()
+    grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    draws, info = draw_grid_paths(orders, inc, torch.Generator().manual_seed(0), grid,
+                                  [lambda p: np.zeros(len(p), bool)], [PAD32], FOOT_HALF)
+    assert not info["reached"] and legal64(orders, inc, draws)
+    assert feet_clear(landings(orders, inc, draws), *PAD32, FOOT_HALF).all()
+
+
+def test_no_clear_path_raises(monkeypatch):
+    monkeypatch.setattr(step_refresh, "REDRAW_ROUNDS", 2)
+    grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    with pytest.raises(NoStartingPath):  # a 3 x 3 m pad, 1 cm tall, under every landing
+        draw_grid_paths(("L",), incoming()[:1].repeat(4, 1, 1).double(), torch.Generator().manual_seed(0),
+                        grid, [None], [pad_at(4, (0.0, 0.0), (1.5, 1.5))], FOOT_HALF)
+
+
+def test_the_start_pair_is_not_feet_tested():
+    grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    under_start = pad_at(8, (0.0, 0.0), (0.15, 0.16))  # under both starting soles, clear of the far landings
+    draws, info = draw_grid_paths(("L",), incoming()[:1].repeat(8, 1, 1).double(), torch.Generator().manual_seed(0),
+                                  grid, [None], [under_start], FOOT_HALF)  # would raise if the start pair were tested
+    inc = incoming()[:1].repeat(8, 1, 1).double()
+    assert info["reached"] and feet_clear(landings(("L",), inc, draws), *under_start, FOOT_HALF).all()

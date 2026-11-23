@@ -17,7 +17,7 @@ from cutamp.landing_predictor import (
     prediction_precision,
 )
 from cutamp.stance import STEP_TRAVEL, STEP_X_MAX, STEP_Y_RANGE, STEP_YAW_RANGE, abs_pose, rel_pose
-from cutamp.step_bound import planner_step_bound, travel
+from cutamp.step_bound import planner_step_bound, travel, wrap
 from cutamp.step_validation import _obb_gap
 
 NUDGE = 1.0e-3  # m and rad: the distance over which the slope is measured (design 6, call 8)
@@ -188,6 +188,134 @@ def feet_clear(feet: Tensor, boxes: Tensor, halves: Tensor, foot_half: Tensor) -
         overlap = -_obb_gap(foot, foot_half, box[:, None], oh)
         clear &= (torch.where(top[:, None] <= 1e-6, 0.0, overlap).clamp_min(0) <= 1e-6).all(-1)
     return clear
+
+
+class NoStartingPath(ValueError):
+    """No legal, feet-clear grid path was found within ``REDRAW_ROUNDS`` rounds."""
+
+
+PATH_CANDIDATES = 64  # whole grid paths each particle without a path draws per round (design 6, step 2)
+NOISE_TRIES = 16  # noisy copies of each particle's path, in one batch (design 6, step 6)
+
+
+def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: Tensor, reach: list, scenes: list,
+                    foot_half: Tensor) -> tuple[list[Tensor | None], dict]:
+    """Each particle's starting commands as one whole grid path (design 6): per gap ``[n, s, 3]`` float32 on
+    ``incoming``'s device, right swings mirrored (x, -y, -yaw), ``None`` where no step; and ``info`` ``{"rounds",
+    "own", "reached", "noisy"}``: rounds drawn, particles that kept a path of their own, False when nothing reached and
+    the paths were drawn without the reach test, particles whose noisy copy passed.
+
+    A path is one left-swing row of ``grid`` (:func:`grid_commands`) per step of every gap of ``orders``, chained from
+    the particle's feet ``incoming`` ``[n, 2, 3]`` with :func:`_intended_pair`. It passes when, in order: every step is
+    legal (the step bound and both ends of the travel), the pair at the end of each gap ``j`` passes ``reach[j]``
+    (``None``: not tested; a callable on ``[m, 2, 3]`` float64 numpy pairs returning bool ``[m]``), and the landed soles
+    of each gap ``j``, with its incoming pair for every gap with steps after the first, are clear of ``scenes[j]``
+    (``None``: not tested; else ``(boxes [n, b, 4, 4], halves [b, 3])``, :func:`feet_clear`). Every test runs in
+    float64 on the CPU; random numbers come from ``generator`` on its own device.
+
+    Rounds draw ``PATH_CANDIDATES`` paths per particle without one and keep each particle's first passing path, until
+    every particle has one or a round keeps none; particles left without one take the kept paths in turn. When the first
+    round keeps none, every particle takes a path that passes without the reach test, drawing further rounds up to
+    ``REDRAW_ROUNDS`` in all, else :class:`NoStartingPath`. Then each particle keeps the first of ``NOISE_TRIES`` copies
+    of its path, each number uniform within half a grid cell cut to the trained box, that passes its own test."""
+    cpu, f64 = torch.device("cpu"), torch.float64
+    start = incoming.detach().to(cpu, f64)
+    n = len(start)
+    s = sum(len(order) for order in orders)
+    bound = planner_step_bound(cpu, f64)
+    mirror = torch.tensor([1.0, -1.0, -1.0], dtype=f64)
+    half_cell = torch.stack([grid[:, a].unique().diff().min() for a in range(3)]) / 2
+    lo = torch.tensor([-STEP_X_MAX, STEP_Y_RANGE[0], STEP_YAW_RANGE[0]], dtype=f64)
+    hi = torch.tensor([STEP_X_MAX, STEP_Y_RANGE[1], STEP_YAW_RANGE[1]], dtype=f64)
+
+    def passes(rows: Tensor, paths: Tensor, with_reach: bool) -> Tensor:
+        """``[m]`` bool: the path test of left-swing ``paths`` ``[m, s, 3]`` from the feet of particles ``rows``."""
+        pair, left = start[rows], torch.ones(len(rows), dtype=torch.bool)
+        ok, heads, landed, ends, i = left.clone(), [], [], [], 0
+        for order in orders:
+            heads.append(pair if i else None)  # a gap's incoming pair is tested only after the first gap with steps
+            soles = []
+            for foot in order:
+                side, c = "LR".index(foot), paths[:, i]
+                command = c if side == 0 else c * mirror
+                was = rel_pose(pair[:, 1 - side], pair[:, side])
+                turn = wrap(command[:, 2] - was[:, 2]).abs()
+                near = (command[:, :2] - was[:, :2]).norm(dim=-1) + 0.1124 * turn  # apply_command's yaw factor
+                # g <= 0 holds sole_gap >= STEP_SOLE_GAP (a term of trained_box); of the two travels apply_command's
+                # (yaw at 0.1124) is the shorter, travel()'s (yaw at RHO) the longer, so each end takes the stricter
+                ok &= (bound.g(c, left) <= 0) & (near >= STEP_TRAVEL[0]) & (travel(was, command) <= STEP_TRAVEL[1])
+                pair = _intended_pair(pair, side, command)
+                soles.append(pair[:, side])
+                i += 1
+            landed.append(torch.stack(soles, 1) if soles else None)
+            ends.append(pair)
+        for j, test in enumerate(reach):
+            if with_reach and test is not None and ok.any():
+                idx = ok.nonzero().squeeze(1)
+                ok[idx] = torch.as_tensor(test(ends[j][idx].numpy()), dtype=torch.bool)
+        for j, scene in enumerate(scenes):
+            if landed[j] is not None and scene is not None and ok.any():
+                idx = ok.nonzero().squeeze(1)
+                feet = landed[j][idx] if heads[j] is None else torch.cat((heads[j][idx], landed[j][idx]), 1)
+                ok[idx] = feet_clear(feet, scene[0][rows[idx]], scene[1], foot_half)
+        return ok
+
+    path, own = torch.empty(n, s, 3, dtype=f64), torch.zeros(n, dtype=torch.bool)
+
+    def keep(todo: Tensor, paths: Tensor, with_reach: bool) -> int:
+        """Give each particle of ``todo`` its first passing path of ``paths`` ``[len(todo) * PATH_CANDIDATES, s, 3]``;
+        how many kept one."""
+        hit = passes(todo.repeat_interleave(PATH_CANDIDATES), paths, with_reach).view(len(todo), PATH_CANDIDATES)
+        found = hit.any(1)
+        path[todo[found]] = paths.view(len(todo), PATH_CANDIDATES, s, 3)[found, hit[found].int().argmax(1)]
+        own[todo[found]] = True
+        return int(found.sum())
+
+    def candidates(m: int) -> Tensor:
+        pick = torch.randint(len(grid), (m * PATH_CANDIDATES, s), generator=generator, device=generator.device)
+        return grid[pick.cpu()]
+
+    everyone = torch.arange(n)
+    first_round = candidates(n)
+    rounds, kept = 1, keep(everyone, first_round, True)
+    reached = kept > 0
+    while kept and not own.all():  # each round that goes on kept a path, so at most n rounds
+        todo = (~own).nonzero().squeeze(1)
+        rounds, kept = rounds + 1, keep(todo, candidates(len(todo)), True)
+    mine = int(own.sum())
+    if not reached:  # nothing reaches: paths that pass without the reach test
+        keep(everyone, first_round, False)
+        while not own.all():
+            if rounds >= REDRAW_ROUNDS:
+                raise NoStartingPath(f"{int((~own).sum())} of {n} particles found no legal, feet-clear grid path "
+                                     f"in {REDRAW_ROUNDS} rounds")
+            todo = (~own).nonzero().squeeze(1)
+            rounds += 1
+            keep(todo, candidates(len(todo)), False)
+        mine = n
+    lacking = (~own).nonzero().squeeze(1)
+    path[lacking] = path[own][torch.arange(len(lacking)) % mine]  # the kept paths, in turn
+
+    centre = path[:, None].expand(n, NOISE_TRIES, s, 3)
+    low, high = torch.maximum(centre - half_cell, lo), torch.minimum(centre + half_cell, hi)
+    r = torch.rand(n, NOISE_TRIES, s, 3, generator=generator, device=generator.device, dtype=f64).cpu()
+    copies = low + r * (high - low)
+    hit = passes(everyone.repeat_interleave(NOISE_TRIES), copies.reshape(-1, s, 3), reached).view(n, NOISE_TRIES)
+    noisy = hit.any(1)
+    path[noisy] = copies[noisy, hit[noisy].int().argmax(1)]
+
+    out, i = [], 0
+    for order in orders:
+        if not order:
+            out.append(None)
+            continue
+        u = path[:, i:i + len(order)].clone()
+        for k, foot in enumerate(order):
+            if foot == "R":
+                u[:, k] *= mirror
+        out.append(u.to(incoming.device, torch.float32))
+        i += len(order)
+    return out, {"rounds": rounds, "own": mine, "reached": reached, "noisy": int(noisy.sum())}
 
 
 def draw_commands(orders, incoming: Tensor, n: int, generator: torch.Generator) -> list[Tensor | None]:
