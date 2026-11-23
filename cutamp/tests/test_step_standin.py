@@ -1,4 +1,5 @@
 import math
+from time import monotonic
 
 import numpy as np
 import torch
@@ -195,7 +196,8 @@ def test_grid_paths_pass_their_tests_and_repeat():
     grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)  # incoming()'s soles stand 0.2 m apart
     pad = pad_at(64, (0.25, 0.35), (0.06, 0.06))
     reach = [lambda p: p[:, :, 0].mean(1) > 0.05, None, lambda p: p[:, :, 0].mean(1) > 0.10]
-    draw = lambda: draw_grid_paths(orders, inc, torch.Generator().manual_seed(0), grid, reach, [pad, None, pad], FOOT_HALF)
+    draw = lambda **kw: draw_grid_paths(orders, inc, torch.Generator().manual_seed(0), grid, reach, [pad, None, pad],
+                                        FOOT_HALF, **kw)
     draws, info = draw()
     assert draws[1] is None and draws[0].shape == (64, 2, 3) and draws[2].shape == (64, 1, 3)
     assert draws[0].dtype == torch.float32 and (info["rounds"], info["own"], info["reached"]) == (1, 64, True)
@@ -205,7 +207,7 @@ def test_grid_paths_pass_their_tests_and_repeat():
     ends = end_pairs(orders, inc, draws)
     assert reach[0](ends[0]).all() and reach[2](ends[2]).all()
     assert feet_clear(landings(orders, inc, draws), pad[0], pad[1], FOOT_HALF).all()
-    again, _ = draw()
+    again, _ = draw(deadline=monotonic() + 3600.0)  # a deadline far ahead changes nothing
     assert all(torch.equal(a, b) for a, b in zip(draws, again) if a is not None)
     assert draws[0][:, 0, 0].std() > 0.05  # spread over the grid, not one path
 
@@ -264,6 +266,17 @@ def test_no_clear_path_raises(monkeypatch):
     with pytest.raises(NoStartingPath):  # a 3 x 3 m pad, 1 cm tall, under every landing
         draw_grid_paths(("L",), incoming()[:1].repeat(4, 1, 1).double(), torch.Generator().manual_seed(0),
                         grid, [None], [pad_at(4, (0.0, 0.0), (1.5, 1.5))], FOOT_HALF)
+
+
+def test_the_draw_stops_at_the_deadline():  # REDRAW_ROUNDS stays 1,000: all of them would raise NoStartingPath
+    grid = grid_commands(np.array([0.224868, 0.10]) / 2, 0.2)
+    with pytest.raises(TimeoutError):  # a 3 x 3 m pad, 1 cm tall, under every landing
+        draw_grid_paths(("L",), incoming()[:1].repeat(4, 1, 1).double(), torch.Generator().manual_seed(0),
+                        grid, [None], [pad_at(4, (0.0, 0.0), (1.5, 1.5))], FOOT_HALF, deadline=monotonic() - 1.0)
+    one_command = lambda p: (np.abs(p[:, 0, :2] - p[:, 1, :2] - [0.224868, 0.35]) < 1e-9).all(1)  # round 1 keeps some
+    with pytest.raises(TimeoutError):
+        draw_grid_paths(("L",), incoming()[:1].repeat(16, 1, 1).double(), torch.Generator().manual_seed(0),
+                        grid, [one_command], [None], FOOT_HALF, deadline=monotonic() - 1.0)
 
 
 def test_the_start_pair_is_not_feet_tested():

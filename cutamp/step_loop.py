@@ -382,7 +382,7 @@ class SteppedPlan:
             foot_half = torch.tensor(_foot_half_extents(world.model), dtype=torch.float64)
             drawing = monotonic()
             commands, self.stats["draw"] = draw_grid_paths(self.orders, self.incoming, generator, grid, reach, scenes,
-                                                           foot_half)
+                                                           foot_half, deadline=deadline)
             self.stats["draw"]["seconds"] = monotonic() - drawing
             for j, u in enumerate(commands):
                 if u is not None:

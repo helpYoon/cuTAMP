@@ -4,6 +4,7 @@ with respect to the commands is measured by nudged rows of the same call (design
 from dataclasses import dataclass, fields, is_dataclass
 
 import math
+from time import monotonic
 
 import torch
 from torch import Tensor
@@ -190,6 +191,11 @@ def feet_clear(feet: Tensor, boxes: Tensor, halves: Tensor, foot_half: Tensor) -
     return clear
 
 
+def _check_deadline(deadline):
+    if deadline is not None and monotonic() >= deadline:
+        raise TimeoutError("the starting-landing draw reached the planner deadline")
+
+
 class NoStartingPath(ValueError):
     """No legal, feet-clear grid path was found within ``REDRAW_ROUNDS`` rounds."""
 
@@ -199,7 +205,7 @@ NOISE_TRIES = 16  # noisy copies of each particle's path, in one batch (design 6
 
 
 def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: Tensor, reach: list, scenes: list,
-                    foot_half: Tensor) -> tuple[list[Tensor | None], dict]:
+                    foot_half: Tensor, deadline: float | None = None) -> tuple[list[Tensor | None], dict]:
     """Each particle's starting commands as one whole grid path (design 6): per gap ``[n, s, 3]`` float32 on
     ``incoming``'s device, right swings mirrored (x, -y, -yaw), ``None`` where no step; and ``info`` ``{"rounds",
     "own", "reached", "noisy"}``: rounds drawn, particles that kept a path of their own, False when nothing reached and
@@ -218,7 +224,8 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
     from its turn on that passes its own test, else the one its turn names. When the first
     round keeps none, every particle takes a path that passes without the reach test, drawing further rounds up to
     ``REDRAW_ROUNDS`` in all, else :class:`NoStartingPath`. Then each particle keeps the first of ``NOISE_TRIES`` copies
-    of its path, each number uniform within half a grid cell cut to the trained box, that passes its own test."""
+    of its path, each number uniform within half a grid cell cut to the trained box, that passes its own test.
+    Before each further round, a ``deadline`` (``time.monotonic()`` seconds) that has passed raises ``TimeoutError``."""
     cpu, f64 = torch.device("cpu"), torch.float64
     start = incoming.detach().to(cpu, f64)
     n = len(start)
@@ -281,6 +288,7 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
     rounds, kept = 1, keep(everyone, first_round, True)
     reached = kept > 0
     while kept and not own.all():  # each round that goes on kept a path, so at most n rounds
+        _check_deadline(deadline)
         todo = (~own).nonzero().squeeze(1)
         rounds, kept = rounds + 1, keep(todo, candidates(len(todo)), True)
     mine = int(own.sum())
@@ -290,6 +298,7 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
             if rounds >= REDRAW_ROUNDS:
                 raise NoStartingPath(f"{int((~own).sum())} of {n} particles found no legal, feet-clear grid path "
                                      f"in {REDRAW_ROUNDS} rounds")
+            _check_deadline(deadline)
             todo = (~own).nonzero().squeeze(1)
             rounds += 1
             keep(todo, candidates(len(todo)), False)
