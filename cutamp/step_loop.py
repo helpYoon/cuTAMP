@@ -24,8 +24,8 @@ from cutamp.stance import STEP_TRAVEL, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
-from cutamp.step_refresh import StandIn, command_rows, draw_commands, refresh_gap
-from cutamp.step_validation import StepStateAdapter, validate_step_geometry
+from cutamp.step_refresh import StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
+from cutamp.step_validation import StepStateAdapter, _foot_half_extents, _object_box, validate_step_geometry
 from cutamp.task_planning.constraints import ComComfort, KinematicConstraint
 from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
 
@@ -147,6 +147,25 @@ def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, gra
         else:
             held.pop(arm)
     return particles, snapshots, wrists, held_before
+
+
+def _foot_scene(world, poses: dict, held: dict, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The scene the starting draw keeps the feet clear of, built as the refresh's foot rule builds its own
+    (:func:`cutamp.step_validation._step_geometry`): boxes ``[n, b, 4, 4]`` and half extents ``[b, 3]``, float64 on the
+    CPU, of ``world.movables + world.statics`` except the objects ``held`` (arm -> (name, grasp)) carries, each posed by
+    ``poses`` (name -> ``[n, 4, 4]``) or else ``world.get_object_pose`` and boxed by :func:`_object_box`."""
+    carried = {name for name, _ in held.values()}
+    boxes, halves = [], []
+    for obj in world.movables + world.statics:
+        if obj.name in carried:
+            continue
+        pose = poses[obj.name] if obj.name in poses else world.get_object_pose(obj)
+        box, half = _object_box(obj, pose.detach().to("cpu", torch.float64).reshape(-1, 4, 4).expand(n, -1, -1))
+        boxes.append(box)
+        halves.append(half)
+    if not boxes:
+        return torch.empty(n, 0, 4, 4, dtype=torch.float64), torch.empty(0, 3, dtype=torch.float64)
+    return torch.stack(boxes, 1), torch.stack(halves)
 
 
 def _validate_motion_rows(rows, pools, skeleton, world, config, attempt, *, deadline):
@@ -282,11 +301,13 @@ def _write(particles, key, value, rows=None):
 class SteppedPlan:
     """A plan with steps inside the Adam loop (design 4 to 6).
 
-    A particle's commands, ``[n, s, 3]`` per gap with steps, are Adam variables drawn uniformly inside the controller's
-    limit; its pick, place and retract postures are Adam variables that start from one solve on the stance the first
-    refresh gives. A refresh runs the world model and controller on every particle's commands, gap by gap, writes the
-    landing postures (never optimized), sets the stand-in the costs read until the next refresh and re-solves the pick,
-    place and retract postures on the pairs they stand on (design 13). The starting pass is the first refresh.
+    A particle's commands, ``[n, s, 3]`` per gap with steps, are Adam variables that start on a half-foot grid path over
+    the task planner's foot orders that reaches each target and keeps the feet off objects, with noise within half a
+    cell (:func:`cutamp.step_refresh.draw_grid_paths`); its pick, place and retract postures are Adam variables that
+    start from one solve on the stance the first refresh gives. A refresh runs the world model and controller on every
+    particle's commands, gap by gap, writes the landing postures (never optimized), sets the stand-in the costs read
+    until the next refresh and re-solves the pick, place and retract postures on the pairs they stand on (design 13).
+    The starting pass is the first refresh.
     """
 
     def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, deadline=None, generator=None):
@@ -344,7 +365,24 @@ class SteppedPlan:
             if generator is None:
                 generator = (torch.cuda.default_generators[like.device.index or 0] if like.device.type == "cuda"
                              else torch.default_generator)
-            for j, u in enumerate(draw_commands(self.orders, self.incoming, n, generator)):
+            # From the first gap with steps on (before it the feet are fixed), a gap whose landing the task planner
+            # measured tests reach: a stance passes when its hand-map gap to the target is at most that landing's.
+            # Each gap with steps keeps its feet clear of its own scene.
+            search = proposal.search
+            grid = grid_commands(search.sole_half, search.home[0][1] - search.home[1][1])
+            j0 = next(j for j, order in enumerate(self.orders) if order)
+            reach, scenes = [], []
+            for j, order in enumerate(self.orders):
+                bar = proposal.schedule.edges[j].distance_m
+                reach.append(None if j < j0 or bar is None
+                             else lambda pairs, t=proposal.targets[j], b=bar: search.reaches(pairs, t, b))
+                scenes.append(_foot_scene(world, objects[j], held_before[j], n) if order else None)
+            foot_half = torch.tensor(_foot_half_extents(world.model), dtype=torch.float64)
+            drawing = monotonic()
+            commands, self.stats["draw"] = draw_grid_paths(self.orders, self.incoming, generator, grid, reach, scenes,
+                                                           foot_half)
+            self.stats["draw"]["seconds"] = monotonic() - drawing
+            for j, u in enumerate(commands):
                 if u is not None:
                     particles[self.command_names[j]] = u
 

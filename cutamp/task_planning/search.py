@@ -12,7 +12,7 @@ from time import monotonic
 import numpy as np
 
 from cutamp.reachability import _rot, canonical_stance
-from cutamp.step_search import Schedule, TargetRegion
+from cutamp.step_search import Schedule, StepSearch, TargetRegion
 from cutamp.task_planning.base_structs import GroundOperator, Operator, State
 from cutamp.task_planning.grounding import _Node, get_valid_ground_operators
 from cutamp.task_planning.insert_steps import with_steps
@@ -75,12 +75,16 @@ class ManipulationPrefix:
 class RankedStepSkeleton:
     """A task plan with its steps inserted, the foot order (``none``, ``L``, ``R``, ``LR`` or ``RL``) before each pick
     and place, and the landing path the plan search ranked it by. The particles' commands do not start at the path's:
-    they are drawn uniformly inside the controller's limit (:func:`cutamp.step_refresh.draw_commands`)."""
+    they start on grid paths over these foot orders that reach the ``targets``, one ``TargetRegion`` per pick and place
+    aligned with ``schedule.edges``, by the reach test of ``search``, the ``StepSearch`` that ranked the plan
+    (:func:`cutamp.step_refresh.draw_grid_paths`)."""
 
     skeleton: PlanSkeleton
     orders: tuple[str, ...]
     schedule: Schedule
     arm_approach_m: float | None = None
+    targets: tuple = ()
+    search: StepSearch | None = None
 
     @property
     def cost(self) -> tuple[int, int]:
@@ -182,7 +186,8 @@ def arm_step_skeletons(search, world, operators, incoming, *, max_base_plans, ad
                 seen.add(orders)
                 gaps = {i: order for i, order in enumerate(orders) if order != "none"}
                 stepped = with_steps(skeleton, gaps, world.initial_state, world.goal_state)
-                yield RankedStepSkeleton(stepped, orders, Schedule(node.edges, (node.unresolved, node.steps)), node.approach)
+                yield RankedStepSkeleton(stepped, orders, Schedule(node.edges, (node.unresolved, node.steps)),
+                                         node.approach, targets=node.targets, search=search)
             continue
 
         for child in node.prefix.choices():

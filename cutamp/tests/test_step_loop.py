@@ -98,6 +98,9 @@ def test_starting_values(stepped_call):
     assert plan.orders == ("L", "") and plan.command_names == {0: "step_commands_0"}
     u = p["step_commands_0"]
     assert u.shape == (16, 1, 3)
+    proposal = stepped_call["proposal"]
+    assert len(proposal.targets) == len(proposal.schedule.edges) == len(proposal.orders) and proposal.search is not None
+    assert plan.stats["draw"]["reached"] and plan.stats["draw"]["seconds"] > 0
     after, _ = as_commanded(plan.orders, plan.incoming, [u, None])
     assert all((v == 0).all() for v in command_rows(plan.orders, plan.incoming, [u, None], after).values())
     (land,) = plan.landing_confs
@@ -238,8 +241,11 @@ def test_a_missing_predictor_is_reported(stepped_call):
 @needs_cuda
 def test_an_unresolved_result_counts_the_particles_each_requirement_fails(stepped_call):
     plan = make_plan(stepped_call)
+    # Grid starts can be feasible; a step 0.5 m forward, beyond the trained 0.33 m, makes every particle fail.
+    with torch.no_grad():
+        plan.particles["step_commands_0"][..., 0] = 0.5
     res = plan.result(plan.particles, stepped_call["reducer"], stepped_call["checker"])
-    assert res.status == "unresolved"  # no particle is feasible at the start on this scene
+    assert res.status == "unresolved"
     counts = res.diagnostics["failure_counts"]
     assert set(res.diagnostics["failed_constraints"]) <= set(counts) and all(0 < v <= 16 for v in counts.values())
 

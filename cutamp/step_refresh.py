@@ -130,7 +130,7 @@ class StandIn:
         return after, final
 
 
-REDRAW_ROUNDS = 1000  # a programming safeguard on the rejection draw, not a planner limit (design 4)
+REDRAW_ROUNDS = 1000  # a programming safeguard on the draw's fallback rounds (design 6, step 5), not a planner limit
 
 
 def as_commanded(orders, incoming: Tensor, commands: list[Tensor | None]) -> tuple[list[Tensor | None], list[Tensor]]:
@@ -322,47 +322,6 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
         out.append(u.to(incoming.device, torch.float32))
         i += len(order)
     return out, {"rounds": rounds, "own": mine, "reached": reached, "noisy": int(noisy.sum())}
-
-
-def draw_commands(orders, incoming: Tensor, n: int, generator: torch.Generator) -> list[Tensor | None]:
-    """Per gap ``[n, s, 3]`` float32 on ``incoming``'s device (``None`` where no step): each step uniform over the
-    trained box (mirrored for a right swing), kept where the step bound allows it and its travel from the sole's pose
-    before the step is within ``STEP_TRAVEL``, refused particles redrawn. A later step and a later gap start from the
-    earlier draws taken as landed. Drawn on the generator's device."""
-    device, dtype = generator.device, torch.float32
-    bound = planner_step_bound(device, dtype)
-    lo = torch.tensor([-STEP_X_MAX, STEP_Y_RANGE[0], STEP_YAW_RANGE[0]], device=device, dtype=dtype)
-    hi = torch.tensor([STEP_X_MAX, STEP_Y_RANGE[1], STEP_YAW_RANGE[1]], device=device, dtype=dtype)
-    mirror = torch.tensor([1.0, -1.0, -1.0], device=device, dtype=dtype)
-    before, out = incoming.to(device, dtype), []
-    for j, order in enumerate(orders):
-        if not order:
-            out.append(None)
-            continue
-        steps = []
-        for k, foot in enumerate(order):
-            side = "LR".index(foot)
-            left = side == 0
-            start = rel_pose(before[:, 1 - side], before[:, side])
-            swing_left = torch.full((n,), left, device=device)
-            c = torch.empty(n, 3, device=device, dtype=dtype)
-            todo = torch.ones(n, dtype=torch.bool, device=device)
-            for _ in range(REDRAW_ROUNDS):
-                cand = lo + torch.rand(n, 3, generator=generator, device=device, dtype=dtype) * (hi - lo)
-                cand = cand if left else cand * mirror
-                t = travel(start, cand)
-                ok = (bound.g(cand, swing_left) <= 0) & (t >= STEP_TRAVEL[0]) & (t <= STEP_TRAVEL[1])
-                take = todo & ok
-                c[take] = cand[take]
-                todo &= ~ok
-                if not todo.any():
-                    break
-            else:
-                raise ValueError(f"gap {j} step {k + 1}: {int(todo.sum())} particles still refused after {REDRAW_ROUNDS} rounds")
-            steps.append(c)
-            before = _intended_pair(before, side, c)
-        out.append(torch.stack(steps, 1).to(incoming.device))
-    return out
 
 
 def command_rows(orders, incoming: Tensor, commands: list[Tensor | None], after_steps: list[Tensor | None]) -> dict[str, Tensor]:

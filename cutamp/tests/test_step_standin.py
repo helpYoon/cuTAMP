@@ -62,20 +62,7 @@ def test_gradient_reaches_every_gaps_commands():
     assert g_first.abs().sum() > 0 and g_third.abs().sum() > 0
 
 
-from cutamp.step_refresh import as_commanded, command_rows, draw_commands
-
-
-def test_draws_lie_in_the_allowed_set_and_repeat():
-    orders, inc = ("LR", "", "R"), incoming().repeat(22, 1, 1)[:64]
-    draws = draw_commands(orders, inc, 64, torch.Generator().manual_seed(0))
-    assert draws[1] is None and draws[0].shape == (64, 2, 3) and draws[2].shape == (64, 1, 3)
-    after, _ = as_commanded(orders, inc, draws)
-    rows = command_rows(orders, inc, draws, after)
-    assert rows and all((v == 0).all() for v in rows.values())
-    assert (draws[0][:, 0, 1] > 0).all() and (draws[0][:, 1, 1] < 0).all()  # a right swing is the mirror image
-    again = draw_commands(orders, inc, 64, torch.Generator().manual_seed(0))
-    assert all(torch.equal(a, b) for a, b in zip(draws, again) if a is not None)
-    assert draws[0][:, 0, 0].std() > 0.05  # spread over the set, not one point
+from cutamp.step_refresh import as_commanded, command_rows
 
 
 def test_rows_rise_outside_the_set_and_have_a_slope():
