@@ -18,6 +18,7 @@ from cutamp.landing_predictor import (
 )
 from cutamp.stance import STEP_TRAVEL, STEP_X_MAX, STEP_Y_RANGE, STEP_YAW_RANGE, abs_pose, rel_pose
 from cutamp.step_bound import planner_step_bound, travel
+from cutamp.step_validation import _obb_gap
 
 NUDGE = 1.0e-3  # m and rad: the distance over which the slope is measured (design 6, call 8)
 
@@ -147,6 +148,46 @@ def as_commanded(orders, incoming: Tensor, commands: list[Tensor | None]) -> tup
             after.append(torch.stack(pairs, 1))
         final.append(before)
     return after, final
+
+
+def grid_commands(sole_half, width: float) -> Tensor:
+    """``[N, 3]`` float64 CPU left-swing commands (x, y, yaw) in the planted sole's frame, x ascending, then y, then
+    turn: the half-foot lattice of the trained box, kept where the step bound allows it.
+
+    Derivation (spec 5): x steps by half a sole length ``sole_half[0]`` within ``STEP_X_MAX`` either way; y steps by
+    half a sole width ``sole_half[1]`` from the home stance's ``width`` within ``STEP_Y_RANGE``; the turn steps from 0
+    to ``STEP_YAW_RANGE[1]`` in the fewest equal parts each no larger than ``sole_half[1] / sole_half[0]``, the turn
+    that swings the toe by half a sole width."""
+    hx, hy = float(sole_half[0]), float(sole_half[1])
+    kx = math.floor(STEP_X_MAX / hx)
+    ky = torch.arange(math.ceil((STEP_Y_RANGE[0] - width) / hy), math.floor((STEP_Y_RANGE[1] - width) / hy) + 1)
+    xs = torch.arange(-kx, kx + 1, dtype=torch.float64) * hx
+    ys = width + ky.double() * hy
+    turns = torch.linspace(0.0, STEP_YAW_RANGE[1], math.ceil(STEP_YAW_RANGE[1] / (hy / hx)) + 1, dtype=torch.float64)
+    c = torch.cartesian_prod(xs, ys, turns)
+    left = torch.ones(len(c), dtype=torch.bool)
+    return c[planner_step_bound(torch.device("cpu"), torch.float64).g(c, left) <= 0]
+
+
+def feet_clear(feet: Tensor, boxes: Tensor, halves: Tensor, foot_half: Tensor) -> Tensor:
+    """``[m]`` bool: no foot of ``feet`` ``[m, k, 3]`` (planar sole poses x, y, yaw) overlaps a box of ``boxes``
+    ``[m, b, 4, 4]`` (world from box, half extents ``halves`` ``[b, 3]``) by more than 1e-6 m; boxes whose top is at
+    most 1e-6 m are ignored. The refresh's own rule (:func:`cutamp.step_validation._step_geometry`): the foot box of
+    half extents ``foot_half`` ``[3]`` lifted to stand on the floor, the same :func:`_obb_gap`, skip and tolerance, one
+    box at a time as it takes one object at a time."""
+    cos, sin = feet[..., 2].cos(), feet[..., 2].sin()
+    foot = torch.zeros(*feet.shape[:-1], 4, 4, dtype=feet.dtype, device=feet.device)
+    foot[..., 0, 0], foot[..., 0, 1], foot[..., 1, 0], foot[..., 1, 1] = cos, -sin, sin, cos
+    foot[..., 2, 2] = foot[..., 3, 3] = 1.0
+    foot[..., :2, 3] = feet[..., :2]
+    foot[..., 2, 3] = foot_half[2]
+    clear = torch.ones(feet.shape[0], dtype=torch.bool, device=feet.device)
+    for i in range(boxes.shape[1]):
+        box, oh = boxes[:, i], halves[i]
+        top = box[..., 2, 3] + (box[..., 2, :3].abs() * oh).sum(-1)
+        overlap = -_obb_gap(foot, foot_half, box[:, None], oh)
+        clear &= (torch.where(top[:, None] <= 1e-6, 0.0, overlap).clamp_min(0) <= 1e-6).all(-1)
+    return clear
 
 
 def draw_commands(orders, incoming: Tensor, n: int, generator: torch.Generator) -> list[Tensor | None]:

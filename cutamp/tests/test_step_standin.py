@@ -1,3 +1,6 @@
+import math
+
+import numpy as np
 import torch
 
 from cutamp.stance import abs_pose, rel_pose
@@ -97,3 +100,46 @@ def test_accuracy_rows_read_the_landed_pair():
     missed[0][:, 0, 0, 0] += 0.03  # the swung sole lands 3 cm off, against a 2 cm tolerance
     row = command_rows(("L",), inc, [u], missed)["gap0_step1_xy_precision"]
     torch.testing.assert_close(row[0], torch.tensor([0.03**2 / 0.02**2 - 1, 0.0]), atol=1e-5, rtol=0)
+
+
+from cutamp.reachability import _rectangle_separation
+from cutamp.step_refresh import feet_clear, grid_commands
+
+
+def test_the_grid_is_the_half_foot_lattice_inside_the_limit():
+    half = np.array([0.224868, 0.10]) / 2  # the reach map's sole_box_m
+    grid = grid_commands(half, 0.2125)
+    assert grid.dtype == torch.float64 and grid.shape == (100, 3)
+    xs, ys, turns = (sorted({round(v, 9) for v in grid[:, a].tolist()}) for a in range(3))
+    assert xs == [round(k * 0.112434, 9) for k in (-2, -1, 0, 1, 2)]
+    assert ys == [round(0.1625 + 0.05 * k, 9) for k in range(7)]
+    assert turns == [0.0, round(math.radians(25), 9), round(math.radians(50), 9)]
+    full = {(round(x, 9), round(y, 9), round(t, 9)) for x in xs for y in ys for t in turns}
+    kept = {tuple(round(v, 9) for v in row) for row in grid.tolist()}
+    refused = {(-0.112434, 50), (0.0, 25), (0.0, 50), (0.112434, 25), (0.112434, 50)}
+    refused = {(round(x, 9), 0.1625, round(math.radians(t), 9)) for x, t in refused}
+    assert full - kept == refused
+    for x, y, t in grid.tolist():  # apply_command's static test (reachability.py:80-85) holds for every kept command
+        assert -0.33 <= x <= 0.33 and 0.14 <= y <= 0.48 and math.radians(-20) <= t <= math.radians(50)
+        assert _rectangle_separation([x, y], np.array([0.112434, 0.05]), np.array([0.112434, 0.05]), t) >= 0.02
+
+
+def test_feet_clear_follows_the_refresh_rule():
+    fh = torch.tensor([0.1124, 0.05, 0.0218], dtype=torch.float64)
+    def box(x, y, z, hx, hy, hz):
+        T = torch.eye(4, dtype=torch.float64); T[:3, 3] = torch.tensor([x, y, z]); return T, [hx, hy, hz]
+    cases = [  # (foot (x, y, yaw), box, clear)
+        ((0.30, 0.0, 0.0), box(0.30, 0.0, 0.005, 0.2, 0.2, 0.005), False),          # on a 1 cm pad
+        ((-0.25, 0.0, 0.0), box(0.30, 0.0, 0.005, 0.2, 0.2, 0.005), True),          # beside it
+        ((0.30, 0.0, 0.0), box(0.30, 0.0, -0.005, 0.2, 0.2, 0.005), True),          # flush pad, top at 0: ignored
+        ((0.05, 0.0, 0.0), box(0.15, 0.0, 0.025, 0.025, 0.025, 0.025), False),      # toe in a movable cube
+        ((0.0, 0.0, 0.0), box(0.1374 - 5e-7, 0.0, 0.025, 0.025, 0.025, 0.025), True),   # 5e-7 m overlap: tolerated
+        ((0.0, 0.0, 0.0), box(0.1374 - 2e-6, 0.0, 0.025, 0.025, 0.025, 0.025), False),  # 2e-6 m: not
+        ((0.0, 0.15, math.pi / 2), box(0.0, 0.25, 0.025, 0.025, 0.025, 0.025), False),  # a turned sole reaches it
+        ((0.0, 0.15, 0.0), box(0.0, 0.25, 0.025, 0.025, 0.025, 0.025), True),           # a straight one does not
+    ]
+    feet = torch.tensor([[f] for f, _, _ in cases], dtype=torch.float64)          # [8, 1, 3]
+    boxes = torch.stack([T for _, (T, _), _ in cases])[:, None]                   # [8, 1, 4, 4]
+    for i, (_, (_, h), clear) in enumerate(cases):
+        got = feet_clear(feet[i:i + 1], boxes[i:i + 1], torch.tensor([h], dtype=torch.float64), fh)
+        assert got.tolist() == [clear], i
