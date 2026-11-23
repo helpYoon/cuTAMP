@@ -229,3 +229,35 @@ def _box_gaps(relative, half, half_cell, yaw):
             best = np.minimum(best, np.sum(gap**2, axis=1))
         planar_sq[~intersects] = best
     return np.sqrt(planar_sq + vertical**2)
+
+
+def _box_gaps_rows(relative, half, half_cell, yaw):
+    """``_box_gaps`` with one box yaw per row: the same arithmetic and branches, the 2 x 2 products written out."""
+    c, s = np.cos(yaw), np.sin(yaw)
+    abs_c, abs_s = np.abs(c), np.abs(s)
+    (hx, hy), half_z = half[:2], half[2]
+    vertical = np.maximum(np.abs(relative[:, 2]) - half_cell - half_z, 0.0)
+    x, y = relative[:, 0], relative[:, 1]
+    extent = np.stack((hx * abs_c + hy * abs_s, hx * abs_s + hy * abs_c), axis=1)
+    aligned = (abs_s < 1e-12) | (abs_c < 1e-12)
+    planar = np.maximum(np.abs(relative[:, :2]) - half_cell - extent, 0.0)
+    planar_sq = np.where(aligned, np.sum(planar**2, axis=1), 0.0)
+
+    in_box = np.stack((x * c + y * s, x * -s + y * c), axis=1)
+    intersects = (np.abs(relative[:, :2]) <= half_cell + extent).all(axis=1) & (
+        np.abs(in_box) <= np.array([hx, hy]) + (half_cell * (abs_c + abs_s))[:, None]
+    ).all(axis=1)
+    outer = ~aligned & ~intersects
+    if np.any(outer):
+        ox, oy, oc, os_ = x[outer], y[outer], c[outer], s[outer]
+        best = np.full(len(ox), np.inf)
+        for sx, sy in _CORNER_SIGNS:
+            vx, vy = ox + half_cell * sx, oy + half_cell * sy
+            gx = np.maximum(np.abs(vx * oc + vy * os_) - hx, 0.0)
+            gy = np.maximum(np.abs(vx * -os_ + vy * oc) - hy, 0.0)
+            best = np.minimum(best, gx**2 + gy**2)
+            gx = np.maximum(np.abs(hx * sx * oc + hy * sy * -os_ - ox) - half_cell, 0.0)
+            gy = np.maximum(np.abs(hx * sx * os_ + hy * sy * oc - oy) - half_cell, 0.0)
+            best = np.minimum(best, gx**2 + gy**2)
+        planar_sq[outer] = best
+    return np.sqrt(planar_sq + vertical**2)

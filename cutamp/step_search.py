@@ -24,9 +24,11 @@ from cutamp.reachability import (
     ORDERS,
     ReachMap,
     _box_gaps,
+    _box_gaps_rows,
     _rectangle_separation,
     _rot,
     _soles_array,
+    _wrap,
     apply_command,
     canonical_stance,
 )
@@ -151,6 +153,7 @@ class _HandIndex:
         self.voxel = voxel_size
         # Distinct sole pairs can put the same target at exactly the same hand-map coordinates.
         self.nearest = lru_cache(maxsize=2048)(self.nearest)
+        self._scaled = lru_cache()(self._scaled)
         self.layers = [layer for layer in layers if len(layer["ijk"])]
         if not self.layers:
             self.tree = None
@@ -180,6 +183,42 @@ class _HandIndex:
         layer = self.layers[layer_id]
         row -= int(self.ends[layer_id - 1]) if layer_id else 0
         return (0.0 if gap <= 1e-12 else gap, layer["posture"], tuple(layer["q"][row].tolist()))
+
+    def within(self, centers, half, yaws, bar):
+        """Per row, whether some cell's gap to the box is <= bar + 1e-12: ``nearest``'s answer without its minimum."""
+        half_cell, limit = self.voxel / 2, bar + 1e-12
+
+        def passes(rows, cells):
+            return _box_gaps_rows(self.tree.data[cells] - centers[rows], half, half_cell, yaws[rows]) <= limit
+
+        _, seed = self.tree.query(centers)
+        passed = passes(np.arange(len(centers)), seed)
+        rest = np.flatnonzero(~passed)
+        if len(rest):
+            # The nearest cells to 9 box points at the centre's height: corners, edge midpoints and the centre.
+            u, v = np.meshgrid((-1, 0, 1), (-1, 0, 1))
+            u, v = u.ravel() * half[0], v.ravel() * half[1]
+            c, s = np.cos(yaws[rest])[:, None], np.sin(yaws[rest])[:, None]
+            points = np.repeat(centers[rest, None], 9, axis=1)
+            points[..., 0] += u * c - v * s
+            points[..., 1] += u * s + v * c
+            _, near = self.tree.query(points.reshape(-1, 3))
+            passed[rest] = passes(np.repeat(rest, 9), near).reshape(-1, 9).any(axis=1)
+            rest = rest[~passed[rest]]
+        if len(rest):
+            # A cell within the limit has its centre this close to the upright box's centre in x, y and in z.
+            r_xy = np.linalg.norm(half[:2]) + half_cell + limit
+            r_z = half[2] + half_cell + limit
+            ids = self._scaled(r_xy / r_z).query_ball_point(
+                centers[rest] * (1, 1, r_xy / r_z), r_xy, p=np.inf, return_sorted=False
+            )
+            rows = np.repeat(rest, [len(i) for i in ids])
+            if len(rows):
+                passed[rows[passes(rows, np.concatenate(ids).astype(np.intp))]] = True
+        return passed
+
+    def _scaled(self, z_scale):
+        return cKDTree(self.tree.data * (1, 1, z_scale))
 
 
 class StepSearch:
@@ -255,6 +294,21 @@ class StepSearch:
             for side, offset, yaw in zip("LR", xy, poses[:, 2])
             if _rectangle_separation(offset, half[:2], self.sole_half, yaw - target.yaw) < -1e-12
         )
+
+    def reaches(self, soles, target, bar):
+        """Per [n, 2, 3] sole pair, whether ``_edges``' hand-map gap to the target is <= bar + 1e-12.
+
+        The target needs a centre, a size and a non-empty map for its arm.
+        """
+        soles = np.asarray(soles, dtype=np.float64)
+        # canonical_stance's frame, one row per stance.
+        xy = soles[:, :, :2].mean(axis=1)
+        yaw = _wrap(soles[:, 0, 2] + 0.5 * _wrap(soles[:, 1, 2] - soles[:, 0, 2]))
+        center = np.asarray(target.center)
+        local = np.empty((len(soles), 3))
+        local[:, :2] = np.matmul((center[:2] - xy)[:, None], np.moveaxis(_rot(-yaw), -1, 0))[:, 0]
+        local[:, 2] = center[2]
+        return self.hands[target.arm].within(local, np.asarray(target.size) / 2, target.yaw - yaw, bar)
 
     def _edges(self, incoming, target):
         known = target.center is not None and target.size is not None

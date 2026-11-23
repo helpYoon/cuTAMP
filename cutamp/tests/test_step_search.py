@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from cutamp.landing_accuracy import CHECKPOINT_SHA256, LANDING_ACCURACY, SOURCE_SHA256
-from cutamp.reachability import ORDERS, REACH_MAP, ReachMap
+from cutamp.reachability import ORDERS, REACH_MAP, ReachMap, _box_gaps, _box_gaps_rows, _rot, canonical_stance
 from cutamp.step_search import StepSearch, TargetRegion
 
 HOME = ((0.0, 0.10, 0.0), (0.0, -0.10, 0.0))
@@ -259,3 +259,44 @@ def test_nominal_build_samples_one_stance_for_both_arms_and_crouch(tmp_path, mon
     saved = ReachMap.load(path)
     assert [r["posture"] for r in saved.layers(HOME, "right")] == ["standing", "crouch"]
     assert saved.metadata["nominal_only"] is True
+
+
+def random_pairs(n, seed):
+    """[n, 2, 3] stances within about 0.5 m of the test targets; the right sole 0.15-0.45 m to the left's right."""
+    rng = np.random.default_rng(seed)
+    yaw = rng.uniform(-np.pi, np.pi, n)
+    left = np.c_[rng.uniform(-0.05, 0.95, n), rng.uniform(-0.5, 0.5, n), yaw]
+    width = rng.uniform(0.15, 0.45, n)
+    right = np.c_[left[:, :2] + width[:, None] * np.c_[np.sin(yaw), -np.cos(yaw)], yaw + rng.uniform(-0.6, 0.6, n)]
+    return np.stack((left, right), axis=1)
+
+
+def test_box_gaps_rows_match_the_scalar_gaps():
+    rng = np.random.default_rng(0)
+    rel = rng.uniform(-0.4, 0.4, (500, 3))
+    yaw = np.r_[rng.uniform(-np.pi, np.pi, 494), 0.0, np.pi / 2, -np.pi / 2, np.pi, 1e-13, -np.pi / 4]
+    half = np.array([0.225, 0.225, 0.025])
+    rows = _box_gaps_rows(rel, half, 0.0125, yaw)
+    scalar = np.array([_box_gaps(r[None], half, 0.0125, y)[0] for r, y in zip(rel, yaw)])
+    np.testing.assert_allclose(rows, scalar, rtol=0, atol=1e-15)
+
+
+@pytest.mark.parametrize("target", [
+    TargetRegion("left", (0.48, 0.18, 0.025), (0.05, 0.05, 0.05), solid_pick=True),   # a pick box
+    TargetRegion("right", (0.45, -0.15, 0.03), (0.45, 0.45, 0.05)),                   # a 45 x 45 cm place surface
+])
+@pytest.mark.parametrize("bar", [0.0, 0.03])
+def test_reaches_matches_the_hand_index(target, bar):
+    search = StepSearch.load(REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8)
+    soles = random_pairs(2000, seed=0)  # [2000, 2, 3]: right sole 0.15-0.45 m to the right of the left, turns within 0.6 rad
+    center, half = np.asarray(target.center), tuple(np.asarray(target.size) / 2)
+    expected = []
+    for feet in soles:  # the task planner's own per-stance test, step_search.py:283-286
+        _, frame = canonical_stance(feet)
+        local = (*((center[:2] - frame[:2]) @ _rot(-frame[2])), center[2])
+        gap, _, _ = search.hands[target.arm].nearest(local, half, target.yaw - frame[2])
+        expected.append(gap <= bar + 1e-12)
+    got = search.reaches(soles, target, bar)
+    assert got.dtype == bool and got.shape == (2000,)
+    assert np.array_equal(got, np.array(expected))
+    assert 0 < got.sum() < 2000  # both outcomes occur; widen or narrow random_pairs' spread if not
