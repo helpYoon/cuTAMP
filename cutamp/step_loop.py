@@ -179,7 +179,7 @@ def _validate_motion_rows(rows, pools, skeleton, world, config, attempt, *, dead
     if not rows or (deadline is not None and monotonic() >= deadline):
         return diagnostics
     if config.com_center_weight != 0:
-        ranked = sorted(rows, key=lambda row: (row.max_center_distance_m, row.effort))
+        ranked = sorted(rows, key=lambda row: row.order)
         candidates = ranked[:config.motion_plan_max_retries]
     else:
         if pools:
@@ -728,7 +728,7 @@ class SteppedPlan:
                           "off_centre": weight * (distance / UNIT_M).sum(1),
                           "joint_effort": effort.sum(1)}
         worst = distance.detach().amax(1) if weight else margin.new_zeros(len(margin))
-        soft["rank"] = plan_rank(lean.detach().abs().asin().amax(1), worst)
+        soft["rank"] = plan_rank(lean.detach().abs().clamp(max=1).asin().amax(1), worst)
         soft["effort"] = effort.detach().amax(1)
         self.weights.apply(cost)
         return cost
@@ -792,8 +792,10 @@ class SteppedPlan:
 
     def result(self, particles: dict, reducer, checker) -> StepResult:
         """The rows handed to the motion stage, after the loop's last refresh (design 7): one evaluation without a
-        gradient, one :class:`StepRow` per particle the checker passes. ``motion_inputs`` maps each row's index to the
-        adapter and the row's saved refresh, for the motion stage; it stays out of ``diagnostics``."""
+        gradient, one :class:`StepRow` per particle the checker passes, its report with the side lean and joint effort
+        of each pick and place and its place in the order of the preferences (``rank``, then the worst ``joint_effort``;
+        2026-11-23 design 4.5). ``motion_inputs`` maps each row's index to the adapter and the row's saved refresh, for
+        the motion stage; it stays out of ``diagnostics``."""
         n = len(particles["left_q0"])
         sole_box = self.world.model.sole_box
         with torch.no_grad():
@@ -807,6 +809,10 @@ class SteppedPlan:
             stances = torch.stack([table[name] for name in rollout["conf_params"]], 1)
             margin = physical_support_margin(rollout["com_xy"], stances, sole_box)
             center = (rollout["com_xy"] - physical_support_centroid(stances, sole_box)).norm(dim=-1)
+            q = torch.stack([particles[name] for name in rollout["conf_params"]], 1)
+            lean = side_lean(q, stances, self.world.model).clamp(-1, 1).asin()
+            efforts = joint_effort(self.world, q)
+            rank, worst_effort = costs["soft"]["rank"], costs["soft"]["effort"]
             joints = range(len(self.world.model.joint_names))
             arms = [*joints[self.world.model.left_arm], *joints[self.world.model.right_arm]]
             move = torch.stack([(particles[name] - start)[:, arms].abs().amax(-1)
@@ -823,6 +829,10 @@ class SteppedPlan:
                 min_com_margin_m=min(margins),
                 best_com_margin=min(margins),
                 secondary_effort=float(effort[i]),
+                side_lean_rad=lean[i].tolist(),
+                joint_efforts=efforts[i].tolist(),
+                joint_effort=float(worst_effort[i]),
+                rank=float(rank[i]),
                 cost=float(hard[i]),
                 largest_arm_joint_move_rad=float(move[i]),
                 gaps=self._gap_records(particles, i),

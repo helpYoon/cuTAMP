@@ -113,6 +113,30 @@ def test_for_a_stepped_plan_only_a_better_plan_restarts_the_countdown():
     assert stop(12) and not stop(12, patience=0)
 
 
+def test_the_record_keeps_the_better_rank_then_the_lower_effort():
+    from cutamp.cost_reduction import CostReducer
+    from cutamp.optimize_plan import _FeasibleArchive, _quality
+    p = _particles(0.)
+    stepped = {"soft": {"type": "cost", "values": {}, "rank": torch.tensor([5., 5., 5., 5.]),
+                        "effort": torch.tensor([.3, .3, .3, .3]), "max_center_distance_m": torch.zeros(4)}}
+    primary, secondary = _quality(stepped, CostReducer({}))
+    assert primary is stepped["soft"]["rank"] and secondary is stepped["soft"]["effort"]
+    standing = {"soft": {"type": "cost", "values": {"x": torch.ones(4)}, "max_center_distance_m": torch.arange(4.)}}
+    primary, secondary = _quality(standing, CostReducer({}))
+    assert primary is standing["soft"]["max_center_distance_m"] and torch.equal(secondary, torch.ones(4))
+    assert _quality({}, CostReducer({})) == (None, None)
+    archive = _FeasibleArchive(p, *_quality(stepped, CostReducer({})))
+    valid = torch.tensor([True, True, True, False])
+    for name in p:
+        p[name] += 1.0
+    inf = float("inf")
+    archive.observe(p, valid, torch.tensor([4., 5., 6., 0.]), torch.tensor([.9, .2, .1, .0]))
+    assert archive.center.tolist() == [4., 5., 6., inf]            # the record starts every particle at infinity
+    archive.observe(p, valid, torch.tensor([4., 5., 7., 0.]), torch.tensor([.5, .1, .0, .0]))
+    assert archive.center.tolist() == [4., 5., 6., inf]            # a worse rank never replaces a better one
+    torch.testing.assert_close(archive.effort, torch.tensor([.5, .1, .1, inf]))   # at the same rank, the lower effort
+
+
 def test_preserve_best_feasible_center_for_each_particle():
     from cutamp.optimize_plan import _FeasibleArchive
 

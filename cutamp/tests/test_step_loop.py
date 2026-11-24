@@ -246,6 +246,24 @@ def test_result_rows(stepped_call):
         assert pick["order"] == "L" and place["order"] == "none" and pick["achieved"] == place["achieved"]
         assert len(pick["commands"]) == 1 and len(pick["final_xy_error_m"]) == 2
         assert sum(k.endswith("_ik_reference") for k in row.particle) == 2
+        assert {"rank", "joint_effort", "side_lean_rad", "joint_efforts"} <= set(m)
+        assert len(m["side_lean_rad"]) == len(m["joint_efforts"]) == 2
+        assert m["joint_effort"] == max(m["joint_efforts"])
+
+
+def test_valid_rows_go_to_arm_motion_by_rank_then_effort():
+    from cutamp.step_loop import _validate_motion_rows
+    from cutamp.step_planner import StepRow
+    rows = [StepRow(i, {}, 0.0, {"rank": rank, "joint_effort": effort, "com_center_distances_m": [centre],
+                                "secondary_effort": 0.0})
+            for i, (rank, effort, centre) in enumerate([(4096.0, 0.1, 0.0), (0.0, 0.3, 0.004), (0.0, 0.2, 0.004)])]
+    tried = []
+    def attempt(row):
+        tried.append(row.index)
+        return None, {"motion_validation": "failed"}
+    config = SimpleNamespace(com_center_weight=1.0, motion_plan_max_retries=3)
+    _validate_motion_rows(rows, {}, [], None, config, attempt, deadline=None)
+    assert tried == [2, 1, 0] and rows[1].order == (0.0, 0.3)
 
 
 from cutamp.step_loop import refine_stepped_plan

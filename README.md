@@ -226,8 +226,10 @@ graph LR
    with no cuRobo during Adam and the Adam step and refresh replayed as CUDA
    graphs (`cuda_graphs.py`).
    Adam stops after `early_stop_patience` steps without progress and keeps the
-   best-seen particles. For a plan with steps, once a particle is valid only a
-   better valid plan restarts the countdown. `ConstraintChecker` decides which particles satisfy.
+   best-seen particles. For a plan with steps, once a particle is valid the
+   countdown restarts only when the best valid plan gains a whole 0.05 rad of
+   side lean or 5 mm of centring. `ConstraintChecker` decides which particles
+   satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
    up to `motion_plan_max_retries` satisfying particles, first success wins,
    in `get_top_satisfying_particles`' order: the worst pick or place CoM
@@ -671,17 +673,21 @@ orders that reach each target and keep the feet off objects, with noise within
 half a cell (`step_refresh.draw_grid_paths`); when no grid path reaches, they
 start on legal, feet-clear paths that do not reach. Every `reik_interval` Adam
 steps a refresh runs `landing-seed3.pt`, the controller and world model, on
-every particle's commands; its landings and their slope enter the costs, and the
-pick, place and retract postures are re-solved on the landings. The loop stops
-as it does for plans without steps.
+every particle's commands; its landings and their slope enter the costs. At
+every Adam step each pick and place posture is put back on its hand target and
+its stance, each retract on its stance, and a refresh solves none. The loop
+stops as in step 3 of "How it works" above.
 
 Nothing is run after the loop: the particles feasible at its last refresh go to
-arm motion planning. Both feet must pass the 2 cm XY and 1° yaw limits. The
-planner tries feasible particles in order of their worst pick/place CoM
-distance to the support polygon centroid, then secondary effort. It returns the
-first connected motion on the first successful skeleton. If optimization or
-motion planning fails, the plan search supplies the next skeleton; when it runs
-out, the planner reports failure. Use `--max_duration` to bound this search.
+arm motion planning. Each landing is judged by itself, not by its distance from
+the command: the step's own checks, the landed sole flat on the floor, the
+step's clearances and its range. The planner tries feasible particles in order
+of their worst pick/place side lean in whole units of 0.05 rad, then their
+worst CoM distance to the support polygon centroid in whole units of 5 mm, then
+their worst joint effort. It returns the first connected motion on the first
+successful skeleton. If optimization or motion planning fails, the plan search
+supplies the next skeleton; when it runs out, the planner reports failure. Use
+`--max_duration` to bound this search.
 A connected prediction carries the status `model_predicted_motion`.
 
 The `two_steps_floor_transfer` demo starts the learned-step planner from a

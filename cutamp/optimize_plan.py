@@ -164,6 +164,18 @@ class _FeasibleArchive:
         return True
 
 
+def _quality(cost_dict, reducer) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """The two numbers :class:`_FeasibleArchive` compares valid particles by, smaller first: a stepped plan's rank and
+    worst joint effort (2026-11-23 design 4.5), else the worst centring distance and the secondary effort, else
+    ``(None, None)``: no record."""
+    soft = cost_dict.get("soft", {})
+    if "rank" in soft:
+        return soft["rank"], soft["effort"]
+    if "max_center_distance_m" in soft:
+        return soft["max_center_distance_m"], reducer.secondary_effort(cost_dict)
+    return None, None
+
+
 def _fixed_row_quality(info, cost_dict, total_cost, soft_cost, reducer):
     """Scores of the same final rows for particle selection and later motion retries."""
     quality = {"best_cost": total_cost, "best_soft_cost": soft_cost}
@@ -211,8 +223,7 @@ class _StepBody:
         costs = self.cost_reducer(cost_dict, consider_types=self.consider_types)
         satisfying_mask = self.get_mask(cost_dict, verbose=False)
         if self.archive is not None and self.judge:
-            centers = cost_dict["soft"]["max_center_distance_m"]
-            self.archive.observe(self.particles, satisfying_mask, centers, self.cost_reducer.secondary_effort(cost_dict))
+            self.archive.observe(self.particles, satisfying_mask, *_quality(cost_dict, self.cost_reducer))
         loss = costs.mean()
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
@@ -252,8 +263,8 @@ class _BestSnapshot:
     a count record beating the previous by ``MIN_DELTA``, or the best
     particle's total loss dropping by ``MIN_LOSS_DELTA`` (proxy for ongoing
     pose-class soft-cost descent). For a plan with steps (``by_rank``), once the
-    archive holds a valid plan only a better-centred valid plan resets the
-    clock: the returned plan is the best-centred one, so neither the count nor
+    archive holds a valid plan only a better-ranked valid plan resets the
+    clock: the returned plan is the best-ranked one, so neither the count nor
     the loss changes it.
     """
 
@@ -271,7 +282,7 @@ class _BestSnapshot:
         self._best_min_loss = float("inf")
         self._last_checked_center = float("inf")
         self._best_center = float("inf")
-        self._center_step = None  # the step of the last better-centred valid plan; None until one exists
+        self._center_step = None  # the step of the last better-ranked valid plan; None until one exists
 
     def update(self, step: int, num_satisfying: int, min_loss: float, particles: dict):
         if num_satisfying > self.best_sat:
@@ -674,12 +685,10 @@ class ParticleOptimizer:
         time_exceeded = False
         best_snapshot = _BestSnapshot()
         archive = None
-        if "max_center_distance_m" in init_cost_dict.get("soft", {}):
+        primary, secondary = _quality(init_cost_dict, self.cost_reducer)
+        if primary is not None:
             mutable = {k: v for k, v in particles.items() if v.requires_grad or k in dropped_conf_names}
-            archive = _FeasibleArchive(
-                mutable, init_cost_dict["soft"]["max_center_distance_m"],
-                self.cost_reducer.secondary_effort(init_cost_dict),
-            )
+            archive = _FeasibleArchive(mutable, primary, secondary)
         body = _StepBody(
             particles, rollout_fn, cost_fn, self.cost_reducer, self.get_satisfying_mask, consider_types,
             params=[p for g in optimizer.param_groups for p in g["params"]], grad_masks=grad_masks,
@@ -733,16 +742,13 @@ class ParticleOptimizer:
                 if body.judge and best_snapshot.should_stop(
                     step, self.config.early_stop_patience, archive, by_rank=steps is not None
                 ):
-                    centring = ""
+                    ranked = ""
                     if steps is not None and best_snapshot._center_step is not None:
-                        centring = (
-                            f"; best centring {best_snapshot._best_center * 1e3:.2f} mm "
-                            f"at step {best_snapshot._center_step}"
-                        )
+                        ranked = f"; best rank {best_snapshot._best_center:.0f} at step {best_snapshot._center_step}"
                     _log.info(
                         f"Early stop at step {step}: no meaningful progress for "
                         f"{self.config.early_stop_patience} steps (best "
-                        f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step}{centring})"
+                        f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step}{ranked})"
                     )
                     opt_metrics["early_stopped_at"] = step
                     # Close it: the next skeleton reuses this timer.

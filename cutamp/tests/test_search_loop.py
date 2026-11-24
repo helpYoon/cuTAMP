@@ -382,9 +382,12 @@ def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypa
             pytest.fail("refined another skeleton after success")
         calls.append(p.orders)
         rows = [
-            StepRow(7, {}, 0.2, {"com_center_distances_m": [.001, .05], "secondary_effort": .1}),
-            StepRow(8, {"q": torch.tensor([8])}, 0.6, {"com_center_distances_m": [.04, .04], "secondary_effort": .6}),
-            StepRow(9, {}, 0.1, {"com_center_distances_m": [.001, .001], "secondary_effort": 0.}),
+            StepRow(7, {}, 0.2, {"com_center_distances_m": [.001, .05], "secondary_effort": .1,
+                                 "rank": 10., "joint_effort": .1}),
+            StepRow(8, {"q": torch.tensor([8])}, 0.6, {"com_center_distances_m": [.04, .04], "secondary_effort": .6,
+                                                       "rank": 8., "joint_effort": .6}),
+            StepRow(9, {}, 0.1, {"com_center_distances_m": [.001, .001], "secondary_effort": 0.,
+                                 "rank": 0., "joint_effort": 0.}),
         ]
         if p.orders == ("R", "none"):
             rows[0].motion_plan = ["less centered"]
@@ -403,7 +406,7 @@ def test_retry_failed_skeletons_then_return_best_connected_row(harness, monkeypa
 
 
 @pytest.mark.parametrize("weight,winning_id", [(1.0, 2), (0.1, 2), (0.0, 1)])
-def test_motion_feasibility_then_worst_center_then_effort_in_successful_skeleton(harness, monkeypatch, weight, winning_id):
+def test_motion_feasibility_then_rank_then_joint_effort_in_successful_skeleton(harness, monkeypatch, weight, winning_id):
     run, _, _ = harness
     viewer, displayed = object(), []
     setup = alg.setup_cutamp
@@ -418,14 +421,15 @@ def test_motion_feasibility_then_worst_center_then_effort_in_successful_skeleton
     def refine(proposal, *args, **kwargs):
         assert kwargs["visualizer"] is viewer  # the Adam loop's; the route keeps it from the motion stage when centring
         candidates = [
-            (1, [.0, .0495], .01, .0, ["worse at place"]),
-            (2, [.049, .049], 8., 1., ["selected"]),
-            (3, [.049, .005], 6., 2., ["higher effort"]),
-            (4, [.001, .001], .001, .001, None),
+            (1, [.0, .03], .01, .0, 4102., ["better centred, leans a unit more"]),
+            (2, [.049, .049], 8., 1., 9., ["selected"]),
+            (3, [.049, .005], 6., 2., 9., ["higher effort"]),
+            (4, [.001, .001], .001, .001, 0., None),
         ]
         rows = [
-            StepRow(i, {}, soft, {"gaps": [{"center_distance_m": x} for x in ds], "secondary_effort": effort}, motion)
-            for i, ds, soft, effort, motion in candidates
+            StepRow(i, {}, soft, {"gaps": [{"center_distance_m": x} for x in ds], "secondary_effort": effort,
+                                  "rank": rank, "joint_effort": effort}, motion)
+            for i, ds, soft, effort, rank, motion in candidates
         ]
         return StepResult(rows, None, "model_feasible")
 
@@ -439,7 +443,7 @@ def test_motion_feasibility_then_worst_center_then_effort_in_successful_skeleton
         assert metrics["max_center_distance_m"] == .049
         assert metrics["total_steps"] == 1 and metrics["secondary_effort"] == 1.
     else:
-        assert motion == ["worse at place"]
+        assert motion == ["better centred, leans a unit more"]
 
 
 def test_secondary_effort_excludes_only_centering_even_with_custom_weights():
@@ -477,7 +481,8 @@ def test_logs_only_the_final_accepted_rows_model_evidence(harness, monkeypatch, 
         if proposal.orders[1] != "none" or proposal.orders[0] not in costs:
             return StepResult([], None, "unresolved")
         side = proposal.orders[0]
-        row = StepRow(2, {}, costs[side], {"gaps": [{"center_distance_m": .04}], "secondary_effort": costs[side]},
+        row = StepRow(2, {}, costs[side], {"gaps": [{"center_distance_m": .04}], "secondary_effort": costs[side],
+                                           "rank": 8., "joint_effort": costs[side]},
                       evidence=lambda: evidence_calls.append(side) or {"side": side})
         return StepResult([row], None, "model_feasible")
 

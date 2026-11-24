@@ -51,6 +51,12 @@ class StepRow:
     def effort(self) -> float:
         return self.metrics["secondary_effort"]
 
+    @property
+    def order(self) -> tuple[float, float]:
+        """A stepped plan's place in the strict order of its preferences (2026-11-23 design 4.5), smaller first: its
+        rank, then its worst joint effort."""
+        return self.metrics["rank"], self.metrics["joint_effort"]
+
 
 @dataclass
 class StepResult:

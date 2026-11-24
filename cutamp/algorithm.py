@@ -672,7 +672,10 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
                     best_model.metrics, row_index=best_model.index, soft_cost=best_model.soft_cost
                 )
             continue
-        row = min(accepted, key=lambda r: plan_key(r, proposal.step_count))
+        if proposal.step_count and center_first:  # within a stepped task plan: 2026-11-23 design 4.5
+            row = min(accepted, key=lambda r: r.order)
+        else:
+            row = min(accepted, key=lambda r: plan_key(r, proposal.step_count))
         key = plan_key(row, proposal.step_count)
         if incumbent is None or key < incumbent:
             if incumbent is None:
