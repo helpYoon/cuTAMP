@@ -23,7 +23,7 @@ from cutamp.rollout import Rollout, RolloutFunction
 from cutamp.samplers import project_supported_placement
 from cutamp.stance import STEP_TRAVEL, UNIT_M, UNIT_RAD, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
-from cutamp.step_costs import GROWTH, WEIGHT_CAP, RequirementWeights, lines
+from cutamp.step_costs import GROWTH, WEIGHT_CAP, RequirementWeights, joint_effort, lines, plan_rank, side_lean
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refresh import NoStartingPath, StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
@@ -696,10 +696,12 @@ class SteppedPlan:
     def __call__(self, rollout, particles: dict) -> dict:
         """The cost the Adam loop reads (design 5): today's cost on the stand-in's stances, the balance cost as the
         shortfall itself, the retracts' feet, the commands' rows, the last refresh's tests (read by the checker only),
-        the step's checks on their straight lines in the commands (``StepChecks``, design 4.4) and staying near the
-        starting postures. Every requirement row carries its weight per particle (:class:`RequirementWeights`,
-        2026-11-23 design 4.3); the hand and feet rows weigh zero: they are held, not costs (design 4.1), and the
-        checker still reads them."""
+        the step's checks on their straight lines in the commands (``StepChecks``, design 4.4) and, as the soft cost's
+        only values, the preferences over the pick and place postures, each in its unit (2026-11-23 design 4.5): side
+        lean (:func:`side_lean`), off centre and joint effort (:func:`joint_effort`); beside them, detached, each
+        particle's ``rank`` (:func:`plan_rank`) and its worst ``effort``. Every requirement row carries its weight per
+        particle (:class:`RequirementWeights`, 2026-11-23 design 4.3); the hand and feet rows weigh zero: they are
+        held, not costs (design 4.1), and the checker still reads them."""
         table, after = self._stances(particles)
         inner = {key: value for key, value in particles.items() if key not in self.landing_confs}
         cost = self.cost_function(rollout, inner, achieved_stances=table)
@@ -716,8 +718,18 @@ class SteppedPlan:
         for j, line in self.checks.items():
             steer = steer + (line["weight"] * _check_line(line, particles[self.command_names[j]]).clamp_min(0)).sum(1)
         cost["StepChecks"] = {"type": "cost", "values": {"lines": steer}}
-        stay = sum((particles[name] - start).square().sum(-1) for name, start in self.start_postures.items())
-        cost.setdefault("soft", {"type": "cost", "values": {}})["values"]["stay_near_start"] = stay
+        q = torch.stack([particles[name] for name in rollout["conf_params"]], 1)
+        lean = side_lean(q, stances, self.world.model)
+        distance = (rollout["com_xy"] - physical_support_centroid(stances, self.world.model.sole_box)).norm(dim=-1)
+        effort = joint_effort(self.world, q)
+        weight = self.config.com_center_weight
+        soft = cost.setdefault("soft", {"type": "cost"})
+        soft["values"] = {"side_lean": (lean / UNIT_RAD).square().sum(1),
+                          "off_centre": weight * (distance / UNIT_M).sum(1),
+                          "joint_effort": effort.sum(1)}
+        worst = distance.detach().amax(1) if weight else margin.new_zeros(len(margin))
+        soft["rank"] = plan_rank(lean.detach().abs().asin().amax(1), worst)
+        soft["effort"] = effort.detach().amax(1)
         self.weights.apply(cost)
         return cost
 

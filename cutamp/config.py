@@ -109,7 +109,7 @@ class TAMPConfiguration:
         # Design docs/superpowers/specs/2026-11-22-adam-alone-steps-design.md, section 5.
         # conf_lr 7e-3 (call 6): at 2.2e-2 the hand hovers above its 5 mm tolerance; at 7e-3 it settles at 1.3 to
         # 2.1 mm. soft_cost [] (call 5): each listed soft cost pulls its variables at Adam's full step and the hand
-        # leaves its target; a stepped plan stays near its starting postures instead (soft "stay_near_start").
+        # leaves its target; a stepped plan's preferences are its own (`step_costs`).
         return replace(self, conf_lr=7e-3, soft_cost=[])
 
 

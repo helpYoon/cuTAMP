@@ -54,8 +54,6 @@ default_constraint_to_mult = {
         # nothing more, 1e5 distorted particle selection). The band is now
         # zero, so it weights limit violations only; kept at 1e3.
         "joint_limit_margin": 1e3,
-        # A stepped plan's postures near their starting values (call 5): the weight measured on the cup scene.
-        "stay_near_start": 1.0,
     },
 }
 

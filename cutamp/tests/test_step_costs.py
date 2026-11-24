@@ -116,3 +116,23 @@ def test_lines_zero_what_is_not_finite_and_keep_each_particle_apart():
     finite[1] = False                                     # particle 1's own row diverged
     _, again = lines(values, n, ticks, finite)
     assert torch.equal(again[0], slope[0]) and (slope[0, 0] != 0).all() and (again[1] == 0).all()
+
+
+def test_side_lean_is_measured_across_the_feet():
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_costs import side_lean
+    names = list(REAL_LEGS.joint_names)
+    q = torch.zeros(3, len(names))
+    q[0, names.index("base_j_roll")] = 0.3          # a roll, feet pointing along x
+    q[1, names.index("base_j_pitch")] = 0.3         # a bow, feet pointing along x
+    q[2, names.index("base_j_pitch")] = 0.3         # the same bow, feet turned a quarter turn
+    stance = torch.zeros(3, 2, 3)
+    stance[2, :, 2] = torch.pi / 2
+    lean = side_lean(q, stance, REAL_LEGS)
+    torch.testing.assert_close(lean.abs(), torch.tensor([0.3, 0.0, 0.3]).sin(), atol=1e-6, rtol=0)
+
+
+def test_the_rank_counts_whole_units():
+    from cutamp.step_costs import RANK_BASE, plan_rank
+    rank = plan_rank(torch.tensor([0.04, 0.06, 0.06]), torch.tensor([0.011, 0.001, 0.006]))
+    assert rank.tolist() == [2.0, RANK_BASE, RANK_BASE + 1.0]

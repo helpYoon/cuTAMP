@@ -35,7 +35,7 @@ def test_the_new_rows_have_settings():
     assert tol["KinematicConstraint"]["retract_sole_pos_err"] == SOLE_POS_TOL
     assert tol["KinematicConstraint"]["retract_sole_rot_err"] == SOLE_ROT_TOL
     assert tol["StepCommand"]["default"] == 0.0 and tol["StepTests"]["refresh_tests"] == 0.0
-    assert mult["soft"]["stay_near_start"] == 1.0
+    assert "stay_near_start" not in mult["soft"]
     assert {"stepped_scene", "retract_soles"} <= set(FK_SITES)
 
 
@@ -170,7 +170,6 @@ def test_the_cost_reads_the_standin(stepped_call):
     assert {"StepCommand", "StepTests"} <= set(cost)
     assert not set(cost["ComPolygon"]["values"]) & plan.landing_confs
     assert cost["KinematicConstraint"]["values"]["retract_sole_pos_err"].shape[0] == 16
-    assert (cost["soft"]["values"]["stay_near_start"] == 0).all()
     assert torch.equal(cost["StepTests"]["values"]["refresh_tests"] > 0, ~plan.tests_ok)
     stepped_call["reducer"](cost, consider_types=ADAM_CONSIDER_TYPES).sum().backward()
     g = p["step_commands_0"].grad
@@ -192,14 +191,45 @@ def test_the_balance_cost_is_the_shortfall_itself(stepped_call):
 
 
 @needs_cuda
-def test_staying_near_the_start_counts_every_joint(stepped_call):
+def test_the_preferences_in_the_loss(stepped_call):
+    from cutamp.com_polygon_cost import physical_support_centroid
+    from cutamp.stance import UNIT_M, UNIT_RAD
+    from cutamp.step_costs import joint_effort, plan_rank, side_lean
     plan = make_plan(stepped_call)
-    p = plan.particles
-    name = next(iter(plan.start_postures))
+    p, world = plan.particles, plan.world
     with torch.no_grad():
-        p[name][:, 7] += 0.1
-        cost = plan(plan.rollout_fn(p), p)
-    torch.testing.assert_close(cost["soft"]["values"]["stay_near_start"], torch.full((16,), 0.01, device="cuda"), atol=1e-6, rtol=0)
+        rollout = plan.rollout(p)
+        cost = plan(rollout, p)
+        soft = cost["soft"]
+        table = plan.stance_table(p)
+        names = rollout["conf_params"]
+        q = torch.stack([p[name] for name in names], 1)
+        stances = torch.stack([table[name] for name in names], 1)
+        lean = side_lean(q, stances, world.model)
+        distance = (rollout["com_xy"] - physical_support_centroid(stances, world.model.sole_box)).norm(dim=-1)
+        effort = joint_effort(world, q)
+    assert set(soft["values"]) == {"side_lean", "off_centre", "joint_effort"}
+    torch.testing.assert_close(soft["values"]["side_lean"], (lean / UNIT_RAD).square().sum(1).to(soft["values"]["side_lean"]))
+    torch.testing.assert_close(soft["values"]["off_centre"], (distance / UNIT_M).sum(1).to(soft["values"]["off_centre"]))
+    torch.testing.assert_close(soft["values"]["joint_effort"], effort.sum(1).to(soft["values"]["joint_effort"]))
+    torch.testing.assert_close(soft["rank"], plan_rank(lean.abs().asin().amax(1), distance.amax(1)).to(soft["rank"]))
+    torch.testing.assert_close(soft["effort"], effort.amax(1).to(soft["effort"]))
+
+
+@needs_cuda
+def test_joint_effort_has_a_slope(stepped_call):
+    from cutamp.step_costs import joint_effort
+    plan = make_plan(stepped_call)
+    name = plan.groups[0][1].arg("q")
+    q = plan.particles[name].detach()[:2, None].clone().requires_grad_(True)      # [2, 1, dof]
+    (grad,) = torch.autograd.grad(joint_effort(plan.world, q).sum(), q)
+    knee = list(plan.world.model.joint_names).index("Left_Knee_Pitch")
+    step = torch.zeros_like(q)
+    step[..., knee] = 1e-3
+    with torch.no_grad():
+        measured = (joint_effort(plan.world, q + step) - joint_effort(plan.world, q - step)) / 2e-3
+    torch.testing.assert_close(grad[..., knee], measured, rtol=1e-3, atol=1e-5)
+    assert grad.isfinite().all()
 
 
 @needs_cuda
