@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from cutamp import held
@@ -36,6 +37,8 @@ def test_put_back_returns_the_hand_and_the_soles(stepped_call):
     q_feet, jac_feet, _ = held.put_back(plan.world, q0, stance)                           # a retract: soles only
     assert jac_feet.shape == (16, 12, 33)
     assert held.held_rows(plan.world, q_feet, stance)[0][near].abs().amax() < 1e-4
+    with pytest.raises(ValueError):
+        held.held_rows(plan.world, q0, stance, target)
 
 
 @needs_cuda
@@ -49,6 +52,7 @@ def test_the_correction_stays_inside_the_joint_limits(stepped_call):
     q0[:, knee] = upper[:, knee]
     q, jac, capped = held.put_back(plan.world, q0, stance, target, arm)
     assert q.isfinite().all() and (q >= lower).all() and (q <= upper).all() and capped.any()
+    assert torch.equal(q[:, knee], upper[:, knee]) and (jac[:, :, knee] == 0).all()
 
 
 @needs_cuda
@@ -76,3 +80,52 @@ def test_the_kept_gradient_moves_neither_hand_nor_feet(stepped_call):
     g[2, 0] = float("nan")
     kept, mu = held.split_gradient(g, jac)
     assert kept[2].isnan().any() and (mu[2] == 0).all() and kept[3].isfinite().all()
+
+
+def slopes(plan, w, move):
+    """(measured, mu, q0) for the pick: the change of w . q per unit of `move(stance, target, d)`, by put_back."""
+    name, arm, stance, target = pick(plan)
+    q0, jac, _ = held.put_back(plan.world, plan.particles[name].detach().clone(), stance, target, arm)
+    _, mu = held.split_gradient(w.expand(16, -1).contiguous(), jac)
+    d = 1e-3
+    moved_stance, moved_target = move(stance.clone(), target.clone(), d)
+    q1, _, _ = held.put_back(plan.world, q0, moved_stance, moved_target, arm)
+    return ((q1 - q0) @ w) / d, mu, (stance, target)
+
+
+@needs_cuda
+def test_the_soles_share_is_the_slope_along_the_held_surface(stepped_call):
+    plan = make_plan(stepped_call)
+    w = torch.randn(33, generator=torch.Generator().manual_seed(1)).cuda()
+    for foot, k in ((0, 0), (1, 1), (0, 2)):
+        def move(stance, target, d, foot=foot, k=k):
+            stance[:, foot, k] += d
+            return stance, target
+        measured, mu, (stance, _) = slopes(plan, w, move)
+        s = stance.clone().requires_grad_(True)
+        share = torch.autograd.grad(held.stance_share(mu, s), s)[0][:, foot, k]
+        error = (measured - share.to(measured)).abs() / (share.abs().to(measured) + 1e-3 * w.norm())
+        assert error.median() < 0.05
+
+
+@needs_cuda
+def test_the_hands_share_is_the_slope_along_the_held_surface(stepped_call):
+    plan = make_plan(stepped_call)
+    w = torch.randn(33, generator=torch.Generator().manual_seed(2)).cuda()
+    def move(stance, target, d):
+        target[:, 0, 3] += d
+        return stance, target
+    measured, mu, (_, target) = slopes(plan, w, move)
+    t = target.clone().requires_grad_(True)
+    share = torch.autograd.grad(held.target_share(mu, t), t)[0][:, 0, 3]
+    error = (measured - share.to(measured)).abs() / (share.abs().to(measured) + 1e-3 * w.norm())
+    assert error.median() < 0.05
+
+
+def test_a_share_ignores_a_row_that_is_not_a_number():
+    mu = torch.ones(2, 12)
+    stance = torch.zeros(2, 2, 3)
+    stance[1] = float("nan")
+    s = stance.clone().requires_grad_(True)
+    grad = torch.autograd.grad(held.stance_share(mu, s), s)[0]
+    assert (grad[0] != 0).any() and (grad[1] == 0).all()

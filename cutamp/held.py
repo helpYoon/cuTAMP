@@ -5,7 +5,8 @@ one Newton step on the held rows, ``dq = Jᵀ (J Jᵀ + EPS I)⁻¹ r``, taken t
 ``MAX_CORRECTION`` and clamped to the joint limits. Joints sitting on a limit are left where they are in both passes.
 The correction prefers nothing: it does not centre, straighten or relax a posture, it only takes away the held rows'
 residual. After the backward, a posture keeps the part of its gradient that moves neither the hand nor the feet, and
-each held row's multiplier is handed on (:func:`split_gradient`).
+each held row's multiplier is handed on (:func:`split_gradient`): when a goal moves by ``d``, the posture put back on
+it changes the costs by ``mu · d`` (section 4.2), the gradient of :func:`stance_share` and :func:`target_share`.
 """
 
 import torch
@@ -24,7 +25,9 @@ def held_rows(world, q: torch.Tensor, stance: torch.Tensor, target: torch.Tensor
     """``(r [n, m], J [n, m, dof])`` in float64 for the postures ``q`` ``[n, dof]`` on the sole pairs ``stance``
     ``[n, 2, 3]``: goal minus current, world frame, and how it moves with ``q`` (``r`` changes by ``−J dq``). The 12 sole
     rows are left position, left rotation vector, right position, right rotation vector; with ``target`` ``[n, 4, 4]``
-    (the tool frame of ``arm``) the hand's 6 rows come first (``m`` 18)."""
+    (the tool frame of ``arm``) the hand's 6 rows come first (``m`` 18). A ``target`` needs its ``arm``."""
+    if target is not None and arm is None:
+        raise ValueError("a hand target needs its arm")
     kin = world.kinematics_jac
     tools = list(kin.tool_frames)
     q = q.contiguous()
@@ -79,3 +82,25 @@ def split_gradient(grad: torch.Tensor, jac: torch.Tensor) -> tuple[torch.Tensor,
     mu = torch.linalg.solve_ex(jac @ jac.mT + EPS * eye, jac @ g[..., None])[0][..., 0]
     kept = torch.where(fine[:, None], (g - (jac.mT @ mu[..., None])[..., 0]).to(grad), grad)
     return kept, mu
+
+
+def stance_share(mu: torch.Tensor, stance: torch.Tensor) -> torch.Tensor:
+    """A scalar whose gradient is the soles' share for whatever ``stance`` ``[n, 2, 3]`` ((x, y, yaw) per sole)
+    depends on: each sole's x, y and yaw times ``mu`` ``[n, m]`` (:func:`split_gradient`'s, detached) of its position
+    x, position y and rotation about the vertical, the last 12 rows. A row of ``stance`` with anything not finite
+    counts as zero."""
+    soles = mu.detach()[:, -12:].reshape(-1, 2, 6)[..., [0, 1, 5]].to(stance)
+    fine = stance.isfinite().all((1, 2))
+    return (soles * torch.where(fine[:, None, None], stance, 0)).sum()
+
+
+def target_share(mu: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """A scalar whose gradient is the hand's share for whatever ``target`` ``[n, 4, 4]`` depends on: ``mu`` ``[n, 18]``
+    (:func:`split_gradient`'s, detached) of the hand's position rows times the target's position, plus that of its
+    rotation rows times ``θ = ½ vee(R R₀ᵀ − R₀ Rᵀ)``, ``R₀ = R`` detached: ``θ`` is zero, and its derivative is the
+    target's rotation in the world frame, the hand rows' metric."""
+    m = mu.detach()[:, :6].to(target)
+    rot = target[:, :3, :3]
+    a = rot @ rot.detach().mT
+    theta = 0.5 * torch.stack((a[:, 2, 1] - a[:, 1, 2], a[:, 0, 2] - a[:, 2, 0], a[:, 1, 0] - a[:, 0, 1]), -1)
+    return (m[:, :3] * target[:, :3, 3]).sum() + (m[:, 3:] * theta).sum()
