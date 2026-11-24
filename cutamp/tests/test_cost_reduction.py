@@ -72,3 +72,20 @@ def test_get_cost_normal_path_unchanged():
     cost_dict = {"soft": {"type": "cost", "values": {"traj_length": torch.ones(5)}}}
     out = reducer.get_cost(cost_dict, consider_types={"cost"})
     assert torch.equal(out, torch.full((5,), 2.0))
+
+
+def test_a_row_that_carries_its_own_weight_uses_it():
+    reducer = CostReducer({"K": {"a": 5.0}})
+    values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    cost = {"K": {"type": "constraint", "values": {"a": values},
+                  "weights": {"a": torch.tensor([[2.0, 0.0], [1.0, 1.0]])}}}
+    torch.testing.assert_close(reducer(cost), torch.tensor([2.0, 7.0]))
+    cost["K"]["weights"]["a"] = 0.0
+    torch.testing.assert_close(reducer(cost), torch.zeros(2))
+
+
+def test_a_row_without_a_weight_is_reduced_as_today():
+    reducer = CostReducer({"K": {"a": 5.0}})
+    values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    cost = {"K": {"type": "constraint", "values": {"a": values, "b": values}, "weights": {"b": 1.0}}}
+    torch.testing.assert_close(reducer(cost), torch.tensor([15.0 + 3.0, 35.0 + 7.0]))

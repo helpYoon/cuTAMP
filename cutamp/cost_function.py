@@ -63,7 +63,8 @@ class CostFunction:
     The __init__ function precomputes the plan's static placement grouping and retract confs.
     """
 
-    def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration):
+    def __init__(self, plan_skeleton: PlanSkeleton, world: TAMPWorld, config: TAMPConfiguration,
+                 self_collision_scales: bool = False):
         require_fixed_stance(plan_skeleton)
         self.plan_skeleton = plan_skeleton
         self.world = world
@@ -84,6 +85,7 @@ class CostFunction:
             weight=self.world.device_cfg.to_device([1.0]),
             device_cfg=self.world.device_cfg,
             self_collision_kin_config=self.world.kinematics.get_self_collision_config(),
+            use_grad_input=self_collision_scales,
         )
         self.self_collision_cost_fn = SelfCollisionCost(self_collision_config)
         # The retract confs join the joint-limit and self-collision constraints (design 7.3), on a cost of their

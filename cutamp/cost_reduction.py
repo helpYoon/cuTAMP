@@ -51,7 +51,14 @@ class CostReducer:
             if entry["type"] not in consider_types:
                 continue
 
+            weights = entry.get("weights", {})
             for name, values in entry["values"].items():
+                if name in weights:
+                    values = values * weights[name]
+                    if values.ndim == 2:
+                        values = values.sum(dim=1)
+                    cost = values if cost is None else cost + values
+                    continue
                 if values.ndim == 2:
                     values = values.sum(dim=1)  # Sum over time
                 if not include_centering and (cost_type, name) == ("soft", "com_center_distance_squared"):

@@ -296,3 +296,27 @@ def test_the_refresh_tests_do_not_compare_the_landing_with_the_command(stepped_c
     assert not any(k.endswith(("precision", "deadline_xy", "deadline_yaw")) for k in rows)
     phases = prediction.steps[0].phases
     assert torch.equal(passed, phases.deadline_ok & phases.hold_ok & phases.support_ok)
+
+
+@needs_cuda
+def test_self_collision_slope_scales_with_its_weight_only_when_asked(stepped_call):
+    from curobo.types import JointState
+    from cutamp.cost_function import CostFunction
+    from cutamp.gn_refresh import _self_pairs
+    world = stepped_call["world"]
+    plan = make_plan(stepped_call)
+    standing = CostFunction(plan.arm_skeleton, world, stepped_call["config"])
+    i, j, _ = _self_pairs(world.kinematics)
+    spheres = world.kinematics.compute_kinematics(JointState.from_position(world.q_init[None])).robot_spheres
+    spheres = spheres.reshape(1, 1, -1, 4).clone()
+    spheres[0, 0, i[0], :3] = spheres[0, 0, j[0], :3]      # one checked pair, centre on centre
+
+    def slope(cost_fn, scale):
+        s = spheres.clone().requires_grad_(True)
+        cost_fn.self_collision_cost_fn.setup_batch_tensors(1, 1)
+        value = cost_fn.self_collision_cost_fn.forward(s)
+        assert value.sum() > 0
+        return torch.autograd.grad((scale * value).sum(), s)[0].abs().sum()
+
+    assert float(slope(plan.cost_function, 1000.0)) == pytest.approx(1000.0 * float(slope(plan.cost_function, 1.0)), rel=1e-4)
+    assert float(slope(standing, 1000.0)) == pytest.approx(float(slope(standing, 1.0)), rel=1e-6)

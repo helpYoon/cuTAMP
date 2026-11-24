@@ -378,7 +378,7 @@ class SteppedPlan:
                 if u is not None:
                     particles[self.command_names[j]] = u
 
-            self.cost_function = CostFunction(self.arm_skeleton, world, config)
+            self.cost_function = CostFunction(self.arm_skeleton, world, config, self_collision_scales=True)
             self.checker, self._retract_of, resolve = checker, retract_of, 0.0
             ok, head, before = torch.ones(n, dtype=torch.bool, device=like.device), None, self.incoming
             for j, (steps, op) in enumerate(self.groups):
