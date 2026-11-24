@@ -16,7 +16,7 @@ from cutamp.landing_predictor import (
     _wrap,
     prediction_precision,
 )
-from cutamp.stance import STEP_TRAVEL, STEP_X_MAX, STEP_Y_RANGE, STEP_YAW_RANGE, abs_pose, rel_pose
+from cutamp.stance import STEP_TRAVEL, STEP_X_MAX, STEP_Y_RANGE, STEP_YAW_RANGE, UNIT_M, abs_pose, rel_pose
 from cutamp.step_bound import planner_step_bound, travel, wrap
 from cutamp.step_validation import _obb_gap
 
@@ -349,9 +349,9 @@ def command_rows(orders, incoming: Tensor, commands: list[Tensor | None], after_
             foot_left = torch.full((len(c),), side == 0, device=c.device)
             t = travel(rel_pose(before[:, 1 - side], before[:, side]), c)
             achieved = landed[:, k]
-            rows[name + "min_travel"] = (STEP_TRAVEL[0] - t) / STEP_TRAVEL[0]
-            rows[name + "max_travel"] = t / STEP_TRAVEL[1] - 1
-            rows[name + "command_bound"] = bounds.g(c, foot_left) / 0.02
-            rows[name + "achieved_bound"] = bounds.g(rel_pose(achieved[:, 1 - side], achieved[:, side]), foot_left) / 0.02
+            rows[name + "min_travel"] = (STEP_TRAVEL[0] - t) / UNIT_M
+            rows[name + "max_travel"] = (t - STEP_TRAVEL[1]) / UNIT_M
+            rows[name + "command_bound"] = bounds.g(c, foot_left) / UNIT_M
+            rows[name + "achieved_bound"] = bounds.g(rel_pose(achieved[:, 1 - side], achieved[:, side]), foot_left) / UNIT_M
             before = achieved
     return {key: value.clamp_min(0) for key, value in rows.items()}

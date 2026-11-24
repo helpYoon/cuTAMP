@@ -89,7 +89,7 @@ def stepped_call():
 
 def make_plan(c, **kw):
     return SteppedPlan(c["proposal"], c["world"], c["config"], c["predictor"], c["inputs"], c["pools"], c["checker"],
-                       generator=torch.Generator(device="cuda").manual_seed(0), **kw)
+                       reducer=c["reducer"], generator=torch.Generator(device="cuda").manual_seed(0), **kw)
 
 
 @needs_cuda
@@ -410,3 +410,20 @@ def test_the_hand_and_feet_rows_leave_the_loss(stepped_call):
             row += 1.0
     assert set(cost["KinematicConstraint"]["weights"]) == set(cost["KinematicConstraint"]["values"])
     torch.testing.assert_close(stepped_call["reducer"](cost), before)
+
+
+@needs_cuda
+def test_the_loss_weighs_each_requirement_per_particle(stepped_call):
+    from cutamp.stance import UNIT_M
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    with torch.no_grad():
+        cost = plan(plan.rollout(p), p)
+    weights = cost["ComComfort"]["weights"]["margin_shortfall"]
+    assert weights.shape == cost["ComComfort"]["values"]["margin_shortfall"].shape and (weights == 1 / UNIT_M).all()
+    assert all((w == 0).all() for w in cost["KinematicConstraint"]["weights"].values())
+    short = cost["ComComfort"]["values"]["margin_shortfall"] > 0
+    plan.refresh(p)
+    with torch.no_grad():
+        again = plan(plan.rollout(p), p)["ComComfort"]["weights"]["margin_shortfall"]
+    assert torch.equal(again > 1 / UNIT_M, short)

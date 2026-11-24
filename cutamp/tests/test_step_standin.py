@@ -78,6 +78,10 @@ def test_rows_rise_outside_the_set_and_have_a_slope():
     far = torch.tensor([[[0.50, 0.60, 0.0]]])  # 0.64 m from where the foot stands, against 0.60 m
     after, _ = as_commanded(("L",), inc, [far])
     assert command_rows(("L",), inc, [far], after)["gap0_step1_max_travel"].item() > 0
+    from cutamp.stance import STEP_TRAVEL, UNIT_M, rel_pose
+    from cutamp.step_bound import travel
+    t = travel(rel_pose(inc[:, 1], inc[:, 0]), far[:, 0])
+    torch.testing.assert_close(command_rows(("L",), inc, [far], after)["gap0_step1_max_travel"], (t - STEP_TRAVEL[1]) / UNIT_M)
 
 
 @needs_cuda

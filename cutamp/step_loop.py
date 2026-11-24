@@ -21,8 +21,9 @@ from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_pla
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.rollout import Rollout, RolloutFunction
 from cutamp.samplers import project_supported_placement
-from cutamp.stance import STEP_TRAVEL, abs_pose, rel_pose, stance_joint_limits
+from cutamp.stance import STEP_TRAVEL, UNIT_M, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
+from cutamp.step_costs import RequirementWeights
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refresh import NoStartingPath, StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
@@ -228,9 +229,9 @@ def landing_constraint_rows(predictor, incoming, order, u, pred):
         foot = torch.full((len(c),), s == 0, device=c.device)
         start = rel_pose(before[:, 1 - s], before[:, s])
         t = travel(start, c)
-        rows[prefix + "min_travel"] = (STEP_TRAVEL[0] - t) / STEP_TRAVEL[0]
-        rows[prefix + "max_travel"] = t / STEP_TRAVEL[1] - 1
-        rows[prefix + "command_bound"] = bounds.g(c, foot) / 0.02
+        rows[prefix + "min_travel"] = (STEP_TRAVEL[0] - t) / UNIT_M
+        rows[prefix + "max_travel"] = (t - STEP_TRAVEL[1]) / UNIT_M
+        rows[prefix + "command_bound"] = bounds.g(c, foot) / UNIT_M
         dest = abs_pose(before[:, 1 - s], c)
         pair = torch.stack((dest, before[:, 1]) if s == 0 else (before[:, 0], dest), dim=1)
         if pred is not None:
@@ -251,7 +252,7 @@ def landing_constraint_rows(predictor, incoming, order, u, pred):
             rows[prefix + "terminal_sole_tilt"] = step.sole_tilt[:, -1] / 0.10 - 1
             hard = hard & ph.deadline_ok & ph.hold_ok & ph.support_ok
         actual = rel_pose(pair[:, 1 - s], pair[:, s])
-        rows[prefix + "achieved_bound"] = bounds.g(actual, foot) / 0.02
+        rows[prefix + "achieved_bound"] = bounds.g(actual, foot) / UNIT_M
         before = pair
     return rows, hard, before
 
@@ -311,7 +312,7 @@ class SteppedPlan:
     design 4.7). The starting pass is the first refresh, with one solve per posture.
     """
 
-    def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, deadline=None, generator=None):
+    def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, reducer, deadline=None, generator=None):
         began = monotonic()
         self.world, self.config, self.predictor, self.pools = world, config, predictor, pools
         self.skeleton = list(proposal.skeleton)
@@ -325,6 +326,7 @@ class SteppedPlan:
         empty = [None] * len(self.groups)
         self.standin = StandIn(self.orders, list(empty), list(empty), list(empty))
         self.last, self.motion_inputs, self.references, self.start_postures = {}, {}, {}, {}
+        self.weights = RequirementWeights(reducer, checker)
         self.stats = {"refresh_s": [], "standin_error_m": [], "command_move_m": [], "correction_capped": []}
         # Each held posture's J from its last put-back, and the rows the correction capped since the last refresh.
         self.held_jac, self.capped = {}, 0
@@ -517,6 +519,7 @@ class SteppedPlan:
             self.stats["correction_capped"].append(int(self.capped))
             self.capped = 0
         self.stats["refresh_s"].append(monotonic() - began)
+        self.weights.grow()
 
     def _commands(self, particles):
         return [particles[self.command_names[j]] if j in self.command_names else None for j in range(len(self.groups))]
@@ -638,8 +641,9 @@ class SteppedPlan:
     def __call__(self, rollout, particles: dict) -> dict:
         """The cost the Adam loop reads (design 5): today's cost on the stand-in's stances, the balance cost as the
         shortfall itself, the retracts' feet, the commands' rows, the last refresh's tests (read by the checker only)
-        and staying near the starting postures. The hand and feet rows weigh zero: they are held, not costs
-        (2026-11-23 design 4.1), and the checker still reads them."""
+        and staying near the starting postures. Every requirement row carries its weight per particle
+        (:class:`RequirementWeights`, 2026-11-23 design 4.3); the hand and feet rows weigh zero: they are held, not
+        costs (design 4.1), and the checker still reads them."""
         table, after = self._stances(particles)
         inner = {key: value for key, value in particles.items() if key not in self.landing_confs}
         cost = self.cost_function(rollout, inner, achieved_stances=table)
@@ -649,12 +653,12 @@ class SteppedPlan:
         cost[ComComfort.type] = {"type": "constraint", "values": {"margin_shortfall": shortfall}}
         kinematic = cost[KinematicConstraint.type]
         kinematic["values"].update(self._retract_sole_errors(particles, table))
-        kinematic["weights"] = {name: 0.0 for name in kinematic["values"]}
         rows = command_rows(self.orders, self.incoming, self._commands(particles), after)
         cost["StepCommand"] = {"type": "constraint", "values": rows}
         cost["StepTests"] = {"type": "constraint", "values": {"refresh_tests": (~self.tests_ok).to(margin.dtype)}}
         stay = sum((particles[name] - start).square().sum(-1) for name, start in self.start_postures.items())
         cost.setdefault("soft", {"type": "cost", "values": {}})["values"]["stay_near_start"] = stay
+        self.weights.apply(cost)
         return cost
 
     def _endpoints(self, masks, n):
@@ -793,7 +797,8 @@ def refine_stepped_plan(proposal, world, config, cost_reducer, constraint_checke
     except ValueError as e:
         return StepResult([], None, "unresolved", str(e))
     try:
-        plan = SteppedPlan(proposal, world, config, predictor, inputs, pools, constraint_checker, deadline=deadline)
+        plan = SteppedPlan(proposal, world, config, predictor, inputs, pools, constraint_checker,
+                           reducer=cost_reducer, deadline=deadline)
     except TimeoutError as e:
         return StepResult([], None, "budget_exhausted", str(e))
     except NoStartingPath as e:

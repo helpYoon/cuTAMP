@@ -11,6 +11,8 @@ STEP_Y_RANGE = (0.14, 0.48)  # m
 STEP_YAW_RANGE = (math.radians(-20.0), math.radians(50.0))  # rad, toes out positive
 STEP_SOLE_GAP = 0.02  # m between the two sole rectangles
 STEP_TRAVEL = (0.05, 0.60)  # m
+UNIT_M = 0.005  # m; the planner's position tolerance (default_constraint_to_tol pos_err): one unit of a length row
+UNIT_RAD = 0.05  # rad; the planner's rotation tolerance (default_constraint_to_tol rot_err): one unit of an angle row
 STEP_KIN_MARGIN = 0.03  # m; measured: the kinematic grid's error (design 5.5)
 STEP_LIFT = 0.025  # m; placeholder: the study's tested height of the swung sole in the lifted set
 
