@@ -31,6 +31,9 @@ class FakeSteps:
     def refresh(self, particles):
         self.refreshes += 1
 
+    def step(self, optimizer, params, particles):
+        return _finite_step(optimizer, params)
+
 
 @needs_cuda
 def test_the_loop_refreshes_judges_and_keeps_every_posture(real_world, real_plan, monkeypatch):

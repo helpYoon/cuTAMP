@@ -30,7 +30,7 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.gn_refresh import gn_gate, gn_project_balanced
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
-from cutamp.rollout import RolloutFunction, movable_spheres_fn
+from cutamp.rollout import RolloutFunction, get_conf_to_arm, movable_spheres_fn
 from cutamp.t1_domain import Conf, Pose
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
@@ -573,7 +573,7 @@ class ParticleOptimizer:
         # Re-IK-coupled Adam: build the IK dependency map and drop covered
         # Confs from the optimizer (they're refreshed by IK every K steps
         # instead of trained by gradient descent).
-        world = rollout_fn.world
+        world = cost_fn.world  # a stepped plan's rollout is a method of the plan (SteppedPlan.rollout), without a world
         # A stepped plan hands no posture to the re-solve: Adam moves every one (design 4).
         ik_deps: List[IKDep] = _build_ik_deps(plan_skeleton, world) if steps is None else []
         dropped_conf_names = {dep.q_name for dep in ik_deps}
@@ -756,7 +756,7 @@ class ParticleOptimizer:
 
                 # The body already ran the backward and the grad masks.
                 if steps is not None:
-                    _finite_step(optimizer, body.params)
+                    steps.step(optimizer, body.params, particles)
                 else:
                     optimizer.step()
                 # Counts from 1 so the first refresh lands at step K-1 (after
@@ -853,7 +853,7 @@ class ParticleOptimizer:
 
         # Log initial state
         timer.start("visualize_rollout")
-        world = rollout_fn.world
+        conf_to_arm = get_conf_to_arm(plan_skeleton)
         # The robot's conf in the model's cspace, and each hand's gripper state on the rerun robot (when one is
         # shown): a pick conf's hand closed, a place conf's open, the other hand as it was; both open at the start.
         rr_robot = getattr(visualizer, "robot", None)
@@ -872,7 +872,7 @@ class ParticleOptimizer:
 
         for ts in range(len(rollout["conf_params"])):
             visualizer.set_time_sequence(f"rollout_{self.opt_counter}", ts + 1)
-            arm = rollout_fn.conf_to_arm.get(rollout["conf_params"][ts])
+            arm = conf_to_arm.get(rollout["conf_params"][ts])
             if arm is not None:
                 grippers[arm] = GRIPPER_CLOSED if rollout["gripper_close"][ts] else GRIPPER_OPEN
             show(rollout["confs"][best_idx, ts])

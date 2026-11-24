@@ -129,3 +129,11 @@ def test_a_share_ignores_a_row_that_is_not_a_number():
     s = stance.clone().requires_grad_(True)
     grad = torch.autograd.grad(held.stance_share(mu, s), s)[0]
     assert (grad[0] != 0).any() and (grad[1] == 0).all()
+    target = torch.eye(4).repeat(2, 1, 1)
+    target[1] = float("nan")
+    t = target.clone().requires_grad_(True)
+    share = held.target_share(torch.ones(2, 18), t)
+    grad = torch.autograd.grad(share, t)[0]
+    assert share.isfinite() and (grad[0] != 0).any() and (grad[1] == 0).all()
+    with pytest.raises(ValueError):
+        held.target_share(torch.ones(2, 12), target)                    # a retract's soles are not hand rows

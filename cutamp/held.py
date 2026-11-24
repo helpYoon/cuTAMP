@@ -98,8 +98,12 @@ def target_share(mu: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """A scalar whose gradient is the hand's share for whatever ``target`` ``[n, 4, 4]`` depends on: ``mu`` ``[n, 18]``
     (:func:`split_gradient`'s, detached) of the hand's position rows times the target's position, plus that of its
     rotation rows times ``θ = ½ vee(R R₀ᵀ − R₀ Rᵀ)``, ``R₀ = R`` detached: ``θ`` is zero, and its derivative is the
-    target's rotation in the world frame, the hand rows' metric."""
+    target's rotation in the world frame, the hand rows' metric. A row of ``target`` with anything not finite counts as
+    zero. Raises ValueError unless ``mu`` has the 18 rows of a pick or place."""
+    if mu.shape[1] != 18:
+        raise ValueError(f"a hand's share needs the 18 held rows of a pick or place; got {mu.shape[1]}")
     m = mu.detach()[:, :6].to(target)
+    target = torch.where(target.isfinite().all((1, 2))[:, None, None], target, 0)
     rot = target[:, :3, :3]
     a = rot @ rot.detach().mT
     theta = 0.5 * torch.stack((a[:, 2, 1] - a[:, 1, 2], a[:, 0, 2] - a[:, 2, 0], a[:, 1, 0] - a[:, 0, 1]), -1)

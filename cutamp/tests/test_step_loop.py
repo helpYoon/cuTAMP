@@ -126,7 +126,6 @@ def test_a_refresh_follows_the_commands(stepped_call):
     assert p[land] is kept and not torch.equal(p[land], before)
     assert torch.equal(plan.standin.at[0], p["step_commands_0"])
     assert len(plan.stats["refresh_s"]) == len(plan.stats["standin_error_m"]) == 2  # the first refresh, then this one
-    assert len(plan.stats["resolve_s"]) == 2
 
 
 @needs_cuda
@@ -265,7 +264,7 @@ def test_an_unresolved_result_counts_the_particles_each_requirement_fails(steppe
 
 @needs_cuda
 def test_a_refresh_puts_drifted_postures_back_on_the_landing(stepped_call):
-    """Adam slid each posture's base 3 cm (as measured in the loop); the refresh's re-solve puts feet and hand back."""
+    """Adam slid each posture's base 3 cm (as measured in the loop); the refresh puts feet and hand back."""
     plan = make_plan(stepped_call)
     p = plan.particles
     names = list(plan.start_postures)
@@ -283,7 +282,6 @@ def test_a_refresh_puts_drifted_postures_back_on_the_landing(stepped_call):
     assert values["sole_pos_err"].median() <= SOLE_POS_TOL
     assert values["retract_sole_pos_err"].median() <= SOLE_POS_TOL
     assert values["pos_err"].median() <= 0.005
-    assert len(plan.stats["resolve_s"]) == len(plan.stats["refresh_s"]) == 2
 
 
 @needs_cuda
@@ -320,3 +318,89 @@ def test_self_collision_slope_scales_with_its_weight_only_when_asked(stepped_cal
 
     assert float(slope(plan.cost_function, 1000.0)) == pytest.approx(1000.0 * float(slope(plan.cost_function, 1.0)), rel=1e-4)
     assert float(slope(standing, 1000.0)) == pytest.approx(float(slope(standing, 1.0)), rel=1e-6)
+
+
+@needs_cuda
+def test_a_refresh_puts_postures_back_and_solves_none(stepped_call, monkeypatch):
+    plan = make_plan(stepped_call)
+    p, calls = plan.particles, []
+    monkeypatch.setattr(plan, "_solve_postures", lambda *a, **k: pytest.fail("a refresh solved a posture"))
+    run_gap, put_back = plan._run_gap, plan.put_back
+    monkeypatch.setattr(plan, "_run_gap", lambda j, *a: (calls.append(("gap", j)), run_gap(j, *a))[1])
+    monkeypatch.setattr(plan, "put_back", lambda q, gaps=None: (calls.append(("back", tuple(gaps))), put_back(q, gaps))[1])
+    with torch.no_grad():
+        p["step_commands_0"][..., 0] += 0.005
+    plan.refresh(p)
+    assert calls == [("gap", 0), ("back", (0,)), ("back", (1,))]       # each gap's postures before the next gap
+    assert "resolve_s" not in plan.stats and plan.stats["correction_capped"][-1] >= 0
+
+
+@needs_cuda
+def test_the_postures_follow_the_feet(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    with torch.no_grad():
+        start = plan(plan.rollout_fn(p), p)["KinematicConstraint"]["values"]
+        reach = (start["pos_err"].amax(1) < 5e-3) & (start["sole_pos_err"].amax(1) < 5e-3)
+        p["step_commands_0"][..., 1] += 0.005                           # every stance moves 5 mm
+        moved = plan(plan.rollout(p), p)["KinematicConstraint"]["values"]
+    assert reach.sum() >= 8
+    for row in ("pos_err", "sole_pos_err", "retract_sole_pos_err"):
+        assert moved[row][reach].amax() < 1e-3
+    assert set(plan.held_jac) == set(plan.gap_of)
+
+
+@needs_cuda
+def test_every_posture_on_a_stance_hands_on_its_share(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    for name in ("step_commands_0", *plan.gap_of):
+        p[name].requires_grad_()
+    plan.rollout(p)
+    u = p["step_commands_0"]
+    shares = []
+    for only in (None, *plan.gap_of):                                   # every posture, then one at a time
+        u.grad = torch.zeros_like(u)
+        for name in plan.gap_of:
+            p[name].grad = torch.ones_like(p[name]) if only in (None, name) else torch.zeros_like(p[name])
+        plan.hand_on(p)
+        shares.append(u.grad.clone())
+        if only is None:
+            for name in plan.gap_of:
+                assert (plan.held_jac[name] @ p[name].grad.double()[..., None]).abs().amax() < 1e-4
+    torch.testing.assert_close(shares[0], sum(shares[1:]), atol=1e-5, rtol=1e-4)
+    assert all(s.isfinite().all() and s.abs().sum() > 0 for s in shares[1:])   # the place has no step of its own
+
+
+@needs_cuda
+def test_a_placement_stays_on_its_support(stepped_call):
+    from torch.optim import Adam
+    from cutamp.samplers import project_supported_placement
+    plan = make_plan(stepped_call)
+    p, world = plan.particles, plan.world
+    op = plan.groups[1][1]
+    key = op.arg("placement")
+    for name in (key, "step_commands_0", *plan.gap_of):
+        p[name].requires_grad_()
+    plan.rollout(p)
+    for name in (key, "step_commands_0", *plan.gap_of):
+        p[name].grad = torch.zeros_like(p[name])
+    p[key].grad[:, 2] = 1.0                                             # pushed down, off its support
+    params = [p[name] for name in (key, "step_commands_0", *plan.gap_of)]
+    plan.step(Adam(params, lr=0.05), params, p)
+    on = project_supported_placement(p[key].detach(), world.get_collision_spheres(op.arg("obj")),
+                                     world.get_aabb(op.arg("surface")))
+    torch.testing.assert_close(p[key].detach(), on)
+
+
+@needs_cuda
+def test_the_hand_and_feet_rows_leave_the_loss(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    with torch.no_grad():
+        cost = plan(plan.rollout(p), p)
+        before = stepped_call["reducer"](cost)
+        for row in cost["KinematicConstraint"]["values"].values():
+            row += 1.0
+    assert set(cost["KinematicConstraint"]["weights"]) == set(cost["KinematicConstraint"]["values"])
+    torch.testing.assert_close(stepped_call["reducer"](cost), before)
