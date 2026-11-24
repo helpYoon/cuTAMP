@@ -82,6 +82,37 @@ def test_patience_extends_only_for_better_feasible_center():
     assert not snap.should_stop(6, 0, archive)
 
 
+def test_for_a_stepped_plan_only_a_better_plan_restarts_the_countdown():
+    from cutamp.optimize_plan import _FeasibleArchive
+
+    p = _particles(0.)
+    snap = _BestSnapshot()
+    feasible = torch.tensor([False, False, False, False])
+    center = torch.tensor([.09, .03, .02, .01])
+    effort = torch.zeros(4)
+    archive = _FeasibleArchive(p, center, effort)
+
+    def stop(step, patience=2):
+        return snap.should_stop(step, patience, archive, by_rank=True)
+
+    archive.observe(p, feasible, center, effort)       # no valid plan yet: the count and loss clock decides
+    snap.update(0, 0, 10., p)
+    assert not stop(2) and stop(3)
+    feasible[0] = True                                  # the first valid plan starts the clock at its own step
+    archive.observe(p, feasible, center, effort)
+    snap.update(4, 1, 10., p)
+    assert not stop(4)
+    snap.update(5, 1 + _BestSnapshot.MIN_DELTA, 10. - 2 * _BestSnapshot.MIN_LOSS_DELTA, p)
+    assert snap.last_improve_step == 5                  # a count jump and a loss drop no longer restart it
+    assert not stop(6) and stop(7)
+    center[0] = .05                                     # a better valid plan does, from its step
+    archive.observe(p, feasible, center, effort)
+    assert not stop(8) and not stop(10) and stop(11)
+    center[1] = 0.                                      # an invalid row getting better does not
+    archive.observe(p, feasible, center, effort)
+    assert stop(12) and not stop(12, patience=0)
+
+
 def test_preserve_best_feasible_center_for_each_particle():
     from cutamp.optimize_plan import _FeasibleArchive
 

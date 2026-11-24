@@ -226,7 +226,8 @@ graph LR
    with no cuRobo during Adam and the Adam step and refresh replayed as CUDA
    graphs (`cuda_graphs.py`).
    Adam stops after `early_stop_patience` steps without progress and keeps the
-   best-seen particles. `ConstraintChecker` decides which particles satisfy.
+   best-seen particles. For a plan with steps, once a particle is valid only a
+   better valid plan restarts the countdown. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
    up to `motion_plan_max_retries` satisfying particles, first success wins,
    in `get_top_satisfying_particles`' order: the worst pick or place CoM

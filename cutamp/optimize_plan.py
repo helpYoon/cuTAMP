@@ -251,7 +251,10 @@ class _BestSnapshot:
     count; reset the early-stop patience clock only on *meaningful* progress:
     a count record beating the previous by ``MIN_DELTA``, or the best
     particle's total loss dropping by ``MIN_LOSS_DELTA`` (proxy for ongoing
-    pose-class soft-cost descent).
+    pose-class soft-cost descent). For a plan with steps (``by_rank``), once the
+    archive holds a valid plan only a better-centred valid plan resets the
+    clock: the returned plan is the best-centred one, so neither the count nor
+    the loss changes it.
     """
 
     # ponytail: constants calibrated on one blocks_t1 trace (max record gap 35,
@@ -267,6 +270,8 @@ class _BestSnapshot:
         self._patience_sat = -1
         self._best_min_loss = float("inf")
         self._last_checked_center = float("inf")
+        self._best_center = float("inf")
+        self._center_step = None  # the step of the last better-centred valid plan; None until one exists
 
     def update(self, step: int, num_satisfying: int, min_loss: float, particles: dict):
         if num_satisfying > self.best_sat:
@@ -283,9 +288,18 @@ class _BestSnapshot:
         if meaningful or loss_improved:
             self.last_improve_step = step
 
-    def should_stop(self, step: int, patience: int, archive: _FeasibleArchive | None = None) -> bool:
+    def should_stop(
+        self, step: int, patience: int, archive: _FeasibleArchive | None = None, by_rank: bool = False
+    ) -> bool:
         if patience <= 0:
             return False
+        if by_rank and archive is not None:
+            best_center = float(archive.center.min())  # inf while no particle has been valid
+            if best_center < self._best_center:
+                self._best_center, self._center_step = best_center, step
+            if self._center_step is not None:
+                return step - self._center_step > patience
+            return step - self.last_improve_step > patience
         expired = step - self.last_improve_step > patience
         if archive is not None and (step == 0 or expired):
             # Check the GPU archive only at the initial step and at a potential stop.
@@ -716,11 +730,19 @@ class ParticleOptimizer:
                 # pre-step, so the clone is consistent with num_satisfying.
                 if body.judge:
                     best_snapshot.update(step, num_satisfying, min_cost, particles)
-                if body.judge and best_snapshot.should_stop(step, self.config.early_stop_patience, archive):
+                if body.judge and best_snapshot.should_stop(
+                    step, self.config.early_stop_patience, archive, by_rank=steps is not None
+                ):
+                    centring = ""
+                    if steps is not None and best_snapshot._center_step is not None:
+                        centring = (
+                            f"; best centring {best_snapshot._best_center * 1e3:.2f} mm "
+                            f"at step {best_snapshot._center_step}"
+                        )
                     _log.info(
                         f"Early stop at step {step}: no meaningful progress for "
                         f"{self.config.early_stop_patience} steps (best "
-                        f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step})"
+                        f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step}{centring})"
                     )
                     opt_metrics["early_stopped_at"] = step
                     # Close it: the next skeleton reuses this timer.
