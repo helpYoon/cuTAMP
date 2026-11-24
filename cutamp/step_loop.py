@@ -809,7 +809,8 @@ class SteppedPlan:
             costs = self(rollout, particles)
             masks = checker.get_full_mask(costs)
             passed = checker.get_mask(costs, verbose=False)
-            soft, effort, hard = reducer.soft_costs(costs), reducer.secondary_effort(costs), reducer(costs)
+            soft, effort = reducer.soft_costs(costs), reducer.secondary_effort(costs)
+            at_start = costs["soft"]["cost_at_start_weights"]  # the weights grow; reported at their start
             ep = self._endpoints(masks, n)
             table = self.stance_table(particles)
             stances = torch.stack([table[name] for name in rollout["conf_params"]], 1)
@@ -839,7 +840,7 @@ class SteppedPlan:
                 joint_efforts=efforts[i].tolist(),
                 joint_effort=float(worst_effort[i]),
                 rank=float(rank[i]),
-                cost=float(hard[i]),
+                cost=float(at_start[i]),
                 largest_arm_joint_move_rad=float(move[i]),
                 gaps=self._gap_records(particles, i),
                 model_feasible=True,
@@ -858,7 +859,7 @@ class SteppedPlan:
             rows.append(StepRow(i, particle, float(soft[i]), report, evidence=_evidence(adapter, saved)))
         if rows:
             return StepResult(rows, ep, "model_feasible")
-        best = int((ep.sum(1) * -1e6 + hard.nan_to_num(1e6)).argmin())
+        best = int((ep.sum(1) * -1e6 + at_start.nan_to_num(1e6)).argmin())
         failures = [f"{kind}.{key}" for kind, items in masks.items() for key, mask in items.items()
                     if not mask[best].all()]
         # How many particles fail each requirement, the requirements every particle meets left out.

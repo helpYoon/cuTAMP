@@ -24,11 +24,7 @@ from cutamp.com_polygon_cost import COM_TOL, SOLE_POS_TOL, SOLE_ROT_TOL
 
 default_constraint_to_mult = {
     # sole_*: the soles against the stance at every conf (design 7.4), weighted as the hand is.
-    # retract_sole_*: a stepped plan's retract confs against their landed stance, weighted as the sole_* rows.
-    KinematicConstraint.type: {
-        "pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0,
-        "retract_sole_pos_err": 1.0, "retract_sole_rot_err": 5.0,
-    },
+    KinematicConstraint.type: {"pos_err": 1.0, "rot_err": 5.0, "sole_pos_err": 1.0, "sole_rot_err": 5.0},
     StablePlacement.type: {"*_support": 2.0},
     TrajectoryLength.type: {"traj_length": 1e-3},
     # ComPolygon penalty values are O(1e-4 to 1e-3) in m²; multiplier 10
@@ -36,10 +32,8 @@ default_constraint_to_mult = {
     # pos_err (mult 1.0 × value O(1e-2)). "default" applies to every
     # per-conf name — relies on CostReducer's (type, "default") fallback.
     ComPolygon.type: {"default": 10.0},
-    # margin_shortfall: a stepped plan's balance row, the shortfall itself (its square never reaches the zero
-    # tolerance; design 2026-11-22-adam-alone-steps, call 4).
-    ComComfort.type: {"margin_shortfall_squared": 10.0, "margin_shortfall": 10.0},
-    # A stepped plan's commands: the travel range, step bound and landing accuracy rows (step_refresh.command_rows).
+    ComComfort.type: {"margin_shortfall_squared": 10.0},
+    # A stepped plan's commands: the travel range and step bound rows (step_refresh.command_rows).
     "StepCommand": {"default": 1.0},
     # The pass-or-fail tests read from the world model's rollout at each refresh (call 12): read by the checker,
     # nothing added to the loss.

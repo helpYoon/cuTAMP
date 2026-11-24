@@ -72,9 +72,10 @@ class TAMPConfiguration:
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = True
-    # On RuntimeError from solve_curobo, retry on the next satisfying particle in get_top_satisfying_particles' order
-    # (_validate_motion_rows' when stepped): worst CoM centre distance, then effort; round the grasp groups with
-    # com_center_weight 0. Up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
+    # On RuntimeError from solve_curobo, retry on the next satisfying particle in get_top_satisfying_particles' order:
+    # worst CoM centre distance, then effort; a stepped plan's rows in _validate_motion_rows' order: the rank (whole
+    # units of side lean, then of centring), then joint effort; round the grasp groups with com_center_weight 0 (both
+    # routes). Up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
     # failures that look feasible but never converge — see motion_solver retry helper.
     # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first plans on its 6th candidate.
     # It also sets how many grasps each pick chooses at init (choose_grasps, G5).

@@ -134,7 +134,8 @@ def _finite_step(optimizer: Adam, params: List[torch.Tensor]) -> torch.Tensor:
 
 
 class _FeasibleArchive:
-    """Keep each particle's best complete feasible state across fixed-stance Adam proposals."""
+    """Keep each particle's best complete feasible state across fixed-stance Adam proposals. For a stepped plan
+    ``center`` holds the rank and ``effort`` the worst joint effort (2026-11-23 design 4.5)."""
 
     def __init__(self, particles, center, effort):
         self.center = torch.full_like(center, float("inf"))
@@ -177,17 +178,24 @@ def _quality(cost_dict, reducer) -> tuple[torch.Tensor | None, torch.Tensor | No
 
 
 def _fixed_row_quality(info, cost_dict, total_cost, soft_cost, reducer):
-    """Scores of the same final rows for particle selection and later motion retries."""
+    """Scores of the same final rows for particle selection and later motion retries; where the cost publishes a
+    stepped plan's rank, also the rank and the worst joint effort (2026-11-23 design 4.5), which choose the row."""
     quality = {"best_cost": total_cost, "best_soft_cost": soft_cost}
     center = cost_dict.get("soft", {}).get("max_center_distance_m")
     if center is not None:
         quality.update(max_center_distance_m=center, secondary_effort=reducer.secondary_effort(cost_dict))
+    if "rank" in cost_dict.get("soft", {}):
+        quality.update(rank=cost_dict["soft"]["rank"], joint_effort=cost_dict["soft"]["effort"])
     info["row_quality"] = quality
     return quality
 
 
 def _best_fixed_row(quality, passing):
-    if "max_center_distance_m" in quality:
+    if "rank" in quality:
+        rank = quality["rank"].masked_fill(~passing, float("inf"))
+        passing = passing & (rank == rank.min())
+        score = quality["joint_effort"]
+    elif "max_center_distance_m" in quality:
         center = quality["max_center_distance_m"].masked_fill(~passing, float("inf"))
         passing = passing & (center == center.min())
         score = quality["secondary_effort"]
@@ -532,7 +540,10 @@ class ParticleOptimizer:
         # Visualize satisfying particles if we have any. Otherwise, just show the best particle so far.
         if num_satisfying > 0:
             center = cost_dict.get("soft", {}).get("max_center_distance_m")
-            if center is None:
+            if "rank" in cost_dict.get("soft", {}):  # a stepped plan: best-ranked, then lowest joint effort
+                best_idx = _best_fixed_row({"rank": cost_dict["soft"]["rank"],
+                                            "joint_effort": cost_dict["soft"]["effort"]}, satisfying_mask)
+            elif center is None:
                 best_idx = indices[satisfying_mask][costs[satisfying_mask].argmin()]
             else:
                 best_idx = _best_fixed_row({"max_center_distance_m": center,
@@ -799,15 +810,9 @@ class ParticleOptimizer:
         # Restore the best-seen state if the loop ended on a dip of the
         # post-convergence oscillation (final state is otherwise a lottery).
         if steps is not None:
-            # The current state was last judged on a stand-in, so every archived state goes back; without an archive
-            # the snapshot is weighed against the last judged step, every reik_interval-th from 0 (call 11).
-            if archive is None:
-                counts, k = opt_metrics["num_satisfying"], self.config.reik_interval
-                last_judged = counts[(len(counts) - 1) // k * k] if counts else 0
-                restored = best_snapshot.restore_if_better(particles, last_judged)
-            else:
-                unjudged = torch.zeros_like(archive.center, dtype=torch.bool)
-                restored = archive.restore(particles, unjudged, archive.center, archive.effort)
+            # The current state was last judged on a stand-in, so every archived state goes back (call 11).
+            unjudged = torch.zeros_like(archive.center, dtype=torch.bool)
+            restored = archive.restore(particles, unjudged, archive.center, archive.effort)
             steps.refresh(particles)  # the last refresh: the final check below reads the world model's values
         elif archive is None:
             restored = best_snapshot.restore_if_better(

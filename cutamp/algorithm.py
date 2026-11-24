@@ -667,7 +667,10 @@ def _run_step_planner(env, config, reducer, checker, q_init, experiment_id, inpu
         if not accepted:
             if result.rows:
                 # Keep evidence for a feasible model prediction whose subsequent motion was unavailable.
-                best_model = min(result.rows, key=lambda row: plan_key(row, proposal.step_count))
+                if proposal.step_count and center_first:  # picked as the accepted rows are, below
+                    best_model = min(result.rows, key=lambda row: row.order)
+                else:
+                    best_model = min(result.rows, key=lambda row: plan_key(row, proposal.step_count))
                 attempt["particle_candidate"] = dict(
                     best_model.metrics, row_index=best_model.index, soft_cost=best_model.soft_cost
                 )

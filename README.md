@@ -227,9 +227,9 @@ graph LR
    graphs (`cuda_graphs.py`).
    Adam stops after `early_stop_patience` steps without progress and keeps the
    best-seen particles. For a plan with steps, once a particle is valid the
-   countdown restarts only when the best valid plan gains a whole 0.05 rad of
-   side lean or 5 mm of centring. `ConstraintChecker` decides which particles
-   satisfy.
+   countdown restarts only when the best valid plan's worst side lean falls
+   into a lower whole 0.05 rad, or its worst off-centre distance into a lower
+   whole 5 mm. `ConstraintChecker` decides which particles satisfy.
 4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
    up to `motion_plan_max_retries` satisfying particles, first success wins,
    in `get_top_satisfying_particles`' order: the worst pick or place CoM
@@ -677,6 +677,13 @@ every particle's commands; its landings and their slope enter the costs. At
 every Adam step each pick and place posture is put back on its hand target and
 its stance, each retract on its stance, and a refresh solves none. The loop
 stops as in step 3 of "How it works" above.
+
+A stepped plan's loss carries three preferences for every pick and place
+posture, each in its unit: side lean, centring and joint effort
+(`step_costs.py`). Every requirement it keeps as a cost has a weight per
+particle that doubles at each refresh while the particle violates it
+(`RequirementWeights`), and the step's own checks enter as straight lines in
+the commands, their value and slope read at the last refresh.
 
 Nothing is run after the loop: the particles feasible at its last refresh go to
 arm motion planning. Each landing is judged by itself, not by its distance from

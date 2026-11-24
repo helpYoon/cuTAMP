@@ -30,8 +30,7 @@ def test_a_stepped_retract_locks_only_its_idle_arm():
 
 def test_the_new_rows_have_settings():
     mult, tol = default_constraint_to_mult, default_constraint_to_tol
-    assert mult["ComComfort"]["margin_shortfall"] == 10.0 and tol["ComComfort"]["margin_shortfall"] == 0.0
-    assert mult["KinematicConstraint"]["retract_sole_rot_err"] == 5.0
+    assert tol["ComComfort"]["margin_shortfall"] == 0.0
     assert tol["KinematicConstraint"]["retract_sole_pos_err"] == SOLE_POS_TOL
     assert tol["KinematicConstraint"]["retract_sole_rot_err"] == SOLE_ROT_TOL
     assert tol["StepCommand"]["default"] == 0.0 and tol["StepTests"]["refresh_tests"] == 0.0

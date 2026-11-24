@@ -163,8 +163,9 @@ def entrypoint():
     )
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
-        help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the squared "
-             "centering term. Zero disables centering.",
+        help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the centering "
+             "term: squared in a plan without steps, linear (one per 5 mm) in a plan with steps. Zero disables "
+             "centering.",
     )
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
     parser.add_argument(
