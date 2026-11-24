@@ -33,7 +33,7 @@ def test_put_back_returns_the_hand_and_the_soles(stepped_call):
     lower, upper = stance_joint_limits(stance, *plan.world.joint_limits)
     assert (q >= lower).all() and (q <= upper).all()
     again, _, _ = held.put_back(plan.world, q, stance, target, arm)
-    torch.testing.assert_close(again[near], q[near], atol=1e-3, rtol=0)
+    torch.testing.assert_close(again[near], q[near], atol=1e-4, rtol=0)
     q_feet, jac_feet, _ = held.put_back(plan.world, q0, stance)                           # a retract: soles only
     assert jac_feet.shape == (16, 12, 33)
     assert held.held_rows(plan.world, q_feet, stance)[0][near].abs().amax() < 1e-4
@@ -83,7 +83,8 @@ def test_the_kept_gradient_moves_neither_hand_nor_feet(stepped_call):
 
 
 def slopes(plan, w, move):
-    """(measured, mu, q0) for the pick: the change of w . q per unit of `move(stance, target, d)`, by put_back."""
+    """(measured, mu, (stance, target)) for the pick: the change of w . q per unit of `move(stance, target, d)`, by
+    put_back."""
     name, arm, stance, target = pick(plan)
     q0, jac, _ = held.put_back(plan.world, plan.particles[name].detach().clone(), stance, target, arm)
     _, mu = held.split_gradient(w.expand(16, -1).contiguous(), jac)

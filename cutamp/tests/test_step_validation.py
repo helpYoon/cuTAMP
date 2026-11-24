@@ -126,6 +126,23 @@ def test_checked_hold_prepares_actual_home_without_instantaneous_pose_reset(roll
 
 
 @needs_cuda
+@torch.no_grad()
+def test_a_hold_whose_feet_do_not_stay_fails_its_geometry(rollout_scene):
+    """A hold's ``tracking_ok`` (contact and drift) still decides the hold (2026-11-23 design 4.4)."""
+    from dataclasses import replace
+
+    from cutamp.step_validation import validate_step_geometry
+
+    _, adapter, world, context, _, _ = rollout_scene
+    preparation = adapter.initialize(world.q_init[None], context, world=world).preparation
+    hold = preparation.steps[0]
+    assert hold.side == "HOLD" and hold.tracking_ok.all()
+    assert validate_step_geometry(world, adapter, preparation)["valid"].all()
+    drifted = replace(preparation, steps=(replace(hold, tracking_ok=torch.zeros_like(hold.tracking_ok)),))
+    assert drifted.tracking_ok.all() and not validate_step_geometry(world, adapter, drifted)["valid"].any()
+
+
+@needs_cuda
 def test_swing_geometry_clearance_and_control_derivative(rollout_scene):
     from cutamp.step_validation import sweep_constraint_rows, validate_step_geometry
 

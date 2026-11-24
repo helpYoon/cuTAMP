@@ -1,6 +1,7 @@
 """Regressions for the stepped motion the learned model predicts."""
 
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -92,7 +93,7 @@ def test_public_stepped_preview_connects_pick_and_place_with_checked_model_landi
     )
     assert metrics["status"] == "model_predicted_motion", metrics["motion_plan_failures"]
     assert metrics["motion_validation"] == "model_predicted" and metrics["independent_motion"] == "untested"
-    assert metrics["max_predicted_landing_xy_m"] >= 0 and metrics["max_predicted_landing_yaw_deg"] >= 0
+    assert math.isfinite(metrics["max_predicted_landing_xy_m"]) and math.isfinite(metrics["max_predicted_landing_yaw_deg"])
     assert len(metrics["connected_motion_gaps"]) == 2
     raw = raw_motion_plan(path, REAL_LEGS)
     assert raw["motion_validation"] == "model_predicted"

@@ -6,7 +6,6 @@ import torch
 
 from cutamp.stance import abs_pose, rel_pose
 from cutamp.step_refresh import StandIn
-from cutamp.tests.conftest import needs_cuda
 
 N = 3
 
@@ -84,7 +83,6 @@ def test_rows_rise_outside_the_set_and_have_a_slope():
     torch.testing.assert_close(command_rows(("L",), inc, [far], after)["gap0_step1_max_travel"], (t - STEP_TRAVEL[1]) / UNIT_M)
 
 
-@needs_cuda
 def test_the_rows_do_not_compare_the_landing_with_the_command():
     inc = incoming()[:1]
     u = torch.tensor([[[0.15, 0.22, 0.0]]])

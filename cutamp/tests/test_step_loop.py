@@ -234,10 +234,12 @@ def test_joint_effort_has_a_slope(stepped_call):
 
 @needs_cuda
 def test_result_rows(stepped_call):
+    from cutamp.step_costs import plan_rank
     plan = make_plan(stepped_call)
     res = plan.result(plan.particles, stepped_call["reducer"], stepped_call["checker"])
     assert res.endpoint_ok.shape == (16, 2) and res.status in ("model_feasible", "unresolved")
     assert set(plan.motion_inputs) == {row.index for row in res.rows}
+    assert res.rows
     for row in res.rows:
         m = row.metrics
         assert len(m["com_center_distances_m"]) == len(m["com_margins_m"]) == 2
@@ -249,6 +251,8 @@ def test_result_rows(stepped_call):
         assert {"rank", "joint_effort", "side_lean_rad", "joint_efforts"} <= set(m)
         assert len(m["side_lean_rad"]) == len(m["joint_efforts"]) == 2
         assert m["joint_effort"] == max(m["joint_efforts"])
+        lean, centre = max(abs(x) for x in m["side_lean_rad"]), max(m["com_center_distances_m"])
+        assert m["rank"] == float(plan_rank(torch.tensor(lean), torch.tensor(centre)))
 
 
 def test_valid_rows_go_to_arm_motion_by_rank_then_effort():
@@ -379,9 +383,11 @@ def test_a_refresh_puts_postures_back_and_solves_none(stepped_call, monkeypatch)
     monkeypatch.setattr(plan, "put_back", lambda q, gaps=None: (calls.append(("back", tuple(gaps))), put_back(q, gaps))[1])
     with torch.no_grad():
         p["step_commands_0"][..., 0] += 0.005
+        p[plan.groups[0][1].arg("q")][0, :2] += 0.30        # row 0's pick 30 cm off its feet: one correction is capped
     plan.refresh(p)
     assert calls == [("gap", 0), ("back", (0,)), ("back", (1,))]       # each gap's postures before the next gap
-    assert "resolve_s" not in plan.stats and plan.stats["correction_capped"][-1] >= 0
+    capped = plan.stats["correction_capped"][-1]
+    assert "resolve_s" not in plan.stats and type(capped) is int and 1 <= capped <= 16 * len(plan.gap_of)
 
 
 @needs_cuda
@@ -424,6 +430,38 @@ def test_every_posture_on_a_stance_hands_on_its_share(stepped_call):
                 assert (plan.held_jac[name] @ p[name].grad.double()[..., None]).abs().amax() < 1e-4
     torch.testing.assert_close(shares[0], sum(shares[1:]), atol=1e-5, rtol=1e-4)
     assert all(s.isfinite().all() and s.abs().sum() > 0 for s in shares[1:])   # the place has no step of its own
+
+
+@needs_cuda
+def test_the_placements_share_is_the_slope_along_the_held_surface(stepped_call):
+    """The place posture's gradient reaches the placement through hand_on as the slope of the cost along the held
+    surface, measured by putting the posture back on the hand target of a moved placement: its x, y and z move the
+    hand's position rows, its yaw the rotation rows too."""
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    op = plan.groups[1][1]
+    name, key, arm = op.arg("q"), op.arg("placement"), op.operator.metadata.arm
+    for k in ("step_commands_0", key, *plan.gap_of):
+        p[k].requires_grad_()
+    plan.rollout(p)                                                     # every posture put back, its J kept
+    w = torch.randn(p[name].shape[1], generator=torch.Generator().manual_seed(3)).cuda()
+    for k in ("step_commands_0", key, *plan.gap_of):
+        p[k].grad = w.expand_as(p[k]).clone() if k == name else torch.zeros_like(p[k])
+    plan.hand_on(p)
+    share = p[key].grad.clone()
+    d = 1e-3
+    with torch.no_grad():
+        stance, q0 = plan.stance_table(p)[name], p[name].detach().clone()
+
+        def put_back_at(c, by):
+            moved = {**p, key: p[key].detach().clone()}
+            moved[key][:, c] += by
+            return held.put_back(plan.world, q0, stance, plan.hand_targets(moved)[1], arm)[0]
+
+        for c in range(4):
+            measured = ((put_back_at(c, d) - put_back_at(c, -d)) @ w) / (2 * d)
+            error = (measured - share[:, c]).abs() / (share[:, c].abs() + 1e-3 * w.norm())
+            assert error.median() < 0.05, (c, error)
 
 
 @needs_cuda

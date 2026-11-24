@@ -113,6 +113,26 @@ def test_for_a_stepped_plan_only_a_better_plan_restarts_the_countdown():
     assert stop(12) and not stop(12, patience=0)
 
 
+def test_for_a_stepped_plan_a_lower_effort_alone_does_not_restart_the_countdown():
+    from cutamp.optimize_plan import _FeasibleArchive
+
+    p = _particles(0.)
+    snap = _BestSnapshot()
+    feasible = torch.tensor([True, False, False, False])
+    rank, effort = torch.tensor([3., 0., 0., 0.]), torch.tensor([.9, 0., 0., 0.])
+    archive = _FeasibleArchive(p, rank, effort)
+
+    def stop(step):
+        return snap.should_stop(step, 2, archive, by_rank=True)
+
+    for step, lower in enumerate((.9, .8, .7, .6)):          # the valid plan's joint effort alone keeps falling
+        effort[0] = lower
+        archive.observe(p, feasible, rank, effort)
+        snap.update(step, 1, 10., p)
+        assert stop(step) == (step == 3)
+    assert archive.effort[0] == effort[0]                       # the record took each lower effort
+
+
 def test_the_record_keeps_the_better_rank_then_the_lower_effort():
     from cutamp.cost_reduction import CostReducer
     from cutamp.optimize_plan import _FeasibleArchive, _quality
