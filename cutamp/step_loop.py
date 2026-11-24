@@ -3,7 +3,7 @@ and controller, the route that runs it through the loop, and the helpers the ste
 stage."""
 
 from collections.abc import Iterable
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import replace
 from functools import partial
 from time import monotonic
 
@@ -26,7 +26,15 @@ from cutamp.step_bound import planner_step_bound, travel
 from cutamp.step_costs import GROWTH, WEIGHT_CAP, RequirementWeights, joint_effort, lines, plan_rank, side_lean
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
-from cutamp.step_refresh import NoStartingPath, StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
+from cutamp.step_refresh import (
+    NoStartingPath,
+    StandIn,
+    _each,
+    command_rows,
+    draw_grid_paths,
+    grid_commands,
+    refresh_gap,
+)
 from cutamp.step_validation import StepStateAdapter, _foot_half_extents, _object_box, validate_step_geometry
 from cutamp.task_planning.constraints import ComComfort, KinematicConstraint
 from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
@@ -41,13 +49,7 @@ def _batch(value, first, stop, tail, like):
 
 def _take(value, i, device):
     """Detach a selected trajectory, retaining its batch axis and metadata."""
-    if torch.is_tensor(value):
-        return value[i : i + 1].detach().to(device)
-    if is_dataclass(value):
-        return type(value)(**{f.name: _take(getattr(value, f.name), i, device) for f in fields(value)})
-    if isinstance(value, tuple):
-        return tuple(_take(v, i, device) for v in value)
-    return value
+    return _each(value, lambda x: x[i : i + 1].detach().to(device))
 
 
 def _evidence(adapter, predictions):
@@ -276,6 +278,25 @@ def _check_line(line, u):
     return line["value"] + torch.einsum("nkc,nc->nk", line["slope"], (u - line["at"]).reshape(len(u), -1))
 
 
+CLEARANCE = 1e-6  # m and rad: the depth :func:`validate_step_geometry`'s verdict accepts
+
+
+def _clearances(check, n, blocks, device):
+    """A gap's geometry verdict and clearances over its refresh's rows: ``blocks`` blocks of ``n``, the particles' own
+    rows, then one block per nudged command number. ``check(rows)`` is :func:`validate_step_geometry` on the rows
+    ``rows`` of that rollout. The own rows are always checked; a particle's copies only where its own row has a
+    clearance above ``CLEARANCE``, else they take its own row's values, so its clearances get no slope (2026-11-24
+    design). Returns ``(valid [n], penetration {name: [blocks * n]})``."""
+    own = check(torch.arange(n, device=device))
+    penetration = {name: value.repeat(blocks) for name, value in own["penetration"].items()}
+    violating = (torch.stack(tuple(own["penetration"].values()), 1) > CLEARANCE).any(1).nonzero().flatten()
+    if len(violating):
+        rows = (torch.arange(1, blocks, device=device)[:, None] * n + violating).flatten()
+        for name, value in check(rows)["penetration"].items():
+            penetration[name][rows] = value
+    return own["valid"], penetration
+
+
 def _finite_rows(state):
     """``[B]`` bool: the rows of a physical state (p, R, v, w, q, qd) whose every value is finite."""
     return torch.stack([t.reshape(len(t), -1).isfinite().all(-1) for t in state]).all(0)
@@ -460,7 +481,8 @@ class SteppedPlan:
 
     def _run_gap(self, j, particles, head, before, objects, held):
         """Gap ``j``'s hold, its rollout and slope at the current commands, the stand-in set, its landing postures and
-        ``sole_to`` written, ``last[j]`` kept and its checks read on every row of the rollout (:meth:`_set_checks`).
+        ``sole_to`` written, ``last[j]`` kept and its checks read (:meth:`_set_checks`): the landing's on every row of
+        the rollout, the clearances as :func:`_clearances` reads them.
         ``head`` ``[n, 2]`` (None: zero) are the head angles the earlier rollout ended with; ``before`` ``[n, 2, 3]``
         is the stand-in's pair the gap starts on. Returns its tests' pass ``[n]`` (the particles' own rows), the pair
         after it, the head angles its rollout ends with and :meth:`_set_checks`'s misses."""
@@ -497,13 +519,21 @@ class SteppedPlan:
         self.last[j] = (start.state, refreshed.commands, prediction, start.preparation)
         feet = self.predictor.model.feet(start.state.tensors[:6])[0]
         rows, hard, _ = landing_constraint_rows(self.predictor, per_copy(feet), order, refreshed.copy_commands, copies)
-        geometry = validate_step_geometry(
-            self.world, self.adapter, checked, object_poses={name: per_copy(pose) for name, pose in objects.items()},
-            held={arm: (name, per_copy(pose)) for arm, (name, pose) in held.items()},
-        )
+
+        def check(chosen):
+            # The geometry of those rows of the rollout, each in its own particle's scene. per_copy first: it lays a
+            # pose out row by row, as this check received every pose before, where a held pose (an inverse) comes
+            # column by column and a product's last bit follows that layout.
+            return validate_step_geometry(
+                self.world, self.adapter, _each(checked, lambda x: x[chosen]),
+                object_poses={name: per_copy(pose)[chosen] for name, pose in objects.items()},
+                held={arm: (name, per_copy(pose)[chosen]) for arm, (name, pose) in held.items()},
+            )
+
+        valid, penetration = _clearances(check, n, blocks, u.device)
         passed = start.compatible & hard[:n] & (torch.cat([v[:n].reshape(n, -1) for v in rows.values()], 1) <= 0).all(1)
-        passed &= geometry["valid"][:n]
-        miss = self._set_checks(j, rows, geometry["penetration"], refreshed, finite)
+        passed &= valid
+        miss = self._set_checks(j, rows, penetration, refreshed, finite)
         _, after = _gap_stances(self.standin, j, before, u)
         head = prediction.terminal.tensors[4][:, self.adapter.columns]
         return passed & own, after, torch.where(own[:, None], head, 0), miss  # a diverged row hands on a zero head
@@ -511,8 +541,8 @@ class SteppedPlan:
     def _set_checks(self, j, rows, penetration, refreshed, finite):
         """``checks[j]`` from gap ``j``'s rows on every row of its refresh ``refreshed`` (2026-11-23 design 4.4): the
         :func:`landing_constraint_rows` ``rows`` other than the step's range, each the worst of its columns, then the
-        clearances ``penetration`` of :func:`validate_step_geometry`, each counted from the 1e-6 its verdict accepts
-        and per unit; :func:`lines` gives their value and slope, ``finite`` ``[(1 + 3 s) n]`` the rows that did not
+        clearances ``penetration`` (:func:`_clearances`), each counted from ``CLEARANCE`` and per unit;
+        :func:`lines` gives their value and slope, ``finite`` ``[(1 + 3 s) n]`` the rows that did not
         diverge. The weights start at 1 and double, up to ``WEIGHT_CAP``, where a check is above zero at a later
         refresh. Returns how far the last refresh's lines missed the values read now, in units, over the checks either
         puts above zero on the particles whose own row did not diverge (None: no earlier line)."""
@@ -523,7 +553,7 @@ class SteppedPlan:
                 columns.append(value.reshape(len(value), -1).amax(1))
         for key, value in penetration.items():
             names.append("geometry_" + key)
-            columns.append((value - 1e-6) / (UNIT_RAD if key.endswith("_rad") else UNIT_M))
+            columns.append((value - CLEARANCE) / (UNIT_RAD if key.endswith("_rad") else UNIT_M))
         n = len(refreshed.commands)
         value, slope = lines(torch.stack(columns, 1), n, refreshed.ticks_changed, finite)
         old, miss = self.checks.get(j), None

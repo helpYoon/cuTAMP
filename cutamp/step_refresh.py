@@ -35,15 +35,20 @@ class GapRefresh:
     copy_commands: Tensor      # [(1 + 3 s) n, s, 3] the commands each row of `copies` ran at
 
 
-def _first(value, n):
-    """``value`` cut to its first ``n`` rows, through dataclasses and tuples; strings and ``None`` pass through."""
+def _each(value, fn):
+    """``fn`` on every tensor of ``value``, through dataclasses and tuples; strings and ``None`` pass through."""
     if torch.is_tensor(value):
-        return value[:n].clone()
+        return fn(value)
     if is_dataclass(value):
-        return type(value)(**{f.name: _first(getattr(value, f.name), n) for f in fields(value)})
+        return type(value)(**{f.name: _each(getattr(value, f.name), fn) for f in fields(value)})
     if isinstance(value, tuple):
-        return tuple(_first(v, n) for v in value)
+        return tuple(_each(v, fn) for v in value)
     return value
+
+
+def _first(value, n):
+    """``value`` cut to its first ``n`` rows (:func:`_each`)."""
+    return _each(value, lambda x: x[:n].clone())
 
 
 def _relative(anchor, pairs):

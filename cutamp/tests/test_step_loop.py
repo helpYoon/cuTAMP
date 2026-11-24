@@ -582,3 +582,146 @@ def test_a_checks_weight_doubles_while_it_fails(stepped_call, monkeypatch):
     others = torch.arange(after.shape[1], device=after.device) != k
     assert torch.equal(after[:, others], before[:, others])
     assert len(plan.stats["check_line_error"]) == 1
+
+
+def test_clearances_are_read_on_the_copies_of_violating_particles_only():
+    from cutamp.step_loop import _clearances
+    n, blocks = 3, 4
+    row = torch.arange(blocks * n, dtype=torch.float64)
+    table = {"a": 5.0 + row, "b": 100.0 + row}                               # every row of the rollout its own values
+    table["a"][:n] = torch.tensor([1e-6, 2e-6, 0.0], dtype=torch.float64)   # the verdict accepts 1e-6: only particle 1
+    table["b"][:n] = 0.0
+    verdict = torch.tensor([True, False, True] + [False] * (blocks - 1) * n)
+    calls = []
+
+    def check(rows):
+        calls.append(rows.tolist())
+        return {"valid": verdict[rows], "steps": [], "penetration": {k: v[rows] for k, v in table.items()},
+                "load_status": "unloaded"}
+
+    valid, pen = _clearances(check, n, blocks, "cpu")
+    assert calls == [[0, 1, 2], [4, 7, 10]]                      # the own rows, then particle 1's three copies
+    assert valid.tolist() == [True, False, True]
+    assert pen["a"].reshape(blocks, n).tolist() == [[1e-6, 2e-6, 0.0], [1e-6, 9.0, 0.0], [1e-6, 12.0, 0.0],
+                                                    [1e-6, 15.0, 0.0]]     # rows 4, 7 and 10 where they belong
+    assert pen["b"].reshape(blocks, n).tolist() == [[0.0, 0.0, 0.0], [0.0, 104.0, 0.0], [0.0, 107.0, 0.0],
+                                                    [0.0, 110.0, 0.0]]
+    table["a"][1] = 0.0
+    calls.clear()
+    _clearances(check, n, blocks, "cpu")
+    assert calls == [[0, 1, 2]]                                  # nothing violated: the own rows only
+
+
+@needs_cuda
+def test_a_refresh_checks_the_copies_of_violating_particles_only(stepped_call, monkeypatch):
+    from cutamp import step_loop
+    plan = make_plan(stepped_call)
+    p, n = plan.particles, 16
+    _, objects, _, held = step_loop._placements_and_grasps(plan.groups, plan.world, plan.pools, 0, n, bindings=p,
+                                                           grasp_indices=p)
+    mark = torch.arange(n, device=p["left_q0"].device) * 1e-4                   # each particle's scene is its own
+    scene = {name: pose.clone() for name, pose in objects[0].items()}
+    carried = {arm: (name, pose.clone()) for arm, (name, pose) in held[1].items()}   # as if the pick's object is held
+    for pose in (*scene.values(), *(pose for _, pose in carried.values())):
+        pose[:, 0, 3] += mark
+    rollout, calls = {}, []
+    refresh_gap, geometry = step_loop.refresh_gap, step_loop.validate_step_geometry
+
+    def gap(*args, **kw):
+        out = refresh_gap(*args, **kw)
+        rollout["all"] = out.copies
+        return out
+
+    def check(world, adapter, prediction, *, object_poses, held):
+        out = geometry(world, adapter, prediction, object_poses=object_poses, held=held)
+        if not calls:                                           # particles 2 and 5 violate a clearance, the rest none
+            for value in out["penetration"].values():
+                value.zero_()
+            next(iter(out["penetration"].values()))[[2, 5]] = 1.0
+        calls.append((prediction.intended_final, object_poses, held))
+        return out
+
+    monkeypatch.setattr(step_loop, "refresh_gap", gap)
+    monkeypatch.setattr(step_loop, "validate_step_geometry", check)
+    plan._run_gap(0, p, None, plan.incoming, scene, carried)
+    rows = torch.tensor([18, 21, 34, 37, 50, 53], device=mark.device)           # their copies, block by block
+    assert [len(intended) for intended, _, _ in calls] == [n, len(rows)]
+    for (intended, poses, hand), chosen in zip(calls, (torch.arange(n, device=mark.device), rows)):
+        assert torch.equal(intended, rollout["all"].intended_final[chosen])
+        assert all(torch.equal(poses[name], scene[name][chosen % n]) for name in scene)
+        assert all(torch.equal(hand[arm][1], carried[arm][1][chosen % n]) for arm in carried)
+    line = plan.checks[0]
+    geometry_checks = [k for k, name in enumerate(line["names"]) if name.startswith("geometry_")]
+    others = [i for i in range(n) if i not in (2, 5)]
+    assert (line["slope"][others][:, geometry_checks] == 0).all()               # no violation, no slope
+
+
+@needs_cuda
+def test_a_particle_the_geometry_check_fails_fails_its_refresh(stepped_call, monkeypatch):
+    from cutamp import step_loop
+    plan = make_plan(stepped_call)
+    p, n = plan.particles, 16
+    _, objects, _, held = step_loop._placements_and_grasps(plan.groups, plan.world, plan.pools, 0, n, bindings=p,
+                                                           grasp_indices=p)
+    passed = plan._run_gap(0, p, None, plan.incoming, objects[0], held[0])[0]
+    assert passed.any()
+    row, real = int(passed.nonzero()[0]), step_loop.validate_step_geometry
+
+    def failing(*args, **kw):
+        out = real(*args, **kw)
+        if len(out["valid"]) == n:                               # the own rows' verdict; a copies call has 3 k rows
+            out["valid"][row] = False
+        return out
+
+    monkeypatch.setattr(step_loop, "validate_step_geometry", failing)
+    again = plan._run_gap(0, p, None, plan.incoming, objects[0], held[0])[0]
+    others = torch.arange(n, device=passed.device) != row
+    assert not again[row] and torch.equal(again[others], passed[others])
+
+
+@needs_cuda
+def test_a_checked_row_reads_what_a_check_of_every_row_reads(stepped_call, monkeypatch):
+    """Up to rounding: an overlap is summed over thousands of sphere pairs in float32, and the last bits of a batched
+    product follow the size of the batch, so the two cannot agree to the bit."""
+    from cutamp import step_loop
+    plan = make_plan(stepped_call)
+    p, n = plan.particles, 16
+    _, objects, _, held = step_loop._placements_and_grasps(plan.groups, plan.world, plan.pools, 0, n, bindings=p,
+                                                           grasp_indices=p)
+    # As if the pick's object is held, pushed 15 cm along one of the six axes of the hand, so that it overlaps the
+    # robot's body on some particles.
+    axis = torch.cat((torch.eye(3), -torch.eye(3))).to(p["left_q0"])[torch.arange(n) % 6]
+    carried = {}
+    for arm, (name, pose) in held[1].items():
+        carried[arm] = (name, pose.clone())
+        carried[arm][1][:, :3, 3] += 0.15 * axis
+    assert carried
+    rollout, seen = {}, []
+    refresh_gap, real = step_loop.refresh_gap, step_loop.validate_step_geometry
+
+    def gap(*args, **kw):
+        rollout["all"] = refresh_gap(*args, **kw)
+        return rollout["all"]
+
+    def recorded(world, adapter, prediction, *, object_poses, held):
+        out = real(world, adapter, prediction, object_poses=object_poses, held=held)
+        seen.append({name: value.clone() for name, value in out["penetration"].items()})
+        if len(seen) == 1:                                       # particles 2 and 5 violate a clearance as well
+            next(iter(out["penetration"].values()))[[2, 5]] = 1.0
+        return out
+
+    monkeypatch.setattr(step_loop, "refresh_gap", gap)
+    monkeypatch.setattr(step_loop, "validate_step_geometry", recorded)
+    plan._run_gap(0, p, None, plan.incoming, objects[0], carried)
+    copies = rollout["all"].copies
+    assert all(part.isfinite().all() for step in copies.steps for part in step.trajectory)   # no row was zeroed
+    every = real(plan.world, plan.adapter, copies, object_poses={k: v.repeat(4, 1, 1) for k, v in objects[0].items()},
+                 held={arm: (name, pose.repeat(4, 1, 1)) for arm, (name, pose) in carried.items()})["penetration"]
+    own, theirs = seen
+    violating = (torch.stack(tuple(own.values()), 1) > 1e-6).any(1)
+    violating[[2, 5]] = True
+    rows = (torch.arange(1, 4, device=violating.device)[:, None] * n + violating.nonzero().flatten()).flatten()
+    assert any((value > 0).any() for name, value in every.items() if name.startswith("payload_robot"))
+    for name in every:
+        torch.testing.assert_close(own[name], every[name][:n], rtol=1e-5, atol=1e-7, msg=name)
+        torch.testing.assert_close(theirs[name], every[name][rows], rtol=1e-5, atol=1e-7, msg=name)
