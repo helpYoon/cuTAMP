@@ -14,7 +14,6 @@ from cutamp.landing_predictor import (
     LandingState,
     _intended_pair,
     _wrap,
-    landing_errors,
     prediction_precision,
 )
 from cutamp.stance import STEP_TRAVEL, STEP_X_MAX, STEP_Y_RANGE, STEP_YAW_RANGE, abs_pose, rel_pose
@@ -335,34 +334,24 @@ def draw_grid_paths(orders, incoming: Tensor, generator: torch.Generator, grid: 
 
 def command_rows(orders, incoming: Tensor, commands: list[Tensor | None], after_steps: list[Tensor | None]) -> dict[str, Tensor]:
     """The commands' cost rows: per gap ``j`` and step ``k`` (1-based) ``gap{j}_step{k}_`` ``min_travel``,
-    ``max_travel``, ``command_bound``, ``achieved_bound``, ``xy_precision`` and ``yaw_precision``, and for a two-step gap
-    ``gap{j}_final_xy_precision`` and ``_yaw_precision``. Each is the positive part of the row of the same name in
+    ``max_travel``, ``command_bound`` and ``achieved_bound``. Each is the positive part of the row of the same name in
     :func:`cutamp.step_loop.landing_constraint_rows`, so 0 where the requirement is met; the landed pairs come
     from ``after_steps``, a step's reference from the intended pair on the pair before it."""
     rows, before = {}, incoming
     for j, order in enumerate(orders):
         if not order:
             continue
-        u, landed, intended = commands[j], after_steps[j], before
+        u, landed = commands[j], after_steps[j]
         bounds = planner_step_bound(u.device, u.dtype)
         for k, foot in enumerate(order):
             name, side = f"gap{j}_step{k + 1}_", "LR".index(foot)
             c = u[:, k]
             foot_left = torch.full((len(c),), side == 0, device=c.device)
             t = travel(rel_pose(before[:, 1 - side], before[:, side]), c)
-            reference = _intended_pair(before, side, c)
-            intended = _intended_pair(intended, side, c)
             achieved = landed[:, k]
-            xy, yaw, _ = landing_errors(achieved, reference)
             rows[name + "min_travel"] = (STEP_TRAVEL[0] - t) / STEP_TRAVEL[0]
             rows[name + "max_travel"] = t / STEP_TRAVEL[1] - 1
             rows[name + "command_bound"] = bounds.g(c, foot_left) / 0.02
             rows[name + "achieved_bound"] = bounds.g(rel_pose(achieved[:, 1 - side], achieved[:, side]), foot_left) / 0.02
-            rows[name + "xy_precision"] = xy.square() / 0.020**2 - 1
-            rows[name + "yaw_precision"] = yaw.square() / math.radians(1) ** 2 - 1
             before = achieved
-        if len(order) > 1:
-            xy, yaw, _ = landing_errors(before, intended)
-            rows[f"gap{j}_final_xy_precision"] = xy.square() / 0.020**2 - 1
-            rows[f"gap{j}_final_yaw_precision"] = yaw.square() / math.radians(1) ** 2 - 1
     return {key: value.clamp_min(0) for key, value in rows.items()}

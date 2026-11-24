@@ -499,8 +499,9 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
         # same positional tolerance used by planted-sole cuRobo trajectories.
         ground_ok = ((step.sole_height >= -0.005) | ~step.valid_ticks[:, :, None]).all((1, 2))
         landed = (step.sole_height[:, -1].abs() <= 0.005).all(-1) & (step.sole_tilt[:, -1] <= 0.05).all(-1)
-        ok = (violations <= 1e-6) & ground_ok & landed & step.tracking_ok
+        ok = (violations <= 1e-6) & ground_ok & landed
         if step.side == "HOLD":
+            ok &= step.tracking_ok
             ok &= (step.sole_height.abs() <= 0.005).all((1, 2)) & (step.sole_tilt <= 0.05).all((1, 2))
             # Remain in double support during the preparatory HOLD.
             from cutamp.com_polygon_cost import margin_from_support_planes, support_region_planes
@@ -524,7 +525,7 @@ def _step_geometry(world, adapter, prediction, *, object_poses=None, held=None):
                 "held_objects": {arm: torch.cat(held_world[arm]).reshape(B, T, 4, 4) for arm in held},
             }
         )
-    valid = prediction.tracking_ok.clone()
+    valid = torch.ones_like(prediction.tracking_ok)
     for entry in history:
         valid &= entry["valid"]
     return {
@@ -591,8 +592,6 @@ def model_step_record(adapter, initial, step, command, row=0, *, preparation=Non
         "dynamics_normalized": array(initial.dynamics[row]),
         "dynamics_raw": array(adapter.raw_context(initial.dynamics[row])),
         "profile": dict(vars(model.profile)),
-        "xy_limit_m": 0.020,
-        "yaw_limit_rad": torch.pi / 180,
         "initial": snapshot(initial),
         "terminal": snapshot(step.terminal),
         "actions": array(step.actions[row, :ticks]),

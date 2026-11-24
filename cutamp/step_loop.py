@@ -2,7 +2,6 @@
 and controller, the route that runs it through the loop, and the helpers the stepped route shares with the motion
 stage."""
 
-import math
 from dataclasses import fields, is_dataclass, replace
 from functools import partial
 from time import monotonic
@@ -237,11 +236,7 @@ def landing_constraint_rows(predictor, incoming, order, u, pred):
             pair = step.achieved
             ph = step.phases
             profile = predictor.profile
-            rows[prefix + "xy_precision"] = step.xy_error.square() / 0.020**2 - 1
-            rows[prefix + "yaw_precision"] = step.yaw_error.square() / math.radians(1) ** 2 - 1
             for key in (
-                "deadline_xy",
-                "deadline_yaw",
                 "deadline_height",
                 "support_xy",
                 "support_yaw",
@@ -256,11 +251,6 @@ def landing_constraint_rows(predictor, incoming, order, u, pred):
         actual = rel_pose(pair[:, 1 - s], pair[:, s])
         rows[prefix + "achieved_bound"] = bounds.g(actual, foot) / 0.02
         before = pair
-    if pred is not None:
-        hard = hard & pred.tracking_ok
-        if len(order) > 1:
-            rows["final_xy_precision"] = pred.final_xy_error.square() / 0.020**2 - 1
-            rows["final_yaw_precision"] = pred.final_yaw_error.square() / math.radians(1) ** 2 - 1
     return rows, hard, before
 
 

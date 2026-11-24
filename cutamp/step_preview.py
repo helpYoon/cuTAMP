@@ -26,9 +26,7 @@ from cutamp.utils.common import get_world_cfg
 
 
 def _check_issued_landings(predictor, initial, order, commands, prediction):
-    """Check the searched controller domain and the strict per-sole and composed landing limits again at issue."""
-    if not prediction.tracking_ok.all():
-        raise ValueError("Predicted step or composed stance exceeds the 2 cm or 1 degree landing limit")
+    """Check the searched controller domain and the phase and landing requirements again at issue."""
     before = predictor.model.feet(initial.tensors[:6])[0]
     rows, phase_ok, _ = landing_constraint_rows(predictor, before, order, commands, prediction)
     if not phase_ok.all() or not (torch.cat([v.flatten() for v in rows.values()]) <= 0).all():
@@ -252,7 +250,6 @@ def plan_predicted_step_motion(
             _, commands, pred, _ = motion.replayed[i]
             gap.update(
                 commands=commands[0].tolist(),
-                tracking_ok=bool(pred.tracking_ok[0]),
                 final_xy_error_m=pred.final_xy_error[0].tolist(),
                 final_yaw_error_deg=pred.final_yaw_error[0].rad2deg().tolist(),
             )

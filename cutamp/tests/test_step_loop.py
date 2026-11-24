@@ -284,3 +284,15 @@ def test_a_refresh_puts_drifted_postures_back_on_the_landing(stepped_call):
     assert values["retract_sole_pos_err"].median() <= SOLE_POS_TOL
     assert values["pos_err"].median() <= 0.005
     assert len(plan.stats["resolve_s"]) == len(plan.stats["refresh_s"]) == 2
+
+
+@needs_cuda
+def test_the_refresh_tests_do_not_compare_the_landing_with_the_command(stepped_call):
+    from cutamp.step_loop import landing_constraint_rows
+    plan = make_plan(stepped_call)
+    start, commands, prediction, _ = plan.last[0]
+    feet = plan.predictor.model.feet(start.tensors[:6])[0]
+    rows, passed, _ = landing_constraint_rows(plan.predictor, feet, plan.orders[0], commands, prediction)
+    assert not any(k.endswith(("precision", "deadline_xy", "deadline_yaw")) for k in rows)
+    phases = prediction.steps[0].phases
+    assert torch.equal(passed, phases.deadline_ok & phases.hold_ok & phases.support_ok)

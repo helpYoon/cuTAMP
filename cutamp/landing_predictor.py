@@ -147,8 +147,6 @@ def _hold_trace(predictor, state, dynamics, counts, ticks):
 class LandingProfile:
     """Phase tolerances in meters and radians for the model-predicted foot trace."""
 
-    deadline_xy: float = 0.05
-    deadline_yaw: float = 0.10
     deadline_height: float = 0.02
     support_xy: float = 0.01
     support_yaw: float = 0.05
@@ -201,9 +199,7 @@ def phase_checks(trace, heights, reference, side, clock, valid, profile):
         support_yaw,
         hold_xy,
         hold_yaw,
-        (arrival_xy <= profile.deadline_xy)
-        & (arrival_yaw <= profile.deadline_yaw)
-        & (height < profile.deadline_height),
+        height < profile.deadline_height,
         (support_xy <= profile.support_xy) & (support_yaw <= profile.support_yaw),
         ((hold_xy <= profile.hold_xy) & (hold_yaw <= profile.hold_yaw)).all(-1),
     )

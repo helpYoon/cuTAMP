@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from cutamp.landing_predictor import LandingProfile, landing_errors, near_rest, phase_checks
@@ -73,3 +74,16 @@ def test_two_locally_accurate_issues_can_miss_the_intended_world_stance():
     assert all(step.tracking_ok.item() for step in out.steps)
     assert not out.tracking_ok.item()
     torch.testing.assert_close(out.final_xy_error, torch.tensor([[0.012, 0.024]]))
+
+
+def test_a_step_is_done_when_the_foot_is_down_at_its_last_tick():
+    reference = torch.zeros(2, 2, 3, dtype=torch.float64)
+    trace = reference[:, None].repeat(1, 4, 1, 1)
+    heights = torch.zeros_like(trace[..., 0])
+    clock, valid = torch.tensor([2, 2]), torch.ones(2, 4, dtype=torch.bool)
+    trace[0, 1:, 0, 0] = 0.20          # lands 20 cm from where it was sent, and stays there
+    heights[1, 1, 0] = 0.03            # still 3 cm up at its last tick
+    checks = phase_checks(trace, heights, reference, 0, clock, valid, LandingProfile())
+    assert checks.deadline_ok.tolist() == [True, False]
+    assert checks.deadline_xy[0] == pytest.approx(0.20) and checks.hold_ok[0]
+    assert not hasattr(LandingProfile(), "deadline_xy") and not hasattr(LandingProfile(), "deadline_yaw")

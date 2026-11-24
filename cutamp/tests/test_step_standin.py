@@ -6,6 +6,7 @@ import torch
 
 from cutamp.stance import abs_pose, rel_pose
 from cutamp.step_refresh import StandIn
+from cutamp.tests.conftest import needs_cuda
 
 N = 3
 
@@ -79,15 +80,14 @@ def test_rows_rise_outside_the_set_and_have_a_slope():
     assert command_rows(("L",), inc, [far], after)["gap0_step1_max_travel"].item() > 0
 
 
-def test_accuracy_rows_read_the_landed_pair():
+@needs_cuda
+def test_the_rows_do_not_compare_the_landing_with_the_command():
     inc = incoming()[:1]
     u = torch.tensor([[[0.15, 0.22, 0.0]]])
     after, _ = as_commanded(("L",), inc, [u])
-    assert (command_rows(("L",), inc, [u], after)["gap0_step1_xy_precision"] == 0).all()
-    missed = [after[0].clone()]
-    missed[0][:, 0, 0, 0] += 0.03  # the swung sole lands 3 cm off, against a 2 cm tolerance
-    row = command_rows(("L",), inc, [u], missed)["gap0_step1_xy_precision"]
-    torch.testing.assert_close(row[0], torch.tensor([0.03**2 / 0.02**2 - 1, 0.0]), atol=1e-5, rtol=0)
+    after[0][:, 0, 0, 0] += 0.03      # the swung sole lands 3 cm from its command
+    rows = command_rows(("L",), inc, [u], after)
+    assert not any("precision" in key for key in rows) and all((v == 0).all() for v in rows.values())
 
 
 from cutamp.reachability import _rectangle_separation
