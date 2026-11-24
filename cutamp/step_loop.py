@@ -699,9 +699,11 @@ class SteppedPlan:
         the step's checks on their straight lines in the commands (``StepChecks``, design 4.4) and, as the soft cost's
         only values, the preferences over the pick and place postures, each in its unit (2026-11-23 design 4.5): side
         lean (:func:`side_lean`), off centre and joint effort (:func:`joint_effort`); beside them, detached, each
-        particle's ``rank`` (:func:`plan_rank`) and its worst ``effort``. Every requirement row carries its weight per
-        particle (:class:`RequirementWeights`, 2026-11-23 design 4.3); the hand and feet rows weigh zero: they are
-        held, not costs (design 4.1), and the checker still reads them."""
+        particle's ``rank`` (:func:`plan_rank`), its worst ``effort`` and ``cost_at_start_weights``, the total with
+        every requirement at its starting weight and the check lines at weight 1, which the stop rule's countdown reads
+        before any particle is valid (design 4.6). Every requirement row carries its weight per particle
+        (:class:`RequirementWeights`, 2026-11-23 design 4.3); the hand and feet rows weigh zero: they are held, not
+        costs (design 4.1), and the checker still reads them."""
         table, after = self._stances(particles)
         inner = {key: value for key, value in particles.items() if key not in self.landing_confs}
         cost = self.cost_function(rollout, inner, achieved_stances=table)
@@ -714,9 +716,11 @@ class SteppedPlan:
         rows = command_rows(self.orders, self.incoming, self._commands(particles), after)
         cost["StepCommand"] = {"type": "constraint", "values": rows}
         cost["StepTests"] = {"type": "constraint", "values": {"refresh_tests": (~self.tests_ok).to(margin.dtype)}}
-        steer = margin.new_zeros(len(margin))
+        steer, at_one = margin.new_zeros(len(margin)), margin.new_zeros(len(margin))
         for j, line in self.checks.items():
-            steer = steer + (line["weight"] * _check_line(line, particles[self.command_names[j]]).clamp_min(0)).sum(1)
+            excess = _check_line(line, particles[self.command_names[j]]).clamp_min(0)
+            steer = steer + (line["weight"] * excess).sum(1)
+            at_one = at_one + excess.detach().sum(1)
         cost["StepChecks"] = {"type": "cost", "values": {"lines": steer}}
         q = torch.stack([particles[name] for name in rollout["conf_params"]], 1)
         lean = side_lean(q, stances, self.world.model)
@@ -731,6 +735,8 @@ class SteppedPlan:
         soft["rank"] = plan_rank(lean.detach().abs().clamp(max=1).asin().amax(1), worst)
         soft["effort"] = effort.detach().amax(1)
         self.weights.apply(cost)
+        soft["cost_at_start_weights"] = self.weights.total_at_start(
+            {**cost, "StepChecks": {"type": "cost", "values": {"lines": at_one}}})
         return cost
 
     def _endpoints(self, masks, n):

@@ -82,7 +82,8 @@ def start_weight(cost_type: str, name: str, reducer) -> float:
 
 class RequirementWeights:
     """A weight per particle and row for every requirement in the cost. :meth:`apply` writes them into the cost and
-    remembers which rows are violated; :meth:`grow` doubles the weights of those, once per refresh."""
+    remembers which rows are violated; :meth:`grow` doubles the weights of those, once per refresh;
+    :meth:`total_at_start` is the cost's total with every requirement at the weight it started at."""
 
     def __init__(self, reducer, checker):
         self.reducer, self.checker = reducer, checker
@@ -106,3 +107,10 @@ class RequirementWeights:
         for key, violated in self.violated.items():
             cap = WEIGHT_CAP * self.start[key]
             self.weight[key] = torch.where(violated, self.weight[key] * GROWTH, self.weight[key]).clamp_max(cap)
+
+    @torch.no_grad()
+    def total_at_start(self, cost: dict) -> Tensor:
+        """The reducer's total ``[n]`` of ``cost``, after :meth:`apply`, with every requirement row at the weight it
+        started at and the entries that are not requirements as they are."""
+        return self.reducer({kind: {**entry, "weights": {name: self.start[(kind, name)] for name in entry["values"]}}
+                             if entry["type"] == "constraint" else entry for kind, entry in cost.items()})

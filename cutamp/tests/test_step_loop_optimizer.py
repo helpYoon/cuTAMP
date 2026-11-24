@@ -20,6 +20,26 @@ def test_a_row_without_a_finite_gradient_keeps_its_values():
     assert torch.isfinite(a).all() and torch.isfinite(b).all()
 
 
+def test_the_countdown_reads_the_published_cost_at_start_weights():
+    from cutamp.cost_reduction import CostReducer
+    x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    published = {"at_start": torch.tensor([0.5, float("nan"), 0.25])}
+
+    def cost_fn(rollout, particles):
+        soft = {"type": "cost", "values": {"preference": x}}
+        if published["at_start"] is not None:
+            soft["cost_at_start_weights"] = published["at_start"]
+        return {"Row": {"type": "constraint", "values": {"row": 100 * x}, "weights": {"row": torch.full((3,), 8.0)}},
+                "soft": soft}
+
+    body = op._StepBody({"x": x}, lambda particles: None, cost_fn, CostReducer({}),
+                        lambda cost, verbose: torch.zeros(3, dtype=torch.bool), op.ADAM_CONSIDER_TYPES, params=[x],
+                        grad_masks={}, keep_vis=False, stepped=True)
+    assert body()[0][2] == 0.25                     # the published total, its row that is not a number skipped
+    published["at_start"], x.grad = None, None
+    assert body()[0][2] == 801.0                    # without it, the weighted total, as before
+
+
 class FakeSteps:
     landing_confs = frozenset()
 

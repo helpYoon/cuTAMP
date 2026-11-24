@@ -478,6 +478,30 @@ def test_the_loss_weighs_each_requirement_per_particle(stepped_call):
 
 
 @needs_cuda
+def test_the_cost_at_start_weights_stays_while_the_weights_double(stepped_call):
+    """Two refreshes double every violated row's weight while the values stay: the total the countdown reads stays,
+    the loss's total rises."""
+    from cutamp.step_costs import GROWTH
+    plan, reducer = make_plan(stepped_call), stepped_call["reducer"]
+    p = plan.particles
+    with torch.no_grad():
+        rollout = plan.rollout(p)
+        cost = plan(rollout, p)
+        at_start, total = cost["soft"]["cost_at_start_weights"], reducer(cost)
+        for _ in range(2):
+            plan.weights.grow()
+            for line in plan.checks.values():
+                line["weight"] = torch.where(line["value"] > 0, line["weight"] * GROWTH, line["weight"])
+        again = plan(rollout, p)
+        grown = reducer(again)
+    torch.testing.assert_close(at_start, total, equal_nan=True)     # every weight is at its start at the first call
+    assert not at_start.requires_grad and at_start.shape == (16,)
+    torch.testing.assert_close(again["soft"]["cost_at_start_weights"], at_start, rtol=0, atol=0, equal_nan=True)
+    finite = total.isfinite()
+    assert (grown[finite] >= total[finite]).all() and (grown[finite] > total[finite]).any()
+
+
+@needs_cuda
 def test_the_checks_are_a_straight_line_in_the_commands(stepped_call):
     plan = make_plan(stepped_call)
     p = plan.particles

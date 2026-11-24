@@ -201,7 +201,8 @@ def _best_fixed_row(quality, passing):
 class _StepBody:
     """One Adam step's device work, run eagerly or captured as G_step: the forward, the per-step scalars
     stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost), and the
-    backward with the grad masks. Returns ``(packed, vis)``; ``vis`` is ``None`` unless ``keep_vis``."""
+    backward with the grad masks. The min cost is the smallest ``cost_at_start_weights`` where the cost publishes
+    it (a stepped plan, whose weights grow). Returns ``(packed, vis)``; ``vis`` is ``None`` unless ``keep_vis``."""
     particles: dict
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
@@ -228,7 +229,10 @@ class _StepBody:
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
         scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-        if self.stepped:  # else one diverged row makes the min NaN, and the stop rule's loss clock never resets
+        at_start = cost_dict.get("soft", {}).get("cost_at_start_weights")
+        if at_start is not None:  # the stop rule's loss clock cannot read weights that double (2026-11-23 design 4.6)
+            scalars[2] = at_start.nan_to_num(nan=float("inf")).min()
+        elif self.stepped:  # else one diverged row makes the min NaN, and the stop rule's loss clock never resets
             scalars[2] = costs.nan_to_num(nan=float("inf")).min()
         soft_costs = self.cost_reducer.soft_costs(cost_dict)
         scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
