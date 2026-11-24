@@ -451,10 +451,25 @@ def test_the_checks_are_a_straight_line_in_the_commands(stepped_call):
 
 
 @needs_cuda
-def test_a_checks_weight_doubles_while_it_fails(stepped_call):
+def test_a_checks_weight_doubles_while_it_fails(stepped_call, monkeypatch):
+    from cutamp import step_loop
+    from cutamp.step_costs import GROWTH, WEIGHT_CAP
     plan = make_plan(stepped_call)
-    failing = plan.checks[0]["value"] > 0
+    weight = plan.checks[0]["weight"]
+    assert (weight == 1.0).all()
+    k, read = 0, step_loop.lines
+
+    def failing(*args):                                             # check k fails on every particle, the rest pass
+        value, slope = read(*args)
+        value[:], value[:, k] = -1.0, 1.0
+        return value, slope
+
+    monkeypatch.setattr(step_loop, "lines", failing)
+    weight[0, k], weight[1, k] = WEIGHT_CAP, 3.0
+    before = weight.clone()
     plan.refresh(plan.particles)
-    still = plan.checks[0]["value"] > 0
-    assert torch.equal(plan.checks[0]["weight"] > 1.0, still) and failing.shape == still.shape
+    after = plan.checks[0]["weight"]
+    assert after[0, k] == WEIGHT_CAP and after[1, k] == 3.0 * GROWTH and (after[2:, k] == GROWTH).all()
+    others = torch.arange(after.shape[1], device=after.device) != k
+    assert torch.equal(after[:, others], before[:, others])
     assert len(plan.stats["check_line_error"]) == 1

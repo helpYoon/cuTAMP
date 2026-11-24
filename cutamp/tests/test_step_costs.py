@@ -102,3 +102,17 @@ def test_lines_are_flat_where_a_copy_cannot_be_trusted():
     finite[1] = False                                     # particle 1's own row diverged
     value, slope = lines(values, n, ticks, finite)
     assert (slope[1] == 0).all()
+
+
+def test_lines_zero_what_is_not_finite_and_keep_each_particle_apart():
+    from cutamp.step_costs import lines
+    n, c = 2, 3
+    values = torch.rand(4 * n, 2)
+    values[0, 1], values[1, 0] = float("nan"), float("inf")      # the particles' own rows
+    ticks = torch.zeros(n, c, dtype=torch.bool)
+    finite = torch.ones(4 * n, dtype=torch.bool)
+    value, slope = lines(values, n, ticks, finite)
+    assert value[0, 1] == 0 and value[1, 0] == 0 and value[0, 0] == values[0, 0] and value[1, 1] == values[1, 1]
+    finite[1] = False                                     # particle 1's own row diverged
+    _, again = lines(values, n, ticks, finite)
+    assert torch.equal(again[0], slope[0]) and (slope[0, 0] != 0).all() and (again[1] == 0).all()

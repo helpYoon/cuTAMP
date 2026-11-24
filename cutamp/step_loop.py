@@ -511,10 +511,11 @@ class SteppedPlan:
     def _set_checks(self, j, rows, penetration, refreshed, finite):
         """``checks[j]`` from gap ``j``'s rows on every row of its refresh ``refreshed`` (2026-11-23 design 4.4): the
         :func:`landing_constraint_rows` ``rows`` other than the step's range, each the worst of its columns, then the
-        clearances ``penetration`` of :func:`validate_step_geometry`, each per unit; :func:`lines` gives their value
-        and slope, ``finite`` ``[(1 + 3 s) n]`` the rows that did not diverge. The weights start at 1 and double,
-        up to ``WEIGHT_CAP``, where a check is above zero at a later refresh. Returns how far the last refresh's lines
-        missed the values read now, in units, over the checks either puts above zero (None: no earlier line)."""
+        clearances ``penetration`` of :func:`validate_step_geometry`, each counted from the 1e-6 its verdict accepts
+        and per unit; :func:`lines` gives their value and slope, ``finite`` ``[(1 + 3 s) n]`` the rows that did not
+        diverge. The weights start at 1 and double, up to ``WEIGHT_CAP``, where a check is above zero at a later
+        refresh. Returns how far the last refresh's lines missed the values read now, in units, over the checks either
+        puts above zero on the particles whose own row did not diverge (None: no earlier line)."""
         names, columns = [], []
         for key, value in rows.items():
             if not key.endswith(("min_travel", "max_travel", "command_bound", "achieved_bound")):
@@ -522,13 +523,13 @@ class SteppedPlan:
                 columns.append(value.reshape(len(value), -1).amax(1))
         for key, value in penetration.items():
             names.append("geometry_" + key)
-            columns.append(value / (UNIT_RAD if key.endswith("_rad") else UNIT_M))
+            columns.append((value - 1e-6) / (UNIT_RAD if key.endswith("_rad") else UNIT_M))
         n = len(refreshed.commands)
         value, slope = lines(torch.stack(columns, 1), n, refreshed.ticks_changed, finite)
         old, miss = self.checks.get(j), None
         if old is not None and old["names"] == names:
             guess = _check_line(old, refreshed.commands)
-            miss = (guess - value)[(guess > 0) | (value > 0)].abs()
+            miss = (guess - value)[((guess > 0) | (value > 0)) & finite[:n, None]].abs()
             weight = torch.where(value > 0, old["weight"] * GROWTH, old["weight"]).clamp_max(WEIGHT_CAP)
         else:
             weight = torch.ones_like(value)
