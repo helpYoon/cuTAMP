@@ -1,11 +1,27 @@
-"""The weights of the requirements a stepped plan keeps as costs (2026-11-23 design 4.3)."""
+"""The weights of the requirements a stepped plan keeps as costs (2026-11-23 design 4.3), and the straight lines that
+carry a step's checks between refreshes (design 4.4)."""
 
 import torch
+from torch import Tensor
 
 from cutamp.stance import UNIT_M
+from cutamp.step_refresh import NUDGE
 
 GROWTH = 2.0  # a violated requirement's weight at each refresh
 WEIGHT_CAP = 1e6  # times the weight a row starts at
+
+
+def lines(values: Tensor, n: int, ticks_changed: Tensor, finite: Tensor) -> tuple[Tensor, Tensor]:
+    """Each check's value and slope in the commands, from ``values`` ``[(1 + c) n, K]``: the ``K`` checks on the
+    particles' own rows (block 0), then on each copy with command number ``k`` nudged by ``NUDGE`` (block ``k + 1``).
+
+    Returns ``(value [n, K], slope [n, K, c])``: block 0 with entries not finite as zero, and each copy's change from it
+    per ``NUDGE``, zero where that nudge changed a tick count (``ticks_changed`` ``[n, c]``), where the particle's own
+    row or the copy is not ``finite`` (``[(1 + c) n]``), or where the change is not finite."""
+    blocks, trusted = values.reshape(-1, n, values.shape[-1]), finite.reshape(-1, n)
+    slope = ((blocks[1:] - blocks[:1]) / NUDGE).permute(1, 2, 0)
+    keep = (~ticks_changed & trusted[1:].T & trusted[:1].T)[:, None] & slope.isfinite()
+    return blocks[0].nan_to_num(0.0, posinf=0.0, neginf=0.0), torch.where(keep, slope, 0.0)
 
 
 def start_weight(cost_type: str, name: str, reducer) -> float:

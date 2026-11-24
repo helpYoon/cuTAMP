@@ -82,6 +82,18 @@ def test_a_nudge_that_changes_a_tick_count_is_not_used(predictor):
 
 
 @needs_cuda
+def test_every_copy_of_the_rollout_is_kept(predictor):
+    start, feet = standing(predictor, 2)
+    u = torch.tensor(COMMANDS, device="cuda")                     # two particles, two steps: seven copies each
+    r = refresh_gap(predictor, start, "LR", u, feet[:, 1])
+    assert r.copy_commands.shape == (14, 2, 3) and len(r.copies.steps[0].achieved) == 14
+    assert torch.equal(r.copy_commands[:2], u)
+    torch.testing.assert_close(r.copies.steps[0].achieved[:2], r.prediction.steps[0].achieved)
+    torch.testing.assert_close((r.copy_commands[2:4] - u)[:, 0],
+                               torch.tensor([NUDGE, 0.0, 0.0], device="cuda").expand(2, 3), rtol=0, atol=1e-8)
+
+
+@needs_cuda
 def test_a_wild_row_does_not_change_its_neighbours(predictor):
     start, feet = standing(predictor, 2)
     u = torch.tensor(COMMANDS, device="cuda")

@@ -427,3 +427,34 @@ def test_the_loss_weighs_each_requirement_per_particle(stepped_call):
     with torch.no_grad():
         again = plan(plan.rollout(p), p)["ComComfort"]["weights"]["margin_shortfall"]
     assert torch.equal(again > 1 / UNIT_M, short)
+
+
+@needs_cuda
+def test_the_checks_are_a_straight_line_in_the_commands(stepped_call):
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    line = plan.checks[0]
+    assert line["value"].shape == line["weight"].shape == (16, len(line["names"]))
+    assert line["slope"].shape == (16, len(line["names"]), 3) and torch.equal(line["at"], plan.standin.at[0])
+    assert any(name.startswith("geometry_") for name in line["names"])
+    assert not any(name.endswith(("travel", "bound", "precision", "deadline_xy")) for name in line["names"])
+    u = p["step_commands_0"].requires_grad_()
+    cost = plan(plan.rollout(p), p)
+    torch.testing.assert_close(cost["StepChecks"]["values"]["lines"],
+                               (line["weight"] * line["value"].clamp_min(0)).sum(1).to(u), atol=1e-6, rtol=1e-5)
+    k = 0
+    line["value"][:], line["slope"][:] = -1.0, 0.0                  # every other check met, with no slope
+    line["value"][:, k], line["slope"][:, k] = 1.0, torch.tensor([2.0, 0.0, 0.0], device=u.device)
+    cost = plan(plan.rollout(p), p)
+    (grad,) = torch.autograd.grad(cost["StepChecks"]["values"]["lines"].sum(), u)
+    torch.testing.assert_close(grad[:, 0, 0], 2.0 * line["weight"][:, k].to(grad))
+
+
+@needs_cuda
+def test_a_checks_weight_doubles_while_it_fails(stepped_call):
+    plan = make_plan(stepped_call)
+    failing = plan.checks[0]["value"] > 0
+    plan.refresh(plan.particles)
+    still = plan.checks[0]["value"] > 0
+    assert torch.equal(plan.checks[0]["weight"] > 1.0, still) and failing.shape == still.shape
+    assert len(plan.stats["check_line_error"]) == 1

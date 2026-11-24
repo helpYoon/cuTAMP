@@ -31,6 +31,8 @@ class GapRefresh:
     slope: Tensor          # [n, s, 2, 3, 3 * s] change of `relative` per unit of each command number
     commands: Tensor       # [n, s, 3] the commands it ran at (a detached copy)
     ticks_changed: Tensor  # [n, 3 * s] bool: nudging that number changed some step's tick count
+    copies: LandingPrediction  # all (1 + 3 s) n rows of the rollout: the particles' own, then one block per nudge
+    copy_commands: Tensor      # [(1 + 3 s) n, s, 3] the commands each row of `copies` ran at
 
 
 def _first(value, n):
@@ -65,7 +67,8 @@ def refresh_gap(predictor, start: LandingState, order: str, commands: Tensor, an
     One call of ``predictor.rollout``, with its default settling hold, on ``1 + 3 s`` rows per particle: the commands as
     they are, then each command number plus NUDGE. ``anchor`` ``[n, 3]`` is the sole that stays planted in the gap's
     first step. A landing jumps where a step's tick count changes, so where a nudge changed one the slope entry is
-    ``previous_slope``'s, or with none the slope of a landing exactly as commanded from the start's own feet.
+    ``previous_slope``'s, or with none the slope of a landing exactly as commanded from the start's own feet. Every row
+    of the call is kept in ``copies``, for the checks that read their own slope from the copies (2026-11-23 design 4.4).
     """
     with torch.no_grad(), prediction_precision():
         u = commands.detach().clone()
@@ -94,7 +97,7 @@ def refresh_gap(predictor, start: LandingState, order: str, commands: Tensor, an
                 pairs.append(pair)
             fallback = _slope(_relative(big_anchor, torch.stack(pairs, 1)), rows)
         slope = torch.where(ticks_changed[:, None, None, None], fallback, slope)
-    return GapRefresh(_first(out, n), landed[:n].clone(), relative[:n].clone(), slope, u, ticks_changed)
+    return GapRefresh(_first(out, n), landed[:n].clone(), relative[:n].clone(), slope, u, ticks_changed, out, big_u)
 
 
 @dataclass

@@ -21,9 +21,9 @@ from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_pla
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.rollout import Rollout, RolloutFunction
 from cutamp.samplers import project_supported_placement
-from cutamp.stance import STEP_TRAVEL, UNIT_M, abs_pose, rel_pose, stance_joint_limits
+from cutamp.stance import STEP_TRAVEL, UNIT_M, UNIT_RAD, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
-from cutamp.step_costs import RequirementWeights
+from cutamp.step_costs import GROWTH, WEIGHT_CAP, RequirementWeights, lines
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refresh import NoStartingPath, StandIn, command_rows, draw_grid_paths, grid_commands, refresh_gap
@@ -216,7 +216,8 @@ def stance_center_residual(ik: StanceIK) -> torch.Tensor:
 
 
 def landing_constraint_rows(predictor, incoming, order, u, pred):
-    """Command domain, phase, per-landing and composed-stance checks on this actual issue state."""
+    """Command domain, phase, per-landing and composed-stance checks on this actual issue state, each its excess over
+    its threshold per unit (``UNIT_M`` for a length, ``UNIT_RAD`` for an angle), so met where at most zero."""
     before = incoming
     rows = {}
     hard = torch.ones(len(u), dtype=torch.bool, device=u.device)
@@ -239,17 +240,16 @@ def landing_constraint_rows(predictor, incoming, order, u, pred):
             pair = step.achieved
             ph = step.phases
             profile = predictor.profile
-            for key in (
-                "deadline_height",
-                "support_xy",
-                "support_yaw",
-                "hold_xy",
-                "hold_yaw",
+            for key, unit in (
+                ("deadline_height", UNIT_M),
+                ("support_xy", UNIT_M),
+                ("support_yaw", UNIT_RAD),
+                ("hold_xy", UNIT_M),
+                ("hold_yaw", UNIT_RAD),
             ):
-                threshold = getattr(profile, key)
-                rows[prefix + key] = (getattr(ph, key) - threshold) / max(threshold, 1e-6)
-            rows[prefix + "terminal_sole_height"] = step.sole_height[:, -1].abs() / 0.02 - 1
-            rows[prefix + "terminal_sole_tilt"] = step.sole_tilt[:, -1] / 0.10 - 1
+                rows[prefix + key] = (getattr(ph, key) - getattr(profile, key)) / unit
+            rows[prefix + "terminal_sole_height"] = (step.sole_height[:, -1].abs() - 0.02) / UNIT_M
+            rows[prefix + "terminal_sole_tilt"] = (step.sole_tilt[:, -1] - 0.10) / UNIT_RAD
             hard = hard & ph.deadline_ok & ph.hold_ok & ph.support_ok
         actual = rel_pose(pair[:, 1 - s], pair[:, s])
         rows[prefix + "achieved_bound"] = bounds.g(actual, foot) / UNIT_M
@@ -269,6 +269,11 @@ def _gap_stances(standin, j, before, u):
     one = StandIn(standin.orders[gap], standin.relative[gap], standin.slope[gap], standin.at[gap])
     after, final = one.stances(before, [u])
     return after[0], final[0]
+
+
+def _check_line(line, u):
+    """``[n, K]``: a gap's checks on their straight line (2026-11-23 design 4.4) at its commands ``u`` ``[n, s, 3]``."""
+    return line["value"] + torch.einsum("nkc,nc->nk", line["slope"], (u - line["at"]).reshape(len(u), -1))
 
 
 def _finite_rows(state):
@@ -307,9 +312,10 @@ class SteppedPlan:
     4.1): each evaluation puts them back first (:meth:`rollout`), their slope along that hold reaches the commands and
     the placements (:meth:`hand_on`), and each Adam step ends with the postures inside their joint limits and the
     placements on their support (:meth:`step`). A refresh runs the world model and controller on every particle's
-    commands, gap by gap, writes the landing postures (never optimized), sets the stand-in the costs read until the next
-    refresh and puts the pick, place and retract postures back on the pairs they stand on; it solves none (2026-11-23
-    design 4.7). The starting pass is the first refresh, with one solve per posture.
+    commands, gap by gap, writes the landing postures (never optimized), sets the stand-in and the step's checks'
+    straight lines (design 4.4) the costs read until the next refresh and puts the pick, place and retract postures
+    back on the pairs they stand on; it solves none (2026-11-23 design 4.7). The starting pass is the first refresh,
+    with one solve per posture.
     """
 
     def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, reducer, deadline=None, generator=None):
@@ -327,7 +333,10 @@ class SteppedPlan:
         self.standin = StandIn(self.orders, list(empty), list(empty), list(empty))
         self.last, self.motion_inputs, self.references, self.start_postures = {}, {}, {}, {}
         self.weights = RequirementWeights(reducer, checker)
-        self.stats = {"refresh_s": [], "standin_error_m": [], "command_move_m": [], "correction_capped": []}
+        # Per gap with steps, its checks' straight lines in its commands and their weights (2026-11-23 design 4.4).
+        self.checks = {}
+        self.stats = {"refresh_s": [], "standin_error_m": [], "command_move_m": [], "correction_capped": [],
+                      "check_line_error": []}
         # Each held posture's J from its last put-back, and the rows the correction capped since the last refresh.
         self.held_jac, self.capped = {}, 0
         # Each pick, place and retract posture's gap; the posture each gap starts from: the plan's start for the first,
@@ -398,7 +407,7 @@ class SteppedPlan:
                 _check_deadline(deadline)
                 seed = particles[self._start_of[j]]  # the posture the robot stands in here: the start, or its landing
                 if steps:
-                    passed, before, head = self._run_gap(j, particles, head, before, objects[j], held_before[j])
+                    passed, before, head, _ = self._run_gap(j, particles, head, before, objects[j], held_before[j])
                     ok &= passed
                     seed = particles[steps[-1].arg("q_land")]
                 self._solve_postures(j, particles, before, wrists[j], objects[j], held_before[j], seed)
@@ -451,9 +460,10 @@ class SteppedPlan:
 
     def _run_gap(self, j, particles, head, before, objects, held):
         """Gap ``j``'s hold, its rollout and slope at the current commands, the stand-in set, its landing postures and
-        ``sole_to`` written and ``last[j]`` kept. ``head`` ``[n, 2]`` (None: zero) are the head angles the earlier
-        rollout ended with; ``before`` ``[n, 2, 3]`` is the stand-in's pair the gap starts on. Returns its tests' pass
-        ``[n]``, the pair after it and the head angles its rollout ends with."""
+        ``sole_to`` written, ``last[j]`` kept and its checks read on every row of the rollout (:meth:`_set_checks`).
+        ``head`` ``[n, 2]`` (None: zero) are the head angles the earlier rollout ended with; ``before`` ``[n, 2, 3]``
+        is the stand-in's pair the gap starts on. Returns its tests' pass ``[n]`` (the particles' own rows), the pair
+        after it, the head angles its rollout ends with and :meth:`_set_checks`'s misses."""
         steps, order = self.groups[j][0], self.orders[j]
         if j == 0:
             start = self._first
@@ -462,37 +472,77 @@ class SteppedPlan:
             start = self.adapter.initialize(particles[self._start_of[j]].detach(), self._dynamics, world=self.world,
                                             object_poses=objects, held=held)
         u = particles[self.command_names[j]]
+        n = len(u)
         anchor = before[:, 1 - "LR".index(order[0])]
         refreshed = refresh_gap(self.predictor, start.state, order, u, anchor, self.standin.slope[j])
         self.standin.set(j, refreshed)
-        prediction = refreshed.prediction
+        prediction, copies = refreshed.prediction, refreshed.copies
+        blocks = len(refreshed.copy_commands) // n
+
+        def per_copy(x):
+            return x.repeat(blocks, *[1] * (x.ndim - 1))
+
         # A diverged row (a state not finite anywhere in its rollout) is garbage and fails the tests. It is zeroed where
         # the planner's batched solve reads it, so the solve still answers for the other rows.
         finite = torch.stack([_finite_rows(s.trajectory) & _finite_rows(s.terminal.tensors[:6])
-                              for s in prediction.steps]).all(0)
-        checked = replace(prediction, steps=tuple(replace(s, trajectory=_zero_unless(finite, s.trajectory))
-                                                  for s in prediction.steps))
+                              for s in copies.steps]).all(0)
+        own = finite[:n]
+        checked = replace(copies, steps=tuple(replace(s, trajectory=_zero_unless(finite, s.trajectory))
+                                              for s in copies.steps))
         for k, step in enumerate(steps):
             landed = prediction.steps[k]
-            q_land = self.adapter.planner(_zero_unless(finite, landed.terminal.tensors[:6]))[0]
+            q_land = self.adapter.planner(_zero_unless(own, landed.terminal.tensors[:6]))[0]
             _write(particles, step.arg("q_land"), q_land)
             _write(particles, step.arg("sole_to"), landed.achieved[:, "LR".index(order[k])])
         self.last[j] = (start.state, refreshed.commands, prediction, start.preparation)
         feet = self.predictor.model.feet(start.state.tensors[:6])[0]
-        rows, hard, _ = landing_constraint_rows(self.predictor, feet, order, refreshed.commands, prediction)
-        passed = start.compatible & hard & (torch.cat([v.reshape(len(u), -1) for v in rows.values()], 1) <= 0).all(1)
-        passed &= validate_step_geometry(self.world, self.adapter, checked, object_poses=objects, held=held)["valid"]
+        rows, hard, _ = landing_constraint_rows(self.predictor, per_copy(feet), order, refreshed.copy_commands, copies)
+        geometry = validate_step_geometry(
+            self.world, self.adapter, checked, object_poses={name: per_copy(pose) for name, pose in objects.items()},
+            held={arm: (name, per_copy(pose)) for arm, (name, pose) in held.items()},
+        )
+        passed = start.compatible & hard[:n] & (torch.cat([v[:n].reshape(n, -1) for v in rows.values()], 1) <= 0).all(1)
+        passed &= geometry["valid"][:n]
+        miss = self._set_checks(j, rows, geometry["penetration"], refreshed, finite)
         _, after = _gap_stances(self.standin, j, before, u)
         head = prediction.terminal.tensors[4][:, self.adapter.columns]
-        return passed & finite, after, torch.where(finite[:, None], head, 0)  # a diverged row hands on a zero head
+        return passed & own, after, torch.where(own[:, None], head, 0), miss  # a diverged row hands on a zero head
+
+    def _set_checks(self, j, rows, penetration, refreshed, finite):
+        """``checks[j]`` from gap ``j``'s rows on every row of its refresh ``refreshed`` (2026-11-23 design 4.4): the
+        :func:`landing_constraint_rows` ``rows`` other than the step's range, each the worst of its columns, then the
+        clearances ``penetration`` of :func:`validate_step_geometry`, each per unit; :func:`lines` gives their value
+        and slope, ``finite`` ``[(1 + 3 s) n]`` the rows that did not diverge. The weights start at 1 and double,
+        up to ``WEIGHT_CAP``, where a check is above zero at a later refresh. Returns how far the last refresh's lines
+        missed the values read now, in units, over the checks either puts above zero (None: no earlier line)."""
+        names, columns = [], []
+        for key, value in rows.items():
+            if not key.endswith(("min_travel", "max_travel", "command_bound", "achieved_bound")):
+                names.append(key)
+                columns.append(value.reshape(len(value), -1).amax(1))
+        for key, value in penetration.items():
+            names.append("geometry_" + key)
+            columns.append(value / (UNIT_RAD if key.endswith("_rad") else UNIT_M))
+        n = len(refreshed.commands)
+        value, slope = lines(torch.stack(columns, 1), n, refreshed.ticks_changed, finite)
+        old, miss = self.checks.get(j), None
+        if old is not None and old["names"] == names:
+            guess = _check_line(old, refreshed.commands)
+            miss = (guess - value)[(guess > 0) | (value > 0)].abs()
+            weight = torch.where(value > 0, old["weight"] * GROWTH, old["weight"]).clamp_max(WEIGHT_CAP)
+        else:
+            weight = torch.ones_like(value)
+        self.checks[j] = {"names": names, "value": value, "slope": slope, "at": refreshed.commands, "weight": weight}
+        return miss
 
     def refresh(self, particles: dict) -> None:
         """One refresh (design 6; 2026-11-23 design 4.7) at the particles' current commands, postures, placements and
         grasps, values only, gap by gap in order: its hold and rollout if it has steps, then its pick or place and
         retract postures put back (:meth:`put_back`) on the pair it stands on, so the next gap's hold starts from the
         retract put back. ``q_land``, ``sole_to`` and the postures are written in place; ``standin``, ``last``,
-        ``tests_ok`` and ``stats`` follow, ``stats["correction_capped"]`` with the rows the correction capped since the
-        last refresh."""
+        ``checks``, ``tests_ok`` and ``stats`` follow, ``stats["correction_capped"]`` with the rows the correction
+        capped since the last refresh and ``stats["check_line_error"]`` with the median miss of the checks' last lines
+        over every gap (:meth:`_set_checks`; None where there is none)."""
         began = monotonic()
         n = len(particles["left_q0"])
         with torch.no_grad(), prediction_precision():
@@ -504,11 +554,13 @@ class SteppedPlan:
             _, objects, _, held_before = _placements_and_grasps(self.groups, self.world, self.pools, 0, n,
                                                                 bindings=particles, grasp_indices=particles)
             ok, head, before = torch.ones(n, dtype=torch.bool, device=self.incoming.device), None, self.incoming
-            errors = {}
+            errors, misses = {}, []
             for j, (steps, _) in enumerate(self.groups):
                 if steps:  # else it stands on the pair before it
-                    passed, before, head = self._run_gap(j, particles, head, before, objects[j], held_before[j])
+                    passed, before, head, miss = self._run_gap(j, particles, head, before, objects[j], held_before[j])
                     ok &= passed
+                    if miss is not None:
+                        misses.append(miss)
                     landed = torch.stack([step.achieved for step in self.last[j][2].steps], 1)
                     distance = (read[j][..., :2] - landed[..., :2]).norm(dim=-1).amax((1, 2))
                     errors[j] = torch.stack((distance.nanmedian(), distance.nanquantile(0.9)))
@@ -518,6 +570,8 @@ class SteppedPlan:
             self.stats["command_move_m"].append(moved.item())
             self.stats["correction_capped"].append(int(self.capped))
             self.capped = 0
+            missed = torch.cat(misses) if misses else torch.empty(0)
+            self.stats["check_line_error"].append(missed.median().item() if len(missed) else None)
         self.stats["refresh_s"].append(monotonic() - began)
         self.weights.grow()
 
@@ -640,10 +694,11 @@ class SteppedPlan:
 
     def __call__(self, rollout, particles: dict) -> dict:
         """The cost the Adam loop reads (design 5): today's cost on the stand-in's stances, the balance cost as the
-        shortfall itself, the retracts' feet, the commands' rows, the last refresh's tests (read by the checker only)
-        and staying near the starting postures. Every requirement row carries its weight per particle
-        (:class:`RequirementWeights`, 2026-11-23 design 4.3); the hand and feet rows weigh zero: they are held, not
-        costs (design 4.1), and the checker still reads them."""
+        shortfall itself, the retracts' feet, the commands' rows, the last refresh's tests (read by the checker only),
+        the step's checks on their straight lines in the commands (``StepChecks``, design 4.4) and staying near the
+        starting postures. Every requirement row carries its weight per particle (:class:`RequirementWeights`,
+        2026-11-23 design 4.3); the hand and feet rows weigh zero: they are held, not costs (design 4.1), and the
+        checker still reads them."""
         table, after = self._stances(particles)
         inner = {key: value for key, value in particles.items() if key not in self.landing_confs}
         cost = self.cost_function(rollout, inner, achieved_stances=table)
@@ -656,6 +711,10 @@ class SteppedPlan:
         rows = command_rows(self.orders, self.incoming, self._commands(particles), after)
         cost["StepCommand"] = {"type": "constraint", "values": rows}
         cost["StepTests"] = {"type": "constraint", "values": {"refresh_tests": (~self.tests_ok).to(margin.dtype)}}
+        steer = margin.new_zeros(len(margin))
+        for j, line in self.checks.items():
+            steer = steer + (line["weight"] * _check_line(line, particles[self.command_names[j]]).clamp_min(0)).sum(1)
+        cost["StepChecks"] = {"type": "cost", "values": {"lines": steer}}
         stay = sum((particles[name] - start).square().sum(-1) for name, start in self.start_postures.items())
         cost.setdefault("soft", {"type": "cost", "values": {}})["values"]["stay_near_start"] = stay
         self.weights.apply(cost)

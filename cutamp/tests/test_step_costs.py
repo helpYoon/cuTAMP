@@ -62,3 +62,43 @@ def test_inside_half_its_tolerance_a_row_is_not_violated():
     weights.grow()
     weights.apply(cost)
     assert cost["Collision"]["weights"]["robot_to_world"].tolist() == [[1.0, GROWTH]]
+
+
+def test_a_row_configured_to_weigh_nothing_stays_at_zero():
+    reducer = CostReducer({"StepTests": {"refresh_tests": 0.0}})
+    weights = RequirementWeights(reducer, ConstraintChecker({"StepTests": {"refresh_tests": 0.0}}))
+    assert start_weight("StepTests", "refresh_tests", reducer) == 0.0
+    cost = {"StepTests": {"type": "constraint", "values": {"refresh_tests": torch.ones(2)}}}
+    weights.apply(cost)
+    weights.grow()
+    weights.apply(cost)
+    assert (cost["StepTests"]["weights"]["refresh_tests"] == 0).all()
+
+
+def test_lines_read_the_value_and_the_slope_from_the_copies():
+    from cutamp.step_costs import lines
+    from cutamp.step_refresh import NUDGE
+    n, c = 2, 3
+    own = torch.tensor([[0.5, -1.0], [2.0, 0.0]])                                # [n, K]
+    true = torch.arange(12.0).reshape(n, 2, c)                                   # [n, K, c]
+    blocks = [own] + [own + NUDGE * true[:, :, k] for k in range(c)]
+    value, slope = lines(torch.cat(blocks), n, torch.zeros(n, c, dtype=torch.bool), torch.ones(4 * n, dtype=torch.bool))
+    torch.testing.assert_close(value, own)
+    torch.testing.assert_close(slope, true, rtol=1e-3, atol=1e-3)
+
+
+def test_lines_are_flat_where_a_copy_cannot_be_trusted():
+    from cutamp.step_costs import lines
+    n, c = 2, 3
+    values = torch.rand(4 * n, 2)
+    ticks = torch.zeros(n, c, dtype=torch.bool)
+    ticks[0, 1] = True                                    # that nudge changed a tick count
+    finite = torch.ones(4 * n, dtype=torch.bool)
+    finite[3 * n + 1] = False                             # particle 1's third copy diverged
+    values[3 * n + 1] = float("nan")
+    value, slope = lines(values, n, ticks, finite)
+    assert (slope[0, :, 1] == 0).all() and (slope[1, :, 2] == 0).all() and slope.isfinite().all()
+    assert (slope[0, :, 0] != 0).any() and value.isfinite().all()
+    finite[1] = False                                     # particle 1's own row diverged
+    value, slope = lines(values, n, ticks, finite)
+    assert (slope[1] == 0).all()
