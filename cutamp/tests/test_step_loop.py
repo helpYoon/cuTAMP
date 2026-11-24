@@ -51,6 +51,7 @@ from time import monotonic
 import pytest
 
 from cutamp import algorithm as alg
+from cutamp import held
 from cutamp.algorithm import run_cutamp
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.particle_initialization import ParticleInitializer
@@ -340,8 +341,13 @@ def test_the_postures_follow_the_feet(stepped_call):
     plan = make_plan(stepped_call)
     p = plan.particles
     with torch.no_grad():
-        start = plan(plan.rollout_fn(p), p)["KinematicConstraint"]["values"]
-        reach = (start["pos_err"].amax(1) < 5e-3) & (start["sole_pos_err"].amax(1) < 5e-3)
+        table, targets = plan.stance_table(p), plan.hand_targets(p)
+        reach = torch.ones(16, dtype=torch.bool, device="cuda")
+        # A posture its limits keep off its hand and feet is the checker's to reject, not this test's to measure.
+        for name, j in plan.gap_of.items():
+            op = plan.groups[j][1]
+            hand = (targets[j], op.operator.metadata.arm) if name == op.arg("q") else ()
+            reach &= held.held_rows(plan.world, p[name], table[name], *hand)[0].abs().amax(1) < 5e-3
         p["step_commands_0"][..., 1] += 0.005                           # every stance moves 5 mm
         moved = plan(plan.rollout(p), p)["KinematicConstraint"]["values"]
     assert reach.sum() >= 8
