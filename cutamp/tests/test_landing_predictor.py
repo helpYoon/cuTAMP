@@ -87,3 +87,12 @@ def test_a_step_is_done_when_the_foot_is_down_at_its_last_tick():
     assert checks.deadline_ok.tolist() == [True, False]
     assert checks.deadline_xy[0] == pytest.approx(0.20) and checks.hold_ok[0]
     assert not hasattr(LandingProfile(), "deadline_xy") and not hasattr(LandingProfile(), "deadline_yaw")
+
+
+def test_a_values_only_call_keeps_the_fuser_and_a_differentiable_one_does_not():
+    from cutamp.landing_predictor import prediction_precision
+
+    with torch.no_grad(), prediction_precision():
+        assert torch._C._get_graph_executor_optimize()
+    with torch.enable_grad(), prediction_precision():
+        assert not torch._C._get_graph_executor_optimize()

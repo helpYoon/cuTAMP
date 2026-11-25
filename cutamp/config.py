@@ -61,7 +61,8 @@ class TAMPConfiguration:
     # Replay the Adam step and the re-IK refresh as CUDA graphs
     # (cutamp/cuda_graphs.py). Default ON (2026-10-31): 3.5x faster steps at n=64,
     # 2.1x at 256, replays bitwise equal to eager. A failed capture ends the
-    # run: no switch to eager.
+    # run: no switch to eager. A plan with steps replays its Adam step too, put-back
+    # included (2026-11-24); its refresh and the Adam update stay eager.
     cuda_graphs: bool = True
 
     ## Task Planning
@@ -108,10 +109,12 @@ class TAMPConfiguration:
     def for_steps(self) -> "TAMPConfiguration":
         """This configuration for a plan with steps in the Adam loop; every other setting is kept."""
         # Design docs/superpowers/specs/2026-11-22-adam-alone-steps-design.md, section 5.
-        # conf_lr 7e-3 (call 6): at 2.2e-2 the hand hovers above its 5 mm tolerance; at 7e-3 it settles at 1.3 to
-        # 2.1 mm. soft_cost [] (call 5): each listed soft cost pulls its variables at Adam's full step and the hand
-        # leaves its target; a stepped plan's preferences are its own (`step_costs`).
-        return replace(self, conf_lr=7e-3, soft_cost=[])
+        # soft_cost [] (call 5): each listed soft cost pulls its variables at Adam's full step and the hand
+        # leaves its target; a stepped plan's preferences are its own (`step_costs`). conf_lr is the planner's own
+        # since 2026-11-24: its 7e-3 (call 6) kept the hand from hovering above its tolerance, which the put-back
+        # now does; over 5 seeds of the three stepped scenes every plan was found and the loop took 24 / 26 / 39
+        # Adam steps against 26 / 32 / 66.
+        return replace(self, soft_cost=[])
 
 
 def validate_tamp_config(config: TAMPConfiguration):

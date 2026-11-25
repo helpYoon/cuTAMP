@@ -103,3 +103,18 @@ def test_a_wild_row_does_not_change_its_neighbours(predictor):
     b = refresh_gap(predictor, start, "LR", wild, feet[:, 1])
     torch.testing.assert_close(b.landed[0], a.landed[0], rtol=0, atol=2e-5)
     torch.testing.assert_close(b.slope[0], a.slope[0], rtol=0, atol=2e-2)
+
+
+@needs_cuda
+def test_a_refresh_without_nudges_runs_the_particles_own_rows_and_keeps_the_slope(predictor):
+    start, feet = standing(predictor, 2)
+    u = torch.tensor(COMMANDS, device="cuda")
+    full = refresh_gap(predictor, start, "LR", u, feet[:, 1])
+    plain = refresh_gap(predictor, start, "LR", u, feet[:, 1], full.slope, nudges=False)
+    assert len(plain.copy_commands) == 2 and plain.copies.steps[0].trajectory[0].shape[0] == 2   # no nudged copy ran
+    torch.testing.assert_close(plain.landed, full.landed, rtol=0, atol=2e-5)
+    torch.testing.assert_close(plain.relative, full.relative, rtol=0, atol=2e-5)
+    assert plain.slope is full.slope and not plain.ticks_changed.any() and plain.ticks_changed.shape == (2, 6)
+    assert torch.equal(plain.commands, u)
+    with pytest.raises(ValueError, match="slope"):
+        refresh_gap(predictor, start, "LR", u, feet[:, 1], nudges=False)

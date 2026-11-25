@@ -121,8 +121,11 @@ class SegmentTorques:
     It runs on ``config``, ``model``'s KinematicsCfg (``TAMPWorld.kinematics``'s, which
     :func:`cutamp.robots.t1.get_t1_kinematics` builds and checks the joint order of). Calling it on a ``plan_js``
     (position, velocity and acceleration, by joint name) returns the second pass's ``[T, dof]`` torques in
-    ``model.joint_names`` order. Eager. ``effort`` ``[dof]`` is cuRobo's bound on each joint's |torque|: the pinned
-    URDF's effort, and 10,000 on the massless base joints (link_params.py:35).
+    ``model.joint_names`` order. It also runs inside a stepped plan's recorded Adam step (``step_costs.joint_effort``):
+    cuRobo's ``Dynamics.setup_batch_size`` allocates its buffers on every call, so a recording owns the ones it
+    allocated, and ``kin`` is in that recording's guard (``SteppedPlan.recorded``). ``limbs`` indexes the joints
+    outside the base. ``effort`` ``[dof]`` is cuRobo's bound on each joint's |torque|: the pinned URDF's effort, and
+    10,000 on the massless base joints (link_params.py:35).
     ``velocity`` ``[dof]`` is cuRobo's bound on each joint's |velocity| (``get_joint_limits()``, never the URDF's
     velocity times the YAML's velocity_scale: cuRobo applies that scale twice).
     """
@@ -140,6 +143,9 @@ class SegmentTorques:
         self.dyn = Dynamics(DynamicsCfg(kinematics_config=kp, device_cfg=config.device_cfg))
         tools = list(self.kin.tool_frames)
         self.base = [self.joint_names.index(j) for j in model.joint_names[model.base]]
+        # The joints outside the base, as an index on the device (a Python list as an index is a copy from the host).
+        self.limbs = torch.tensor([j for j in range(len(self.joint_names)) if j not in self.base],
+                                  device=config.device_cfg.device)
         self.support = model.support.link
         self.fn = make_floor_wrench_fn(self.base, tuple(tools.index(f) for f in model.sole_frames),
                                        tuple(kp.link_name_to_idx_map[f] for f in model.sole_frames), kp.num_links)

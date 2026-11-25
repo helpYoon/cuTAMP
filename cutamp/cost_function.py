@@ -9,7 +9,7 @@
 
 import itertools
 from collections import defaultdict
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Dict, Tuple, Union
 
 import torch
@@ -71,6 +71,7 @@ class CostFunction:
         self.config = config
 
         self.retract_info = get_retract_parameters(plan_skeleton)
+        self._body_ids: dict[str, torch.Tensor] = {}  # per arm, _body_spheres' answer
         # The same target soles used for the wrist pose's sole-lock check.
         # A drifting FK sole must not move the support region with the body.
         soles = world.stance_soles
@@ -280,13 +281,41 @@ class CostFunction:
 
         return {"type": "constraint", "values": coll_values}
 
+    @cached_property
+    def _foot_half(self) -> torch.Tensor:
+        """A foot's half extents ``[3]``, built once: a recorded Adam step cannot copy from the host."""
+        from cutamp.step_set import _facts
+
+        return self.world.q_init.new_tensor(_facts(self.world.model)["foot_box"]) / 2
+
+    @cached_property
+    def _movables(self) -> dict:
+        """Per movable, its world pose ``[4, 4]`` and its box in its own frame (``step_validation._local_box``), built
+        once, for the same reason."""
+        from cutamp.step_validation import _local_box
+
+        poses = {obj.name: self.world.get_object_pose(obj) for obj in self.world.movables}
+        return {obj.name: (poses[obj.name], _local_box(obj, poses[obj.name])) for obj in self.world.movables}
+
+    def _body_spheres(self, kp, arm: str, count: int) -> torch.Tensor:
+        """The indices, among the robot's ``count`` spheres, of those outside ``arm``'s hand (its tool frame, its hand
+        link and its gripper links): what an object that arm carries is checked against. Found once per arm and kept:
+        finding them waits on the device, and a selection by a mask does too."""
+        if arm not in self._body_ids:
+            from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
+
+            keep = torch.ones(count, dtype=torch.bool, device=kp.link_sphere_idx_map.device)
+            for link in (self.world.tool_frame_for_arm(arm), f"{arm}_hand_link", *GRIPPER_JOINT_NAMES[arm]):
+                if link in kp.link_name_to_idx_map:
+                    keep[kp.get_sphere_index_from_link_name(link).long()] = False
+            self._body_ids[arm] = keep.nonzero().flatten()
+        return self._body_ids[arm]
+
     def stepped_scene_costs(self, particles, ops=None, initial_loose=None, initial_held=None, *, include_self=True,
                             site: str = "stepped_scene"):
         """Check selected postures against the other links, loose objects and carried objects, with the FK run on
         the FK site ``site`` (TAMPWorld.site_kinematics)."""
         from cutamp.gn_refresh import self_sphere_overlaps
-        from cutamp.robots.t1 import GRIPPER_JOINT_NAMES
-        from cutamp.step_set import _facts
         from cutamp.step_validation import _obb_gap, _object_box
 
         if ops is None:
@@ -303,8 +332,8 @@ class CostFunction:
         kp = kin.kinematics_config
         held = dict(initial_held or {})
         loose = (dict(initial_loose) if initial_loose is not None else
-                 {o.name: self.world.get_object_pose(o).expand(b, -1, -1) for o in self.world.movables})
-        foot_half = q.new_tensor(_facts(self.world.model)["foot_box"]) / 2
+                 {name: pose.expand(b, -1, -1) for name, (pose, _) in self._movables.items()})
+        foot_half = self._foot_half
         feet = []
         for frame in self.world.model.sole_frames:
             foot = fk.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(b, h, 4, 4).clone()
@@ -326,18 +355,14 @@ class CostFunction:
                     frame = self.world.tool_frame_for_arm(owner)
                     ee = fk.tool_poses.get_link_pose(frame, make_contiguous=True).get_matrix().reshape(b, h, 4, 4)
                     pose = ee[:, t] @ ee_from_obj
-                    keep = torch.ones(spheres.shape[1], dtype=torch.bool, device=q.device)
-                    for link in (frame, f"{owner}_hand_link", *GRIPPER_JOINT_NAMES[owner]):
-                        if link in kp.link_name_to_idx_map:
-                            keep[kp.get_sphere_index_from_link_name(link).long()] = False
-                    spheres = spheres[:, keep]
+                    spheres = spheres.index_select(1, self._body_spheres(kp, owner, spheres.shape[1]))
                 else:
                     pose = loose[name]
                 obj_s = transform_spheres(self.world.get_collision_spheres(obj), pose)
                 object_spheres[name] = obj_s
                 peaks.append(sphere_to_sphere_overlap(spheres, obj_s))
                 peaks.append(self.world.collision_fn(obj_s[:, None].contiguous()).reshape(b))
-                box, half = _object_box(obj, pose)
+                box, half = _object_box(obj, pose, self._movables[name][1])
                 for foot in feet:
                     peaks.append((-_obb_gap(foot[:, t], foot_half, box, half)).clamp_min(0))
             for a, c in itertools.combinations(object_spheres.values(), 2):
@@ -345,7 +370,8 @@ class CostFunction:
             if kind == "pick":
                 frame = self.world.tool_frame_for_arm(arm)
                 g = grasp_7dof_to_mat4x4(particles[op.arg("grasp")])
-                held[op.arg("obj")] = arm, torch.linalg.inv(g @ self.world.tool_from_ee[frame])
+                # inv_ex: inv's values without its error check, which waits on the device
+                held[op.arg("obj")] = arm, torch.linalg.inv_ex(g @ self.world.tool_from_ee[frame])[0]
             values[f"{t}_movables"] = torch.stack(peaks, dim=1).amax(1, keepdim=True)
         return {"type": "constraint", "values": values}
 

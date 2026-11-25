@@ -89,7 +89,8 @@ def stance_share(mu: torch.Tensor, stance: torch.Tensor) -> torch.Tensor:
     depends on: each sole's x, y and yaw times ``mu`` ``[n, m]`` (:func:`split_gradient`'s, detached) of its position
     x, position y and rotation about the vertical, the last 12 rows. A row of ``stance`` with anything not finite
     counts as zero."""
-    soles = mu.detach()[:, -12:].reshape(-1, 2, 6)[..., [0, 1, 5]].to(stance)
+    rows = mu.detach()[:, -12:].reshape(-1, 2, 6)
+    soles = torch.cat((rows[..., :2], rows[..., 5:]), -1).to(stance)  # columns 0, 1 and 5, without a host index
     fine = stance.isfinite().all((1, 2))
     return (soles * torch.where(fine[:, None, None], stance, 0)).sum()
 

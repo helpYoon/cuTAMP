@@ -195,17 +195,6 @@ class _HandIndex:
         passed = passes(np.arange(len(centers)), seed)
         rest = np.flatnonzero(~passed)
         if len(rest):
-            # The nearest cells to 9 box points at the centre's height: corners, edge midpoints and the centre.
-            u, v = np.meshgrid((-1, 0, 1), (-1, 0, 1))
-            u, v = u.ravel() * half[0], v.ravel() * half[1]
-            c, s = np.cos(yaws[rest])[:, None], np.sin(yaws[rest])[:, None]
-            points = np.repeat(centers[rest, None], 9, axis=1)
-            points[..., 0] += u * c - v * s
-            points[..., 1] += u * s + v * c
-            _, near = self.tree.query(points.reshape(-1, 3))
-            passed[rest] = passes(np.repeat(rest, 9), near).reshape(-1, 9).any(axis=1)
-            rest = rest[~passed[rest]]
-        if len(rest):
             # A cell within the limit has its centre this close to the upright box's centre in x, y and in z.
             r_xy = np.linalg.norm(half[:2]) + half_cell + limit
             r_z = half[2] + half_cell + limit

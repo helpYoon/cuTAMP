@@ -304,7 +304,7 @@ def _null_space_step(ja, jac, rows, target, extra=None, own_complement=False):
     return (rows.mT @ y).squeeze(-1)
 
 
-def _centring_step(ja, jac, jac_com, com_lin, active, half):
+def _centring_step(ja, jac, jac_com, com_lin, active, half, extra=None):
     """Level 3, below :func:`_prioritized_step`'s two: the CoM axes level 1 leaves free (``~active``) toward the
     support's centre from ``com_lin``, the CoM (about the centre) after levels 1-2's step, linear on every
     column, in the null space of level 1's rows ``ja`` ``[B, k, dof]`` and of the hand rows ``jac``
@@ -314,11 +314,15 @@ def _centring_step(ja, jac, jac_com, com_lin, active, half):
     Without the level, GN's minimum-norm steps leave the CoM wherever level 1 stops it, at the rectangle's edge:
     GN IK's blocks_t1 first picks sat at a median 0.95 (x) and 0.96 (|y|) of ``half``, with the base slid
     0.12-0.18 m sideways onto one leg, and trajopt's move there from home needed 1.06-1.37 of the
-    Left_Ankle_Roll's effort (2026-11-06)."""
+    Left_Ankle_Roll's effort (2026-11-06).
+
+    ``extra`` ``[B, e, dof]`` puts the level below another one, whose rows those are: the step is then in their null
+    space too, on its own complement, as level 4's is (:func:`_null_space_step`)."""
     f64 = torch.float64
     w = (~active).to(f64) / half.to(f64)                                             # [B, 2]
     rows = jac_com.to(f64) * w.unsqueeze(-1)                                         # [B, 2, dof]
-    return _null_space_step(ja, jac, rows, -com_lin.to(f64) * w).to(jac_com.dtype)
+    return _null_space_step(ja, jac, rows, -com_lin.to(f64) * w, extra=extra,
+                            own_complement=extra is not None).to(jac_com.dtype)
 
 
 def _upright_step(ja, jac, jac_com, active, half, q3, cols, free):
@@ -345,6 +349,20 @@ def _upright_step(ja, jac, jac_com, active, half, q3, cols, free):
     w = (~active).to(f64) / half.to(f64)
     return _null_space_step(ja, jac, rows, target, extra=jac_com.to(f64) * w.unsqueeze(-1),
                             own_complement=True).to(jac.dtype)
+
+
+def _side_lean_row(q, cols, free, heading):
+    """``(rows [B, 1, dof], target [B, 1])``, float64: the side lean a stepped plan's preferences read
+    (:func:`cutamp.step_costs.side_lean`, the trunk's up axis along the left of the stance heading ``heading`` ``[B]``),
+    linear in the base's pitch and roll (``cols``) at ``q`` ``[B, dof]`` on the columns ``free`` leaves, and minus its
+    value there. The forward bow has no row: those preferences leave it free."""
+    f64 = torch.float64
+    pitch, roll = cols
+    p, r, h = q[:, pitch].to(f64), q[:, roll].to(f64), heading.to(f64)
+    rows = torch.zeros(free.shape[0], 1, free.shape[1], device=free.device, dtype=f64)
+    rows[:, 0, pitch] = -h.sin() * r.cos() * p.cos() * free[:, pitch].to(f64)
+    rows[:, 0, roll] = (h.sin() * r.sin() * p.sin() - h.cos() * r.cos()) * free[:, roll].to(f64)
+    return rows, (h.sin() * r.cos() * p.sin() + h.cos() * r.sin()).unsqueeze(-1)
 
 
 def _fraction_that_fits(base, extra):
@@ -461,7 +479,7 @@ def _region_balance_rows(normals, bounds, seen, at_com, jac_com):
 
 
 def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_sole, r_sole, coll=None, centre=False,
-                   upright=None, region=None):
+                   upright=None, region=None, heading=None):
     """``(step, step3, step12)``, each ``[N, dof]``: one balance-first step, levels 1-4 of
     :func:`gn_project_balanced` (level 3 only with ``centre``, which needs ``coll``, and level 4 only with level 3
     and ``upright``, the base's pitch and roll columns), levels 1-3's and levels 1-2's alone, on ``jac``,
@@ -486,7 +504,10 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     bound (:func:`~cutamp.com_polygon_cost.support_region_sides`): level 1 holds a plane as an equality, and on a plane
     outside the region that drags the CoM out through a side. Level 1 holds two of its planes
     (:func:`_region_balance_rows`) by the rectangle's rules, and levels 3 and 4 read the CoM about ``centre``, both
-    axes alike, in metres."""
+    axes alike, in metres.
+
+    ``heading`` ``[N]`` (with ``centre`` and ``upright``) swaps the lower levels for a stepped plan's: level 3 the side
+    lean across that heading (:func:`_side_lean_row`), level 4 the CoM toward the centre, below it."""
     from cutamp.com_polygon_cost import _half_extents
 
     if region is None:
@@ -558,7 +579,17 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
                                              jac_sole * fc, r_sole, *row_coll)
         dq = dq1 + dq2
         com_lin = com + (jac_com @ dq.unsqueeze(-1)).squeeze(-1)
-        if centre:
+        if centre and heading is not None:
+            # A plan with steps: its two preferences in the order its plans are ranked by. Level 3 is the side lean,
+            # aimed from levels 1-2's box-scaled step as level 4 aims from levels 1-3's in the other order; level 4 is
+            # the CoM toward the centre from where levels 1-3 leave it (linear), in the side lean's null space too.
+            f3c, f4c = free3.unsqueeze(1), free4.unsqueeze(1)
+            q12 = q + _scaled_step(q, dq1, dq2, lower, upper)
+            dq3 = _null_space_step(ja * f3c, jac * f3c, *_side_lean_row(q12, upright, free3, heading),
+                                   own_complement=True).to(jac.dtype)
+            dq4 = _centring_step(ja * f4c, jac * f4c, jac_com * f4c, com_lin + (jac_com @ dq3.unsqueeze(-1)).squeeze(-1),
+                                 active, half, extra=_side_lean_row(q12, upright, free4, heading)[0])
+        elif centre:
             f3c = free3.unsqueeze(1)
             dq3 = _centring_step(ja * f3c, jac * f3c, jac_com * f3c, com_lin, active, half)
             if upright is not None:
@@ -588,16 +619,24 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     def com_after(s):
         return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
 
-    if region is None:
-        skip = in_contact | ((com_after(step).abs() > half) & (com_after(step12).abs() <= half)).any(-1, keepdim=True)
-    else:
-        past = _plane_violations(normals, bounds, com_after(step)) > 0
+    def leaves(s):
+        """``[N, 1]`` bool: ``s`` carries the CoM past a bound that levels 1-2's step leaves it inside (linear)."""
+        if region is None:
+            return ((com_after(s).abs() > half) & (com_after(step12).abs() <= half)).any(-1, keepdim=True)
+        past = _plane_violations(normals, bounds, com_after(s)) > 0
         past &= _plane_violations(normals, bounds, com_after(step12)) <= 0
-        skip = in_contact | past.any(-1, keepdim=True)
+        return past.any(-1, keepdim=True)
+
+    skip = in_contact | leaves(step)
     step3 = torch.where(skip, step12, step)
     if upright is None:
         return step3, step3, step12
     step4 = _add_scaled(q, step, dq4, lower, upper)
+    if heading is not None:
+        # The CoM's level is the last one here, so the whole step is the one tested: a row whose side lean alone
+        # would carry the CoM out still takes it together with the pull back, and a row whose whole step would
+        # takes ``step3``.
+        skip = in_contact | leaves(step4)
     return torch.where(skip, step3, step4), step3, step12
 
 
@@ -620,6 +659,7 @@ def gn_project_balanced(
     movables: Optional[torch.Tensor] = None,
     collision: bool = True,
     stances: Optional[torch.Tensor] = None,
+    side_lean_first: bool = False,
 ) -> torch.Tensor:
     """Project ``q_full`` (``[N, dof]`` full-cspace joint positions, not modified) toward
     ``FK(q) == world_from_ee`` (``[N, 4, 4]`` target tool poses), balance first, on ``world.kinematics_jac``.
@@ -683,6 +723,12 @@ def gn_project_balanced(
     :func:`~cutamp.com_polygon_cost.support_region_planes` (keyframe) and pulled by level 3 toward :func:`~cutamp.com_polygon_cost.physical_support_centroid`, in metres (:func:`_balanced_step`'s
     ``region``). The region and its centre are built once per call, without gradient.
 
+    ``side_lean_first`` (it needs ``stances``) gives the lower levels the preferences of a plan with steps, in the
+    order its plans are ranked by (:func:`~cutamp.step_costs.plan_rank`): level 3 the side lean toward 0, across each
+    row's stance heading (the mean of its two soles' yaws, :func:`_side_lean_row`), level 4 the CoM toward the centre
+    in what that leaves. The forward bow is left free, as those preferences leave it. The call then serves them in
+    place of Adam's small moves (2026-11-25).
+
     Returns ``[N, dof]`` projected joint positions, clamped to the joint
     limits. Convergence is NOT guaranteed: :func:`gn_gate` measures it.
     """
@@ -694,7 +740,11 @@ def gn_project_balanced(
     kin, frames, joint_names, q, lower, upper, col_mask, is_left = _setup(world, q_full, arms)
     sole_idx = tuple(list(kin.tool_frames).index(frame) for frame in world.model.sole_frames)
     upright = (joint_names.index("base_j_pitch"), joint_names.index("base_j_roll"))
-    goals, region = world.stance_soles, None
+    goals, region, heading = world.stance_soles, None, None
+    if side_lean_first:
+        if stances is None:
+            raise ValueError("side_lean_first reads each row's stance heading: it needs stances")
+        heading = torch.atan2(stances[..., 2].sin().mean(-1), stances[..., 2].cos().mean(-1)).detach()
     if stances is not None:
         from cutamp.com_polygon_cost import physical_support_centroid, support_region_planes, support_region_sides
         from cutamp.stance import stance_joint_limits
@@ -746,7 +796,7 @@ def gn_project_balanced(
             step, step3, step12 = _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask,
                                                  half=support.keyframe_half if region is None else None,
                                                  jac_sole=jac_sole, r_sole=r_sole, coll=coll, centre=centre,
-                                                 upright=upright, region=region)
+                                                 upright=upright, region=region, heading=heading)
             if centre:
                 # Levels 3 and 4 never take a row into contact: where levels 1-3's step ends in contact, levels 1-2's
                 # alone, and where only the full step does, levels 1-3's. Each test is its own FK, read before the

@@ -244,3 +244,79 @@ def test_particle_ik_follows_translated_feet_beyond_home_chart(one_cpu_thread):
     torch.testing.assert_close(moved.q[:, :2] - regular.q[:, :2], shift, atol=1e-6, rtol=0)
     torch.testing.assert_close(moved.q[:, 2:], regular.q[:, 2:], atol=1e-6, rtol=0)
     torch.testing.assert_close(moved.margin, regular.margin)
+
+
+def test_an_idle_arm_excursion_solves_again_only_the_rows_that_collide(one_cpu_thread, monkeypatch):
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_ik import _Kinematics, _kinematics, solve_stance_ik
+
+    n, home = 64, torch.tensor(REAL_LEGS.home, dtype=torch.double)
+    other = REAL_LEGS.right_arm
+    q = home.expand(n, -1).clone()
+    kin = _kinematics(q.device)
+    tools = kin.fk(q, "left", jacobian=False)[0].reshape(n, 3, 12)
+    soles = torch.cat([tools[:, :2, :2], q.new_zeros(n, 2, 1)], dim=-1)
+    wrist = torch.eye(4, dtype=q.dtype).repeat(n, 1, 1)
+    wrist[:, :3, :3] = tools[:, 2, 3:].reshape(n, 3, 3).mT / 0.2
+    wrist[:, :3, 3] = tools[:, 2, :3]
+    q[:, other.start] += 0.8
+    levels = q.new_full((n,), -1.0)
+    levels[[5, 40]] = 0.25                      # rows 5 and 40 collide until the idle arm has moved a quarter of the way
+
+    def blocked(posture):
+        return posture[:, other.start] - home[other.start] < levels
+
+    sizes, solve = [], _Kinematics.solve
+    monkeypatch.setattr(_Kinematics, "solve", lambda self, target, seed, *a, **k: (
+        sizes.append(len(seed)), solve(self, target, seed, *a, **k))[1])
+    with torch.no_grad():
+        fitted = solve_stance_ik(soles, wrist, q, "left", collides=blocked, center_posture=True)
+        plain = solve_stance_ik(soles, wrist, q, "left", center_posture=True)
+    assert sizes[0] == n and sizes[1:-1] and max(sizes[1:-1]) <= 16   # the last is the solve without a collision test
+    assert fitted.ok.all()
+    still = torch.ones(n, dtype=torch.bool)
+    still[[5, 40]] = False
+    assert torch.equal(fitted.q[still], plain.q[still])               # a row that never collided keeps its first solve
+    assert (fitted.q[[5, 40], other.start] - home[other.start] >= 0.25).all()
+
+
+def test_the_idle_arm_excursions_of_the_colliding_rows_are_solved_in_one_call(one_cpu_thread, monkeypatch):
+    # A colliding row's fit at one excursion does not depend on its fit at another, so one solve holds all three; each
+    # row still takes the smallest excursion that clears it, with the posture a solve at that excursion alone gives.
+    from cutamp.robots.t1 import REAL_LEGS
+    from cutamp.step_ik import _Kinematics, _kinematics, solve_stance_ik
+
+    n, home = 64, torch.tensor(REAL_LEGS.home, dtype=torch.double)
+    other = REAL_LEGS.right_arm
+    q = home.expand(n, -1).clone()
+    kin = _kinematics(q.device)
+    tools = kin.fk(q, "left", jacobian=False)[0].reshape(n, 3, 12)
+    soles = torch.cat([tools[:, :2, :2], q.new_zeros(n, 2, 1)], dim=-1)
+    wrist = torch.eye(4, dtype=q.dtype).repeat(n, 1, 1)
+    wrist[:, :3, :3] = tools[:, 2, 3:].reshape(n, 3, 3).mT / 0.2
+    wrist[:, :3, 3] = tools[:, 2, :3]
+    q[:, other.start] += 0.8                    # where the idle arm was: 0.8 rad off home on its first joint
+    levels = q.new_full((n,), -1.0)
+    clears_at = {3: 0.25, 20: 0.5, 41: 1.0}     # the first excursion (a fraction of the 0.8 rad) that clears the row
+    levels[[3, 20, 41, 50]] = q.new_tensor([0.1, 0.3, 0.6, 1.2])  # row 50 never clears
+
+    def blocked(posture):
+        return posture[:, other.start] - home[other.start] < levels
+
+    sizes, solve = [], _Kinematics.solve
+    monkeypatch.setattr(_Kinematics, "solve", lambda self, target, seed, *a, **k: (
+        sizes.append(len(seed)), solve(self, target, seed, *a, **k))[1])
+    with torch.no_grad():
+        fitted = solve_stance_ik(soles, wrist, q, "left", collides=blocked, center_posture=True)
+        assert sizes == [n, 16]                 # every row once, then the 4 colliding rows at 3 excursions, padded to 16
+        plain = solve_stance_ik(soles, wrist, q, "left", center_posture=True)
+        witness = q[0, other].clamp(kin.lower[other], kin.upper[other])   # the joint's limit cuts the 0.8 rad to 0.77
+        for row, fraction in clears_at.items():
+            held = torch.lerp(home[other], witness, fraction)
+            torch.testing.assert_close(fitted.q[row, other], held, atol=1e-12, rtol=0)
+            alone = solve_stance_ik(soles, wrist, q, "left", other_arm_reference=held.expand(n, -1), center_posture=True)
+            torch.testing.assert_close(fitted.q[row], alone.q[row], atol=1e-9, rtol=0)
+    still = torch.ones(n, dtype=torch.bool)
+    still[list(clears_at)] = False
+    assert torch.equal(fitted.q[still], plain.q[still])               # never collided, or never cleared: the first solve
+    assert fitted.ok.tolist() == [i != 50 for i in range(n)]

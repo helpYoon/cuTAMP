@@ -14,12 +14,20 @@ from cutamp import held
 from cutamp.com_polygon_cost import physical_support_centroid, physical_support_margin
 from cutamp.cost_function import CostFunction
 from cutamp.costs import curobo_pose_error
+from cutamp.gn_refresh import GN_ITERS, gn_project_balanced
 from cutamp.grasps import GRASP_SCORE_CUTOFF
 from cutamp.landing_predictor import LandingState, nominal_landing_dynamics, prediction_precision
 from cutamp.optimize_plan import ParticleOptimizer, _finite_step
-from cutamp.particle_initialization import IKTol, ParticleInitializer, _draw_placements, pick_place_confs, worst_posture
+from cutamp.particle_initialization import (
+    GN_IK_CLEAR_ITERS,
+    IKTol,
+    ParticleInitializer,
+    _draw_placements,
+    pick_place_confs,
+    worst_posture,
+)
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.rollout import Rollout, RolloutFunction
+from cutamp.rollout import Rollout, RolloutFunction, movable_spheres_fn
 from cutamp.samplers import project_supported_placement
 from cutamp.stance import STEP_TRAVEL, UNIT_M, UNIT_RAD, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
@@ -105,12 +113,15 @@ def _retract_on_stance(soles, arrived, arm, limits, *, other_arm_reference=None,
     return solve_stance_ik(soles, wrist, bounded, arm, other_arm_reference=other_arm_reference, kinematics=kinematics)
 
 
-def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, grasp_indices=None, project=True):
-    """``project`` False takes the ``bindings`` placements as they are, without the support projection."""
+def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, grasp_indices=None, project=True,
+                           poses=None):
+    """``project`` False takes the ``bindings`` placements as they are, without the support projection. ``poses``:
+    the movables' world poses by name, kept on the device (a recording cannot copy them from the host)."""
     n = stop - first
     like = world.q_init
     particles = {k: like.expand(n, -1).clone() for k in ("left_q0", "right_q0")}
-    objects = {obj.name: world.get_object_pose(obj).expand(n, -1, -1) for obj in world.movables}
+    poses = poses or {obj.name: world.get_object_pose(obj) for obj in world.movables}
+    objects = {name: pose.expand(n, -1, -1) for name, pose in poses.items()}
     snapshots, wrists, held, held_before = [], [], {}, []
     for _, op in groups:
         arm = op.operator.metadata.arm
@@ -147,7 +158,7 @@ def _placements_and_grasps(groups, world, pools, first, stop, bindings=None, gra
         tool = g @ world.tool_from_ee[world.tool_frame_for_arm(arm)]
         wrists.append(objects[obj] @ tool)
         if op.operator.metadata.action_type == "pick":
-            held[arm] = (obj, torch.linalg.inv(tool))
+            held[arm] = (obj, torch.linalg.inv_ex(tool)[0])  # inv without its wait on the device for the check
         else:
             held.pop(arm)
     return particles, snapshots, wrists, held_before
@@ -290,7 +301,7 @@ def _clearances(check, n, blocks, device):
     own = check(torch.arange(n, device=device))
     penetration = {name: value.repeat(blocks) for name, value in own["penetration"].items()}
     violating = (torch.stack(tuple(own["penetration"].values()), 1) > CLEARANCE).any(1).nonzero().flatten()
-    if len(violating):
+    if len(violating) and blocks > 1:
         rows = (torch.arange(1, blocks, device=device)[:, None] * n + violating).flatten()
         for name, value in check(rows)["penetration"].items():
             penetration[name][rows] = value
@@ -330,13 +341,15 @@ class SteppedPlan:
     cell (:func:`cutamp.step_refresh.draw_grid_paths`); when no grid path reaches, the particles start on legal,
     feet-clear paths that do not reach. A particle's pick, place and retract postures are Adam variables that start from
     one solve on the stance the first refresh gives, and are held on their hand target and stance (2026-11-23 design
-    4.1): each evaluation puts them back first (:meth:`rollout`), their slope along that hold reaches the commands and
-    the placements (:meth:`hand_on`), and each Adam step ends with the postures inside their joint limits and the
-    placements on their support (:meth:`step`). A refresh runs the world model and controller on every particle's
+    4.1): each evaluation puts them back first (:meth:`rollout`; in the loop, :meth:`put_back` and then the recorded
+    step on :attr:`rollout_fn`), their slope along that hold reaches the commands and the placements
+    (:meth:`hand_on`), and each Adam step ends with the postures inside their joint limits and the placements on
+    their support (:meth:`step`). A refresh runs the world model and controller on every particle's
     commands, gap by gap, writes the landing postures (never optimized), sets the stand-in and the step's checks'
-    straight lines (design 4.4) the costs read until the next refresh and puts the pick, place and retract postures
-    back on the pairs they stand on; it solves none (2026-11-23 design 4.7). The starting pass is the first refresh,
-    with one solve per posture.
+    straight lines (design 4.4) the costs read until the next refresh, takes each pick and place posture through the
+    planner's IK projection on its new stance (:meth:`project`, 2026-11-25) and puts the pick, place and retract
+    postures back on the pairs they stand on; it runs no starting solve (2026-11-23 design 4.7). The starting pass is
+    the first refresh, with one solve per posture and the same projection after it.
     """
 
     def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, reducer, deadline=None, generator=None):
@@ -349,6 +362,9 @@ class SteppedPlan:
         self.command_names = {j: f"step_commands_{j}" for j, (steps, _) in enumerate(self.groups) if steps}
         self.landing_confs = frozenset(step.arg("q_land") for steps, _ in self.groups for step in steps)
         self.rollout_fn = RolloutFunction(self.arm_skeleton, world)
+        # Per pick or place, the scene's objects where that conf has them, for its IK projection (:meth:`project`).
+        self._objects_at = [movable_spheres_fn(world, self.arm_skeleton, self.arm_skeleton.index(op))
+                            for _, op in self.groups]
         self.adapter = StepStateAdapter(predictor)
         empty = [None] * len(self.groups)
         self.standin = StandIn(self.orders, list(empty), list(empty), list(empty))
@@ -359,7 +375,7 @@ class SteppedPlan:
         self.stats = {"refresh_s": [], "standin_error_m": [], "command_move_m": [], "correction_capped": [],
                       "check_line_error": []}
         # Each held posture's J from its last put-back, and the rows the correction capped since the last refresh.
-        self.held_jac, self.capped = {}, 0
+        self.held_jac, self.capped = {}, torch.zeros((), dtype=torch.long, device=world.device)
         # Each pick, place and retract posture's gap; the posture each gap starts from: the plan's start for the first,
         # else the retract after the gap before it (without one, the posture the robot stood in at that pick or place).
         self.gap_of, retract_of, gap = {}, {}, -1
@@ -433,10 +449,12 @@ class SteppedPlan:
                     seed = particles[steps[-1].arg("q_land")]
                 self._solve_postures(j, particles, before, wrists[j], objects[j], held_before[j], seed)
                 self.references[op.arg("q") + "_ik_reference"] = seed.clone()
-                self.start_postures[op.arg("q")] = particles[op.arg("q")].clone()
-                if j in retract_of:
-                    self.start_postures[retract_of[j]] = particles[retract_of[j]].clone()
             self.tests_ok = ok
+            # The start is projected as every refresh is, with the iterations the planner's own IK takes on a posture
+            # that already reaches (GN_IK_CLEAR_ITERS), every posture in one call (nothing is recorded yet); the loop
+            # starts from the projected postures, retracts included (the projection's put-back moves them too).
+            self.project(particles, range(len(self.groups)), GN_IK_CLEAR_ITERS)
+            self.start_postures = {name: particles[name].clone() for name in self.gap_of}
         self.particles = particles
         self.stats["standin_error_m"].append(None)  # no stand-in before the first refresh
         self.stats["command_move_m"].append(None)
@@ -479,7 +497,7 @@ class SteppedPlan:
             blocked |= value.reshape(len(q), -1).amax(1) > self.checker._get_tol("Collision", key)
         return blocked
 
-    def _run_gap(self, j, particles, head, before, objects, held):
+    def _run_gap(self, j, particles, head, before, objects, held, slopes=True):
         """Gap ``j``'s hold, its rollout and slope at the current commands, the stand-in set, its landing postures and
         ``sole_to`` written, ``last[j]`` kept and its checks read (:meth:`_set_checks`): the landing's on every row of
         the rollout, the clearances as :func:`_clearances` reads them.
@@ -496,7 +514,7 @@ class SteppedPlan:
         u = particles[self.command_names[j]]
         n = len(u)
         anchor = before[:, 1 - "LR".index(order[0])]
-        refreshed = refresh_gap(self.predictor, start.state, order, u, anchor, self.standin.slope[j])
+        refreshed = refresh_gap(self.predictor, start.state, order, u, anchor, self.standin.slope[j], nudges=slopes)
         self.standin.set(j, refreshed)
         prediction, copies = refreshed.prediction, refreshed.copies
         blocks = len(refreshed.copy_commands) // n
@@ -554,26 +572,37 @@ class SteppedPlan:
         for key, value in penetration.items():
             names.append("geometry_" + key)
             columns.append((value - CLEARANCE) / (UNIT_RAD if key.endswith("_rad") else UNIT_M))
-        n = len(refreshed.commands)
-        value, slope = lines(torch.stack(columns, 1), n, refreshed.ticks_changed, finite)
+        n, stacked = len(refreshed.commands), torch.stack(columns, 1)
         old, miss = self.checks.get(j), None
-        if old is not None and old["names"] == names:
+        same = old is not None and old["names"] == names
+        if len(stacked) == n:  # a refresh without the nudged copies: the values, the slopes as they were
+            value = stacked.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+            slope = old["slope"] if same else value.new_zeros(*value.shape, refreshed.commands[0].numel())
+        else:
+            value, slope = lines(stacked, n, refreshed.ticks_changed, finite)
+        if same:
             guess = _check_line(old, refreshed.commands)
             miss = (guess - value)[((guess > 0) | (value > 0)) & finite[:n, None]].abs()
             weight = torch.where(value > 0, old["weight"] * GROWTH, old["weight"]).clamp_max(WEIGHT_CAP)
+            for key, new in (("value", value), ("slope", slope), ("at", refreshed.commands), ("weight", weight)):
+                old[key].copy_(new)  # in place: a recorded Adam step reads the lines at their addresses
         else:
-            weight = torch.ones_like(value)
-        self.checks[j] = {"names": names, "value": value, "slope": slope, "at": refreshed.commands, "weight": weight}
+            self.checks[j] = {"names": names, "value": value, "slope": slope, "at": refreshed.commands.clone(),
+                              "weight": torch.ones_like(value)}
         return miss
 
-    def refresh(self, particles: dict) -> None:
+    def refresh(self, particles: dict, slopes: bool = True) -> None:
         """One refresh (design 6; 2026-11-23 design 4.7) at the particles' current commands, postures, placements and
         grasps, values only, gap by gap in order: its hold and rollout if it has steps, then its pick or place and
         retract postures put back (:meth:`put_back`) on the pair it stands on, so the next gap's hold starts from the
         retract put back. ``q_land``, ``sole_to`` and the postures are written in place; ``standin``, ``last``,
         ``checks``, ``tests_ok`` and ``stats`` follow, ``stats["correction_capped"]`` with the rows the correction
         capped since the last refresh and ``stats["check_line_error"]`` with the median miss of the checks' last lines
-        over every gap (:meth:`_set_checks`; None where there is none)."""
+        over every gap (:meth:`_set_checks`; None where there is none). Each gap's pick or place posture goes through
+        the IK projection on its new stance (:meth:`project`, 2026-11-25). Without ``slopes`` every gap is run on the
+        particles' own rows only, the stand-in's and the checks' slopes stay as they were and the postures are put
+        back without the projection: for the loop's last refresh, after which no command moves and nothing is judged
+        again, so no slope is read and each posture stays the one that was judged (2026-11-24)."""
         began = monotonic()
         n = len(particles["left_q0"])
         with torch.no_grad(), prediction_precision():
@@ -588,19 +617,26 @@ class SteppedPlan:
             errors, misses = {}, []
             for j, (steps, _) in enumerate(self.groups):
                 if steps:  # else it stands on the pair before it
-                    passed, before, head, miss = self._run_gap(j, particles, head, before, objects[j], held_before[j])
+                    passed, before, head, miss = self._run_gap(j, particles, head, before, objects[j], held_before[j],
+                                                               slopes)
                     ok &= passed
                     if miss is not None:
                         misses.append(miss)
                     landed = torch.stack([step.achieved for step in self.last[j][2].steps], 1)
                     distance = (read[j][..., :2] - landed[..., :2]).norm(dim=-1).amax((1, 2))
                     errors[j] = torch.stack((distance.nanmedian(), distance.nanquantile(0.9)))
-                self.put_back(particles, (j,))
-            self.tests_ok = ok
+                # The gap's pick or place on its new stance; it ends in the put-back. Gap by gap, so each call has the
+                # particles' own row count: a call of another size would re-size the kinematics buffers the recorded
+                # Adam step replays on, and its guard would refuse the next replay.
+                if slopes:
+                    self.project(particles, (j,))
+                else:
+                    self.put_back(particles, (j,))
+            self.tests_ok.copy_(ok)  # in place, as the stand-in and the checks' lines are
             self.stats["standin_error_m"].append({j: e.tolist() for j, e in errors.items()})
             self.stats["command_move_m"].append(moved.item())
             self.stats["correction_capped"].append(int(self.capped))
-            self.capped = 0
+            self.capped.zero_()
             missed = torch.cat(misses) if misses else torch.empty(0)
             self.stats["check_line_error"].append(missed.median().item() if len(missed) else None)
         self.stats["refresh_s"].append(monotonic() - began)
@@ -626,8 +662,9 @@ class SteppedPlan:
         """Per gap, the hand's target ``[n, 4, 4]`` as the hand cost reads it: the placements as Adam holds them, not
         projected onto their support. Differentiable in the placements."""
         n = len(particles["left_q0"])
+        poses = {name: pose for name, (pose, _) in self.cost_function._movables.items()}
         return _placements_and_grasps(self.groups, self.world, self.pools, 0, n, bindings=particles,
-                                      grasp_indices=particles, project=False)[2]
+                                      grasp_indices=particles, project=False, poses=poses)[2]
 
     def _holds_hand(self, name):
         """Whether posture ``name`` is a pick or place (held on its hand target and its soles), not a retract."""
@@ -637,7 +674,8 @@ class SteppedPlan:
         """Without a gradient, every pick, place and retract posture of the gaps ``gaps`` (None: all) put back in place
         on its stand-in stance by :func:`held.put_back` (2026-11-23 design 4.1): a pick or place with its hand target
         and arm, a retract with its soles only. Each posture's ``J`` is kept in ``held_jac``; the rows the correction
-        capped are added to ``capped``."""
+        capped are added to ``capped``. Both are written in place once they exist: the loop's recorded step runs this
+        (:meth:`recorded`), and a refresh's own put-back must write where the recording does."""
         gaps = set(range(len(self.groups)) if gaps is None else gaps)
         with torch.no_grad():
             table, targets = self.stance_table(particles), self.hand_targets(particles)
@@ -649,15 +687,71 @@ class SteppedPlan:
                     hand = targets[j], self.groups[j][1].operator.metadata.arm
                 else:
                     hand = None, None
-                q_new, self.held_jac[name], capped = held.put_back(self.world, q.detach(), table[name], *hand)
+                q_new, jac, capped = held.put_back(self.world, q.detach(), table[name], *hand)
                 q.copy_(q_new)
-                self.capped = self.capped + capped.sum()
+                if name in self.held_jac:
+                    self.held_jac[name].copy_(jac)
+                else:
+                    self.held_jac[name] = jac.clone()
+                self.capped.add_(capped.sum())
+
+    def project(self, particles: dict, gaps: Iterable[int], iters: int = GN_ITERS) -> None:
+        """Without a gradient, the pick and place postures of ``gaps`` through the planner's IK projection
+        (:func:`~cutamp.gn_refresh.gn_project_balanced`, 2026-11-25), all in one call (the start's; a refresh hands
+        over one gap at a time), each on its stand-in stance and hand target, with the scene's objects where that pick
+        or place has them: balance and feet, then the hand, then
+        the side lean toward 0, then the CoM toward the centre, the preferences in the order plans are ranked by
+        (:func:`~cutamp.step_costs.plan_rank`), which Adam's small moves reach only over many refreshes. Then
+        :meth:`put_back` on the same gaps: the hand and feet exact, each ``J`` kept. A row with anything not finite
+        keeps its posture, and a retract, which has no hand target, is only put back."""
+        gaps = set(gaps)
+        with torch.no_grad():
+            table, targets = self.stance_table(particles), self.hand_targets(particles)
+            names, arms, rows, fines = [], [], [], []
+            for name, j in self.gap_of.items():
+                if j not in gaps or not self._holds_hand(name):
+                    continue
+                row = (particles[name].detach(), table[name], targets[j], self._objects_at[j](particles))
+                fine = _finite_rows(row)
+                if not fine.any():
+                    continue
+                first = fine.nonzero()[0]  # a batched solve cannot take a row that is not finite: it takes a copy of one
+                rows.append([torch.where(fine.view(-1, *[1] * (x.ndim - 1)), x, x[first]) for x in row])
+                names.append(name), arms.append(self.groups[j][1].operator.metadata.arm), fines.append(fine)
+            if names:
+                q, stance, target, objects = (torch.cat(x) for x in zip(*rows))
+                new = gn_project_balanced(self.world, q, target, arms, iters=iters, movables=objects, stances=stance,
+                                          side_lean_first=True).to(q)
+                for name, fine, block in zip(names, fines, new.split(len(fines[0]))):
+                    _keep_finite(particles[name], torch.where(fine[:, None], block, particles[name]))
+        self.put_back(particles, gaps)
 
     def rollout(self, particles: dict) -> Rollout:
-        """:meth:`put_back` on every posture, then the arm skeleton's rollout: what the loop and :meth:`result`
-        evaluate."""
+        """:meth:`put_back` on every posture, then the arm skeleton's rollout (:attr:`rollout_fn`): what an evaluation
+        outside the loop's Adam steps reads, and :meth:`result`. The loop's own step body calls the two itself, with
+        the backward and :meth:`hand_on` after them, and is recorded whole as a GPU graph (2026-11-24 design)."""
         self.put_back(particles)
         return self.rollout_fn(particles)
+
+    def recorded(self) -> tuple[list, list]:
+        """``(tensors, kinematics)``: what a recording of the cost on :attr:`rollout_fn`'s rollout reads beyond the
+        particles, each at the address it had when recorded. The tensors are those a refresh or an evaluation writes
+        in place (the stand-in, the checks' lines, the tests' verdict, the requirements' weights and violated flags)
+        and the pair the plan starts on (``incoming``); the kinematics are the FK sites the rollout and the cost run,
+        and the joint effort's own."""
+        tensors = [self.tests_ok, self.incoming, *self.weights.weight.values(), *self.weights.violated.values()]
+        # What the put-back and the hand-on read and write: each kept J, the capped count, and their constants.
+        tensors += [self.capped, *self.held_jac.values(), self.world.joint_limits]
+        tensors += [pool for pool, _ in self.pools.values()]
+        tensors += [pose for pose, _ in self.cost_function._movables.values()]
+        for j in self.command_names:
+            tensors += [self.standin.relative[j], self.standin.slope[j], self.standin.at[j]]
+            tensors += [self.checks[j][key] for key in ("value", "slope", "at", "weight")]
+        sites = ["rollout", "com", "stepped_scene"]
+        if self.cost_function.retract_info:
+            sites += ["retract_motion", "retract_soles"]
+        return tensors, [*(self.world.site_kinematics(site) for site in sites), self.world.segment_torques.kin,
+                         self.world.kinematics_jac]
 
     def hand_on(self, particles: dict) -> None:
         """After the backward (2026-11-23 design 4.2): each posture with a gradient and a kept ``J`` keeps the part of
@@ -689,11 +783,11 @@ class SteppedPlan:
                 leaf.grad.add_(grad.nan_to_num(0.0, posinf=0.0, neginf=0.0))
 
     def step(self, optimizer, params, particles: dict) -> torch.Tensor:
-        """One Adam step (2026-11-23 design 4.1): :meth:`hand_on`, :func:`_finite_step`, then without a gradient each
+        """The Adam update (2026-11-23 design 4.1), after the step body's :meth:`put_back`, backward and
+        :meth:`hand_on`: :func:`_finite_step`, then without a gradient each
         posture clamped to its stand-in stance's joint limits (:func:`stance_joint_limits`) and each placement put
         back on its support (:func:`project_supported_placement`); a row that would not be finite keeps its value.
         Returns :func:`_finite_step`'s held rows."""
-        self.hand_on(particles)
         rows = _finite_step(optimizer, params)
         with torch.no_grad():
             table = self.stance_table(particles)
@@ -856,6 +950,8 @@ class SteppedPlan:
                                 for name, start in self.start_postures.items()], 1).amax(1)
         adapter = StepStateAdapter(self.predictor)
         self.motion_inputs, rows = {}, []
+        # One copy of each of the last refresh's tensors to the host; each row's slice is cut there, not on the device.
+        host = {j: _each(trace, lambda x: x.detach().to("cpu")) for j, trace in self.last.items()}
         for i in torch.where(passed)[0].tolist():
             particle = {key: value[i].detach().clone() for key, value in particles.items()}
             particle.update({key: value[i].clone() for key, value in self.references.items()})
@@ -884,7 +980,7 @@ class SteppedPlan:
             )
             if self.config.curobo_plan:
                 report["motion_validation"] = "unattempted"
-            saved = {j: _take(trace, i, "cpu") for j, trace in self.last.items()}
+            saved = {j: _take(trace, i, "cpu") for j, trace in host.items()}
             self.motion_inputs[i] = (adapter, saved)
             rows.append(StepRow(i, particle, float(soft[i]), report, evidence=_evidence(adapter, saved)))
         if rows:

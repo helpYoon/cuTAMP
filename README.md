@@ -673,10 +673,19 @@ orders that reach each target and keep the feet off objects, with noise within
 half a cell (`step_refresh.draw_grid_paths`); when no grid path reaches, they
 start on legal, feet-clear paths that do not reach. Every `reik_interval` Adam
 steps a refresh runs `landing-seed3.pt`, the controller and world model, on
-every particle's commands; its landings and their slope enter the costs. At
+every particle's commands; its landings and their slope enter the costs, and
+each pick and place posture goes through the planner's IK projection on its new
+stance (`gn_refresh.gn_project_balanced` with `side_lean_first`: balance and
+feet, then the hand, then the side lean toward 0, then the CoM toward the
+centre, the order plans are ranked in), as it does once at the start. At
 every Adam step each pick and place posture is put back on its hand target and
-its stance, each retract on its stance, and a refresh solves none. The loop
-stops as in step 3 of "How it works" above.
+its stance, each retract on its stance. An Adam step
+replays one recorded CUDA graph: the put-back, the arm's rollout, the costs, the
+backward pass and the shares handed on to the commands and placements; the
+refresh and the Adam update run eagerly. The loop stops as in
+step 3 of "How it works" above, its clock restarted only by a better-ranked
+valid plan, and at once when a valid plan has rank 0 (side lean and CoM
+distance both under one unit), the lowest rank there is.
 
 A stepped plan's loss carries three preferences for every pick and place
 posture, each in its unit: side lean, centring and joint effort

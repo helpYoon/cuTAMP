@@ -291,16 +291,24 @@ def _obb_gap(A, ah, B, bh):
     return ((unit * delta).sum(-1).abs() - a_radius - b_radius).masked_fill(length < 1.0e-6, -torch.inf).amax(-1)
 
 
-def _object_box(obj, world_from_obj):
+def _local_box(obj, like):
+    """``(centre [3], half [3])`` of ``obj``'s box in its own frame, as tensors like ``like``: a copy from the host."""
     from cutamp.step_search import _local_bounds
 
     bounds = _local_bounds(obj)
     if bounds is None:
         raise ValueError(f"No bounds for scene object {obj.name}")
-    a, b = world_from_obj.new_tensor(bounds)
+    a, b = like.new_tensor(bounds)
+    return (a + b) / 2, (b - a) / 2
+
+
+def _object_box(obj, world_from_obj, local=None):
+    """``obj``'s box at ``world_from_obj``: the world pose of its centre and its half extents. ``local`` is
+    :func:`_local_box`'s answer where the caller keeps it (a recorded Adam step cannot copy from the host)."""
+    centre, half = _local_box(obj, world_from_obj) if local is None else local
     transform = world_from_obj.clone()
-    transform[..., :3, 3] += (transform[..., :3, :3] @ ((a + b) / 2)[..., None]).squeeze(-1)
-    return transform, (b - a) / 2
+    transform[..., :3, 3] += (transform[..., :3, :3] @ centre[..., None]).squeeze(-1)
+    return transform, half
 
 
 def _moving_head(spheres, p, R, joints, adapter, inds, offset):

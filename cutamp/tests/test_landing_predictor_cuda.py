@@ -32,14 +32,18 @@ def predictor():
 
 @needs_cuda
 @torch.no_grad()
+@torch.no_grad()  # values only, as the planner runs the model
 def test_captured_rollout_matches_eager_and_retains_prior_results(predictor):
     bundle = Path(os.environ.get("CUTAMP_LANDING_BUNDLE", LANDING_BUNDLE))
     fast = LandingPredictor(bundle, use_cuda_graph=True)
     ctx = torch.zeros(2, 38, device="cuda")
     ctx[:, -5:] = -1
+    commands = ctx.new_tensor([[[.12,.21,0], [.10,-.21,0]], [[.24,.21,0], [.06,-.21,0]]])
+    # TorchScript's fuser compiles during a model's first calls, which round differently from every later one
+    for warm in (predictor, fast):
+        warm.rollout(warm.standing_start(ctx), "LR", commands)
     start = predictor.standing_start(ctx)
     assert_same_prediction(fast.standing_start(ctx), start)
-    commands = ctx.new_tensor([[[.12,.21,0], [.10,-.21,0]], [[.24,.21,0], [.06,-.21,0]]])
     expected = predictor.rollout(start, "LR", commands)
     result = fast.rollout(start, "LR", commands)
     assert expected.steps[0].clock.unique().numel() == 2

@@ -12,12 +12,12 @@ from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_
 from cutamp.tamp_world import FK_SITES
 
 
-def test_a_stepped_plan_overrides_two_settings_only():
+def test_a_stepped_plan_overrides_one_setting_only():
     base = TAMPConfiguration()
     stepped = base.for_steps()
-    assert stepped.conf_lr == 7e-3 and stepped.soft_cost == []
+    assert stepped.conf_lr == base.conf_lr and stepped.soft_cost == []  # the planner's own step size (2026-11-24)
     changed = {f.name for f in fields(base) if getattr(base, f.name) != getattr(stepped, f.name)}
-    assert changed == {"conf_lr", "soft_cost"}
+    assert changed == {"soft_cost"}
 
 
 def test_a_stepped_retract_locks_only_its_idle_arm():
@@ -373,7 +373,7 @@ def test_self_collision_slope_scales_with_its_weight_only_when_asked(stepped_cal
 
 
 @needs_cuda
-def test_a_refresh_puts_postures_back_and_solves_none(stepped_call, monkeypatch):
+def test_a_refresh_puts_postures_back_and_runs_no_starting_solve(stepped_call, monkeypatch):
     plan = make_plan(stepped_call)
     p, calls = plan.particles, []
     monkeypatch.setattr(plan, "_solve_postures", lambda *a, **k: pytest.fail("a refresh solved a posture"))
@@ -725,3 +725,348 @@ def test_a_checked_row_reads_what_a_check_of_every_row_reads(stepped_call, monke
     for name in every:
         torch.testing.assert_close(own[name], every[name][:n], rtol=1e-5, atol=1e-7, msg=name)
         torch.testing.assert_close(theirs[name], every[name][rows], rtol=1e-5, atol=1e-7, msg=name)
+
+
+def refreshed_state(plan) -> dict:
+    """By name, the tensors a refresh or an evaluation writes and the cost reads: the stand-in, the checks' lines, the
+    tests' verdict, the requirements' weights and their violated flags."""
+    tensors = {"tests_ok": plan.tests_ok}
+    for j in plan.command_names:
+        tensors.update({f"standin_{k}_{j}": getattr(plan.standin, k)[j] for k in ("relative", "slope", "at")})
+        tensors.update({f"check_{k}_{j}": plan.checks[j][k] for k in ("value", "slope", "at", "weight")})
+    tensors.update({f"weight_{key}": w for key, w in plan.weights.weight.items()})
+    tensors.update({f"violated_{key}": v for key, v in plan.weights.violated.items()})
+    return tensors
+
+
+@needs_cuda
+def test_a_refresh_writes_what_the_cost_reads_in_place(stepped_call):
+    """A recorded Adam step reads the stand-in, the checks' lines, the tests' verdict and the weights at the addresses
+    they had when it was recorded."""
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    plan(plan.rollout(p), p)                                     # the weights exist from the first evaluation on
+    before = refreshed_state(plan)
+    kept = {name: (tensor, tensor.data_ptr()) for name, tensor in before.items()}
+    with torch.no_grad():
+        p["step_commands_0"] += 0.01
+    plan.refresh(p)
+    plan(plan.rollout(p), p)
+    after = refreshed_state(plan)
+    assert list(after) == list(before)
+    moved = [name for name, (tensor, pointer) in kept.items()
+             if after[name] is not tensor or tensor.data_ptr() != pointer]
+    assert not moved, moved
+    torch.testing.assert_close(plan.standin.at[0], p["step_commands_0"].detach())   # and it holds the new values
+
+
+@needs_cuda
+def test_the_cost_after_the_put_back_makes_no_host_call(stepped_call):
+    """What a recorded Adam step runs (the arm's rollout, the cost, its reduction and the backward) neither waits on
+    the device nor copies from the host, once one evaluation has filled the caches."""
+    from cutamp.tests.conftest import sync_debug_error
+    plan = make_plan(stepped_call)
+    p, reducer = plan.particles, stepped_call["reducer"]
+    for name in (*plan.gap_of, *plan.command_names.values()):
+        p[name].requires_grad_()
+
+    def loss():
+        for value in p.values():
+            value.grad = None
+        return reducer(plan(plan.rollout_fn(p), p), consider_types=frozenset(("constraint", "cost"))).mean()
+
+    plan.put_back(p)                                             # its own host calls: the put-back's test below
+    loss().backward()                                            # fills the caches
+    with sync_debug_error():
+        loss().backward()
+
+
+def run_loop(c, cuda_graphs: bool, steps: int = 12, viewer: bool = False):
+    """``(plan, opt_metrics)``: the stepped plan of ``c`` through ``steps`` Adam steps of the real loop, a refresh every
+    5, without the stop rule; with ``viewer`` the loop keeps each step's costs for a viewer that shows nothing."""
+    from dataclasses import replace
+
+    from cutamp.optimize_plan import ParticleOptimizer
+    from cutamp.tests.conftest import SpyVis, run_optimizer
+
+    torch.manual_seed(641)                                       # the placements are drawn from the global generator
+    plan = make_plan(c)
+    config = replace(c["config"], num_opt_steps=steps, reik_interval=5, early_stop_patience=0, cuda_graphs=cuda_graphs)
+    info = {"plan_skeleton": plan.arm_skeleton, "particles": plan.particles, "rollout_fn": plan.rollout,
+            "cost_fn": plan, "steps": plan}
+    metrics, _ = run_optimizer(info, config, optimizer=ParticleOptimizer(config, c["reducer"], c["checker"]),
+                               visualizer=SpyVis(config) if viewer else None)
+    return plan, metrics
+
+
+@needs_cuda
+def test_a_stepped_plans_recorded_step_equals_the_eager_one(stepped_call, monkeypatch):
+    """Every replay of the recorded Adam step against the same step run eagerly on copies of the particles, bit for
+    bit, through two refreshes: its scalars, every gradient and, kept for the viewer, every cost row."""
+    from cutamp.tests.conftest import install_step_replay_spy
+    replays = install_step_replay_spy(monkeypatch)
+    _, metrics = run_loop(stepped_call, cuda_graphs=True, viewer=True)
+    assert metrics["capture_step"] == 0 and replays == [list(range(12))]
+
+
+@needs_cuda
+def test_the_loop_ends_in_the_same_particles_with_and_without_the_recording(stepped_call):
+    """The record of valid particles included: it is restored after the loop, so a record taken on a step that is not
+    judged would show in the particles."""
+    from cutamp.tests.conftest import assert_bitwise
+    recorded, with_graph = run_loop(stepped_call, cuda_graphs=True)
+    eager, without = run_loop(stepped_call, cuda_graphs=False)
+    assert with_graph["capture_step"] == 0 and without.get("capture_step") is None
+    assert recorded.stats["correction_capped"] == eager.stats["correction_capped"]
+    assert with_graph["num_satisfying"] == without["num_satisfying"] and max(without["num_satisfying"]) > 0
+    assert_bitwise({k: v.detach() for k, v in recorded.particles.items()},
+                   {k: v.detach() for k, v in eager.particles.items()}, "the particles after the loop")
+
+
+@needs_cuda
+def test_the_recordings_guard_covers_what_the_cost_runs_and_reads(stepped_call, monkeypatch):
+    """A recording bakes in the address of every tensor it reads and of every buffer a kinematics object writes."""
+    from curobo.kinematics import Kinematics
+    plan = make_plan(stepped_call)
+    p, reducer = plan.particles, stepped_call["reducer"]
+    for name in (*plan.gap_of, *plan.command_names.values()):
+        p[name].requires_grad_()
+    plan.put_back(p)
+    used, run = [], Kinematics.compute_kinematics
+    monkeypatch.setattr(Kinematics, "compute_kinematics",
+                        lambda self, *a, **k: (used.append(self), run(self, *a, **k))[1])
+    reducer(plan(plan.rollout_fn(p), p), consider_types=frozenset(("constraint", "cost"))).mean().backward()
+    tensors, kinematics = plan.recorded()
+    assert len(used) >= 3 and all(any(kin is ran for kin in kinematics) for ran in used)
+    missing = [name for name, tensor in refreshed_state(plan).items() if not any(tensor is t for t in tensors)]
+    assert not missing, missing
+
+
+@needs_cuda
+@pytest.mark.parametrize("moved", ["a tensor a refresh writes", "a kinematics object the cost runs",
+                                   "a kept J the put-back writes"])
+def test_a_moved_address_stops_the_stepped_plans_replay(stepped_call, monkeypatch, moved):
+    """The guard reads the plan's own list at every replay: whatever the recorded step reads must be where it was."""
+    from cutamp.cuda_graphs import CapturedGraph
+    replay, replays = CapturedGraph.replay, []
+
+    def spy(self):
+        if self.name != "G_step":
+            return replay(self)
+        replays.append(self.name)
+        if len(replays) == 2:                                    # between the first replay and the second
+            plan = self.body.cost_fn
+            if moved.startswith("a tensor"):
+                plan.tests_ok = plan.tests_ok.clone()
+            elif moved.startswith("a kept J"):
+                name = next(iter(plan.held_jac))
+                plan.held_jac[name] = plan.held_jac[name].clone()
+            else:
+                plan.world.site_kinematics("stepped_scene").update_batch_size(1, 1)
+        return replay(self)
+
+    monkeypatch.setattr(CapturedGraph, "replay", spy)
+    with pytest.raises(AssertionError, match="G_step: guard entries"):
+        run_loop(stepped_call, cuda_graphs=True)
+    assert replays == ["G_step", "G_step"]
+
+
+@needs_cuda
+def test_a_replay_that_is_not_judged_leaves_the_record_alone(stepped_call, monkeypatch):
+    """The recorded step takes the record at every replay; the flag the loop sets decides whether it keeps anything."""
+    from cutamp.cuda_graphs import CapturedGraph
+    replay, changed = CapturedGraph.replay, []
+
+    def spy(self):
+        if self.name != "G_step":
+            return replay(self)
+        archive = self.body.archive
+        before = archive.center.clone(), archive.effort.clone()
+        replay(self)
+        same = torch.equal(archive.center, before[0]) and torch.equal(archive.effort, before[1])
+        changed.append((bool(self.body.judge), not same))
+
+    monkeypatch.setattr(CapturedGraph, "replay", spy)
+    _, metrics = run_loop(stepped_call, cuda_graphs=True)
+    assert [k for k, (judged, _) in enumerate(changed) if judged] == [0, 5, 10]
+    # Step 0's record was taken by the warm-ups before the recording; after it only a judged replay adds to it.
+    assert [k for k, (_, took) in enumerate(changed) if took] == [5, 10]
+    assert min(metrics["num_satisfying"]) > 0                    # valid particles on the other steps too
+
+
+@needs_cuda
+def test_the_put_back_makes_no_host_call_and_writes_in_place(stepped_call):
+    """What the recorded put-back runs neither waits on the device nor copies from the host, and it writes each
+    posture's kept ``J`` and the count of capped rows where they were."""
+    from cutamp.tests.conftest import sync_debug_error
+    plan = make_plan(stepped_call)
+    p = plan.particles
+    plan.put_back(p)                                             # fills the caches
+    kept = {name: (jac, jac.data_ptr()) for name, jac in plan.held_jac.items()}
+    capped = plan.capped
+    assert set(kept) == set(plan.gap_of)
+    with sync_debug_error():
+        plan.put_back(p)
+    plan.refresh(p)                                              # a refresh puts back too, gap by gap
+    assert plan.capped is capped
+    assert all(plan.held_jac[name] is jac and jac.data_ptr() == pointer for name, (jac, pointer) in kept.items())
+    tensors, _ = plan.recorded()
+    assert all(any(t is jac for t in tensors) for jac, _ in kept.values()) and any(t is capped for t in tensors)
+
+
+@needs_cuda
+def test_every_replay_puts_the_postures_back_as_the_eager_put_back_does(stepped_call, monkeypatch):
+    """The recorded step's own put-back against :meth:`put_back` run eagerly on copies, bit for bit, across two
+    refreshes: the postures, each kept ``J`` and the count of capped rows. (Its scalars and the gradients after the
+    hand-on are compared by ``test_a_stepped_plans_recorded_step_equals_the_eager_one``.)"""
+    from cutamp.cuda_graphs import CapturedGraph
+    from cutamp.tests.conftest import assert_bitwise
+    replay, compared = CapturedGraph.replay, []
+
+    def spy(self):
+        plan, p = self.body.steps, self.body.particles
+        capped = plan.capped.clone()
+        copies = {k: v.detach().clone() for k, v in p.items()}
+        plan.put_back(copies)                                    # eagerly, first
+        want = {k: copies[k] for k in plan.gap_of}, {k: v.clone() for k, v in plan.held_jac.items()}, plan.capped.clone()
+        with torch.no_grad():
+            plan.capped.copy_(capped)
+            for jac in plan.held_jac.values():
+                jac.fill_(float("nan"))                          # the eager run wrote them: the replay must too
+        replay(self)
+        assert_bitwise(({k: p[k].detach() for k in plan.gap_of}, dict(plan.held_jac), plan.capped), want,
+                       f"replay {len(compared)}")
+        compared.append(len(compared))
+
+    monkeypatch.setattr(CapturedGraph, "replay", spy)
+    plan, _ = run_loop(stepped_call, cuda_graphs=True)
+    assert compared == list(range(12))
+
+
+@needs_cuda
+@pytest.mark.parametrize("cuda_graphs", [True, False])
+def test_the_loops_step_hands_the_gradients_on_before_the_update(stepped_call, monkeypatch, cuda_graphs):
+    """When the Adam update runs, each posture's gradient moves neither its hand nor its feet (``J g = 0``): the step
+    body handed it on after the backward and the grad masks."""
+    update, worst = SteppedPlan.step, []
+
+    def spy(self, optimizer, params, particles):
+        for name, jac in self.held_jac.items():
+            grad = particles[name].grad
+            worst.append((jac @ torch.where(grad.isfinite(), grad, 0).double()[..., None]).abs().amax().item())
+        return update(self, optimizer, params, particles)
+
+    monkeypatch.setattr(SteppedPlan, "step", spy)
+    plan, _ = run_loop(stepped_call, cuda_graphs=cuda_graphs, steps=3)
+    assert len(worst) == 3 * len(plan.held_jac) and max(worst) < 1e-4
+
+
+@needs_cuda
+def test_a_refresh_without_slopes_reads_the_same_values_on_the_particles_own_rows(stepped_call, monkeypatch):
+    """The loop's last refresh (after it no command moves): the same verdict, landings and check values as a full
+    refresh, from the particles' own rows only, the slopes left as they were."""
+    from cutamp.landing_predictor import LandingPredictor
+
+    full, plain = make_plan(stepped_call), make_plan(stepped_call)
+    for plan in (full, plain):
+        with torch.no_grad():
+            plan.particles["step_commands_0"][..., 0] += 0.005
+    slopes = plain.standin.slope[0].clone(), plain.checks[0]["slope"].clone()
+    sizes, rollout = [], LandingPredictor.rollout
+    monkeypatch.setattr(LandingPredictor, "rollout",
+                        lambda self, initial, order, commands, **k: (sizes.append(len(commands)),
+                                                                     rollout(self, initial, order, commands, **k))[1])
+    full.refresh(full.particles)
+    n, of_full = len(full.tests_ok), list(sizes)
+    sizes.clear()
+    plain.refresh(plain.particles, slopes=False)
+    assert of_full == [4 * n] and sizes == [n]                    # one left step: three nudged copies of every row, or none
+    assert torch.equal(plain.tests_ok, full.tests_ok)
+    torch.testing.assert_close(plain.standin.relative[0], full.standin.relative[0], rtol=0, atol=2e-5)
+    assert torch.equal(plain.standin.at[0], full.standin.at[0])
+    torch.testing.assert_close(plain.checks[0]["value"], full.checks[0]["value"], rtol=0, atol=1e-2)
+    assert torch.equal(plain.standin.slope[0], slopes[0]) and torch.equal(plain.checks[0]["slope"], slopes[1])
+    for name in full.landing_confs:
+        torch.testing.assert_close(plain.particles[name], full.particles[name], rtol=0, atol=1e-4)
+
+
+@needs_cuda
+def test_the_rows_traces_reach_the_host_in_one_copy_per_tensor(stepped_call, monkeypatch):
+    """Each valid row keeps its own slice of the last refresh for the motion stage. The slices are cut on the host
+    from one copy of every tensor, not copied off the device row by row."""
+    from cutamp.step_refresh import _each
+
+    plan = make_plan(stepped_call)
+    leaves, copies, to = [], [], torch.Tensor.to
+    for trace in plan.last.values():
+        _each(trace, leaves.append)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: (
+        copies.append(self.is_cuda and any(str(x) == "cpu" for x in a)), to(self, *a, **k))[1])
+    res = plan.result(plan.particles, stepped_call["reducer"], stepped_call["checker"])
+    monkeypatch.undo()
+    assert len(res.rows) > 1 and sum(copies) <= len(leaves)
+    row = res.rows[-1].index
+    kept, direct = [], []
+    for j, trace in plan.last.items():
+        _each(plan.motion_inputs[row][1][j], kept.append)
+        _each(trace, lambda x: direct.append(x[row:row + 1].detach().cpu()))
+    assert len(kept) == len(direct) and all(not a.is_cuda and torch.equal(a, b) for a, b in zip(kept, direct))
+
+
+@needs_cuda
+def test_the_start_and_each_refresh_project_the_pick_and_place_postures(stepped_call, monkeypatch):
+    """A stepped plan's pick and place postures go through the planner's IK projection (balance and feet, the hand, the
+    side lean to 0, the CoM to the centre) at the start, every posture in one call, and gap by gap at each refresh (a
+    call of another size would re-size the buffers the recorded Adam step replays on), with the scene's objects; not at
+    the loop's last refresh, after which nothing is judged again, and not in the Adam step's put-back. The starting
+    postures on record are the projected ones, retracts included: the projection's put-back moves those too."""
+    import cutamp.step_loop as SL
+    from cutamp.gn_refresh import GN_ITERS
+    from cutamp.particle_initialization import GN_IK_CLEAR_ITERS
+
+    calls, project = [], SL.gn_project_balanced
+
+    def spy(world, q, target, arm, **k):
+        calls.append((k.get("iters"), k.get("side_lean_first"), k.get("stances") is not None,
+                      k.get("movables") is not None, len(q)))
+        return project(world, q, target, arm, **k)
+
+    monkeypatch.setattr(SL, "gn_project_balanced", spy)
+    plan = make_plan(stepped_call)
+    p, n = plan.particles, len(plan.tests_ok)
+    assert calls == [(GN_IK_CLEAR_ITERS, True, True, True, 2 * n)]      # the pick's posture and the place's, one call
+    assert set(plan.start_postures) == set(plan.gap_of) and all(torch.equal(v, p[k]) for k, v in plan.start_postures.items())
+    calls.clear()
+    plan.refresh(p)
+    assert calls == [(GN_ITERS, True, True, True, n)] * 2               # gap by gap, at the particles' own row count
+    calls.clear()
+    plan.refresh(p, slopes=False)
+    plan.put_back(p)
+    plan(plan.rollout(p), p)
+    assert calls == []
+
+
+@needs_cuda
+def test_the_projection_leaves_the_postures_better_ranked_with_hand_and_feet_in_place(stepped_call, monkeypatch):
+    # On this scene the reach leaves a posture either upright sideways or centred, not both: the median particle
+    # starts 6 units of side lean and 15 of centring out. The projection takes the side lean first, as the rank does
+    # (0 and 16 units); with the centring above the side lean it ended at 12 and 9 units, a worse rank (2026-11-25).
+    import cutamp.step_loop as SL
+
+    def ranks(plan):
+        with torch.no_grad():
+            return plan(plan.rollout(plan.particles), plan.particles)["soft"]["rank"]
+
+    with monkeypatch.context() as without:
+        without.setattr(SL, "gn_project_balanced", lambda world, q, *a, **k: q)
+        plain = ranks(make_plan(stepped_call))
+    plan = make_plan(stepped_call)
+    projected = ranks(plan)
+    fine = plain.isfinite() & projected.isfinite()
+    assert int(fine.sum()) >= 8 and float(projected[fine].median()) < float(plain[fine].median())
+    assert float((projected[fine] <= plain[fine]).float().mean()) > 0.7
+    p, table, targets = plan.particles, plan.stance_table(plan.particles), plan.hand_targets(plan.particles)
+    for j, (_, op) in enumerate(plan.groups):
+        r, _ = held.held_rows(plan.world, p[op.arg("q")], table[op.arg("q")], targets[j], op.operator.metadata.arm)
+        rows = r.isfinite().all(1)
+        assert float(r[rows].abs().amax(1).median()) < 1e-4            # metres and radians: on the hand and the feet

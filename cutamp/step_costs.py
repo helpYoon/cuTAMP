@@ -30,7 +30,7 @@ def joint_effort(world, q: Tensor) -> Tensor:
     requires one the value carries its slope by central differences of ``h`` on every joint, all ``1 + 2 dof`` rows of
     every posture in one call."""
     torques, dof, h = world.segment_torques, q.shape[-1], 1e-3
-    joints = [k for k in range(dof) if k not in range(dof)[world.model.base]]
+    joints = torques.limbs
     flat = q.detach().reshape(-1, dof)
     rows = flat
     if q.requires_grad:
@@ -83,7 +83,9 @@ def start_weight(cost_type: str, name: str, reducer) -> float:
 class RequirementWeights:
     """A weight per particle and row for every requirement in the cost. :meth:`apply` writes them into the cost and
     remembers which rows are violated; :meth:`grow` doubles the weights of those, once per refresh;
-    :meth:`total_at_start` is the cost's total with every requirement at the weight it started at."""
+    :meth:`total_at_start` is the cost's total with every requirement at the weight it started at. A row's weight and
+    its violated flags keep their tensors and are written in place: a recorded Adam step reads them at their
+    addresses."""
 
     def __init__(self, reducer, checker):
         self.reducer, self.checker = reducer, checker
@@ -100,13 +102,17 @@ class RequirementWeights:
                     self.start[key] = start_weight(cost_type, name, self.reducer)
                     self.weight[key] = torch.full_like(values.detach(), self.start[key])
                 tolerance = self.checker._get_tol(cost_type, name)
-                self.violated[key] = (values.detach() - tolerance / 2).clamp_min(0) > 0
+                violated = (values.detach() - tolerance / 2).clamp_min(0) > 0
+                if key in self.violated and self.violated[key].shape == violated.shape:
+                    self.violated[key].copy_(violated)
+                else:
+                    self.violated[key] = violated
                 weights[name] = self.weight[key]
 
     def grow(self) -> None:
         for key, violated in self.violated.items():
             cap = WEIGHT_CAP * self.start[key]
-            self.weight[key] = torch.where(violated, self.weight[key] * GROWTH, self.weight[key]).clamp_max(cap)
+            self.weight[key].copy_(torch.where(violated, self.weight[key] * GROWTH, self.weight[key]).clamp_max(cap))
 
     @torch.no_grad()
     def total_at_start(self, cost: dict) -> Tensor:

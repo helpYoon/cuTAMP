@@ -241,3 +241,62 @@ def test_planes_that_are_not_sides_change_nothing():
     wide = (torch.cat([normals, spare], 1), torch.cat([bounds, torch.full((len(bounds), 6), float("inf"))], 1), centre)
     for got, want in zip(_on_region(stack, wide), _on_region(stack)):
         assert torch.equal(got, want)
+
+
+def test_the_side_lean_row_reads_the_heading():
+    # A stepped plan's side lean (step_costs.side_lean, the trunk's up axis along the left of the stance's heading) as
+    # one row. Nothing above it here, so the row's own columns show: at heading 0 the roll alone moves and the forward
+    # bow stays; a quarter turn on, the pitch does.
+    from cutamp.gn_refresh import _null_space_step, _side_lean_row
+    from cutamp.step_costs import side_lean
+
+    dof, B = len(REAL_LEGS.joint_names), 3
+    q = torch.zeros(B, dof)
+    q[:, UPRIGHT[0]], q[:, UPRIGHT[1]] = 0.3, 0.2                                      # bowed forward and leaning
+    heading = torch.tensor([0.0, math.pi / 2, 0.7])
+    stance = torch.zeros(B, 2, 3)
+    stance[..., 2] = heading[:, None]
+    rows, target = _side_lean_row(q, UPRIGHT, torch.ones(B, dof), heading)
+    d = _null_space_step(torch.zeros(B, 1, dof), torch.zeros(B, 6, dof), rows, target, own_complement=True).to(q.dtype)
+    before, after = side_lean(q, stance, REAL_LEGS).abs(), side_lean(q + d, stance, REAL_LEGS).abs()
+    assert bool((after < 0.2 * before).all())
+    assert float(d[0, UPRIGHT[0]]) == 0 and float(d[0, UPRIGHT[1]]) < 0
+    assert float(d[1, UPRIGHT[0]].abs()) > 5 * float(d[1, UPRIGHT[1]].abs())
+    assert not d[:, [i for i in range(dof) if i not in UPRIGHT]].any()
+
+
+def test_with_a_heading_the_side_lean_comes_before_the_centring():
+    # A stepped plan's lower levels, in the order its plans are ranked by: level 3 the side lean, level 4 the CoM toward
+    # the centre in what the side lean leaves. Levels 1-2 are as without the heading; neither lower level moves the
+    # soles or the hand; level 4 keeps the side lean where level 3 put it; and the whole step crosses no plane that
+    # levels 1-2's leaves the CoM inside.
+    from cutamp.gn_refresh import _side_lean_row
+    from cutamp.step_costs import side_lean
+
+    stack, _ = _synthetic(0, coll=True)
+    q, jac, jac_com, com, jac_sole = stack[0], stack[2], stack[3], stack[4], stack[9]
+    region = _rectangle_region(stack[8], len(com))
+    heading = (2 * torch.rand(len(q), generator=torch.Generator().manual_seed(1)) - 1) * 0.8
+    stance = torch.zeros(len(q), 2, 3)
+    stance[..., 2] = heading[:, None]
+    step, step3, step12 = _balanced_step(*stack[:8], None, *stack[9:], upright=UPRIGHT, region=region, heading=heading)
+    assert torch.equal(step12, _on_region(stack, region)[2])
+    d3, d4 = step3 - step12, step - step3
+    leaned = d3.norm(dim=-1) > 1e-3
+    centred = leaned & (d4.norm(dim=-1) > 1e-3)
+    assert int(leaned.sum()) >= 40 and int(centred.sum()) >= 40
+    for rows in (jac_sole, jac):
+        assert float((rows @ d3.unsqueeze(-1))[leaned].abs().max()) < 1e-6
+        assert float((rows @ d4.unsqueeze(-1))[centred].abs().max()) < 1e-6
+    lean12, lean3 = (side_lean(q + s, stance, REAL_LEGS).abs() for s in (step12, step3))
+    assert bool((lean3[leaned] < lean12[leaned]).all())
+    row = _side_lean_row(q + step12, UPRIGHT, torch.ones_like(q), heading)[0].to(q.dtype)
+    assert float((row @ d4.unsqueeze(-1))[centred].abs().max()) < 1e-6
+
+    def after(s):
+        return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
+
+    assert float(after(step)[centred].norm(dim=-1).median()) < float(after(step3)[centred].norm(dim=-1).median())
+    kept_inside = _violation(region, after(step12)) <= 0
+    assert bool((_violation(region, after(step))[kept_inside] <= 1e-6).all())
+    assert bool((_violation(region, after(step3))[kept_inside] <= 1e-6).all())

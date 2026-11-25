@@ -37,9 +37,15 @@ def prediction_precision():
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
         # A profiling-mode HOLD can specialize the deployed tick before planning
-        # and silently drop its input tangents on a subsequent batch shape. Use
-        # the same ATen path for state preparation, FK and differentiation.
-        with torch.jit.optimized_execution(False):
+        # and silently drop its input tangents on a subsequent batch shape, so a
+        # call that can differentiate runs the plain ATen path. A call entered
+        # with gradients off reads values only and keeps TorchScript's fuser:
+        # a tick is 170 GPU kernels instead of 450, equal to rounding (2026-11-24).
+        # A model's first calls run before its fused programs exist and round
+        # differently (1e-7), so a process's first plan can differ from its later
+        # ones. Observed: once fused, a model also runs fused when called with
+        # gradients on; no planner call differentiates through it.
+        with torch.jit.optimized_execution(not torch.is_grad_enabled()):
             yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
@@ -86,7 +92,8 @@ class _HoldTickGraph:
         caller = torch.cuda.current_stream(dynamics.device)
         stream.wait_stream(caller)
         with torch.cuda.stream(stream):
-            model(self.state, self.hold, self.dynamics)  # initialize kernels and the stream's BLAS workspace
+            for _ in range(3):  # initialize kernels and the stream's BLAS workspace; the fuser compiles by the third
+                model(self.state, self.hold, self.dynamics)
             self.graph.capture_begin(capture_error_mode="thread_local")
             try:
                 advanced = model(self.state, self.hold, self.dynamics)
@@ -126,7 +133,8 @@ def _hold_trace(predictor, state, dynamics, counts, ticks):
     ):
         capacity = max(ticks, 62 + predictor.hold_ticks)
         shapes = tuple(x.shape for x in (*state, dynamics))
-        key = (torch.cuda.current_stream(dynamics.device).cuda_stream, torch.is_inference_mode_enabled(), shapes, capacity)
+        key = (torch.cuda.current_stream(dynamics.device).cuda_stream, torch.is_inference_mode_enabled(),
+               torch._C._get_graph_executor_optimize(), shapes, capacity)  # a fused tick rounds differently
         if key not in cache:
             if len(cache) >= 8:
                 cache.pop(next(iter(cache)))

@@ -40,7 +40,7 @@ def abs_pose(planted: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         -1,
     )
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=None)  # never evicted: a recorded put-back reads these at their addresses
 def _base_reach(device, dtype):
     from cutamp.robots.t1 import REAL_LEGS
 

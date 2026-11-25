@@ -608,9 +608,14 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
         target = torch.cat((target, weight * centroid), dim=-1)
     bounds = (stance_joint_limits(soles.double(), kin.lower, kin.upper) if kinematics is None
               else (kin.lower.expand_as(seed), kin.upper.expand_as(seed)))
+    pose_and_centre = target
 
-    def fit(reference_pose, start=None):
+    def fit(reference_pose, start=None, rows=None):
+        """The fit of every row, or of ``rows`` only (``reference_pose`` and ``start`` are then theirs)."""
         lower, upper = bounds
+        target = pose_and_centre if rows is None else pose_and_centre[rows]
+        if rows is not None:
+            lower, upper = lower[rows], upper[rows]
         if center_posture:
             lower, upper = lower.clone(), upper.clone()
             lower[:, other] = upper[:, other] = reference_pose[:, other]
@@ -650,21 +655,47 @@ def solve_stance_ik(soles, wrist, posture_seed, arm, *, other_arm_reference=None
             # An idle-arm excursion changes the centered optimum through its mass.
             alternate = torch.where(valid[:, None], alternate, 0).clamp(kin.lower[other], kin.upper[other])
             reference = torch.where(valid[:, None], reference, 0)
-            for fraction in (0.25, 0.5, 1.0):
-                candidate = q.clone()
-                candidate[:, other] = torch.lerp(reference, alternate, fraction)
+            fractions = [0.25, 0.5, 1.0]
+            while fractions and (collision & can_move).any():
+                # Only a colliding row takes the new fit, so only those are solved again: padded with the last one to
+                # a power of two of at least 16, the sizes the recorded solve keeps (2026-11-24). A row's fit at one
+                # excursion does not depend on its fit at another, so the excursions still to try are solved in one
+                # call, as many as the recorded solve's largest batch of 128 rows holds (2026-11-25); each row still
+                # takes the smallest that clears it. Where the padded rows would fill the batch, every row is fitted
+                # again, one excursion at a time, as before.
+                todo = collision.nonzero().flatten()
+                alone = not center_posture or max(16, 1 << (len(todo) - 1).bit_length()) >= b
+                group = fractions[:1 if alone else max(1, 128 // len(todo))]
+                del fractions[:len(group)]
+                idle = [torch.lerp(reference, alternate, fraction) for fraction in group]
                 if center_posture:
                     changed = seed.clone()
-                    changed[:, other] = candidate[:, other]
-                    candidate, candidate_opt, candidate_condition = fit(changed)
-                cleared = collision & ~blocked(candidate)
-                q = torch.where(cleared[:, None], candidate, q)
-                if center_posture:
-                    optimality = torch.where(cleared, candidate_opt, optimality)
-                    conditioning_ok = torch.where(cleared, candidate_condition, conditioning_ok)
-                collision = collision & ~cleared
-                if not (collision & can_move).any():
-                    break
+                    if alone:
+                        changed[:, other] = idle[0]
+                        fits = [[v[todo]] for v in fit(changed)]
+                    else:
+                        rows = todo.repeat(len(group))
+                        changed = changed[rows]
+                        changed[:, other] = torch.cat([arm_pose[todo] for arm_pose in idle])
+                        pad = max(16, 1 << (len(rows) - 1).bit_length()) - len(rows)
+                        again = fit(torch.cat((changed, changed[-1:].expand(pad, -1))),
+                                    rows=torch.cat((rows, rows[-1:].expand(pad))))
+                        fits = [v[:len(rows)].split(len(todo)) for v in again]   # per value, one piece per excursion
+                for k, arm_pose in enumerate(idle):
+                    candidate = q.clone()
+                    candidate[:, other] = arm_pose
+                    if center_posture:
+                        candidate = candidate.index_copy(0, todo, fits[0][k])
+                        candidate_opt = optimality.index_copy(0, todo, fits[1][k])
+                        candidate_condition = conditioning_ok.index_copy(0, todo, fits[2][k])
+                    cleared = collision & ~blocked(candidate)
+                    q = torch.where(cleared[:, None], candidate, q)
+                    if center_posture:
+                        optimality = torch.where(cleared, candidate_opt, optimality)
+                        conditioning_ok = torch.where(cleared, candidate_condition, conditioning_ok)
+                    collision = collision & ~cleared
+                    if not (collision & can_move).any():
+                        break
         collision_free = ~collision
     pose, com = kin.fk(q, arm, False)
     optimality = torch.where(valid, optimality, torch.inf)

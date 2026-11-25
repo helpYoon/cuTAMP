@@ -170,3 +170,23 @@ def test_preserve_best_feasible_center_for_each_particle():
     restored = archive.restore(p, torch.tensor([False, True, True]), torch.tensor([0., .4, .5]), torch.zeros(3))
     assert restored
     assert p["q"].flatten().tolist() == [1., 12., 23.]
+
+
+def test_for_a_stepped_plan_the_loop_ends_when_a_valid_plan_reaches_rank_zero():
+    from cutamp.optimize_plan import _FeasibleArchive
+
+    p = _particles(0.)
+    snap = _BestSnapshot()
+    rank, effort = torch.tensor([3., 0., 5., 5.]), torch.tensor([.5, .5, .5, .5])
+    feasible = torch.tensor([True, False, False, False])
+    archive = _FeasibleArchive(p, rank, effort)
+    archive.observe(p, feasible, rank, effort)
+    snap.update(0, 1, 10., p)
+    assert not snap.should_stop(0, 50, archive, by_rank=True)   # a valid plan above rank 0, and a row at 0 not valid
+    rank[0] = 1.
+    archive.observe(p, feasible, rank, effort)
+    assert not snap.should_stop(5, 50, archive, by_rank=True)
+    rank[0] = 0.                                                # no rank is lower: nothing could restart the clock
+    archive.observe(p, feasible, rank, effort)
+    assert snap.should_stop(10, 50, archive, by_rank=True)
+    assert not snap.should_stop(10, 0, archive, by_rank=True)   # patience 0 still switches the rule off

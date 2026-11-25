@@ -66,7 +66,7 @@ def _slope(relative, rows):
 
 
 def refresh_gap(predictor, start: LandingState, order: str, commands: Tensor, anchor: Tensor,
-                previous_slope: Tensor | None = None) -> GapRefresh:
+                previous_slope: Tensor | None = None, *, nudges: bool = True) -> GapRefresh:
     """Run a gap's steps from ``start`` on every particle's commands, values only, and measure their slope.
 
     One call of ``predictor.rollout``, with its default settling hold, on ``1 + 3 s`` rows per particle: the commands as
@@ -74,13 +74,18 @@ def refresh_gap(predictor, start: LandingState, order: str, commands: Tensor, an
     first step. A landing jumps where a step's tick count changes, so where a nudge changed one the slope entry is
     ``previous_slope``'s, or with none the slope of a landing exactly as commanded from the start's own feet. Every row
     of the call is kept in ``copies``, for the checks that read their own slope from the copies (2026-11-23 design 4.4).
+
+    Without ``nudges`` the call runs the particles' own rows only: the values, with ``previous_slope`` (required) kept
+    as the slope and no tick count changed. For a refresh after which no command moves.
     """
     with torch.no_grad(), prediction_precision():
         u = commands.detach().clone()
         n, s = u.shape[:2]
         k = 3 * s
-        rows = 1 + k
-        offsets = torch.cat((u.new_zeros(1, k), NUDGE * torch.eye(k, dtype=u.dtype, device=u.device)))
+        if not nudges and previous_slope is None:
+            raise ValueError("a refresh without nudges measures no slope: it needs the previous one")
+        rows = 1 + k if nudges else 1
+        offsets = torch.cat((u.new_zeros(1, k), NUDGE * torch.eye(k, dtype=u.dtype, device=u.device)))[:rows]
         big_u = (u.reshape(1, n, k) + offsets[:, None]).reshape(rows * n, s, 3)
         big = LandingState(
             tuple(t.repeat(rows, *([1] * (t.ndim - 1))) for t in start.tensors),
@@ -91,6 +96,9 @@ def refresh_gap(predictor, start: LandingState, order: str, commands: Tensor, an
         big_anchor = anchor.repeat(rows, 1)
         landed = torch.stack([step.achieved for step in out.steps], 1)
         relative = _relative(big_anchor, landed)
+        if not nudges:
+            same_ticks = torch.zeros(n, k, dtype=torch.bool, device=u.device)
+            return GapRefresh(out, landed.clone(), relative.clone(), previous_slope, u, same_ticks, out, big_u)
         slope = _slope(relative, rows)
         clocks = torch.stack([step.clock for step in out.steps], -1).reshape(rows, n, s)
         ticks_changed = (clocks[1:] != clocks[:1]).any(-1).T
@@ -115,7 +123,13 @@ class StandIn:
     at: list[Tensor | None]          # per gap [n, s, 3]
 
     def set(self, gap: int, refresh: GapRefresh) -> None:
-        self.relative[gap], self.slope[gap], self.at[gap] = refresh.relative, refresh.slope, refresh.commands
+        """Gap ``gap``'s landings as ``refresh`` measured them, written into the tensors this stand-in holds once it
+        holds them: a recorded Adam step reads them at their addresses."""
+        for kept, new in ((self.relative, refresh.relative), (self.slope, refresh.slope), (self.at, refresh.commands)):
+            if kept[gap] is None:
+                kept[gap] = new.clone()
+            else:
+                kept[gap].copy_(new)
 
     def stances(self, incoming: Tensor, commands: list[Tensor | None]) -> tuple[list[Tensor | None], list[Tensor]]:
         """``(after_steps, final)``: ``after_steps[j]`` ``[n, s, 2, 3]`` is the world pair after each step of gap ``j``
