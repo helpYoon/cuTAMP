@@ -18,6 +18,16 @@ from cutamp.envs import TAMPEnvironment
 Particles = Dict[str, torch.Tensor]  # each [num_particles, *h, d]
 
 
+def file_version(path) -> tuple:
+    """``path`` resolved and its (device, inode, mtime, size), or None for a missing file: a cache key that changes
+    when the file is rewritten."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (str(path.resolve()), None)
+    return (str(path.resolve()), (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size))
+
+
 def pose_list_to_mat4x4(pose: list[float] | None) -> torch.Tensor:
     """cuRobo pose list to 4x4 transformation matrix."""
     mat4x4 = torch.eye(4)

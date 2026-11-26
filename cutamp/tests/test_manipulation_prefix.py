@@ -1,19 +1,21 @@
 from cutamp.t1_domain import On, all_t1_fluents, all_t1_operators, get_initial_state
-from cutamp.task_planning import Fluent, Operator, search
+from cutamp.task_planning import Fluent, Operator
+from cutamp.task_planning import plan_search as search_module
+from cutamp.task_planning.plan_search import ManipulationPrefix
 
 
 def test_immediate_pick_choices_are_shared_and_bound_before_expanding_place(monkeypatch):
     initial = get_initial_state(("a", "b"), ("pad",))
     goal = frozenset((On.ground("a", "pad"), On.ground("b", "pad")))
-    root = search.ManipulationPrefix(initial, goal, all_t1_operators)
+    root = ManipulationPrefix(initial, goal, all_t1_operators)
     grounded_from = []
-    ground = search.get_valid_ground_operators
+    ground = search_module.get_valid_ground_operators
 
     def trace(node, *args, **kwargs):
         grounded_from.append(node.operator)
         return ground(node, *args, **kwargs)
 
-    monkeypatch.setattr(search, "get_valid_ground_operators", trace)
+    monkeypatch.setattr(search_module, "get_valid_ground_operators", trace)
     picks = root.choices()
     assert root.action is None and root.skeleton() == []
     assert {(p.action.operator.metadata.arm, p.action.arg("obj")) for p in picks} == {
@@ -46,25 +48,25 @@ def test_holding_rest_and_already_satisfied_goals_stop_at_first_satisfying_state
     facts = {f.name: f for f in all_t1_fluents}
     initial = get_initial_state(("a",), ("pad",))
     holding = facts["RightHolding"].ground("a")
-    pick_goal = search.ManipulationPrefix(initial, {holding}, all_t1_operators)
+    pick_goal = ManipulationPrefix(initial, {holding}, all_t1_operators)
     right_pick = next(p for p in pick_goal.choices() if p.action.operator.metadata.arm == "right")
     assert right_pick.complete and right_pick.choices() == ()
     rest_goal = {holding, facts["RightCanMove"].ground()}
-    root = search.ManipulationPrefix(initial, rest_goal, all_t1_operators)
+    root = ManipulationPrefix(initial, rest_goal, all_t1_operators)
     pick = next(p for p in root.choices() if p.action.operator.metadata.arm == "right")
     (rest,) = pick.choices()
     assert rest.complete and rest.action is None and rest.loaded
     assert rest.skeleton()[-1].operator.name == "RightRetractHolding"
-    done = search.ManipulationPrefix(initial, initial, all_t1_operators)
+    done = ManipulationPrefix(initial, initial, all_t1_operators)
     assert done.complete and done.choices() == ()
 
 
 def test_deadline_and_cycle_before_first_manipulation():
     a, b, goal = Fluent("A"), Fluent("B"), Fluent("Goal")
     ops = [Operator("toB", [], [a], [b], [a]), Operator("toA", [], [b], [a], [b])]
-    root = search.ManipulationPrefix(frozenset((a.ground(),)), {goal.ground()}, ops)
+    root = ManipulationPrefix(frozenset((a.ground(),)), {goal.ground()}, ops)
     assert root.choices() == ()
-    expired = search.ManipulationPrefix(
+    expired = ManipulationPrefix(
         get_initial_state(("a",), ("pad",)), {On.ground("a", "pad")}, all_t1_operators, deadline=0.0
     )
     assert expired.choices() == ()

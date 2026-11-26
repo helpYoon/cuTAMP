@@ -6,37 +6,37 @@ import torch
 from torch.optim import Adam
 from torch.profiler import ProfilerActivity, profile
 
-from cutamp.config import TAMPConfiguration
 from cutamp.costs import _sphere_to_sphere_overlap, get_aabb_from_spheres
-from cutamp.tests.conftest import (
-    SpyVis, clone_particles, make_plan_info, needs_cuda, run_optimizer, sync_debug_error,
-)
+from cutamp.tests.conftest import SpyVis, needs_cuda, plan_info, run_optimizer, sync_debug_error, zero_step_plan
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
 
 @needs_cuda
 @pytest.mark.parametrize("cuda_graphs", [False, True])
-def test_noop_visualizer_skips_vis_block(real_world, real_plan, cuda_graphs):
-    world, (skeleton, base) = real_world, real_plan
-    config = TAMPConfiguration(num_particles=64, num_opt_steps=12, early_stop_patience=0,
-                               cuda_graphs=cuda_graphs, enable_visualizer=False)
-    _, timer = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
+def test_noop_visualizer_skips_vis_block(real_world, cuda_graphs):
+    def plan():
+        return zero_step_plan(real_world, num_opt_steps=12, early_stop_patience=0, cuda_graphs=cuda_graphs,
+                              enable_visualizer=False)
+    first = plan()
+    config = first.config
+    _, timer = run_optimizer(plan_info(first), config)
     assert "visualize_opt_rollout" not in timer.get_summaries()  # the no-op visualizer skips the block
     vis = SpyVis(config)
-    run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
+    run_optimizer(plan_info(plan()), config, visualizer=vis)
     assert vis.opt_steps == [0, 10, 11]
 
 
 @needs_cuda
-def test_rollout_viewer_takes_the_conf_and_the_gripper_state(real_world, real_plan):
+def test_rollout_viewer_takes_the_conf_and_the_gripper_state(real_world):
     # The rollout_* timeline shows each conf in the model's cspace, with each hand's gripper set on the rerun robot:
     # both open at the start, then a pick conf's hand closed and a place conf's open, the other hand as it was.
     from types import SimpleNamespace
 
     from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
-    world, (skeleton, base) = real_world, real_plan
-    config = TAMPConfiguration(num_particles=64, num_opt_steps=2, early_stop_patience=0, enable_visualizer=False)
+    world = real_world
+    plan = zero_step_plan(world, num_opt_steps=2, early_stop_patience=0, enable_visualizer=False)
+    config, skeleton = plan.config, plan.arm_skeleton
 
     class Vis(SpyVis):
         def __init__(self, config):
@@ -53,7 +53,7 @@ def test_rollout_viewer_takes_the_conf_and_the_gripper_state(real_world, real_pl
                 self.shown.append((len(q), self.grippers))
 
     vis = Vis(config)
-    run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
+    run_optimizer(plan_info(plan), config, visualizer=vis)
     dof, state = len(world.model.joint_names), {"left": GRIPPER_OPEN, "right": GRIPPER_OPEN}
     want = [(dof, (GRIPPER_OPEN, GRIPPER_OPEN))]
     for op in skeleton:

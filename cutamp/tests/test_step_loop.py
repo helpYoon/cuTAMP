@@ -1,4 +1,3 @@
-from dataclasses import fields
 from types import SimpleNamespace
 
 import torch
@@ -12,20 +11,11 @@ from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_
 from cutamp.tamp_world import FK_SITES
 
 
-def test_a_stepped_plan_overrides_one_setting_only():
-    base = TAMPConfiguration()
-    stepped = base.for_steps()
-    assert stepped.conf_lr == base.conf_lr and stepped.soft_cost == []  # the planner's own step size (2026-11-24)
-    changed = {f.name for f in fields(base) if getattr(base, f.name) != getattr(stepped, f.name)}
-    assert changed == {"soft_cost"}
-
-
-def test_a_stepped_retract_locks_only_its_idle_arm():
+def test_a_retract_locks_only_its_idle_arm():
     op = SimpleNamespace(values=("q_start", "traj", "q_r"),
                          operator=SimpleNamespace(metadata=SimpleNamespace(arm="left", action_type="retract")))
     idle = list(range(REAL_LEGS.right_arm.start, REAL_LEGS.right_arm.stop))
-    assert get_conf_locked_dofs([op], "q_r", REAL_LEGS, stepped=True) == idle
-    assert set(get_conf_locked_dofs([op], "q_r", REAL_LEGS)) > set(idle)
+    assert get_conf_locked_dofs([op], "q_r", REAL_LEGS) == idle
 
 
 def test_the_new_rows_have_settings():
@@ -53,7 +43,7 @@ from cutamp import algorithm as alg
 from cutamp import held
 from cutamp.algorithm import run_cutamp
 from cutamp.constraint_checker import ConstraintChecker
-from cutamp.particle_initialization import ParticleInitializer
+from cutamp.particle_initialization import _pick_pools
 from cutamp.step_loop import SteppedPlan
 from cutamp.step_planner import StepResult
 from cutamp.step_refresh import NoStartingPath, as_commanded, command_rows
@@ -81,8 +71,7 @@ def stepped_call():
         run_cutamp(env, cfg, CostReducer(default_constraint_to_mult.copy()),
                    ConstraintChecker(default_constraint_to_tol.copy()), q_init=q, step_inputs=inputs,
                    experiment_id="capture")
-    got["config"] = got["config"].for_steps()
-    got["pools"] = ParticleInitializer(got["world"], got["config"], got["checker"])._pick_pools(got["proposal"].skeleton)
+    got["pools"] = _pick_pools(got["world"], got["proposal"].skeleton)
     return got
 
 
@@ -99,7 +88,8 @@ def test_starting_values(stepped_call):
     u = p["step_commands_0"]
     assert u.shape == (16, 1, 3)
     proposal = stepped_call["proposal"]
-    assert len(proposal.targets) == len(proposal.schedule.edges) == len(proposal.orders) and proposal.search is not None
+    assert len(proposal.targets) == len(proposal.schedule.edges) == len(proposal.orders)
+    assert proposal.landing_options is not None
     assert plan.stats["draw"]["reached"] and plan.stats["draw"]["seconds"] > 0
     after, _ = as_commanded(plan.orders, plan.incoming, [u, None])
     assert all((v == 0).all() for v in command_rows(plan.orders, plan.incoming, [u, None], after).values())
@@ -193,7 +183,7 @@ def test_the_balance_cost_is_the_shortfall_itself(stepped_call):
 def test_the_preferences_in_the_loss(stepped_call):
     from cutamp.com_polygon_cost import physical_support_centroid
     from cutamp.stance import UNIT_M, UNIT_RAD
-    from cutamp.step_costs import joint_effort, plan_rank, side_lean
+    from cutamp.step_costs import forward_lean, joint_effort, plan_rank, plan_score, side_lean
     plan = make_plan(stepped_call)
     p, world = plan.particles, plan.world
     with torch.no_grad():
@@ -208,6 +198,8 @@ def test_the_preferences_in_the_loss(stepped_call):
         distance = (rollout["com_xy"] - physical_support_centroid(stances, world.model.sole_box)).norm(dim=-1)
         effort = joint_effort(world, q)
     assert set(soft["values"]) == {"side_lean", "off_centre", "joint_effort"}
+    tilt, bow = lean.abs().asin().amax(1), forward_lean(q, stances, world.model).abs().amax(1)
+    torch.testing.assert_close(soft["score"], plan_score(tilt, distance.amax(1), bow).to(soft["score"]))
     torch.testing.assert_close(soft["values"]["side_lean"], (lean / UNIT_RAD).square().sum(1).to(soft["values"]["side_lean"]))
     torch.testing.assert_close(soft["values"]["off_centre"], (distance / UNIT_M).sum(1).to(soft["values"]["off_centre"]))
     torch.testing.assert_close(soft["values"]["joint_effort"], effort.sum(1).to(soft["values"]["joint_effort"]))
@@ -247,26 +239,28 @@ def test_result_rows(stepped_call):
         assert pick["order"] == "L" and place["order"] == "none" and pick["achieved"] == place["achieved"]
         assert len(pick["commands"]) == 1 and len(pick["final_xy_error_m"]) == 2
         assert sum(k.endswith("_ik_reference") for k in row.particle) == 2
-        assert {"rank", "joint_effort", "side_lean_rad", "joint_efforts"} <= set(m)
+        assert {"score", "rank", "joint_effort", "side_lean_rad", "forward_lean_rad", "joint_efforts"} <= set(m)
         assert len(m["side_lean_rad"]) == len(m["joint_efforts"]) == 2
         assert m["joint_effort"] == max(m["joint_efforts"])
         lean, centre = max(abs(x) for x in m["side_lean_rad"]), max(m["com_center_distances_m"])
         assert m["rank"] == float(plan_rank(torch.tensor(lean), torch.tensor(centre)))
 
 
-def test_valid_rows_go_to_arm_motion_by_rank_then_effort():
+def test_valid_rows_go_to_arm_motion_by_score_then_rank_then_effort():
+    # Row 0 is centred but folded (rank 0, score 40); rows 1 to 3 share a lower score.
     from cutamp.step_loop import _validate_motion_rows
     from cutamp.step_planner import StepRow
-    rows = [StepRow(i, {}, 0.0, {"rank": rank, "joint_effort": effort, "com_center_distances_m": [centre],
-                                "secondary_effort": 0.0})
-            for i, (rank, effort, centre) in enumerate([(4096.0, 0.1, 0.0), (0.0, 0.3, 0.004), (0.0, 0.2, 0.004)])]
+    rows = [StepRow(i, {}, 0.0, {"score": score, "rank": rank, "joint_effort": effort,
+                                "com_center_distances_m": [0.004], "secondary_effort": 0.0})
+            for i, (score, rank, effort) in enumerate([(40.0, 0.0, 0.1), (23.0, 3.0, 0.3), (23.0, 4.0, 0.2),
+                                                       (23.0, 3.0, 0.2)])]
     tried = []
     def attempt(row):
         tried.append(row.index)
         return None, {"motion_validation": "failed"}
     config = SimpleNamespace(com_center_weight=1.0, motion_plan_max_retries=3)
     _validate_motion_rows(rows, {}, [], None, config, attempt, deadline=None)
-    assert tried == [2, 1, 0] and rows[1].order == (0.0, 0.3)
+    assert tried == [3, 1, 2] and rows[1].order == (23.0, 3.0, 0.3)
 
 
 from cutamp.step_loop import refine_stepped_plan
@@ -349,13 +343,11 @@ def test_the_refresh_tests_do_not_compare_the_landing_with_the_command(stepped_c
 
 
 @needs_cuda
-def test_self_collision_slope_scales_with_its_weight_only_when_asked(stepped_call):
+def test_self_collision_slope_scales_with_its_weight(stepped_call):
     from curobo.types import JointState
-    from cutamp.cost_function import CostFunction
     from cutamp.gn_refresh import _self_pairs
     world = stepped_call["world"]
     plan = make_plan(stepped_call)
-    standing = CostFunction(plan.arm_skeleton, world, stepped_call["config"])
     i, j, _ = _self_pairs(world.kinematics)
     spheres = world.kinematics.compute_kinematics(JointState.from_position(world.q_init[None])).robot_spheres
     spheres = spheres.reshape(1, 1, -1, 4).clone()
@@ -369,7 +361,6 @@ def test_self_collision_slope_scales_with_its_weight_only_when_asked(stepped_cal
         return torch.autograd.grad((scale * value).sum(), s)[0].abs().sum()
 
     assert float(slope(plan.cost_function, 1000.0)) == pytest.approx(1000.0 * float(slope(plan.cost_function, 1.0)), rel=1e-4)
-    assert float(slope(standing, 1000.0)) == pytest.approx(float(slope(standing, 1.0)), rel=1e-6)
 
 
 @needs_cuda
@@ -435,7 +426,9 @@ def test_every_posture_on_a_stance_hands_on_its_share(stepped_call):
 def test_the_placements_share_is_the_slope_along_the_held_surface(stepped_call):
     """The place posture's gradient reaches the placement through hand_on as the slope of the cost along the held
     surface, measured by putting the posture back on the hand target of a moved placement: its x, y and z move the
-    hand's position rows, its yaw the rotation rows too."""
+    hand's position rows, its yaw the rotation rows too. Measured only on the rows where neither measuring move clamps
+    a joint onto a limit: there the slope is one-sided, and put_back's J leaves a joint free until it sits on one."""
+    from cutamp.stance import stance_joint_limits
     plan = make_plan(stepped_call)
     p = plan.particles
     op = plan.groups[1][1]
@@ -457,10 +450,17 @@ def test_the_placements_share_is_the_slope_along_the_held_surface(stepped_call):
             moved[key][:, c] += by
             return held.put_back(plan.world, q0, stance, plan.hand_targets(moved)[1], arm)[0]
 
+        lower, upper = stance_joint_limits(stance.to(q0), *plan.world.joint_limits.to(q0))
+
+        def on_limit(x):
+            return (x <= lower + 1e-7) | (x >= upper - 1e-7)
+
         for c in range(4):
-            measured = ((put_back_at(c, d) - put_back_at(c, -d)) @ w) / (2 * d)
+            up, down = put_back_at(c, d), put_back_at(c, -d)
+            measured = ((up - down) @ w) / (2 * d)
             error = (measured - share[:, c]).abs() / (share[:, c].abs() + 1e-3 * w.norm())
-            assert error.median() < 0.05, (c, error)
+            smooth = ~((on_limit(up) | on_limit(down)) & ~on_limit(q0)).any(1)
+            assert int(smooth.sum()) >= 4 and error[smooth].median() < 0.05, (c, error, smooth)
 
 
 @needs_cuda
@@ -801,8 +801,8 @@ def run_loop(c, cuda_graphs: bool, steps: int = 12, viewer: bool = False):
 
 @needs_cuda
 def test_a_stepped_plans_recorded_step_equals_the_eager_one(stepped_call, monkeypatch):
-    """Every replay of the recorded Adam step against the same step run eagerly on copies of the particles, bit for
-    bit, through two refreshes: its scalars, every gradient and, kept for the viewer, every cost row."""
+    """Every replay of the recorded Adam step against the same step run eagerly on copies of the particles, at
+    float32 tolerance, through two refreshes: its scalars, every gradient and, kept for the viewer, every cost row."""
     from cutamp.tests.conftest import install_step_replay_spy
     replays = install_step_replay_spy(monkeypatch)
     _, metrics = run_loop(stepped_call, cuda_graphs=True, viewer=True)
@@ -881,9 +881,9 @@ def test_a_replay_that_is_not_judged_leaves_the_record_alone(stepped_call, monke
         if self.name != "G_step":
             return replay(self)
         archive = self.body.archive
-        before = archive.center.clone(), archive.effort.clone()
+        before = archive.score.clone(), archive.effort.clone()
         replay(self)
-        same = torch.equal(archive.center, before[0]) and torch.equal(archive.effort, before[1])
+        same = torch.equal(archive.score, before[0]) and torch.equal(archive.effort, before[1])
         changed.append((bool(self.body.judge), not same))
 
     monkeypatch.setattr(CapturedGraph, "replay", spy)

@@ -78,7 +78,7 @@ commands, where its landings and their slope enter the costs; and
 `home-model.json` is its measured landing accuracy.
 With the nominal hand reach map,
 `cutamp/robots/assets/t1_29dof/t1-nominal-hand-map.npz`, the accuracy table
-guides task search.
+guides the plan search.
 
 > **bfm_wm is not public yet.** The step model and its accuracy table are frozen
 > exports from bfm_wm, the repository that trains the T1 controller and its world
@@ -163,112 +163,73 @@ until one satisfies every hard constraint, then motion-planning the result.
 
 ```mermaid
 graph LR
-    A["Task planning<br/>(t1_domain → skeletons)"] --> B["Particle init<br/>(IK-seeded candidates)"]
-    B --> C["Optimize<br/>(coupled-Adam:<br/>hard constraints + soft costs)"]
+    A["Task planning<br/>(t1_domain → skeletons)"] --> B["Particle init<br/>(stance IK + projection)"]
+    B --> C["Optimize<br/>(Adam + IK projection:<br/>hard constraints + preferences)"]
     C --> D["Motion plan<br/>(single planner,<br/>CoM/ZMP gate per segment)"]
     D --> E["Playback / save<br/>(Rerun · raw plan pickle)"]
 ```
 
-1. **Task planning** — Automatic stepping A* with a nominal hand map puts arm,
+1. **Task planning** — The plan search, a best-first (A*-like) search with a nominal hand map, puts arm,
    object and foot choices in one queue. It charges the nominal palm-to-object
    distance when a pick chooses its hand, then scores reach and landing evidence
-   for the candidate steps.
-2. **Particle initialization** — `ParticleInitializer`
-   (`particle_initialization.py`) seeds a batch of candidate grasps / placements
-   / configs and solves each pick / place conf with GN IK
-   (`gn_ik`): balance-first Gauss-Newton from home and from three noisy starts
-   on the stance in one batch, first reaching and then clearing any collision
-   with the scene, the robot itself and the movable objects, the clearing
-   iterations also pulling the CoM toward the keyframe rectangle's centre so
-   a conf doesn't park on its edge, and the Trunk toward upright. Each target
-   keeps its most upright accepted start, and a conf is accepted only inside the checker's
-   tolerances (`ik_check`): the hand, both soles on the stance, the CoM in the
-   model's keyframe rectangle (`world.model.support.keyframe_half`) and no
-   collision. Retract confs start at the model's home
-   (`REAL_LEGS.home`). Each pick first tries every grasp of its object that the
-   hand can take (`world.grasp_candidates`: none with a hand sphere below the
-   object's bottom face or touching the object, `grasps.drop_grasps`), top or
-   side, from any direction: one IK row per grasp at the pick and one at its
-   place, on a placement drawn for it. Of the grasps balanced at both, those
-   GraspGenX scores at `GRASP_SCORE_CUTOFF` (0.7, its own cutoff) or more rank
-   upright first: the Trunk's tilt, then its travel from home, then the CoM
-   margin, each at the worse of the pick and the place, with ties going by
-   GraspGenX's order. The first `motion_plan_max_retries` of them are the
-   pick's chosen grasps; when fewer clear the cutoff, the best-scoring balanced
-   ones below it fill the rest (`choose_grasps`). The particles take the chosen
-   grasps in turn, each keeping its grasp's pick conf where `ik_check` accepts
-   it in the particle's own scene. Where no grasp is balanced, the pick draws
-   by score as before and logs a warning. Each place row draws its placement
+   for the candidate steps. Taking no step (`none`) is one of a pick's landing
+   options, so a plan without steps wins when no step shortens its reach.
+2. **Particle initialization** — `SteppedPlan` (`step_loop.py`) starts every
+   plan's particles, with or without steps. When the plan steps, the step
+   commands start on half-foot grid paths over the task planner's foot orders
+   that reach each target and keep the feet off objects, with noise within half
+   a cell (`step_refresh.draw_grid_paths`; a right swing mirrored); when no grid
+   path reaches, they start on legal, feet-clear paths that do not reach. Each
+   pick takes its object's grasps in score order (`world.grasp_candidates`: none
+   with a hand sphere below the object's bottom face or touching the object,
+   `grasps.drop_grasps`), each place row draws its placement
    (`place_4dof_sampler`), its yaw turned so the held grasp approaches from the
-   robot's side. The rows whose IK fails draw again, up to
-   `GRASP_REDRAW_ROUNDS` times, a pick from its chosen grasps. Grasps are never
-   optimized. A plan with steps starts its particles in `step_loop.py` instead:
-   the step commands start on half-foot grid paths over the task planner's foot
-   orders that reach each target and keep the feet off objects, with noise
-   within half a cell (`step_refresh.draw_grid_paths`; a right swing mirrored);
-   when no grid path reaches, they start on legal, feet-clear paths that do not
-   reach. The pick's grasps are taken in score order, and each pick, place and
-   retract posture starts from one stance IK solve on the stance it stands on at
-   the first refresh; the Adam loop then moves the commands with the placements
-   and postures.
-3. **Optimization** — `ParticleOptimizer` (`optimize_plan.py`) runs Adam over the
-   particles against `CostFunction` (`cost_function.py`): hard constraints
-   (kinematic — the hand's pose and both soles on the stance — motion,
-   collision, stable-placement, and the `ComPolygon` gate: every conf's CoM
-   inside the model's keyframe rectangle, which sits 5 mm inside its support
-   region for the arrival's deceleration: the stance's two soles shrunk 2 cm
-   and another 5 mm, where each foot carries at least a tenth of the weight,
-   `support_rectangles`) plus soft costs. Adam is always **re-IK-coupled** —
-   outer Adam moves poses while the confs an IK target covers are re-projected
-   every `reik_interval` steps by balance-first Gauss-Newton (`gn_refresh.py`:
-   the CoM in the support rectangle, both soles on the stance and no
-   collision first, then the pose, every step kept inside the joint limits),
-   with no cuRobo during Adam and the Adam step and refresh replayed as CUDA
-   graphs (`cuda_graphs.py`).
+   robot's side, and each pick, place and retract posture starts from one stance
+   IK solve (`solve_stance_ik`) on the stance it stands on, then the
+   balance-first IK projection (`gn_project_balanced`). Grasps are never
+   optimized.
+3. **Optimization** — `refine_stepped_plan` runs `ParticleOptimizer`
+   (`optimize_plan.py`) on the `SteppedPlan` as its cost: `CostFunction`'s
+   hard constraints (`cost_function.py`: kinematic — the hand's pose and both
+   soles on each posture's stance — motion, collision, stable-placement, and
+   the `ComPolygon` gate: every conf's CoM inside its stance's support region)
+   plus the preferences side lean, off centre and joint effort. Adam moves the
+   postures, the placements and, when the plan steps, the step commands; every
+   `reik_interval` steps the IK projection (`gn_project_balanced`: the CoM in
+   the support region, both soles on the stance and no collision first, then
+   the pose, every step kept inside the joint limits) puts each posture back on
+   its target. The hand and the feet are held, not costs. With no steps the
+   feet stay on the starting stance and only the postures and placements move.
    Adam stops after `early_stop_patience` steps without progress and keeps the
-   best-seen particles. For a plan with steps, once a particle is valid the
-   countdown restarts only when the best valid plan's worst side lean falls
-   into a lower whole 0.05 rad, or its worst off-centre distance into a lower
-   whole 5 mm. `ConstraintChecker` decides which particles satisfy.
-4. **Motion planning** — `_motion_plan_with_retries` (`algorithm.py`) drives
-   up to `motion_plan_max_retries` satisfying particles, first success wins,
-   in `get_top_satisfying_particles`' order: the worst pick or place CoM
-   distance to the support centroid first, then secondary effort. Each
-   candidate gets 2 `plan_cspace` attempts per segment and, if it ran out of
-   them, cuRobo's 20, before the next candidate is tried. With
-   `--com_center_weight 0` the candidates go round their grasp groups (groups
-   whose grasps all score 0.7 or more first, then upright first on each
-   group's best particle by soft cost), and every candidate gets its 2-attempt
-   pass before any gets 20. They plan through `motion_solver.py`: one
-   `MotionPlanner` over the model's cspace, built on the first motion-plan
-   attempt, and planned to each particle conf with `plan_cspace`, so a pick or place
-   ends exactly at the conf the optimizer approved and cuRobo can't
-   re-resolve the redundancy at the endpoint. Each pick and place is three
-   segments: an approach to a pre conf, a straight insert to the particle conf
-   and a straight leave to a post conf (`grasps.approach_targets`). A pick
-   comes in along the hand's approach from `APPROACH_DISTANCE` back and leaves
-   the same way, or lifts `LIFT_HEIGHT` straight up if its approach is more
-   than `VERTICAL_CONE` from vertical; a place comes in the same way, or,
-   past that cone, from `LIFT_HEIGHT` above, and always backs out along its
-   approach. GN solves the
-   pre and post confs (`_approach_confs`), trajopt holds the hand on each line
-   (`_line_motion`) and FK checks it (`check_line`). Trajopt holds both soles on the
-   stance at every waypoint and penalizes every joint's torque past its effort
-   with cuRobo's RNEA, the floor's push on the soles included
-   (`install_floor_wrench`); its success test leaves torque to the gate. Each
-   segment then passes `_balance_gate`: every frame must keep both soles on
-   the stance and its CoM inside the model's support rectangle
-   (`world.model.support.gate_half`: the home stance's two soles, shrunk 2 cm
-   and kept where each foot carries at least a tenth of the weight). A CoM
-   outside fails the candidate and the next one is tried. The gate then sets
-   the segment's pace: the smallest uniform time scale, never faster than the
-   planner's and up to 4× slower (`RETIME_MAX`), at which every actuated joint's
-   speed stays within cuRobo's limit, every joint's torque, cuRobo's RNEA with
-   the floor's push on the soles (`SegmentTorques`), within its effort, and
-   the multibody ZMP (`com_zmp_in_support`, from the same RNEA's floor
-   wrench) inside. The frames it returns are
-   checked again, and a segment no scale up to 4× passes fails the candidate,
-   naming the check.
+   best-seen particles; once a particle is valid the countdown restarts only
+   when a valid plan reaches a lower score. A plan's score adds whole units of
+   its worst side lean (0.05 rad), its worst off-centre distance (5 mm) and
+   its worst forward lean (0.05 rad) (`step_costs.plan_score`).
+   `ConstraintChecker` decides which particles satisfy.
+4. **Motion planning** — up to `motion_plan_max_retries` satisfying rows, in
+   order of their score (with `--com_center_weight 0`, round their grasp
+   groups, `grasp_group_order`), plan through
+   `step_preview.plan_predicted_step_motion` and `motion_solver.solve_curobo`,
+   first success wins. Each pick and place is three segments: an approach to a
+   pre conf, a straight insert to the particle conf and a straight leave to a
+   post conf (`grasps.approach_targets`). A pick comes in along the hand's
+   approach from `APPROACH_DISTANCE` back and leaves the same way, or lifts
+   `LIFT_HEIGHT` straight up if its approach is more than `VERTICAL_CONE` from
+   vertical; a place comes in the same way, or, past that cone, from
+   `LIFT_HEIGHT` above, and always backs out along its approach. One stance IK
+   solve on the posture's stance gives the pre and post confs
+   (`PredictedSteppedMotion.approach`). Each segment first tries the direct
+   path (`_direct_supported_path`), else plans with cuRobo's `plan_cspace` on
+   one `MotionPlanner` over the model's cspace, so a pick or place ends exactly
+   at the conf the optimizer approved; trajopt holds the hand on each line
+   (`_line_motion`) and FK checks it (`check_line`). Each segment then passes
+   `_supported_segment_gate`: every frame keeps both soles on the achieved
+   stance and its CoM and multibody ZMP (`com_zmp_in_support`, from cuRobo's
+   RNEA with the floor's push on the soles) inside the achieved support region,
+   every actuated joint's speed within cuRobo's limit and every torque within
+   its effort. A ZMP, torque or speed failure retries the segment at uniform
+   time scales up to 4× slower (`RETIME_MAX`); a segment no scale passes fails
+   the row, naming the check.
 5. **Playback / save** — the Rerun visualizer renders every trajectory (both
    arms' held objects tracked); `--save_plan` pickles the plan raw
    (`stage4-raw`, `raw_motion_plan` in `utils/plan_processor.py`): per segment,
@@ -344,7 +305,7 @@ provenance.
   `write_mujoco_fixture.py` writes `mujoco_fixture.npz` (MuJoCo's FK, masses,
   inertias and soft limits on bfm_wm's `t1.xml`), which the tests check the
   model against. `t1-nominal-hand-map.npz` is the hand reach map from the
-  home stance that step search reads (`python -m cutamp.scripts.t1_reachability
+  home stance that the landing options read (`python -m cutamp.scripts.t1_reachability
   build --nominal-only` rebuilds it under `data/`).
 - **[`assets/t1_description/`](cutamp/robots/assets/t1_description/)** —
   cuTAMP's gripper: `gripper.urdf` (the links and joints the builder appends
@@ -397,7 +358,7 @@ provenance.
 
 - [`tamp_world.py`](cutamp/tamp_world.py) — `TAMPWorld` wraps a
   TAMPEnvironment with the collision Scene and the single `Kinematics` (built
-  with `compute_com=True`); it builds no IK solver (the IK is GN's, `gn_ik`)
+  with `compute_com=True`); it builds no IK solver (the IK is GN's, `gn_refresh.py`)
   and no planner (`motion_solver.build_motion_planner` does). `q_init` is the
   model's home. It also holds the stance (`stance_soles`), the movables'
   GraspGenX grasps (`grasps`, same-shaped movables share one set), each hand's
@@ -425,19 +386,13 @@ provenance.
   consumers: `com_polygon_penalty` (outside-quadratic + inside-margin barrier),
   `ComOverBasePolygonCost` (the planner rollout cost),
   `compute_com_polygon_penalties` (the hard `ComPolygon` constraint),
-  `com_polygon_mask_from_state` (GN IK's acceptance and `gn_gate`),
-  `particle_com_margin` (a particle's static margin through
-  `compute_com_margin`, for the run metrics' measure-only `best_com_margin`
-  after Adam and `planned_com_margin` for the planned particle), and for the
-  trajectory gate `com_zmp_in_support` (each frame's CoM and multibody ZMP,
+  `com_polygon_mask_from_state`, `compute_com_margin` (a conf's static
+  margin, measure only), and for the trajectory gate `com_zmp_in_support` (each frame's CoM and multibody ZMP,
   the ZMP from the floor's wrench, RNEA's first-pass base wrench).
 
-- [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) —
-  `joint_limit_margin_soft_cost` (the `joint_limit_margin` soft cost: a
-  hinge² penalty on segment-endpoint confs past the joint limits, which are
-  bfm_wm's soft limits cut by the envelope, so there is no band), and
-  `trunk_tilt_cosine`, the cosine of the Trunk's tilt, by which `gn_ik` ranks
-  each target's accepted starts.
+- [`joint_limit_cost.py`](cutamp/joint_limit_cost.py) — `trunk_tilt_cosine`,
+  the cosine of the Trunk's tilt, by which the motion stage orders its rows
+  without centring (`particle_initialization.worst_posture`).
 
 - [`floor_wrench.py`](cutamp/floor_wrench.py) — the floor's push on the
   planted soles: `install_floor_wrench` hooks it into trajopt's RNEA, and
@@ -446,47 +401,31 @@ provenance.
   from which the gate takes the ZMP.
 
 - [`motion_solver.py`](cutamp/motion_solver.py) — drives the plan skeleton
-  through the single planner (`build_motion_planner`). Per operator, each
-  segment plans to a conf with `plan_cspace` (a pick or place three, each
-  tagged with its phase: approach, insert, then lift or back-out; a retract
-  one), then passes `_balance_gate`: every
-  frame keeps both soles on the stance and its CoM inside
-  `world.model.support.gate_half`, and the gate times each segment at the
-  smallest uniform scale from 1 (the planner's own timing) up that its speed,
-  torque and ZMP checks pass, each exactly (the torques and the floor's wrench
-  are linear in 1/s²), on the planner's frames with the velocities over s and
-  the accelerations over s², up to `RETIME_MAX` = 4×. It resamples the segment
-  at that scale (`_retime`, a C² cubic spline) and checks the frames it
-  returns again (`_recheck`). Each segment is appended to `accum_plans` (with
+  through the single planner on a row's predicted stances (`solve_curobo`, fed
+  by `step_preview.plan_predicted_step_motion`). Per operator, each segment
+  goes to a conf (a pick or place three, each tagged with its phase: approach,
+  insert, then lift or back-out; a retract one), first on the direct path
+  (`_direct_supported_path`), else with `plan_cspace`, then passes
+  `_supported_segment_gate`: every frame keeps both soles on the achieved
+  stance and its CoM and ZMP inside the achieved support region, every speed
+  and torque within its limit, and a ZMP, torque or speed failure retries the
+  segment resampled (`_retime`, a C² cubic spline) at scales up to
+  `RETIME_MAX` = 4×. Each segment is appended to `accum_plans` (with
   `held_objs`, `_held_obj_poses` for every arm holding an object; a slowed one
-  also keeps `planner_timing`, the same spline at the planner's own timing),
-  then the object is attached/detached via the AttachmentManager. A held
-  mesh is fit on its convex hull (`held_fit_obstacle`): cuRobo's VOXEL fit
-  inscribes its spheres, and a thin wall such as cup_t1's holds none of use.
-  Playback
-  walks `accum_plans` and hands each entry to the visualizer. The run metrics
-  get the gate's `retime_min` and `retime_max`, `retime_binding` (segments per
-  binding check: `velocity <joint>`, `torque <joint>`, `zmp`, or `none` where
-  none binds), `traj_com_min_margin` and `traj_zmp_min_margin`, plus
-  `plan_duration_s`.
+  also keeps `planner_timing`, the path at the planner's own timing), then the
+  object is attached/detached via the AttachmentManager. A held mesh is fit on
+  its convex hull (`held_fit_obstacle`): cuRobo's VOXEL fit inscribes its
+  spheres, and a thin wall such as cup_t1's holds none of use. Playback walks
+  `accum_plans` and hands each entry to the visualizer. The run metrics get the
+  gate's `retime_min`, `retime_max`, `retime_binding`, `traj_com_min_margin`
+  and `traj_zmp_min_margin`, plus `plan_duration_s`.
 
-- [`particle_initialization.py`](cutamp/particle_initialization.py) — IK-seeded
-  particle init for `LeftPick` / `RightPick` / `LeftPlace` / etc. `gn_ik` is
-  the planner's only IK: multi-start balance-first GN (home, plus
-  noisy starts that stand on the stance, `_noisy_start`), 30
-  reaching iterations without the collision row and 10 with it (the iterates
-  are not motions, so only the result must be collision-free), then
-  `ik_check` on the checker's tolerances; each target keeps its accepted
-  start whose Trunk tilts least (accepted starts' hand errors tie), else the
-  safe one (every check but the hand's) with the smallest hand error, else
-  the one with the smallest hand error. The movable objects' spheres at each
-  conf come from `rollout.movable_spheres_fn`, placed as the rollout places
-  them. A pick row takes one of its pick's chosen grasps (a pool walk solves
-  every eligible grasp once, then `choose_grasps`) and a place row draws its
-  placement, and the rows whose IK fails draw again (a placement keeps the
-  least-colliding of its candidates, `_draw_placements`). Each walk draws
-  every pick and place first, then solves them all in one `gn_ik` call, and
-  each redraw round in one more (`_solve_steps`).
+- [`particle_initialization.py`](cutamp/particle_initialization.py) — pieces
+  of the starting particles that `SteppedPlan` builds: each pick's grasp pool
+  in score order (`_pick_pools`), the placements drawn at each place (each
+  keeping the least-colliding of its candidates, `_draw_placements`), the
+  checker's IK tolerances (`IKTol`) and the posture summary the motion stage
+  orders its rows by without centring (`worst_posture`).
 
 - [`grasps.py`](cutamp/grasps.py) — the grasps: `grasp_sets` runs
   GraspGenX's graspmoe planner on an object shape's surface points when a
@@ -507,8 +446,9 @@ provenance.
   (`grasps.py`).
 
 - [`task_planning/`](cutamp/task_planning/) — the symbolic layer:
-  `search.py` (the A* over hands, objects and footsteps, `arm_step_skeletons`,
+  `plan_search.py` (the plan search over hands, objects and landings, `plan_search`,
   whose `ManipulationPrefix` grounds the moves between picks and places),
+  `landing_options.py` (each pick or place's landing options),
   `grounding.py` (the actions whose preconditions hold in a state) and
   `insert_steps.py`, over the domain structs (`tamp_structs.py`,
   `base_structs.py`, `constraints.py`, `costs.py`).
@@ -520,26 +460,21 @@ provenance.
   `LeftPick`, `LeftPlace`, `LeftRetractHolding`, `LeftRetractFree` and their
   `Right…` twins.
 
-- [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported)
-  and `SUPPORTED_SOFT_COSTS`. Notable defaults: `num_particles` 128;
-  `soft_cost=["place_close_to_base", "joint_limit_margin",
-  "minimize_body_movement"]` (what `None` resolves to; `[]` runs none); the
-  balance-first GN refresh every `reik_interval=5` steps; `cuda_graphs=True`;
+- [`config.py`](cutamp/config.py) — `TAMPConfiguration` (only T1 supported).
+  Notable defaults: `num_particles` 128; the IK projection every
+  `reik_interval=5` steps; `cuda_graphs=True`;
   `early_stop_patience=50`; `motion_plan_max_retries=10`.
 
 - [`algorithm.py`](cutamp/algorithm.py) — `setup_cutamp` + `run_cutamp`
-  outer loop. The motion-plan retry sweep lives in `_motion_plan_with_retries`:
-  a cuRobo failure or a balance-gate rejection moves on to the next
-  candidate, skipping candidates that repeat a failed plan, and every failed
-  plan's message, over both attempt passes, goes into the run metrics
-  (`motion_plan_failures`).
+  outer loop: every plan the plan search proposes, with or without steps, goes
+  through `refine_stepped_plan` (`step_loop.py`), and every failed motion
+  plan's message goes into the run metrics (`motion_plan_failures`).
 
 - [`optimize_plan.py`](cutamp/optimize_plan.py) — Adam-based optimization over
   particles; respects `left_q0` / `right_q0` as fixed initial-state. Holds the
-  re-IK dependencies (`IKDep`), the balance-first refresh
-  (`_refresh_balanced`), the best-seen snapshot and early stop (`_BestSnapshot`), per-refresh stats
-  (`_ReikDriftGate`), and the CUDA step and refresh graphs
-  (`G_step`, `G_refresh`; `--no_cuda_graphs` runs them eagerly).
+  best-seen snapshot and early stop (`_BestSnapshot`) and the CUDA step graph
+  (`G_step`; `--no_cuda_graphs` runs it eagerly); the plan's refresh is
+  `SteppedPlan.refresh`.
 
 - [`gn_refresh.py`](cutamp/gn_refresh.py) — batched damped Gauss-Newton
   projection of the warm conf onto a moved pose target, balance first:
@@ -556,8 +491,7 @@ provenance.
   toward upright, the base's pitch and roll toward 0 (`_upright_step`; a row
   whose level-3 step is taken back takes neither, and one whose level-4 step
   would end in contact takes levels 1-3's), every step
-  scaled inside the joint limits, with no cuRobo during Adam. `gn_gate` checks the result against the checker's
-  tolerances for the refresh stats; it checks no collision.
+  scaled inside the joint limits, with no cuRobo during Adam.
 
 - [`cuda_graphs.py`](cutamp/cuda_graphs.py) — `CapturedGraph` capture and
   replay of those graphs, refusing a replay once a device address it
@@ -565,11 +499,9 @@ provenance.
 
 - [`cost_function.py`](cutamp/cost_function.py) — hard constraints
   (kinematic, with both soles against the stance; motion; collision; stable
-  placement; and the `ComPolygon` CoM-in-rectangle gate on the model's
-  keyframe rectangle, over every `q_*` conf) plus the soft costs listed in
-  `SUPPORTED_SOFT_COSTS` (`place_close_to_base`, `joint_limit_margin`,
-  `retract_close_to_home`, `minimize_body_movement`). `_compute_soft_cost`
-  hard-codes the names, so a new soft cost goes in both places.
+  placement; and the `ComPolygon` CoM gate, over every `q_*` conf), each on
+  the conf's own stance (`achieved_stances`). `SteppedPlan` adds the
+  preferences (side lean, off centre, joint effort).
 
 - [`costs.py`](cutamp/costs.py) — low-level differentiable cost primitives
   (`trajectory_length`, sphere-overlap, AABB, `curobo_pose_error`) that
@@ -677,15 +609,17 @@ every particle's commands; its landings and their slope enter the costs, and
 each pick and place posture goes through the planner's IK projection on its new
 stance (`gn_refresh.gn_project_balanced` with `side_lean_first`: balance and
 feet, then the hand, then the side lean toward 0, then the CoM toward the
-centre, the order plans are ranked in), as it does once at the start. At
+centre, then last the trunk upright, the forward lean toward 0), as it does
+once at the start. At
 every Adam step each pick and place posture is put back on its hand target and
 its stance, each retract on its stance. An Adam step
 replays one recorded CUDA graph: the put-back, the arm's rollout, the costs, the
 backward pass and the shares handed on to the commands and placements; the
 refresh and the Adam update run eagerly. The loop stops as in
-step 3 of "How it works" above, its clock restarted only by a better-ranked
-valid plan, and at once when a valid plan has rank 0 (side lean and CoM
-distance both under one unit), the lowest rank there is.
+step 3 of "How it works" above, its clock restarted only by a valid plan of
+a lower score, and at once when the best plan, the valid one of the lowest
+score, has its side lean and CoM distance both under one unit: the loop does
+not wait for the forward lean alone to fall further.
 
 A stepped plan's loss carries three preferences for every pick and place
 posture, each in its unit: side lean, centring and joint effort
@@ -698,9 +632,13 @@ Nothing is run after the loop: the particles feasible at its last refresh go to
 arm motion planning. Each landing is judged by itself, not by its distance from
 the command: the step's own checks, the landed sole flat on the floor, the
 step's clearances and its range. The planner tries feasible particles in order
-of their worst pick/place side lean in whole units of 0.05 rad, then their
-worst CoM distance to the support polygon centroid in whole units of 5 mm, then
-their worst joint effort. It returns the first connected motion on the first
+of their score: whole units of the worst pick/place side lean (0.05 rad), of
+the worst CoM distance to the support polygon centroid (5 mm) and of the worst
+forward lean (0.05 rad), added. Equal scores go to the smaller side lean, then
+the smaller CoM distance, then the lower worst joint effort. Adding the units
+keeps a small gain in one preference from buying a large loss in another: a
+strict order once returned a posture folded 117° backward because it was
+15 mm better centred. It returns the first connected motion on the first
 successful skeleton. If optimization or motion planning fails, the plan search
 supplies the next skeleton; when it runs out, the planner reports failure. Use
 `--max_duration` to bound this search.
@@ -730,10 +668,6 @@ uv run python -m cutamp.scripts.run_cutamp -n 64 --save_plan auto
 uv run python -m cutamp.scripts.run_cutamp -n 64 --env shelf_t1
 uv run python -m cutamp.scripts.run_cutamp -n 64 --env cylinder_t1 --surface_height 0.5
 
-# Different soft costs (replaces the default list)
-uv run python -m cutamp.scripts.run_cutamp \
-    --soft_cost retract_close_to_home minimize_body_movement
-
 # Eager Adam steps and refreshes (no CUDA graphs)
 uv run python -m cutamp.scripts.run_cutamp --no_cuda_graphs
 
@@ -750,23 +684,10 @@ mean something only for plans that take no step.
 
 `uv run python -m cutamp.scripts.run_cutamp -h` lists every option.
 
-**Available soft costs** (see `SUPPORTED_SOFT_COSTS`):
-- `place_close_to_base` *(default)* — pull placed objects toward the base;
-  keeps placements inside the range the balanced IK reaches.
-- `joint_limit_margin` *(default)* — a hinge² penalty on segment-endpoint
-  confs past the joint limits; the limits are already bfm_wm's soft limits
-  (cut by the envelope), so there is no band and the cost is zero inside them. It acts on the confs
-  Adam optimizes: the confs an IK target covers (pick, place) are outside
-  Adam, and the GN refresh keeps its steps inside the joint limits.
-- `retract_close_to_home` — penalize retract configs far from the model's
-  home.
-- `minimize_body_movement` *(default)* — penalize body (legs and Waist)
-  drift from home.
-
-Pose-class soft costs (e.g. `place_close_to_base`) are optimized through the
-re-IK coupling: outer Adam moves pose particles while their dependent
-confs are re-projected every `reik_interval` steps (balance-first,
-collision-aware Gauss-Newton, no cuRobo during Adam).
+**Preferences**: among valid plans, the optimizer prefers less side lean,
+the CoM nearer the support's centre (`--com_center_weight`, 0 turns it off),
+less forward lean and less joint effort; the hand and the feet are held by the
+IK projection every `reik_interval` steps, not costed.
 
 ### Remote visualization with Rerun
 
@@ -807,10 +728,9 @@ skips the robot's meshes; both cut bandwidth.
 
 2. **Retract after pick/place** — the per-arm `RetractHolding` (collision checks
    exclude held object) and `RetractFree` (empty gripper) operators move toward
-   the model's home after each manipulation. Retract confs start at that home,
-   with their base and body locked there, so only the active arm moves; the
-   hard collision, joint-limit and `ComPolygon` constraints, the default
-   `joint_limit_margin` soft cost and the opt-in `retract_close_to_home`
+   the model's home after each manipulation. Retract confs start from one
+   stance IK solve on their stance; Adam moves them, the IK projection holds
+   the soles, and the hard collision, joint-limit and `ComPolygon` constraints
    shape the result.
 
 3. **cuRobo internals isolated** — every workaround that reaches into cuRobo's

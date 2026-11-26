@@ -59,12 +59,8 @@ side: its horizontal direction within this angle of the direction from the stanc
 
 GRASP_SCORE_CUTOFF = 0.7
 """GraspGenX's own "``0.7`` keeps confident grasps" (``GraspGenX/SKILL.md:498``): a grasp scoring at or above it
-counts as holding well enough, and a pick chooses among those by the robot's posture instead of by score."""
-
-GRASP_REDRAW_ROUNDS = 2
-"""How many times init draws again for the rows whose IK failed, and solves only those rows: a pick row draws a new
-grasp, a place row a new placement. Nothing Adam moves sets a pick's target (grasps are never optimized), so only a
-new draw can repair a pick row."""
+counts as holding well enough. With centring off, the motion stage tries first the rows whose grasps all clear it
+(``step_loop._validate_motion_rows``)."""
 
 
 def near_vertical(approach: torch.Tensor) -> torch.Tensor:
@@ -88,7 +84,7 @@ def drop_grasps(
     - a sphere's lowest point (z - r, in the object frame) is below ``obj_bottom_z``, the object's bottom face. Objects
       stand upright on a support at every pick and place, so such a grasp goes into the support;
     - a sphere overlaps one of the object's own spheres ``obj_spheres`` ``[M, 4]`` (object frame). GN's collision row
-      would push the hand off such a grasp's target, and ``ik_check`` rejects the conf.
+      would push the hand off such a grasp's target, and the checker rejects the conf.
     """
     # In float64: CUDA float32 matmuls run in TF32 here (torch.backends.cuda.matmul.allow_tf32 is on), which moves the
     # spheres by about 0.1 mm and flipped 3 of blocks_t1's 4,100 grasps per hand.
@@ -135,8 +131,8 @@ _README_FOLDERS = {
 
 
 class GraspSet(NamedTuple):
-    """One object shape's GraspGenX grasps, every one kept with no threshold: init chooses among them
-    (``particle_initialization.choose_grasps``), those scoring ``GRASP_SCORE_CUTOFF`` or more first."""
+    """One object shape's GraspGenX grasps, every one kept with no threshold: a pick's particles take them in score
+    order (``step_loop._placements_and_grasps``)."""
 
     grasps: torch.Tensor
     """``[K, 7]`` float32 on the device: GraspGenX's gripper frame G in the object frame, ``[x, y, z, qw, qx, qy, qz]``

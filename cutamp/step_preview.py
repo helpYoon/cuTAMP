@@ -264,7 +264,7 @@ def plan_predicted_step_motion(
             series = entry["step"].pop("head")
             head = series[-1]
         else:
-            series = head.expand(len(entry["plan"].position), -1)
+            series = head.expand(entry["plan"].position.reshape(-1, entry["plan"].position.shape[-1]).shape[0], -1)
         entry["head"] = series
     ms.play_curobo_motion(motion.world, plan, visualizer)
     row.particle.update(bindings)
@@ -275,13 +275,16 @@ def plan_predicted_step_motion(
         "independent_motion": "untested",
         "com_center_distances_m": centers,
         "connected_motion_gaps": connected,
+        # None: a plan without steps predicts no landing.
         "max_predicted_landing_xy_m": max(
-            max(pred.final_xy_error.max().item(), *(s.xy_error.max().item() for s in pred.steps))
-            for _, _, pred, _ in motion.replayed.values()
+            (max(pred.final_xy_error.max().item(), *(s.xy_error.max().item() for s in pred.steps))
+             for _, _, pred, _ in motion.replayed.values()),
+            default=None,
         ),
         "max_predicted_landing_yaw_deg": max(
-            max(pred.final_yaw_error.rad2deg().max().item(), *(s.yaw_error.rad2deg().max().item() for s in pred.steps))
-            for _, _, pred, _ in motion.replayed.values()
+            (max(pred.final_yaw_error.rad2deg().max().item(), *(s.yaw_error.rad2deg().max().item() for s in pred.steps))
+             for _, _, pred, _ in motion.replayed.values()),
+            default=None,
         ),
         "com_margins_m": margins,
         "best_com_margin": min(margins),

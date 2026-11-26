@@ -30,7 +30,7 @@ import collections
 import contextlib
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -43,14 +43,11 @@ from curobo.types import JointState, Pose
 
 from cutamp.com_polygon_cost import soles_planted
 from cutamp.config import TAMPConfiguration
-from cutamp.gn_refresh import gn_project_balanced
-from cutamp.grasps import LINE_BACKTRACK, LINE_END_TOL, LINE_TOL, approach_targets, is_vertical
+from cutamp.grasps import LINE_BACKTRACK, LINE_END_TOL, LINE_TOL
 from cutamp.optimize_plan import PlanContainer
-from cutamp.particle_initialization import GN_IK_CLEAR_ITERS, IKTol, ik_check
+from cutamp.particle_initialization import IKTol
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN, TOOL_FRAME_FOR_ARM, get_t1_motion_planner
-from cutamp.rollout import movable_spheres_fn
 from cutamp.tamp_world import TAMPWorld
-from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
     Particles,
     action_4dof_to_mat4x4,
@@ -87,7 +84,7 @@ def _plan_arm_to_conf(
     redundancy solution. Pick, place and retract all plan here. ``disable_obstacle`` (if
     given, else None) is temporarily removed from the world during planning, so terminal
     gripper-block / held-block-surface contact isn't rejected. Returns the
-    cuRobo result; raises ``RuntimeError`` if it fails, with ``out_of_attempts`` set.
+    cuRobo result; raises ``RuntimeError`` if it fails.
 
     One call: plan_cspace makes up to ``max_attempts`` attempts (cuRobo's default 20; all but the first graph-seeded,
     each with one finetune pass). On the fork, which made 5, calling it again with the same start and goal returned
@@ -100,7 +97,6 @@ def _plan_arm_to_conf(
         result = planner.plan_cspace(target_js, last_js, max_attempts=max_attempts)
     if not _cspace_plan_succeeded(result):
         error = RuntimeError(f"cspace-anchored plan failed for {ground_op}")
-        error.out_of_attempts = True  # more attempts may plan it (_motion_plan_with_retries' second pass)
         raise error
     return result
 
@@ -141,44 +137,6 @@ def _hand_poses(world: TAMPWorld, q: torch.Tensor, arms: Union[str, Sequence[str
         return pose(arms)
     is_left = torch.tensor([arm == "left" for arm in arms], device=q.device).view(-1, 1, 1)
     return torch.where(is_left, pose("left"), pose("right"))
-
-
-def _approach_confs(
-    world: TAMPWorld, best_particle: Particles, plan_skeleton: PlanSkeleton, ik_tol: IKTol,
-) -> Dict[int, Tuple[torch.Tensor, torch.Tensor, bool]]:
-    """``{op index: (q_pre, q_post, vertical)}`` for each pick and place of ``plan_skeleton``: the confs where its
-    straight insert starts and its leave ends, from one batched balance-aware GN call (design 7.8), and whether its hand
-    is vertical at its particle conf (``grasps.is_vertical``).
-
-    Each op's targets are ``grasps.approach_targets`` of the hand's pose at its particle conf (FK, so the insert's
-    line through the conf's palm starts on the pre target). Each row is seeded at that conf and runs
-    ``GN_IK_CLEAR_ITERS`` iterations of ``gn_project_balanced`` with the collision row on, against the objects where
-    the rollout puts them at that op (``movable_spheres_fn`` on ``best_particle``); ``ik_check`` judges every row on
-    ``ik_tol``. A failed row raises a RuntimeError whose ``op_idx`` is that op's index, the first such op's, so the
-    retry skips candidates that repeat ops up to it."""
-    ops = [(idx, op) for idx, op in enumerate(plan_skeleton) if op.operator.metadata.action_type in ("pick", "place")]
-    if not ops:
-        return {}
-    arms = tuple(op.operator.metadata.arm for _, op in ops)
-    confs = torch.stack([best_particle[op.values[-1]] for _, op in ops])
-    hands = _hand_poses(world, confs, arms)
-    targets = torch.stack([t for (_, op), hand in zip(ops, hands)
-                           for t in approach_targets(hand, op.operator.metadata.action_type)])  # [2K, 4, 4]
-    one = {name: v.unsqueeze(0) for name, v in best_particle.items()}  # a batch of one particle
-    movables = torch.cat([movable_spheres_fn(world, plan_skeleton, idx)(one).expand(2, -1, -1) for idx, _ in ops])
-    seeds = confs.repeat_interleave(2, dim=0)  # rows (pre, post) per op: len(arms) dep-major blocks of 2
-    q = gn_project_balanced(world, seeds, targets, arms, iters=GN_IK_CLEAR_ITERS, movables=movables)
-    ok, safe, err = ik_check(world, q, targets, arms, movables, ik_tol)
-    ok, safe, err = ok.tolist(), safe.tolist(), err.tolist()
-    for row, accepted in enumerate(ok):
-        if not accepted:
-            idx, op = ops[row // 2]
-            why = (f"misses its target by {err[row]:.4f} (m + rad)" if safe[row]
-                   else "is off balance, off the stance or in collision")
-            error = RuntimeError(f"approach IK failed for {op}: its {('pre', 'post')[row % 2]} conf {why}")
-            error.op_idx = idx
-            raise error
-    return {idx: (q[2 * k], q[2 * k + 1], is_vertical(hands[k])) for k, (idx, _) in enumerate(ops)}
 
 
 @contextlib.contextmanager
@@ -244,13 +202,6 @@ _ATTACH_LINK_FOR_ARM = {
     "left": "attached_object_left",
     "right": "attached_object_right",
 }
-
-
-def _plan_dt(planner) -> float:
-    """The time step between the positions of ``get_interpolated_plan()``: cuRobo's
-    ``interpolation_dt``. Not ``js_solution.dt``, the optimizer's step (0.0145-0.0246 s),
-    which labelled plans 1.02-1.54x too fast."""
-    return float(planner.trajopt_solver.config.interpolation_dt)
 
 
 def _last_timestep_js(plan: JointState, planner) -> JointState:
@@ -563,22 +514,19 @@ def solve_curobo(
     get_planner,
     *,
     ik_tol: IKTol,
-    max_attempts: int = 20,
-    step_motion=None,
+    step_motion,
 ):
     """Run trajopt across the plan skeleton, producing a list of trajectories.
 
-    ``get_planner`` returns the planner: on a standing plan ``_run_step_planner``'s, which builds
-    ``build_motion_planner`` (no warmup) on its first call; on a stepped preview ``PredictedSteppedMotion.get_planner``.
-    ``ik_tol``: the tolerances the run's checker holds every IK conf to, which the pre and post confs of the picks and
-    places meet too (``_approach_confs``).
-    ``max_attempts`` is each segment's plan_cspace budget (``_plan_arm_to_conf``).
+    ``get_planner`` returns the planner (``PredictedSteppedMotion.get_planner``). ``ik_tol``: the tolerances the run's
+    checker holds every IK conf to, which the pre and post confs of the picks and places meet too
+    (``step_motion.approach``).
     """
     plan_skeleton = plan_info["plan_skeleton"]
 
     with timer.time("curobo_motion_gen_warmup", log_callback=_log.debug):
         planner = get_planner()
-        if step_motion is not None and not hasattr(planner, "set_support_stance"):
+        if not hasattr(planner, "set_support_stance"):
             raise ValueError("A stepped motion planner must track the achieved support in trajopt")
 
     # Defensive reset in case a prior solve_curobo aborted mid-plan and left the
@@ -593,14 +541,12 @@ def solve_curobo(
         self_collision_kin_config=planner.kinematics.get_self_collision_config(),
     ))
 
-    # Every pick's and place's pre and post confs, in one GN call before the first segment.
-    with timer.time("approach_ik"):
-        approach = _approach_confs(world, best_particle, plan_skeleton, ik_tol) if step_motion is None else {}
+    approach = {}  # each pick's and place's (q_pre, q_post, vertical), from step_motion.approach as it comes
 
     # The initial state: particles are in the planner's joint order (the module docstring).
     last_js = JointState.from_position(best_particle["left_q0"].clone().reshape(1, -1),
                                        joint_names=list(planner.kinematics.joint_names))
-    if step_motion is not None and 0 in step_motion.inputs:
+    if 0 in step_motion.inputs:
         # The first gap may start from measured nonzero rates.
         last_js.velocity = step_motion.initial_velocity()
     held = {}  # {arm: (obj_name, grasp_from_obj)}
@@ -612,31 +558,27 @@ def solve_curobo(
 
     def segment(ground_op, idx, arm, conf, phase, *, disable=None, gripper=None, line=False, direction=None):
         # One segment of ground_op (index idx) from last_js to conf (_plan_arm_to_conf, disabling the obstacle
-        # `disable`), through the real robot's balance check (_balance_gate): every frame's CoM and ZMP inside the
-        # support rectangle, and the segment's pace from its speeds, torques and ZMP; a RuntimeError fails the
-        # candidate. A retimed segment also keeps its motion planner's timing, with the held objects along it. The entry
+        # `disable`), through the real robot's balance check (_supported_segment_gate): the soles on the stance, every
+        # frame's CoM and ZMP inside the achieved support region, and the segment's pace from its speeds and torques; a
+        # RuntimeError fails the candidate. A retimed segment also keeps its motion planner's timing, with the held objects along it. The entry
         # names its op, its phase ("approach", "insert", "lift", "back_out" or "retract") and the gripper event at its
         # end ("close" after a pick's insert, "open" after a place's, else None). A straight segment (`line`) plans
         # under _line_motion, along the goal palm's +x or the world `direction`, and FK of its frames checks the palm's
         # line (check_line) from where it starts to the conf's palm. A failure names the op and the phase.
         nonlocal last_js
         what = f"{ground_op} {phase}"
-        if step_motion is not None:
-            step_motion.check_supported_start()
-        stance = step_motion.stance if step_motion is not None else None
-        dt = step_motion.direct_dt if hasattr(step_motion, "direct_dt") else _plan_dt(planner)
+        step_motion.check_supported_start()
+        stance = step_motion.stance
+        dt = step_motion.direct_dt
 
         def checked(path):
-            if stance is None:
-                accepted, stats, fast = _balance_gate(world, path, dt)
-            else:
-                from cutamp.step_validation import boundary_errors, compatible_boundary
+            from cutamp.step_validation import boundary_errors, compatible_boundary
 
-                accepted, stats, fast = _supported_segment_gate(world, path, dt, stance)
-                start = _model_frames(world, accepted)
-                if not compatible_boundary(boundary_errors(start.position[0], start.velocity[0],
-                            last_js.position.reshape(-1), last_js.velocity.reshape(-1))).all():
-                    raise _gate_error("handoff", "Supported trajectory cannot connect to the arriving state and velocity")
+            accepted, stats, fast = _supported_segment_gate(world, path, dt, stance)
+            start = _model_frames(world, accepted)
+            if not compatible_boundary(boundary_errors(start.position[0], start.velocity[0],
+                        last_js.position.reshape(-1), last_js.velocity.reshape(-1))).all():
+                raise _gate_error("handoff", "Supported trajectory cannot connect to the arriving state and velocity")
             _check_supported_path_geometry(planner, world, self_collision, accepted, dt)
             _check_path_rates(planner, accepted)
             if line:
@@ -648,25 +590,21 @@ def solve_curobo(
             solved = None
             source = "curobo"
             with _disabled_world_obstacle(planner, disable):
-                if stance is not None:
-                    path = _direct_supported_path(last_js, conf, world.model, dt, arm)
-                    try:
-                        solved = checked(path)
-                        source = "direct_supported"
-                    except RuntimeError as exc:
-                        if not hasattr(exc, "check") and not str(exc).startswith("palm "):
-                            raise
-                        _log.debug("Direct path for %s rejected: %s", what, exc)
+                path = _direct_supported_path(last_js, conf, world.model, dt, arm)
+                try:
+                    solved = checked(path)
+                    source = "direct_supported"
+                except RuntimeError as exc:
+                    if not hasattr(exc, "check") and not str(exc).startswith("palm "):
+                        raise
+                    _log.debug("Direct path for %s rejected: %s", what, exc)
                 if solved is None:
-                    fallback = planner
-                    if hasattr(step_motion, "fallback_planner"):
-                        fallback = step_motion.fallback_planner(obj_to_current_pose, held)
+                    fallback = step_motion.fallback_planner(obj_to_current_pose, held)
                     contact = disable if fallback is not planner else None
                     with _line_motion(fallback, arm, direction) if line else contextlib.nullcontext():
                         with timer.time("curobo_planning"):
                             result = _plan_arm_to_conf(
                                 fallback, conf, last_js, disable_obstacle=contact, ground_op=what,
-                                max_attempts=max_attempts,
                             )
                     path = _interp_plan(result)
                     opposite = "right" if arm == "left" else "left"
@@ -691,8 +629,7 @@ def solve_curobo(
             e.args = (f"{what}: {e}",)  # the same error object, so a gate error keeps its `check`
             raise
         last_js = _last_timestep_js(plan, planner)
-        if step_motion is not None:
-            last_js.velocity = _model_frames(world, plan).velocity[-1:].clone()
+        last_js.velocity = _model_frames(world, plan).velocity[-1:].clone()
 
     obj_to_current_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
 
@@ -703,11 +640,9 @@ def solve_curobo(
         # Both arms stay in the collision checks, except against the obstacle a pick or place segment disables for
         # the whole robot (the grasped block, or the support surface; _plan_arm_to_conf).
         try:
-            if step_motion is not None and metadata.action_type in ("pick", "place"):
+            if metadata.action_type in ("pick", "place"):
                 approach[idx] = step_motion.approach(idx, ground_op, best_particle, obj_to_current_pose, config, ik_tol)
             if metadata.action_type == "step":
-                if step_motion is None:
-                    raise RuntimeError("A step requires a stepped motion")
                 for plan, record in step_motion.step_segments(idx, last_js, obj_to_current_pose, held):
                     accum_plans.append({"arm": None, "dt": record["dt"], "op_idx": idx, "phase": record["phase"],
                                         "gripper": None, "plan": plan, "step": record,
@@ -774,8 +709,7 @@ def solve_curobo(
             else:
                 raise NotImplementedError(f"Unsupported operator {ground_op.operator.name}")
 
-        except RuntimeError as e:
-            e.op_idx = idx  # lets _motion_plan_with_retries skip candidates that repeat ops 0..idx
+        except RuntimeError:
             raise
 
         _log.info(f"{idx + 1}. {ground_op.name}")
@@ -851,10 +785,6 @@ def _full_positions(world: TAMPWorld, plan_js) -> torch.Tensor:
 
 # The slowest the balance gate will make a segment: 4x longer, 16x lower accelerations.
 RETIME_MAX = 4.0
-# The gate slows a resampled segment that fails its re-check by this factor until it passes, up to RETIME_MAX.
-RETIME_RECHECK_STEP = 1.05
-
-
 def _gate_error(check: str, message: str) -> RuntimeError:
     """Trajectory rejection with its cause in ``check``: soles, com, zmp, torque or velocity of a joint, or self_collision."""
     error = RuntimeError(message)
@@ -891,23 +821,6 @@ def _retime(plan_js: JointState, s: float, dt: float) -> JointState:
 
     return JointState(position=sample(0), velocity=sample(1), acceleration=sample(2), jerk=sample(3),
                       joint_names=plan_js.joint_names, dt=plan_js.dt)
-
-
-def _check_planted(world: TAMPWorld, q: torch.Tensor) -> None:
-    """Raise a RuntimeError, naming its check, unless every frame ``q`` ``[T, dof]`` keeps both soles on the stance
-    (``world.stance_soles``) within the kinematic constraint's sole tolerances (``soles_planted``). A NaN fails the
-    check."""
-    from cutamp.com_polygon_cost import _fk_state
-    from cutamp.costs import curobo_pose_error
-
-    ks = _fk_state(world, q)
-    soles = torch.stack([ks.tool_poses.get_link_pose(f, make_contiguous=True).get_matrix()
-                         for f in world.model.sole_frames], dim=1)  # [T, 2, 4, 4]
-    pos, rot = curobo_pose_error(soles, world.stance_soles.expand_as(soles))
-    if not bool(soles_planted(pos, rot).all()):
-        pos_max, rot_max = pos.max().item(), rot.max().item()
-        raise _gate_error("soles", f"trajectory soles leave the stance by up to {1000 * pos_max:.1f} mm and "
-                                   f"{rot_max:.3f} rad")
 
 
 def _check_torques(world: TAMPWorld, plan_js: JointState) -> None:
@@ -952,175 +865,6 @@ def _check_velocity(world: TAMPWorld, js: JointState, s: float = 1.0) -> Tuple[f
                           f"retimed trajectory velocity passes {limit} by {100 * (s_v - 1):.1f}%" if s == 1.0
                           else f"trajectory velocity passes {limit} at the {s}x slowdown cap")
     return s_v, names[j]
-
-
-def _at_scales(js: JointState, scales: torch.Tensor) -> JointState:
-    """``js``'s frames (``[T, n]``) under each uniform time scale s in ``scales`` (``[K]``), stacked ``[K T, n]``: the
-    positions repeated, the velocities over s, the accelerations over s^2. That is each frame's whole state at that
-    scale, so every per-frame check on the stack is exact for it."""
-    T, n = js.position.shape
-    s = scales.to(js.position).reshape(-1, 1, 1)
-    K = s.shape[0]
-    return JointState(position=js.position.expand(K, T, n).reshape(K * T, n),
-                      velocity=(js.velocity / s).reshape(K * T, n),
-                      acceleration=(js.acceleration / s**2).reshape(K * T, n), joint_names=js.joint_names)
-
-
-def _torque_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tuple[float, Optional[str]]:
-    """The smallest uniform time scale s in [lo, hi] at which every frame of ``js`` (``[T, n]``, the model's order)
-    keeps every joint's |torque| within its effort, and the joint that sets it (None where ``lo`` passes). Exact: the
-    torque, cuRobo's two RNEA passes with the floor's push (``world.segment_torques``), is linear in the accelerations
-    and in the products of the velocities, and the floor's split depends on the positions only, so at scale s it is
-    tau_0 + (tau_1 - tau_0) / s^2, tau_0 at rest and tau_1 at the plan's own timing; each frame and joint keeps
-    u = 1 / s^2 inside an interval. Raises a RuntimeError naming the joint when no s in [lo, hi] passes; a NaN torque
-    fails."""
-    torques, names = world.segment_torques, list(world.model.joint_names)
-    q, v, a = js.position, js.velocity, js.acceleration
-    T, rest = q.shape[0], torch.zeros_like(v)
-    tau = torques(JointState(position=torch.cat([q, q]), velocity=torch.cat([rest, v]),
-                             acceleration=torch.cat([rest, a]), joint_names=js.joint_names))
-    tau0, d = tau[:T], tau[T:] - tau[:T]
-    e = torques.effort
-    # |tau0 + d u| <= e bounds u to [lower, upper] at each frame and joint; a joint whose torque does not move with s
-    # allows every u, or none.
-    b1, b2 = (-e - tau0) / d, (e - tau0) / d
-    still, inside = d == 0, tau0.abs() <= e
-    lower = torch.where(still, torch.where(inside, -math.inf, math.inf), torch.minimum(b1, b2))
-    upper = torch.where(still, torch.where(inside, math.inf, -math.inf), torch.maximum(b1, b2)).amin(0)  # [n]
-    u = min(float(upper.min()), lo**-2)
-    if not u >= max(float(lower.max()), hi**-2):  # no s in [lo, hi] passes, or a NaN
-        excess = ((tau0 + d * hi**-2).abs() - e).nan_to_num(nan=math.inf).amax(0)
-        j = int(excess.argmax())
-        raise _gate_error(f"torque {names[j]}", f"trajectory torque passes {names[j]}'s {float(e[j]):.1f} N m effort "
-                                                f"by {float(excess[j]):.2f} N m at the {hi}x slowdown cap")
-    if u == lo**-2:
-        return lo, None
-    return u**-0.5, names[int(upper.argmin())]
-
-
-def _zmp_margins(world: TAMPWorld, js: JointState, scales: torch.Tensor) -> torch.Tensor:
-    """``[K]``: the multibody ZMP's smallest margin to the gate's support rectangle over the frames of ``js`` under each
-    uniform time scale in ``scales`` (negative outside, -inf where a frame would need the floor to pull; a NaN
-    fails)."""
-    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
-
-    _, zmp = com_zmp_in_support(world, _at_scales(js, scales))
-    return com_margin_from_base(zmp, world.model.support.gate_half).reshape(len(scales), -1).amin(-1)
-
-
-def _zmp_scale(world: TAMPWorld, js: JointState, lo: float, hi: float) -> Tuple[float, bool]:
-    """The smallest uniform time scale s in [lo, hi] at which every frame of ``js`` (``[T, n]``, the model's order)
-    keeps its multibody ZMP inside the gate's support rectangle, and whether the ZMP sets it (False where ``lo``
-    passes). Exact, like ``_torque_scale``: the floor's wrench (``world.segment_torques.floor``) is linear in the first
-    pass's torques, so at scale s it is w_0 + (w_1 - w_0) u with u = 1 / s^2, and the ZMP inside, |M_y| <= h_x F_z and
-    |M_x| <= h_y F_z (which needs F_z >= 0: the floor pushes), keeps each frame's u inside an interval. With the CoM
-    inside, u = 0 passes, so every s above the smallest passes too. Raises a RuntimeError when no s in [lo, hi]
-    passes; a NaN fails."""
-    q, v, a = js.position, js.velocity, js.acceleration
-    T, rest = q.shape[0], torch.zeros_like(v)
-    force, moment, _ = world.segment_torques.floor(JointState(
-        position=torch.cat([q, q]), velocity=torch.cat([rest, v]), acceleration=torch.cat([rest, a]),
-        joint_names=js.joint_names))
-    hx, hy = map(float, world.model.support.gate_half)
-    fz, mx, my = force[:, 2], moment[:, 0], moment[:, 1]
-    g = torch.stack([hx * fz - my, hx * fz + my, hy * fz - mx, hy * fz + mx])  # [4, 2T]: each >= 0 inside
-    c0, c1 = g[:, :T], g[:, T:] - g[:, :T]  # c0 + c1 u >= 0
-    bound, still = -c0 / c1, c1 == 0
-    lower = torch.where(still, torch.where(c0 >= 0, -math.inf, math.inf), torch.where(c1 > 0, bound, -math.inf))
-    upper = torch.where(still, torch.where(c0 >= 0, math.inf, -math.inf), torch.where(c1 < 0, bound, math.inf))
-    lower = lower.masked_fill(c0.isnan() | c1.isnan(), math.inf)
-    u = min(float(upper.min()), lo**-2)
-    if not u >= max(float(lower.max()), hi**-2):
-        raise _gate_error("zmp", f"trajectory ZMP stays outside the support region at the {hi}x slowdown cap")
-    if u == lo**-2:
-        return lo, False
-    return u**-0.5, True
-
-
-def _recheck(world: TAMPWorld, js: JointState, planted: bool = True) -> Tuple[float, float]:
-    """The gate's checks on the frames it returns, from their own velocities and accelerations: both soles on the
-    stance (``_check_planted``; ``planted`` False skips it on the planner's own frames, which
-    passed it already), the CoM and the multibody ZMP inside the gate's support rectangle (a frame that would need the
-    floor to pull has no ZMP and fails it), every joint's torque within its effort and every actuated joint's speed
-    within its limit. Returns the CoM's and the ZMP's smallest margins; a failed check raises a RuntimeError whose
-    ``check`` names it."""
-    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
-
-    half = world.model.support.gate_half
-    if planted:
-        _check_planted(world, _full_positions(world, js))
-    com, zmp = com_zmp_in_support(world, js)
-    com_m, zmp_m = com_margin_from_base(com, half).min().item(), com_margin_from_base(zmp, half).min().item()
-    if not com_m >= 0:
-        raise _gate_error("com", f"retimed trajectory CoM leaves the support region by {-100 * com_m:.1f} cm")
-    lifted = int(torch.isposinf(zmp).any(-1).sum())  # com_zmp_in_support: no ZMP where the floor would have to pull
-    if lifted:
-        raise _gate_error("zmp", f"the floor would have to pull on the retimed trajectory's soles at {lifted} "
-                                 f"frames: there is no ZMP")
-    if not zmp_m >= 0:
-        raise _gate_error("zmp", f"retimed trajectory ZMP leaves the support region by {-100 * zmp_m:.1f} cm")
-    _check_torques(world, js)
-    _check_velocity(world, _model_frames(world, js))
-    return com_m, zmp_m
-
-
-def _balance_gate(world: TAMPWorld, plan_js: JointState, dt: float):
-    """The real robot's balance check on every interpolated frame of a segment, and the segment at the pace the
-    robot allows. Returns ``(plan_js, stats, planner_timing)``: the plan at that pace; its stats; and, for a retimed
-    segment, the same spline sampled at the motion planner's own timing: its positions exactly, with the spline's
-    velocities and accelerations (the timing test runs both), else None. Each check raises a RuntimeError that names
-    it, so the planner moves to its next candidate or skeleton.
-
-    Every frame must keep both soles on the stance (``_check_planted``) and its CoM inside the gate's support
-    rectangle; no time scale changes either. The gate then finds the smallest uniform time scale s in [1, RETIME_MAX]
-    (never faster than the planner, whose timing keeps trajopt's acceleration and jerk caps) at which every actuated
-    joint keeps its speed within cuRobo's limit (s_v: ``_check_velocity``), every joint its torque within its effort
-    (``_torque_scale``) and the multibody ZMP stays inside (``_zmp_scale``), each exactly, on the planner's own frames
-    with the velocities over s and the accelerations over s^2. Where the planner's own timing passes, no check binds
-    (``"none"``). The segment is resampled at s (``_retime``, whose whole steps give s_eff >= s; at s_eff
-    1 it is the planner's own), its first and last frames kept the planner's bit for bit (the next segment starts
-    from the last), and the frames it returns are checked again (``_recheck``); one whose speed, torque or ZMP fails
-    is slowed by RETIME_RECHECK_STEP until it passes, and past RETIME_MAX, on any other failed check, or when no s
-    passes, the gate raises, naming the check. The stats' ``"retime"`` is s_eff and ``"binding"`` the check that sets
-    it: ``"velocity <joint>"``, ``"torque <joint>"``, ``"zmp"``, ``"none"``, or the re-check's that failed last. Their
-    ``"com_min_margin"`` and ``"zmp_min_margin"`` are the smaller of the returned frames' and the planner's frames' at
-    s_eff (the returned spline at its knots): the returned frames can miss the planner's, where the scale solve ran."""
-    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support
-
-    with torch.no_grad():
-        _check_planted(world, _full_positions(world, plan_js))
-        js = _model_frames(world, plan_js)
-        com, _ = com_zmp_in_support(world, js)
-        com_planner = com_margin_from_base(com, world.model.support.gate_half).min().item()
-        if not com_planner >= 0:
-            raise _gate_error("com", f"trajectory CoM leaves the support region by {-100 * com_planner:.1f} cm")
-        n = js.position.shape[0]
-        s_v, joint = _check_velocity(world, js, RETIME_MAX)
-        s, binding = (s_v, f"velocity {joint}") if s_v >= 1 else (1.0, "none")  # never faster than the planner
-        s_t, joint = _torque_scale(world, js, s, RETIME_MAX)
-        if joint is not None:
-            s, binding = s_t, f"torque {joint}"
-        s_z, zmp_binds = _zmp_scale(world, js, s, RETIME_MAX)
-        if zmp_binds:
-            s, binding = s_z, "zmp"
-        while True:
-            out = plan_js if math.ceil(s * (n - 1)) + 1 == n else _retime(plan_js, s, dt)
-            if out is not plan_js:  # the spline's end values miss a joint that moves to 0 by a rounding error
-                out.position[..., [0, -1], :] = plan_js.position[..., [0, -1], :]
-            try:
-                com_m, zmp_m = _recheck(world, out, planted=out is not plan_js)
-                break
-            except RuntimeError as e:
-                check = getattr(e, "check", None) or ""
-                if check.split(" ")[0] not in ("velocity", "torque", "zmp") or s >= RETIME_MAX:
-                    raise  # the soles and the CoM follow the path, which no time scale changes
-                s, binding = min(RETIME_RECHECK_STEP * s, RETIME_MAX), check
-        n_out = out.position.shape[-2]
-        s_eff = (n_out - 1) / (n - 1) if n_out != n else 1.0
-        zmp_planner = float(_zmp_margins(world, js, torch.tensor([s_eff]))[0])
-    stats = {"retime": s_eff, "binding": binding, "com_min_margin": min(com_m, com_planner),
-             "zmp_min_margin": min(zmp_m, zmp_planner)}
-    return out, stats, None if out is plan_js else _retime(plan_js, 1.0, dt)
 
 
 def _supported_segment_gate(world, plan, dt, stance):

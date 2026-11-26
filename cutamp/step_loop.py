@@ -21,8 +21,8 @@ from cutamp.optimize_plan import ParticleOptimizer, _finite_step
 from cutamp.particle_initialization import (
     GN_IK_CLEAR_ITERS,
     IKTol,
-    ParticleInitializer,
     _draw_placements,
+    _pick_pools,
     pick_place_confs,
     worst_posture,
 )
@@ -31,7 +31,17 @@ from cutamp.rollout import Rollout, RolloutFunction, movable_spheres_fn
 from cutamp.samplers import project_supported_placement
 from cutamp.stance import STEP_TRAVEL, UNIT_M, UNIT_RAD, abs_pose, rel_pose, stance_joint_limits
 from cutamp.step_bound import planner_step_bound, travel
-from cutamp.step_costs import GROWTH, WEIGHT_CAP, RequirementWeights, joint_effort, lines, plan_rank, side_lean
+from cutamp.step_costs import (
+    GROWTH,
+    WEIGHT_CAP,
+    RequirementWeights,
+    forward_lean,
+    joint_effort,
+    lines,
+    plan_rank,
+    plan_score,
+    side_lean,
+)
 from cutamp.step_ik import StanceIK, solve_stance_ik
 from cutamp.step_planner import StepResult, StepRow
 from cutamp.step_refresh import (
@@ -334,7 +344,7 @@ def _keep_finite(value, new):
 
 
 class SteppedPlan:
-    """A plan with steps inside the Adam loop (design 4 to 6).
+    """A plan inside the Adam loop (design 4 to 6); a plan without steps has no commands and stands on its start.
 
     A particle's commands, ``[n, s, 3]`` per gap with steps, are Adam variables that start on a half-foot grid path over
     the task planner's foot orders that reaches each target and keeps the feet off objects, with noise within half a
@@ -342,14 +352,14 @@ class SteppedPlan:
     feet-clear paths that do not reach. A particle's pick, place and retract postures are Adam variables that start from
     one solve on the stance the first refresh gives, and are held on their hand target and stance (2026-11-23 design
     4.1): each evaluation puts them back first (:meth:`rollout`; in the loop, :meth:`put_back` and then the recorded
-    step on :attr:`rollout_fn`), their slope along that hold reaches the commands and the placements
-    (:meth:`hand_on`), and each Adam step ends with the postures inside their joint limits and the placements on
-    their support (:meth:`step`). A refresh runs the world model and controller on every particle's
-    commands, gap by gap, writes the landing postures (never optimized), sets the stand-in and the step's checks'
-    straight lines (design 4.4) the costs read until the next refresh, takes each pick and place posture through the
-    planner's IK projection on its new stance (:meth:`project`, 2026-11-25) and puts the pick, place and retract
-    postures back on the pairs they stand on; it runs no starting solve (2026-11-23 design 4.7). The starting pass is
-    the first refresh, with one solve per posture and the same projection after it.
+    step on :attr:`rollout_fn`), their slope along that hold reaches the commands and the placements (:meth:`hand_on`),
+    and each Adam step ends with the postures inside their joint limits and the placements on their support
+    (:meth:`step`). A refresh runs the world model and controller on every particle's commands, gap by gap, writes the
+    landing postures (never optimized), sets the stand-in and the step's checks' straight lines (design 4.4) the costs
+    read until the next refresh, takes each pick and place posture through the planner's IK projection on its new stance
+    (:meth:`project`, 2026-11-25) and puts the pick, place and retract postures back on the pairs they stand on; it runs
+    no starting solve (2026-11-23 design 4.7). The starting pass is the first refresh, with one solve per posture and
+    the same projection after it.
     """
 
     def __init__(self, proposal, world, config, predictor, inputs, pools, checker, *, reducer, deadline=None, generator=None):
@@ -418,26 +428,27 @@ class SteppedPlan:
                              else torch.default_generator)
             # From the first gap with steps on (before it the feet are fixed), a gap whose landing the task planner
             # measured tests reach: a stance passes when its hand-map gap to the target is at most that landing's.
-            # Each gap with steps keeps its feet clear of its own scene.
-            search = proposal.search
-            grid = grid_commands(search.sole_half, search.home[0][1] - search.home[1][1])
-            j0 = next(j for j, order in enumerate(self.orders) if order)
-            reach, scenes = [], []
-            for j, order in enumerate(self.orders):
-                bar = proposal.schedule.edges[j].distance_m
-                reach.append(None if j < j0 or bar is None
-                             else lambda pairs, t=proposal.targets[j], b=bar: search.reaches(pairs, t, b))
-                scenes.append(_foot_scene(world, objects[j], held_before[j], n) if order else None)
-            foot_half = torch.tensor(_foot_half_extents(world.model), dtype=torch.float64)
-            drawing = monotonic()
-            commands, self.stats["draw"] = draw_grid_paths(self.orders, self.incoming, generator, grid, reach, scenes,
-                                                           foot_half, deadline=deadline)
-            self.stats["draw"]["seconds"] = monotonic() - drawing
-            for j, u in enumerate(commands):
-                if u is not None:
-                    particles[self.command_names[j]] = u
+            # Each gap with steps keeps its feet clear of its own scene. A plan without steps has no commands to draw.
+            if any(self.orders):
+                options = proposal.landing_options
+                grid = grid_commands(options.sole_half, options.home[0][1] - options.home[1][1])
+                j0 = next(j for j, order in enumerate(self.orders) if order)
+                reach, scenes = [], []
+                for j, order in enumerate(self.orders):
+                    bar = proposal.schedule.edges[j].distance_m
+                    reach.append(None if j < j0 or bar is None
+                                 else lambda pairs, t=proposal.targets[j], b=bar: options.reaches(pairs, t, b))
+                    scenes.append(_foot_scene(world, objects[j], held_before[j], n) if order else None)
+                foot_half = torch.tensor(_foot_half_extents(world.model), dtype=torch.float64)
+                drawing = monotonic()
+                commands, self.stats["draw"] = draw_grid_paths(self.orders, self.incoming, generator, grid, reach,
+                                                               scenes, foot_half, deadline=deadline)
+                self.stats["draw"]["seconds"] = monotonic() - drawing
+                for j, u in enumerate(commands):
+                    if u is not None:
+                        particles[self.command_names[j]] = u
 
-            self.cost_function = CostFunction(self.arm_skeleton, world, config, self_collision_scales=True)
+            self.cost_function = CostFunction(self.arm_skeleton, world, config)
             self.checker, self._retract_of = checker, retract_of
             ok, head, before = torch.ones(n, dtype=torch.bool, device=like.device), None, self.incoming
             for j, (steps, op) in enumerate(self.groups):
@@ -609,8 +620,9 @@ class SteppedPlan:
             commands = [particles[self.command_names[j]] if j in self.command_names else None
                         for j in range(len(self.groups))]
             read, _ = self.standin.stances(self.incoming, commands)  # what the costs read until now
-            moved = torch.stack([(u - self.standin.at[j])[..., :2].norm(dim=-1).amax()
-                                 for j, u in enumerate(commands) if u is not None]).amax()
+            moves = [(u - self.standin.at[j])[..., :2].norm(dim=-1).amax()
+                     for j, u in enumerate(commands) if u is not None]
+            moved = torch.stack(moves).amax() if moves else None  # None: a plan without steps
             _, objects, _, held_before = _placements_and_grasps(self.groups, self.world, self.pools, 0, n,
                                                                 bindings=particles, grasp_indices=particles)
             ok, head, before = torch.ones(n, dtype=torch.bool, device=self.incoming.device), None, self.incoming
@@ -634,7 +646,7 @@ class SteppedPlan:
                     self.put_back(particles, (j,))
             self.tests_ok.copy_(ok)  # in place, as the stand-in and the checks' lines are
             self.stats["standin_error_m"].append({j: e.tolist() for j, e in errors.items()})
-            self.stats["command_move_m"].append(moved.item())
+            self.stats["command_move_m"].append(None if moved is None else moved.item())
             self.stats["correction_capped"].append(int(self.capped))
             self.capped.zero_()
             missed = torch.cat(misses) if misses else torch.empty(0)
@@ -697,13 +709,12 @@ class SteppedPlan:
 
     def project(self, particles: dict, gaps: Iterable[int], iters: int = GN_ITERS) -> None:
         """Without a gradient, the pick and place postures of ``gaps`` through the planner's IK projection
-        (:func:`~cutamp.gn_refresh.gn_project_balanced`, 2026-11-25), all in one call (the start's; a refresh hands
-        over one gap at a time), each on its stand-in stance and hand target, with the scene's objects where that pick
-        or place has them: balance and feet, then the hand, then
-        the side lean toward 0, then the CoM toward the centre, the preferences in the order plans are ranked by
-        (:func:`~cutamp.step_costs.plan_rank`), which Adam's small moves reach only over many refreshes. Then
-        :meth:`put_back` on the same gaps: the hand and feet exact, each ``J`` kept. A row with anything not finite
-        keeps its posture, and a retract, which has no hand target, is only put back."""
+        (:func:`~cutamp.gn_refresh.gn_project_balanced`, 2026-11-25), all in one call (the start's; a refresh hands over
+        one gap at a time), each on its stand-in stance and hand target, with the scene's objects where that pick or
+        place has them: balance and feet, then the hand, then the side lean toward 0, then the CoM toward the centre,
+        then last the Trunk upright (the forward lean toward 0), which Adam's small moves reach only over many
+        refreshes. Then :meth:`put_back` on the same gaps: the hand and feet exact, each ``J`` kept. A row with anything
+        not finite keeps its posture, and a retract, which has no hand target, is only put back."""
         gaps = set(gaps)
         with torch.no_grad():
             table, targets = self.stance_table(particles), self.hand_targets(particles)
@@ -823,7 +834,9 @@ class SteppedPlan:
         the step's checks on their straight lines in the commands (``StepChecks``, design 4.4) and, as the soft cost's
         only values, the preferences over the pick and place postures, each in its unit (2026-11-23 design 4.5): side
         lean (:func:`side_lean`), off centre and joint effort (:func:`joint_effort`); beside them, detached, each
-        particle's ``rank`` (:func:`plan_rank`), its worst ``effort`` and ``cost_at_start_weights``, the total with
+        particle's ``score`` (:func:`plan_score`: its worst side lean, off centre and forward lean, which valid plans
+        are ordered by, 2026-11-25), its ``rank`` (:func:`plan_rank`), its worst ``effort`` and
+        ``cost_at_start_weights``, the total with
         every requirement at its starting weight and the check lines at weight 1, which the stop rule's countdown reads
         before any particle is valid (design 4.6). Every requirement row carries its weight per particle
         (:class:`RequirementWeights`, 2026-11-23 design 4.3); the hand and feet rows weigh zero: they are held, not
@@ -856,7 +869,10 @@ class SteppedPlan:
                           "off_centre": weight * (distance / UNIT_M).sum(1),
                           "joint_effort": effort.sum(1)}
         worst = distance.detach().amax(1) if weight else margin.new_zeros(len(margin))
-        soft["rank"] = plan_rank(lean.detach().abs().clamp(max=1).asin().amax(1), worst)
+        tilt = lean.detach().abs().clamp(max=1).asin().amax(1)
+        soft["rank"] = plan_rank(tilt, worst)
+        bow = forward_lean(q.detach(), stances.detach(), self.world.model)
+        soft["score"] = plan_score(tilt, worst, bow.abs().amax(1))
         soft["effort"] = effort.detach().amax(1)
         self.weights.apply(cost)
         soft["cost_at_start_weights"] = self.weights.total_at_start(
@@ -923,9 +939,9 @@ class SteppedPlan:
     def result(self, particles: dict, reducer, checker) -> StepResult:
         """The rows handed to the motion stage, after the loop's last refresh (design 7): one evaluation without a
         gradient, one :class:`StepRow` per particle the checker passes, its report with the side lean and joint effort
-        of each pick and place and its place in the order of the preferences (``rank``, then the worst ``joint_effort``;
-        2026-11-23 design 4.5). ``motion_inputs`` maps each row's index to the adapter and the row's saved refresh, for
-        the motion stage; it stays out of ``diagnostics``."""
+        of each pick and place and its place among valid plans (``score``, then ``rank``, then the worst
+        ``joint_effort``; 2026-11-25). ``motion_inputs`` maps each row's index to the adapter
+        and the row's saved refresh, for the motion stage; it stays out of ``diagnostics``."""
         n = len(particles["left_q0"])
         sole_box = self.world.model.sole_box
         with torch.no_grad():
@@ -942,6 +958,7 @@ class SteppedPlan:
             center = (rollout["com_xy"] - physical_support_centroid(stances, sole_box)).norm(dim=-1)
             q = torch.stack([particles[name] for name in rollout["conf_params"]], 1)
             lean = side_lean(q, stances, self.world.model).clamp(-1, 1).asin()
+            bow = forward_lean(q, stances, self.world.model)
             efforts = joint_effort(self.world, q)
             rank, worst_effort = costs["soft"]["rank"], costs["soft"]["effort"]
             joints = range(len(self.world.model.joint_names))
@@ -963,9 +980,11 @@ class SteppedPlan:
                 best_com_margin=min(margins),
                 secondary_effort=float(effort[i]),
                 side_lean_rad=lean[i].tolist(),
+                forward_lean_rad=bow[i].tolist(),
                 joint_efforts=efforts[i].tolist(),
                 joint_effort=float(worst_effort[i]),
                 rank=float(rank[i]),
+                score=float(costs["soft"]["score"][i]),
                 cost=float(at_start[i]),
                 largest_arm_joint_move_rad=float(move[i]),
                 gaps=self._gap_records(particles, i),
@@ -998,17 +1017,17 @@ class SteppedPlan:
 
 def refine_stepped_plan(proposal, world, config, cost_reducer, constraint_checker, *, inputs, predictor, timer,
                         visualizer, deadline) -> StepResult:
-    """A plan with steps through the Adam loop (design 4 to 7): its starting values, the loop with its refreshes, the
-    rows its last refresh passes and, with ``curobo_plan``, the motion stage on them.
+    """A plan through the Adam loop (design 4 to 7), with or without steps: its starting values, the loop with its
+    refreshes, the rows its last refresh passes and, with ``curobo_plan``, the motion stage on them. Without steps the
+    feet stay where the robot stands, so the loop is the IK projection and Adam on the postures and placements.
 
     ``diagnostics["adam"]`` holds the Adam steps run, their rate over the optimizer's call, the step the loop stopped
     early at (None: it did not) and the plan's ``stats``. A deadline that passes before the loop, or during it with no
     row passing, answers ``budget_exhausted``."""
     if predictor is None:
         return StepResult([], None, "unavailable", "missing trained landing predictor")
-    config = config.for_steps()
     try:
-        pools = ParticleInitializer(world, config, constraint_checker)._pick_pools(proposal.skeleton)
+        pools = _pick_pools(world, proposal.skeleton)
     except ValueError as e:
         return StepResult([], None, "unresolved", str(e))
     try:
@@ -1036,7 +1055,7 @@ def refine_stepped_plan(proposal, world, config, cost_reducer, constraint_checke
     if config.curobo_plan and result.rows:
         from cutamp.step_preview import plan_predicted_step_motion
 
-        # Plans chosen by their centring show their motion after the search, as on the standing route.
+        # Plans chosen by their centring show their motion after the search (the planner plays the winner's).
         shown = None if config.com_center_weight != 0 else visualizer
         ik_tol = IKTol.from_checker(constraint_checker)
 

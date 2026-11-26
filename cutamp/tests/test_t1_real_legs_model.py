@@ -1,6 +1,6 @@
-"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the soft-cost default, the
-support rectangles, and the blocks_t1 world on the real legs, standing on the home stance. The GPU tests share
-conftest's module-scoped ``real_world``: one world per module."""
+"""The planning model as data (design 7.2, 7.4; calls 11, 12, 15): the real legs' layout, the support rectangles,
+and the blocks_t1 world on the real legs, standing on the home stance. The GPU tests share conftest's module-scoped
+``real_world``: one world per module."""
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -11,7 +11,7 @@ import torch
 import yaml
 
 from cutamp.com_polygon_cost import LOAD_GUARD_A, support_rectangles
-from cutamp.config import TAMPConfiguration, validate_tamp_config
+from cutamp.config import TAMPConfiguration
 from cutamp.robots.t1 import REAL_LEGS
 from cutamp.tests.conftest import link_kinematics, needs_cuda
 
@@ -136,90 +136,6 @@ def test_cli_defaults_to_predicted_motion_and_allows_keyframes(monkeypatch):
     cfg = _cli_config(monkeypatch)
     assert cfg.curobo_plan
     assert not _cli_config(monkeypatch, "--no-motion_plan").curobo_plan
-
-
-def test_soft_cost_default_and_choice(monkeypatch):
-    # CostReducer sums the soft costs in this order, so the order is part of a same-seed run's result.
-    default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
-    assert TAMPConfiguration().soft_cost == default and _cli_config(monkeypatch).soft_cost == default
-    assert TAMPConfiguration(soft_cost=["joint_limit_margin"]).soft_cost == ["joint_limit_margin"]
-    assert _cli_config(monkeypatch, "--soft_cost", "joint_limit_margin").soft_cost == ["joint_limit_margin"]
-    assert TAMPConfiguration(soft_cost=[]).soft_cost == []
-
-
-def test_joint_limit_margin_is_registered_and_weighted():
-    # Unregistered names pass through UNWEIGHTED in CostReducer, so the weight entry is mandatory.
-    from cutamp.config import SUPPORTED_SOFT_COSTS
-    from cutamp.scripts.utils import default_constraint_to_mult
-    assert "joint_limit_margin" in SUPPORTED_SOFT_COSTS
-    validate_tamp_config(TAMPConfiguration(soft_cost=["joint_limit_margin"]))
-    assert default_constraint_to_mult["soft"]["joint_limit_margin"] == 1e3
-
-
-WAIST = REAL_LEGS.joint_names.index("Waist")
-
-
-def _real_limits() -> torch.Tensor:
-    """The real legs' ``[2, 33]`` limits in the model's joint order, row 0 lower: t1_29dof.yml's, which every factory's
-    kinematics reports (test_factories_keep_the_soft_limits_on_their_joints), so the soft cost's
-    ``world.joint_limits``."""
-    soft = _yaml_soft_limits()
-    return torch.tensor([soft[n] for n in REAL_LEGS.joint_names], dtype=torch.float32).T.contiguous()
-
-
-def _joint_limit_margin(particles: dict, n: int) -> torch.Tensor:
-    """The joint_limit_margin soft cost as cost_function.py computes it: on the real legs' limits."""
-    from cutamp.joint_limit_cost import joint_limit_margin_soft_cost
-    return joint_limit_margin_soft_cost(particles, _real_limits(), num_particles=n, device=torch.device("cpu"))
-
-
-def _real_home(n: int) -> torch.Tensor:
-    return torch.tensor(REAL_LEGS.home, dtype=torch.float32).expand(n, -1).clone()
-
-
-def test_joint_limit_margin_is_zero_inside_the_limits():
-    # No margin band: home, and a conf 1 mrad inside the Waist's upper limit, cost exactly nothing.
-    near = _real_home(4)
-    near[:, WAIST] = _real_limits()[1, WAIST] - 0.001
-    cost = _joint_limit_margin({"q_retract": _real_home(4), "left_q1": near}, 4)
-    assert cost.shape == (4,)
-    assert torch.all(cost == 0.0)
-
-
-def test_joint_limit_margin_penalizes_a_conf_past_its_limit():
-    # The Waist 0.08 rad past its upper limit: penalty 0.08^2 = 6.4e-3.
-    q = _real_home(2)
-    q[:, WAIST] = _real_limits()[1, WAIST] + 0.08
-    assert torch.allclose(_joint_limit_margin({"q_pick": q}, 2), torch.full((2,), 0.08 ** 2), atol=1e-6)
-
-
-def test_joint_limit_margin_excludes_the_initial_confs():
-    # A violating conf under every initial-state name and a clean home under q_pick: the total is exactly 0 (the
-    # exclusion works inside the stacked path, not just via the empty-dict fallback). Initial states must never
-    # acquire limit gradients through the Adam soft loss.
-    bad = _real_home(2)
-    bad[:, WAIST] = _real_limits()[1, WAIST] + 0.08
-    cost = _joint_limit_margin({"q0": bad, "left_q0": bad.clone(), "right_q0": bad.clone(), "q_pick": _real_home(2)}, 2)
-    assert torch.all(cost == 0.0)
-
-
-def test_joint_limit_margin_without_confs_is_zero():
-    cost = _joint_limit_margin({"pose1": torch.zeros(3, 4)}, 3)
-    assert cost.shape == (3,) and torch.all(cost == 0.0)
-
-
-def test_joint_limit_margin_gradient_restores_and_skips_the_initial_confs():
-    # (a) The gradient through the hinge^2 points back toward the interior; (b) an excluded initial-state conf gets
-    # no gradient even when it is in the dict, the safety property the exclusion exists for.
-    bad = _real_home(2)
-    bad[:, WAIST] = _real_limits()[0, WAIST] - 0.08  # 0.08 below the lower limit
-    q_pick, left_q0 = bad.clone().requires_grad_(True), bad.clone().requires_grad_(True)
-    _joint_limit_margin({"q_pick": q_pick, "left_q0": left_q0}, 2).sum().backward()
-    assert left_q0.grad is None or torch.all(left_q0.grad == 0.0)
-    # d/dq of relu(lower - q)^2 is -2 relu(lower - q): pushing q up, toward the interior, lowers the cost.
-    assert q_pick.grad is not None and bool((q_pick.grad[:, WAIST] < 0.0).all())
-    others = [k for k in range(len(REAL_LEGS.joint_names)) if k != WAIST]
-    assert torch.all(q_pick.grad[:, others] == 0.0)  # the untouched joints get no gradient
 
 
 def test_support_rectangles():

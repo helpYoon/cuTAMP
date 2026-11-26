@@ -8,16 +8,8 @@
 # its affiliates is strictly prohibited.
 
 import math
-from dataclasses import dataclass, replace
-from typing import List, Optional
-
-
-# The CLI choices (run_cutamp.py) and validate_tamp_config key off this tuple.
-# Note: cost_function.py's _compute_soft_cost hard-codes the same names and
-# must be kept in sync by hand.
-SUPPORTED_SOFT_COSTS = (
-    "place_close_to_base", "retract_close_to_home", "minimize_body_movement", "joint_limit_margin",
-)
+from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -27,9 +19,9 @@ class TAMPConfiguration:
 
     # Optimization hyperparams
     num_opt_steps: int = 1_000
-    # Stop Adam after this many steps without meaningful progress
-    # (new-best satisfying count or best-particle loss drop). 0 disables.
-    # The best-seen particle snapshot is kept regardless of this setting.
+    # Stop Adam after this many steps without meaningful progress: before any particle is valid, a new-best
+    # satisfying count or a best-particle loss drop; after, a better-ranked valid plan (_BestSnapshot). 0 disables.
+    # Each particle's best valid state is kept regardless of this setting.
     # Default 50, still above the max record gap of 35 on the blocks_t1 traces
     # it was calibrated on. On a full 1000-step raised-surface run (2026-08-05)
     # no record came after step 50, and on 15 blocks_t1 problems (2026-11-07)
@@ -42,44 +34,29 @@ class TAMPConfiguration:
     # The whole search's budget in seconds, timed from planner entry (_run_step_planner's deadline). None: no cap.
     max_loop_dur: Optional[float] = None
 
-    ## Soft Costs
-    # Must be members of SUPPORTED_SOFT_COSTS (checked in validate_tamp_config).
-    # None (the default, and run_cutamp's without --soft_cost) resolves in
-    # __post_init__ to place_close_to_base, joint_limit_margin and
-    # minimize_body_movement, which holds the legs, free to move (design call
-    # 2), in that order: CostReducer sums them in it. [] means no soft costs.
-    soft_cost: Optional[List[str]] = None
-    # The periodic IK projection (coupled re-IK): Adam optimizes the Poses
-    # and free Confs, and the Confs an IK target covers (q_pick,
-    # q_place, ...) leave the optimizer. Every reik_interval steps the
-    # balance-first GN refresh (gn_project_balanced) projects them onto their
-    # moved targets: the CoM in the support rectangle, both soles on the
-    # stance and the robot clear of collision first, the pose least squares
-    # inside it. Every row's iterate is written back; the satisfaction check
-    # after the loop drops the rows that still miss.
+    # The refresh interval: every reik_interval Adam steps the plan refreshes (SteppedPlan.refresh): the world model
+    # runs at the current commands, and each pick and place posture goes through the balance-first IK projection
+    # (gn_project_balanced) on the stance it then stands on, the CoM in the support region, both soles on the stance
+    # and the robot clear of collision first, the pose least squares inside it. A plan's particles are judged only
+    # on the Adam step right after a refresh.
     reik_interval: int = 5
-    # Replay the Adam step and the re-IK refresh as CUDA graphs
-    # (cutamp/cuda_graphs.py). Default ON (2026-10-31): 3.5x faster steps at n=64,
-    # 2.1x at 256, replays bitwise equal to eager. A failed capture ends the
-    # run: no switch to eager. A plan with steps replays its Adam step too, put-back
-    # included (2026-11-24); its refresh and the Adam update stay eager.
+    # Replay the Adam step as a CUDA graph (cutamp/cuda_graphs.py), put-back included (2026-11-24), and run the
+    # landing model and the stance IK on their own graphs. Default ON (2026-10-31). A failed capture ends the run: no
+    # switch to eager. The refresh and the Adam update stay eager.
     cuda_graphs: bool = True
 
     ## Task Planning
-    # The most distinct symbolic skeletons the step search admits (arm_step_skeletons' max_base_plans)
+    # The most distinct pick-and-place orders the plan search hands out (plan_search's max_base_plans)
     num_initial_plans: int = 30
     step_lag: int = 2  # actuator delay in physics substeps
 
     ## Trajectories and cuRobo
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = True
-    # On RuntimeError from solve_curobo, retry on the next satisfying particle in get_top_satisfying_particles' order:
-    # worst CoM centre distance, then effort; a stepped plan's rows in _validate_motion_rows' order: the rank (whole
-    # units of side lean, then of centring), then joint effort; round the grasp groups with com_center_weight 0 (both
-    # routes). Up to this many total attempts (1 = no retry). Mitigates per-particle trajopt
-    # failures that look feasible but never converge — see motion_solver retry helper.
-    # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first plans on its 6th candidate.
-    # It also sets how many grasps each pick chooses at init (choose_grasps, G5).
+    # When a row's motion fails, try the next satisfying row in _validate_motion_rows' order: the rank (whole units of
+    # side lean, then of centring), then joint effort; round the grasp groups with com_center_weight 0. Up to this
+    # many rows in all (1 = no retry). Mitigates per-particle trajopt failures that look feasible but never converge.
+    # 10 (the user, 2026-11-05): a stage 3 gate run on the real legs first planned on its 6th candidate.
     motion_plan_max_retries: int = 10
 
     ## Visualizer Args
@@ -101,21 +78,6 @@ class TAMPConfiguration:
     # Zero restores step-count/effort selection.
     com_center_weight: float = 1.0
 
-    def __post_init__(self):
-        if self.soft_cost is None:
-            default = ["place_close_to_base", "joint_limit_margin", "minimize_body_movement"]
-            object.__setattr__(self, "soft_cost", default)
-
-    def for_steps(self) -> "TAMPConfiguration":
-        """This configuration for a plan with steps in the Adam loop; every other setting is kept."""
-        # Design docs/superpowers/specs/2026-11-22-adam-alone-steps-design.md, section 5.
-        # soft_cost [] (call 5): each listed soft cost pulls its variables at Adam's full step and the hand
-        # leaves its target; a stepped plan's preferences are its own (`step_costs`). conf_lr is the planner's own
-        # since 2026-11-24: its 7e-3 (call 6) kept the hand from hovering above its tolerance, which the put-back
-        # now does; over 5 seeds of the three stepped scenes every plan was found and the loop took 24 / 26 / 39
-        # Adam steps against 26 / 32 / 66.
-        return replace(self, soft_cost=[])
-
 
 def validate_tamp_config(config: TAMPConfiguration):
     if config.num_particles <= 0:
@@ -132,9 +94,6 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"Configuration learning rate (conf_lr) must be positive, not {config.conf_lr}")
     if config.reik_interval <= 0:
         raise ValueError(f"reik_interval must be positive, not {config.reik_interval}")
-    for name in (config.soft_cost or []):
-        if name not in SUPPORTED_SOFT_COSTS:
-            raise ValueError(f"Unknown soft cost {name!r}; supported: {SUPPORTED_SOFT_COSTS}")
 
     # Time budget
     if config.max_loop_dur is not None and config.max_loop_dur <= 0:

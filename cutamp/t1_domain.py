@@ -21,7 +21,7 @@ from typing import Sequence
 
 from cutamp.task_planning import Fluent, OperatorMetadata, Parameter, TAMPOperator, State
 from cutamp.task_planning.constraints import Footprint, KinematicConstraint, Motion, StablePlacement, StandOnStance, StepReach
-from cutamp.task_planning.costs import StepTaken, TrajectoryLength
+from cutamp.task_planning.costs import TrajectoryLength
 
 # Types
 Conf = "conf"
@@ -227,7 +227,7 @@ def _step_operator(foot: str) -> TAMPOperator:
             StandOnStance(q_stand, q_land, *landed),
             Footprint(sole_from, sole_planted, sole_to),
         ],
-        costs=[StepTaken()],
+        costs=[],
         metadata=OperatorMetadata(action_type="step", foot=foot),
     )
 

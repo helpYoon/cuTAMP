@@ -120,7 +120,7 @@ def test_lines_zero_what_is_not_finite_and_keep_each_particle_apart():
 
 def test_side_lean_is_measured_across_the_feet():
     from cutamp.robots.t1 import REAL_LEGS
-    from cutamp.step_costs import side_lean
+    from cutamp.step_costs import forward_lean, side_lean
     names = list(REAL_LEGS.joint_names)
     q = torch.zeros(3, len(names))
     q[0, names.index("base_j_roll")] = 0.3          # a roll, feet pointing along x
@@ -130,9 +130,23 @@ def test_side_lean_is_measured_across_the_feet():
     stance[2, :, 2] = torch.pi / 2
     lean = side_lean(q, stance, REAL_LEGS)
     torch.testing.assert_close(lean.abs(), torch.tensor([0.3, 0.0, 0.3]).sin(), atol=1e-6, rtol=0)
+    # The forward lean is the rest of the tilt: the bow along the feet, positive forward, as an angle. Folded past
+    # 90 degrees back it reads past -90, where a sine would read the fold as nearly upright.
+    torch.testing.assert_close(forward_lean(q, stance, REAL_LEGS), torch.tensor([0.0, 0.3, 0.0]), atol=1e-6, rtol=0)
+    folded = torch.zeros(1, len(names))
+    folded[0, names.index("base_j_pitch")] = -2.1
+    torch.testing.assert_close(forward_lean(folded, stance[:1], REAL_LEGS), torch.tensor([-2.1]), atol=1e-6, rtol=0)
 
 
 def test_the_rank_counts_whole_units():
     from cutamp.step_costs import RANK_BASE, plan_rank
     rank = plan_rank(torch.tensor([0.04, 0.06, 0.06]), torch.tensor([0.011, 0.001, 0.006]))
     assert rank.tolist() == [2.0, RANK_BASE, RANK_BASE + 1.0]
+
+
+def test_the_score_adds_whole_units_of_every_preference():
+    # Side lean, off centre and forward lean, each in whole units, added: 15 mm off centre does not outweigh a fold.
+    from cutamp.step_costs import plan_score
+    lean, off_centre = torch.tensor([0.04, 0.06, 0.0, 0.0]), torch.tensor([0.011, 0.001, 0.0005, 0.019])
+    bow = torch.tensor([0.0, 0.12, 2.04, 1.04])
+    assert plan_score(lean, off_centre, bow).tolist() == [2.0, 3.0, 40.0, 23.0]

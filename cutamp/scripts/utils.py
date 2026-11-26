@@ -40,14 +40,6 @@ default_constraint_to_mult = {
     "StepTests": {"refresh_tests": 0.0},
     "soft": {
         "com_center_distance_squared": 1.0,  # CostFunction applies the configured coefficient.
-        "retract_close_to_home": 1e-1,
-        "minimize_body_movement": 10,  # Penalize leg/torso deviation from home
-        # Tuned on the simplified model's 0.1 rad margin band (branch
-        # ablation-baseline; Task-6 verification battery, 2026-06-11: 1e2 left
-        # endpoint offenders, 1e3 cleared every non-trunk endpoint, 1e4 bought
-        # nothing more, 1e5 distorted particle selection). The band is now
-        # zero, so it weights limit violations only; kept at 1e3.
-        "joint_limit_margin": 1e3,
     },
 }
 

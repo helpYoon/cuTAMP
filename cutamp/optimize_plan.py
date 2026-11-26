@@ -10,7 +10,7 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import AbstractSet, Callable, Dict, List, Literal, NamedTuple, Optional, Tuple, TypedDict
+from typing import AbstractSet, Callable, Dict, List, Optional, Tuple, TypedDict
 
 import torch
 from torch.optim import Adam
@@ -18,90 +18,22 @@ from tqdm import tqdm
 
 from cutamp import cuda_graphs
 from cutamp.conf_locking import apply_grad_masks, build_grad_masks
-from cutamp.utils.common import (
-    Particles,
-    action_4dof_to_mat4x4,
-    grasp_7dof_to_mat4x4,
-)
-from cutamp.com_polygon_cost import particle_com_margin
+from cutamp.utils.common import Particles
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
-from cutamp.gn_refresh import gn_gate, gn_project_balanced
 from cutamp.robots.t1 import GRIPPER_CLOSED, GRIPPER_OPEN
-from cutamp.rollout import RolloutFunction, get_conf_to_arm, movable_spheres_fn
+from cutamp.rollout import RolloutFunction, get_conf_to_arm
 from cutamp.t1_domain import Conf, Pose
-from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
-from cutamp.task_planning.constraints import KinematicConstraint
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
 
 _log = logging.getLogger(__name__)
 
 
-@dataclass
-class IKDep:
-    """Re-IK dependency: which Conf to refresh and how to rebuild its IK target.
-
-    ``target_fn(particles)`` rebuilds ``world_from_ee`` from the current
-    particle state. ``q_name`` is the Conf to overwrite (in-place) with the
-    IK solution. ``arm`` selects the active tool frame, and so which arm is
-    inactive (GN freezes its columns). ``movables_fn(particles)`` gives the object spheres the conf must clear,
-    ``[B, M, 4]`` (:func:`~cutamp.rollout.movable_spheres_fn`).
-    """
-    q_name: str
-    arm: Literal["left", "right"]
-    target_fn: Callable[[dict], torch.Tensor]
-    movables_fn: Callable[[dict], torch.Tensor]
-
-
-def _build_ik_deps(
-    plan_skeleton: PlanSkeleton, world: TAMPWorld,
-) -> List[IKDep]:
-    """Walk the plan skeleton and emit one IKDep per actionable op whose Conf
-    is determined by Pose / Grasp particles via IK.
-
-    Mirrors ``ParticleInitializer``'s init-time IK targets (Pick /
-    Place) so re-IK reproduces what was done at init,
-    just from updated particle values. Operators with no IK target
-    (Retract, MoveFree, MoveHolding) are skipped.
-    """
-    deps: List[IKDep] = []
-    for idx, ground_op in enumerate(plan_skeleton):
-        meta = ground_op.operator.metadata
-        if not getattr(meta, "is_actionable", False):
-            continue
-        action_type = meta.action_type
-        arm = meta.arm
-        if arm is None:
-            continue
-        params = ground_op.values
-        tool_frame = world.tool_frame_for_arm(arm)
-        tool_from_ee = world.tool_from_ee[tool_frame]
-
-        if action_type == "pick":
-            obj, grasp_name, q_name = params
-            # Snapshot the object's INITIAL pose. If the skeleton ever picks
-            # the same object after a place (Pick A → Place A → Pick A), the
-            # IK target should follow A's placed pose, not its initial one —
-            # not handled today; blocks_t1 has no such re-grasp pattern.
-            world_from_obj = world.get_object_pose(obj)
-            def target_fn(p, _wo=world_from_obj, _g=grasp_name, _t=tool_from_ee):
-                return _wo @ grasp_7dof_to_mat4x4(p[_g]) @ _t
-            deps.append(IKDep(q_name, arm, target_fn, movable_spheres_fn(world, plan_skeleton, idx)))
-        elif action_type == "place":
-            obj, grasp_name, placement, surface, q_name = params
-            def target_fn(p, _pl=placement, _g=grasp_name, _t=tool_from_ee):
-                return action_4dof_to_mat4x4(p[_pl]) @ grasp_7dof_to_mat4x4(p[_g]) @ _t
-            deps.append(IKDep(q_name, arm, target_fn, movable_spheres_fn(world, plan_skeleton, idx)))
-        # action_type in {"retract", None}: no IK target, skip.
-    return deps
-
-
-#: Cost types in the Adam loss: the hard constraints and the soft costs, which the periodic IK projection makes
-#: trainable (the covered Confs follow the Poses that Adam moves; grasps stay as sampled).
+#: Cost types in the Adam loss: the hard constraints and the soft costs.
 ADAM_CONSIDER_TYPES = frozenset(("constraint", "cost"))
 
 
@@ -114,7 +46,7 @@ def _adam_param_groups(params: List[Tuple[torch.Tensor, bool]], conf_lr: float) 
 
 
 def _finite_step(optimizer: Adam, params: List[torch.Tensor]) -> torch.Tensor:
-    """``optimizer.step()`` for a stepped plan (design 4): a particle (a row, the first dimension) whose gradient is not
+    """``optimizer.step()`` for a plan (design 4): a particle (a row, the first dimension) whose gradient is not
     finite in any parameter keeps its values, so a refresh never receives a command that is not a number. Its gradient
     rows are zeroed, so Adam's moments take no NaN, and its values are put back after the step, which the moments
     still move. A parameter without a gradient is left alone. Returns the held rows, ``[B]`` bool; no host sync."""
@@ -134,28 +66,50 @@ def _finite_step(optimizer: Adam, params: List[torch.Tensor]) -> torch.Tensor:
 
 
 class _FeasibleArchive:
-    """Keep each particle's best complete feasible state across fixed-stance Adam proposals. For a stepped plan
-    ``center`` holds the rank and ``effort`` the worst joint effort (2026-11-23 design 4.5)."""
+    """Keep each particle's best complete feasible state across the Adam steps, by ``keys`` compared in order, smaller
+    first (:func:`_quality`'s): ``score`` is the first key and ``effort`` the last, its worst joint effort."""
 
-    def __init__(self, particles, center, effort):
-        self.center = torch.full_like(center, float("inf"))
-        self.effort = torch.full_like(effort, float("inf"))
+    def __init__(self, particles, *keys):
+        self.keys = [torch.full_like(key, float("inf")) for key in keys]
         self.state = {name: value.detach().clone() for name, value in particles.items()}
 
+    @property
+    def score(self):
+        return self.keys[0]
+
+    @property
+    def effort(self):
+        return self.keys[-1]
+
+    @staticmethod
+    def _before(a, b):
+        """``[n]`` bool: the keys ``a`` come before ``b``, compared in order."""
+        before, tied = torch.zeros_like(a[0], dtype=torch.bool), torch.ones_like(a[0], dtype=torch.bool)
+        for x, y in zip(a, b):
+            before, tied = before | (tied & (x < y)), tied & (x == y)
+        return before
+
+    def best(self) -> list[float]:
+        """The keys of the best particle on record, in order; all infinite while no particle has been valid."""
+        best, tied = [], torch.ones_like(self.keys[0], dtype=torch.bool)
+        for key in self.keys:
+            value = key.masked_fill(~tied, float("inf"))
+            best.append(value.min())
+            tied = tied & (value == best[-1])
+        return torch.stack(best).tolist()
+
     @torch.no_grad()
-    def observe(self, particles, feasible, center, effort):
-        better = feasible & ((center < self.center) | ((center == self.center) & (effort < self.effort)))
-        self.center.copy_(torch.where(better, center, self.center))
-        self.effort.copy_(torch.where(better, effort, self.effort))
+    def observe(self, particles, feasible, *keys):
+        better = feasible & self._before(keys, self.keys)
+        for saved, key in zip(self.keys, keys):
+            saved.copy_(torch.where(better, key, saved))
         for name, saved in self.state.items():
             mask = better.view((-1,) + (1,) * (saved.ndim - 1))
             saved.copy_(torch.where(mask, particles[name], saved))
 
     @torch.no_grad()
-    def restore(self, particles, feasible, center, effort):
-        better = self.center.isfinite() & (
-            ~feasible | (self.center < center) | ((self.center == center) & (self.effort < effort))
-        )
+    def restore(self, particles, feasible, *keys):
+        better = self.score.isfinite() & (~feasible | self._before(self.keys, keys))
         if not better.any():
             return False
         for name, saved in self.state.items():
@@ -165,52 +119,40 @@ class _FeasibleArchive:
         return True
 
 
-def _quality(cost_dict, reducer) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """The two numbers :class:`_FeasibleArchive` compares valid particles by, smaller first: a stepped plan's rank and
-    worst joint effort (2026-11-23 design 4.5), else the worst centring distance and the secondary effort, else
-    ``(None, None)``: no record."""
-    soft = cost_dict.get("soft", {})
-    if "rank" in soft:
-        return soft["rank"], soft["effort"]
-    if "max_center_distance_m" in soft:
-        return soft["max_center_distance_m"], reducer.secondary_effort(cost_dict)
-    return None, None
+def _quality(cost_dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The numbers :class:`_FeasibleArchive` compares valid particles by, in order, smaller first: the score
+    (:func:`cutamp.step_costs.plan_score`), the rank (:func:`cutamp.step_costs.plan_rank`) and the worst joint effort
+    the plan's cost publishes (2026-11-25)."""
+    soft = cost_dict["soft"]
+    return soft["score"], soft["rank"], soft["effort"]
 
 
-def _fixed_row_quality(info, cost_dict, total_cost, soft_cost, reducer):
-    """Scores of the same final rows for particle selection and later motion retries; where the cost publishes a
-    stepped plan's rank, also the rank and the worst joint effort (2026-11-23 design 4.5), which choose the row."""
+def _fixed_row_quality(cost_dict, total_cost, soft_cost, reducer):
+    """Scores of the final rows: the costs, the centring distance where the cost publishes one, and the score, the
+    rank and the worst joint effort, which choose the row."""
     quality = {"best_cost": total_cost, "best_soft_cost": soft_cost}
-    center = cost_dict.get("soft", {}).get("max_center_distance_m")
+    center = cost_dict["soft"].get("max_center_distance_m")
     if center is not None:
         quality.update(max_center_distance_m=center, secondary_effort=reducer.secondary_effort(cost_dict))
-    if "rank" in cost_dict.get("soft", {}):
-        quality.update(rank=cost_dict["soft"]["rank"], joint_effort=cost_dict["soft"]["effort"])
-    info["row_quality"] = quality
+    quality.update(score=cost_dict["soft"]["score"], rank=cost_dict["soft"]["rank"],
+                   joint_effort=cost_dict["soft"]["effort"])
     return quality
 
 
 def _best_fixed_row(quality, passing):
-    if "rank" in quality:
-        rank = quality["rank"].masked_fill(~passing, float("inf"))
-        passing = passing & (rank == rank.min())
-        score = quality["joint_effort"]
-    elif "max_center_distance_m" in quality:
-        center = quality["max_center_distance_m"].masked_fill(~passing, float("inf"))
-        passing = passing & (center == center.min())
-        score = quality["secondary_effort"]
-    else:
-        score = quality["best_soft_cost"]
-    return int(score.masked_fill(~passing, float("inf")).argmin())
-
+    """The passing row of the lowest score, then of the lowest rank, then of the lowest joint effort."""
+    for key in ("score", "rank"):
+        value = quality[key].masked_fill(~passing, float("inf"))
+        passing = passing & (value == value.min())
+    return int(quality["joint_effort"].masked_fill(~passing, float("inf")).argmin())
 
 
 @dataclass
 class _StepBody:
-    """One Adam step's device work, run eagerly or captured as G_step: the forward, the per-step scalars
-    stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost), and the
-    backward with the grad masks. The min cost is the smallest ``cost_at_start_weights`` where the cost publishes
-    it (a stepped plan, whose weights grow). Returns ``(packed, vis)``; ``vis`` is ``None`` unless ``keep_vis``."""
+    """One Adam step's device work, run eagerly or captured as G_step: the put-back, the forward, the per-step
+    scalars stacked into ``packed`` (satisfying count, loss, min cost, then the best satisfying soft cost), the backward
+    with the grad masks and the gradients' hand-on. The min cost is the smallest ``cost_at_start_weights`` where the
+    cost publishes it, since the weights grow. Returns ``(packed, vis)``; ``vis`` is ``None`` unless ``keep_vis``."""
     particles: dict
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
@@ -220,35 +162,31 @@ class _StepBody:
     params: List[torch.Tensor]
     grad_masks: Dict[int, torch.Tensor]
     keep_vis: bool
-    archive: _FeasibleArchive | None = None
-    #: Whether the archive reads this step. ``True`` for a plan without steps. A stepped plan's particles are judged
-    #: only right after a refresh (call 11): the loop hands a 0-dim bool tensor and sets it before each step, since a
-    #: recorded step takes the record at every replay and can only mask it.
-    judge: bool | torch.Tensor = True
-    #: A stepped plan: a row whose refresh diverged holds NaN costs, and the min cost skips it.
-    stepped: bool = False
-    #: The stepped plan itself: its postures are put back before the forward and, after the backward, their
-    #: gradients are handed on to the commands and placements (``put_back``, ``hand_on``), all in the one recording.
-    steps: object = None
+    #: The plan itself (:class:`~cutamp.step_loop.SteppedPlan`): its postures are put back before the forward and,
+    #: after the backward, their gradients are handed on to the commands and placements (``put_back``,
+    #: ``hand_on``), all in the one recording.
+    steps: object
+    archive: _FeasibleArchive
+    #: Whether the archive reads this step, a 0-dim bool tensor: a plan's particles are judged only right after a
+    #: refresh (call 11). The loop sets it before each step, since a recorded step takes the record at every replay
+    #: and can only mask it.
+    judge: torch.Tensor
 
     def __call__(self) -> Tuple[torch.Tensor, Optional[tuple]]:
-        if self.steps is not None:
-            self.steps.put_back(self.particles)
+        self.steps.put_back(self.particles)
         rollout = self.rollout_fn(self.particles)
         cost_dict = self.cost_fn(rollout, self.particles)
         costs = self.cost_reducer(cost_dict, consider_types=self.consider_types)
         satisfying_mask = self.get_mask(cost_dict, verbose=False)
-        if self.archive is not None:
-            judged = satisfying_mask if self.judge is True else satisfying_mask & self.judge
-            self.archive.observe(self.particles, judged, *_quality(cost_dict, self.cost_reducer))
+        self.archive.observe(self.particles, satisfying_mask & self.judge, *_quality(cost_dict))
         loss = costs.mean()
         # Every per-step scalar in one tensor, so the loop reads them in one
         # device-to-host copy: each .item() blocks the host until the GPU drains.
         scalars = [satisfying_mask.sum().to(costs.dtype), loss, costs.min()]
-        at_start = cost_dict.get("soft", {}).get("cost_at_start_weights")
+        at_start = cost_dict["soft"].get("cost_at_start_weights")
         if at_start is not None:  # the stop rule's loss clock cannot read weights that double (2026-11-23 design 4.6)
             scalars[2] = at_start.nan_to_num(nan=float("inf")).min()
-        elif self.stepped:  # else one diverged row makes the min NaN, and the stop rule's loss clock never resets
+        else:  # a row whose refresh diverged holds NaN costs: else the min is NaN and the loss clock never resets
             scalars[2] = costs.nan_to_num(nan=float("inf")).min()
         soft_costs = self.cost_reducer.soft_costs(cost_dict)
         scalars.append(soft_costs.masked_fill(~satisfying_mask, float("inf")).min())
@@ -257,8 +195,7 @@ class _StepBody:
         # it. It writes only .grad, which the bookkeeping doesn't read.
         loss.backward()
         apply_grad_masks([{"params": self.params}], self.grad_masks)
-        if self.steps is not None:
-            self.steps.hand_on(self.particles)
+        self.steps.hand_on(self.particles)
         return packed, ((rollout, cost_dict, costs, satisfying_mask) if self.keep_vis else None)
 
     def clear_autograd(self) -> None:
@@ -273,22 +210,18 @@ class PlanContainer(TypedDict):
     particles: Particles
     rollout_fn: RolloutFunction
     cost_fn: CostFunction
+    steps: object  # the plan itself (cutamp.step_loop.SteppedPlan)
 
 
 class _BestSnapshot:
-    """Track and restore the best-seen particle state during the Adam loop.
+    """The Adam loop's early-stop bookkeeping.
 
-    The satisfying count oscillates after convergence (±~50 particles with
-    period ``reik_interval`` — re-IK repairs kinematic drift each refresh),
-    so the final step's state is a lottery ticket. Snapshot on every new-best
-    count; reset the early-stop patience clock only on *meaningful* progress:
-    a count record beating the previous by ``MIN_DELTA``, or the best
-    particle's total loss dropping by ``MIN_LOSS_DELTA`` (proxy for ongoing
-    pose-class soft-cost descent). For a plan with steps (``by_rank``), once the
-    archive holds a valid plan only a better-ranked valid plan resets the
-    clock: the returned plan is the best-ranked one, so neither the count nor
-    the loss changes it; and once that plan has rank 0, the lowest rank there is,
-    the loop ends at once, since no plan could restart the clock.
+    Before any particle has been valid, the patience clock resets only on *meaningful* progress: a satisfying-count
+    record beating the previous by ``MIN_DELTA``, or the best particle's loss dropping by ``MIN_LOSS_DELTA``. Once
+    the archive holds a valid plan, only a valid plan of a lower score resets the clock: the returned plan is the one
+    of the lowest score, so neither the count nor the loss changes it. Once that plan has rank 0, no unit of side lean
+    or off centre left, the loop ends at once: it does not wait for the forward lean, the last preference, to fall
+    further (user, 2026-11-25). A plan of rank 0 that is not the best one, such as a centred fold, ends nothing.
     """
 
     # ponytail: constants calibrated on one blocks_t1 trace (max record gap 35,
@@ -300,19 +233,16 @@ class _BestSnapshot:
         self.best_sat = -1
         self.best_step = 0
         self.last_improve_step = 0
-        self.state = None
         self._patience_sat = -1
         self._best_min_loss = float("inf")
-        self._last_checked_center = float("inf")
-        self._best_center = float("inf")
-        self._center_step = None  # the step of the last better-ranked valid plan; None until one exists
+        self._best_score = float("inf")
+        self._score_step = None  # the step of the last valid plan of a lower score; None until one exists
+        self.centred = False  # the best plan on record has rank 0
 
-    def update(self, step: int, num_satisfying: int, min_loss: float, particles: dict):
+    def update(self, step: int, num_satisfying: int, min_loss: float):
         if num_satisfying > self.best_sat:
             self.best_sat = num_satisfying
             self.best_step = step
-            with torch.no_grad():
-                self.state = {k: v.detach().clone() for k, v in particles.items()}
         meaningful = num_satisfying >= self._patience_sat + self.MIN_DELTA
         loss_improved = min_loss < self._best_min_loss - self.MIN_LOSS_DELTA
         if meaningful:
@@ -322,195 +252,18 @@ class _BestSnapshot:
         if meaningful or loss_improved:
             self.last_improve_step = step
 
-    def should_stop(
-        self, step: int, patience: int, archive: _FeasibleArchive | None = None, by_rank: bool = False
-    ) -> bool:
+    def should_stop(self, step: int, patience: int, archive: _FeasibleArchive) -> bool:
         if patience <= 0:
             return False
-        if by_rank and archive is not None:
-            best_center = float(archive.center.min())  # inf while no particle has been valid
-            if best_center < self._best_center:
-                self._best_center, self._center_step = best_center, step
-            if best_center == 0:  # no rank is lower, so nothing could restart the clock (user, 2026-11-24)
-                return True
-            if self._center_step is not None:
-                return step - self._center_step > patience
-            return step - self.last_improve_step > patience
-        expired = step - self.last_improve_step > patience
-        if archive is not None and (step == 0 or expired):
-            # Check the GPU archive only at the initial step and at a potential stop.
-            best_center = float(archive.center.min())
-            if best_center < self._last_checked_center:
-                self._last_checked_center = best_center
-                self.last_improve_step = step
-                return False
-        return expired
-
-    def restore_if_better(self, particles: dict, current_num_satisfying: int) -> bool:
-        """Copy the best-seen state back into ``particles`` (in place) if it
-        beats the current state's satisfying count. Ties keep the current
-        state (it has had more soft-cost descent)."""
-        if self.state is None or self.best_sat <= current_num_satisfying:
-            return False
-        with torch.no_grad():
-            for k, v in particles.items():
-                v.copy_(self.state[k])
-        return True
-
-
-class _QueuedRefresh(NamedTuple):
-    """One balance-first refresh's stats and timing events, on the device until ``_ReikDriftGate.flush``."""
-    step: int
-    q_names: Tuple[str, ...]
-    batch: int
-    packed: torch.Tensor  # [D, 3]: _ReikDriftGate._pack
-    start: torch.cuda.Event
-    end: torch.cuda.Event
-
-
-class _ReikDriftGate:
-    """Per-refresh instrumentation for the re-IK subsystem, plus the checker
-    tolerances the GN merge gate tests against.
-
-    Records per dep-refresh: solve time and the merge-gate misses, split by pose and CoM. Lands in
-    ``opt_metrics["reik_refresh"]``. Refreshes keep their stats on the device until :meth:`flush`.
-    """
-
-    def __init__(self, pos_tol: float, rot_tol: float):
-        self.pos_tol = pos_tol
-        self.rot_tol = rot_tol
-        self.stats: List[dict] = []
-        self._queued: List[_QueuedRefresh] = []  # refreshes awaiting flush()
-
-    def _append_record(self, step, q_name, batch, solve_s, gn_fail, gn_fail_pose, gn_fail_com):
-        """Append one ``stats`` record."""
-        # solve_s: the refresh's CUDA-event span (a G_refresh replay's also covers the stats packing) split evenly
-        # over its deps.
-        rec = {"step": step, "conf": q_name, "batch": batch, "solve_s": round(solve_s, 4)}
-        # Rows the projection missed, split by which merge-gate criterion failed (a row can fail both).
-        rec["gn_fail"] = gn_fail
-        rec["gn_fail_pose"] = gn_fail_pose
-        rec["gn_fail_com"] = gn_fail_com
-        self.stats.append(rec)
-
-    def _pack(self, D: int, batch: int, ok, pose_ok, com_ok) -> torch.Tensor:
-        """A balance-first refresh's stats as a ``[D, 3]`` float32 device tensor: per dep, each mask's miss
-        count."""
-        cols = [(~m).view(D, batch).sum(-1) for m in (ok, pose_ok, com_ok)]
-        return torch.stack([c.float() for c in cols], dim=-1)
-
-    def log_batch(self, step: int, q_names: List[str], batch: int, ok, pose_ok, com_ok, start, end) -> None:
-        """Queue one balance-first refresh's :meth:`_pack` and timing events for :meth:`flush`: no host read."""
-        packed = self._pack(len(q_names), batch, ok, pose_ok, com_ok)
-        self._queued.append(_QueuedRefresh(step, tuple(q_names), batch, packed, start, end))
-
-    def flush(self) -> None:
-        """Turn the queued refreshes into ``stats`` records, in refresh order, with one event wait and one
-        device-to-host copy. ``solve_s`` splits each event time over its deps."""
-        if not self._queued:
-            return
-        self._queued[-1].end.synchronize()  # elapsed_time needs both events done
-        values = iter(torch.cat([r.packed.view(-1) for r in self._queued]).tolist())
-        for r in self._queued:
-            solve_s = r.start.elapsed_time(r.end) / 1e3 / len(r.q_names)  # ms -> s, per dep
-            for q_name in r.q_names:
-                gn_fail, gn_fail_pose, gn_fail_com = (int(next(values)) for _ in range(3))
-                self._append_record(r.step, q_name, r.batch, solve_s, gn_fail, gn_fail_pose, gn_fail_com)
-        self._queued.clear()
-
-
-def _project_and_write_back(
-    particles: dict, ik_deps: List[IKDep], world: TAMPWorld, world_from_ee: torch.Tensor, gate: _ReikDriftGate,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GN-project the covered Confs' dep-major stack toward ``world_from_ee`` (``[D*B, 4, 4]``), clear of each
-    conf's objects (``IKDep.movables_fn``), gate the result on the ``"gate"`` FK site, and write every row back in
-    place. Returns ``(pose_ok, com_ok)``: the gate checks no collision (the stats count pose and CoM misses)."""
-    q_names = [dep.q_name for dep in ik_deps]
-    batch = world_from_ee.shape[0] // len(ik_deps)
-    arms = tuple(dep.arm for dep in ik_deps)
-    movables = torch.cat([dep.movables_fn(particles).detach() for dep in ik_deps])
-    q = gn_project_balanced(
-        world, torch.cat([particles[name].detach() for name in q_names]), world_from_ee, arms, movables=movables,
-    )
-    pose_ok, com_ok = gn_gate(
-        world, q, world_from_ee, arms, gate.pos_tol, gate.rot_tol, kin=world.site_kinematics("gate"),
-    )
-    with torch.no_grad():
-        for name, q_dep in zip(q_names, q.split(batch)):
-            particles[name].copy_(q_dep)
-            # Dropped from the optimizer, so .grad has no consumer.
-            particles[name].grad = None
-    return pose_ok, com_ok
-
-
-def _refresh_balanced(
-    particles: dict, ik_deps: List[IKDep], world: TAMPWorld, gate: _ReikDriftGate, step: int,
-) -> None:
-    """Balance-first refresh: one :func:`gn_project_balanced` call over every dep's covered Conf.
-
-    Every row's result is written back (a persistent lower-level iterate): an unconverged row resumes
-    next refresh, and an unreachable one sits at its closest balanced pose, which the kinematic cost
-    pulls the placement toward. The :func:`gn_gate` masks only feed the stats. No host syncs
-    once gn_refresh's constants are cached, since the loop is launch-bound: CUDA events time it, and
-    the stats stay on the device until ``gate.flush()``.
-    """
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    q_names = [dep.q_name for dep in ik_deps]
-    assert len(set(q_names)) == len(q_names), f"one dep per covered Conf, got {q_names}"
-    # Detached: nothing may flow into the Pose / Grasp leaves.
-    targets = [dep.target_fn(particles).detach() for dep in ik_deps]
-    batch = targets[0].shape[0]
-    assert all(t.shape[0] == batch for t in targets), [t.shape[0] for t in targets]
-
-    pose_ok, com_ok = _project_and_write_back(particles, ik_deps, world, torch.cat(targets), gate)
-    end.record()
-
-    gate.log_batch(step, q_names, batch, pose_ok & com_ok, pose_ok, com_ok, start, end)
-
-
-class _StaticRefresh:
-    """G_refresh: :func:`_refresh_balanced` captured as a CUDA graph and replayed at each later refresh.
-
-    Static I/O besides the particles: ``slot`` ``[D, 3]``, the packed stats, which :meth:`__call__` queues
-    since a replay runs no Python. Captured right after an eager refresh, which sizes the ``"gate"`` site and
-    ``world.kinematics_jac`` for the ``D*B`` stack and fills gn_refresh's cached constants (a miss is a
-    host-to-device copy, which fails a capture).
-    """
-
-    def __init__(self, particles: dict, ik_deps: List[IKDep], world: TAMPWorld, gate: _ReikDriftGate):
-        self.particles, self.ik_deps, self.world, self.gate = particles, ik_deps, world, gate
-        self.q_names = tuple(dep.q_name for dep in ik_deps)
-        self.batch = particles[self.q_names[0]].shape[0]
-        self.slot = torch.zeros(len(ik_deps), 3, device=world.device)  # _pack's [D, 3]
-
-        def warmup() -> None:  # on scratch copies: the body writes the confs
-            self.body({k: v.detach().clone() for k, v in particles.items()}, self.slot.detach().clone())
-
-        # Guard every Kinematics the body runs; the eager refresh built both.
-        self.graph = cuda_graphs.CapturedGraph(
-            "G_refresh", lambda: self.body(particles, self.slot), warmup,
-            ptrs=lambda: cuda_graphs.graph_ptrs(
-                [*particles.values(), self.slot],
-                [world.site_kinematics("gate"), world.kinematics_jac],
-            ),
-        )
-
-    def body(self, particles: dict, slot: torch.Tensor) -> None:
-        """:func:`_refresh_balanced`'s device work on static I/O, sync-free so it can be captured."""
-        targets = [dep.target_fn(particles).detach() for dep in self.ik_deps]
-        pose_ok, com_ok = _project_and_write_back(particles, self.ik_deps, self.world, torch.cat(targets), self.gate)
-        slot.copy_(self.gate._pack(len(targets), self.batch, pose_ok & com_ok, pose_ok, com_ok))
-
-    def __call__(self, step: int) -> None:
-        """Replay G_refresh as the refresh at ``step`` and queue its stats for ``gate.flush()``."""
-        # Events recorded inside a capture are invalid, so these time the replay from outside.
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        self.graph.replay()
-        end.record()
-        # The next replay rewrites the slot, so the queue keeps a copy.
-        self.gate._queued.append(_QueuedRefresh(step, self.q_names, self.batch, self.slot.clone(), start, end))
+        score, rank = archive.best()[:2]  # inf while no particle has been valid
+        if score < self._best_score:
+            self._best_score, self._score_step = score, step
+        self.centred = rank == 0
+        if self.centred:
+            return True
+        if self._score_step is not None:
+            return step - self._score_step > patience
+        return step - self.last_improve_step > patience
 
 
 class ParticleOptimizer:
@@ -526,54 +279,43 @@ class ParticleOptimizer:
         self.types_to_optimize = {Pose, Conf}
         self.opt_counter = 0
 
-    def _capture_step(self, body: _StepBody, world: TAMPWorld, steps=None) -> cuda_graphs.CapturedGraph:
+    def _capture_step(self, body: _StepBody) -> cuda_graphs.CapturedGraph:
         """Capture ``body`` as G_step. Each warm-up drops every ``.grad``, so the captured AccumulateGrad
         gives each param a graph-owned ``.grad`` that every replay rewrites in place (never zero_grad it).
-        The guard covers the particles, those grads and the step's FK sites: three, and the retract confs'
-        motion site (cost_function.motion_costs). For a stepped plan (``steps``) it covers, beside the particles
-        and their grads, what the plan names (``steps.recorded()``): the tensors its refresh writes and the
-        kinematics its cost runs."""
+        The guard covers the particles, those grads and what the plan names (``body.steps.recorded()``): the tensors
+        its refresh writes and the kinematics its cost runs."""
+        steps = body.steps
         body.clear_autograd()
 
         def warmup() -> None:
-            if steps is not None:  # a put-back moves the postures and counts capped rows: each warm-up undoes both
-                with torch.no_grad():
-                    kept = {name: body.particles[name].clone() for name in steps.gap_of}
-                    capped = steps.capped.clone()
+            # A put-back moves the postures and counts capped rows: each warm-up undoes both.
+            with torch.no_grad():
+                kept = {name: body.particles[name].clone() for name in steps.gap_of}
+                capped = steps.capped.clone()
             body()
             for p in body.params:
                 p.grad = None
-            if steps is not None:
-                with torch.no_grad():
-                    for name, q in kept.items():
-                        body.particles[name].copy_(q)
-                    steps.capped.copy_(capped)
+            with torch.no_grad():
+                for name, q in kept.items():
+                    body.particles[name].copy_(q)
+                steps.capped.copy_(capped)
 
         def ptrs() -> tuple:
-            if steps is None:
-                tensors, kins = [], [world.site_kinematics(s) for s in ("rollout", "retract", "com", "retract_motion")]
-            else:
-                tensors, kins = steps.recorded()
+            tensors, kins = steps.recorded()
             return cuda_graphs.graph_ptrs([*body.particles.values(), *(p.grad for p in body.params), *tensors], kins)
 
         return cuda_graphs.CapturedGraph("G_step", body, warmup, ptrs=ptrs)
 
     def _visualize_step(self, visualizer: Visualizer, step: int, vis: tuple, num_satisfying: int,
-                        loss_val: float, indices: torch.Tensor) -> None:
+                        loss_val: float) -> None:
         """Log the best particle's last conf and object poses, the cost dict and the loss, from the step's ``vis``."""
         rollout, cost_dict, costs, satisfying_mask = vis
-        # Visualize satisfying particles if we have any. Otherwise, just show the best particle so far.
+        # Visualize satisfying particles if we have any: lowest score, then rank, then joint effort.
+        # Otherwise, just show the best particle so far.
         if num_satisfying > 0:
-            center = cost_dict.get("soft", {}).get("max_center_distance_m")
-            if "rank" in cost_dict.get("soft", {}):  # a stepped plan: best-ranked, then lowest joint effort
-                best_idx = _best_fixed_row({"rank": cost_dict["soft"]["rank"],
-                                            "joint_effort": cost_dict["soft"]["effort"]}, satisfying_mask)
-            elif center is None:
-                best_idx = indices[satisfying_mask][costs[satisfying_mask].argmin()]
-            else:
-                best_idx = _best_fixed_row({"max_center_distance_m": center,
-                                            "secondary_effort": self.cost_reducer.secondary_effort(cost_dict)},
-                                           satisfying_mask)
+            soft = cost_dict["soft"]
+            best_idx = _best_fixed_row({"score": soft["score"], "rank": soft["rank"],
+                                        "joint_effort": soft["effort"]}, satisfying_mask)
         else:
             best_idx = costs.argmin()
 
@@ -597,19 +339,19 @@ class ParticleOptimizer:
 
         Returns ``(solution_found, opt_metrics, time_exceeded)``.
 
-        ``plan_info["steps"]``, when given, is a stepped plan (:class:`~cutamp.step_loop.SteppedPlan`, design 4 and 6):
-        its commands are Adam variables, no posture goes to the re-solve, it refreshes every ``reik_interval`` steps,
-        its particles are judged only on the step right after a refresh, and it refreshes once more after the loop.
-        Its step body puts the postures back first (``steps.put_back``), then runs on ``steps.rollout_fn`` and hands
-        the gradients on (``steps.hand_on``); with ``cuda_graphs`` the body is recorded and replayed like any other plan's
-        (2026-11-24 design), guarded by what ``steps.recorded()`` names. The recording holds the whole step but the
-        Adam update and the clamps after it: the put-back, the forward and backward, and the gradients' hand-on.
+        ``plan_info["steps"]`` is the plan (:class:`~cutamp.step_loop.SteppedPlan`, design 4 and 6), with or without
+        steps: its commands and its postures are Adam variables, it refreshes every ``reik_interval`` steps, its
+        particles are judged only on the step right after a refresh, and it refreshes once more after the loop. Its
+        step body puts the postures back first (``steps.put_back``), then runs on ``steps.rollout_fn`` and hands the
+        gradients on (``steps.hand_on``); with ``cuda_graphs`` the body is recorded and replayed (2026-11-24 design),
+        guarded by what ``steps.recorded()`` names. The recording holds the whole step but the Adam update and the
+        clamps after it: the put-back, the forward and backward, and the gradients' hand-on.
         """
         plan_skeleton = plan_info["plan_skeleton"]
         particles = plan_info["particles"]
         rollout_fn = plan_info["rollout_fn"]
         cost_fn = plan_info["cost_fn"]
-        steps = plan_info.get("steps")
+        steps = plan_info["steps"]
         opt_metrics = {
             "plan_skeleton": [str(op) for op in plan_skeleton],
             "num_particles": self.config.num_particles,
@@ -625,25 +367,12 @@ class ParticleOptimizer:
             for param_name, param_type in zip(param_names, types):
                 param_to_type[param_name] = param_type
 
-        # Re-IK-coupled Adam: build the IK dependency map and drop covered
-        # Confs from the optimizer (they're refreshed by IK every K steps
-        # instead of trained by gradient descent).
-        world = cost_fn.world  # a stepped plan's rollout is a method of the plan (SteppedPlan.rollout), without a world
-        # A stepped plan hands no posture to the re-solve: Adam moves every one (design 4).
-        ik_deps: List[IKDep] = _build_ik_deps(plan_skeleton, world) if steps is None else []
-        dropped_conf_names = {dep.q_name for dep in ik_deps}
-        # Refresh instrumentation + the GN merge-gate tolerances, taken from
-        # the live checker so the gate tracks whatever the run enforces.
-        reik_gate = _ReikDriftGate(
-            pos_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "pos_err"),
-            rot_tol=self.constraint_checker._get_tol(KinematicConstraint.type, "rot_err"),
-        ) if ik_deps else None
-
+        world = cost_fn.world  # the plan's rollout is a method of the plan (SteppedPlan.rollout), without a world
         pairs = []  # (tensor, is a Conf) per optimized param, for _adam_param_groups
         # Initial configurations that we don't optimize
         initial_confs = {"q0", "left_q0", "right_q0"}
         for param, val in particles.items():
-            if steps is not None and param in steps.landing_confs:
+            if param in steps.landing_confs:
                 val.requires_grad = False  # the posture a step lands in is the world model's, written by a refresh
                 continue
             # Skip particles that aren't used in this plan (e.g., right_q0 in a left-arm only plan)
@@ -654,47 +383,19 @@ class ParticleOptimizer:
                 continue
             if param in initial_confs:
                 continue  # we don't optimize the initial configuration(s)
-            if param in dropped_conf_names:
-                # Coupled re-IK: q is determined by IK from current Pose/Grasp,
-                # not by Adam, so nothing reads its gradient; skip computing it.
-                val.requires_grad = False
-                continue
             pairs.append((val, param_type == Conf))
             val.requires_grad = True
-        if steps is not None:
-            for name in steps.command_names.values():  # the commands, in the placements' group (call 15)
-                pairs.append((particles[name], False))
-                particles[name].requires_grad = True
-
-        if not pairs:
-            # A pick-only skeleton can bind every configuration through grasp IK. Its
-            # initialized poses still require the same fresh whole-particle checks.
-            timer.stop("setup_optimizer")
-            with torch.no_grad():
-                rollout = rollout_fn(particles)
-                costs = cost_fn(rollout, particles)
-                passing = self.get_satisfying_mask(costs, verbose=False)
-                n = int(passing.sum())
-                total = self.cost_reducer(costs, consider_types=ADAM_CONSIDER_TYPES)
-                soft = self.cost_reducer.soft_costs(costs)
-                quality = _fixed_row_quality(plan_info, costs, total, soft, self.cost_reducer)
-                selected = _best_fixed_row(quality, passing) if n else None
-                opt_metrics.update(num_steps=0, num_satisfying_final=n)
-                opt_metrics.update({k: float(v[selected]) if n else None for k, v in quality.items()})
-                if n and "max_center_distance_m" not in quality:
-                    opt_metrics["best_cost"] = float(total[passing].min())
-            return n > 0, opt_metrics, False
+        for name in steps.command_names.values():  # the commands, in the placements' group (call 15)
+            pairs.append((particles[name], False))
+            particles[name].requires_grad = True
 
         optimizer = Adam(params=_adam_param_groups(pairs, self.config.conf_lr), lr=self.config.lr)
 
         # Per-conf gradient mask: hard-zero DOFs that should not move during
-        # this operator (e.g., base + inactive arm during arm operations).
+        # this operator (the inactive arm during arm operations).
         # See cutamp/conf_locking.py for the policy.
-        grad_masks = build_grad_masks(
-            plan_skeleton, particles, param_to_type, Conf, world.model, stepped=steps is not None,
-        )
+        grad_masks = build_grad_masks(plan_skeleton, particles, param_to_type, Conf, world.model)
 
-        indices = torch.arange(self.config.num_particles, device="cuda")
         consider_types = ADAM_CONSIDER_TYPES
         found_solution = False
         timer.stop("setup_optimizer")
@@ -710,9 +411,9 @@ class ParticleOptimizer:
         opt_metrics["num_steps"] = num_steps
 
         # Adam: find satisfying particles and descend the soft
-        # costs. Adam runs even when the IK init already satisfies, since the
-        # goal is to actively move the Pose particles for the soft cost; the
-        # init's satisfying particles are step 0's count.
+        # costs. Adam runs even when the starting values already satisfy, since the
+        # goal is to actively move the particles for the soft cost; the
+        # start's satisfying particles are step 0's count.
         with torch.no_grad():
             init_rollout = rollout_fn(particles)
             init_cost_dict = cost_fn(init_rollout, particles)
@@ -720,7 +421,7 @@ class ParticleOptimizer:
             init_num = init_satisfying.sum().item()
         if init_num > 0:
             # First-solution timing semantics: we already have a solution
-            # from IK init, so stamp 0.0 even though Adam is about to run.
+            # from the starting values, so stamp 0.0 even though Adam is about to run.
             opt_metrics["opt_start_to_first_sol"] = 0.0
             found_solution = True
 
@@ -728,38 +429,31 @@ class ParticleOptimizer:
         start_time = time.perf_counter()
         time_exceeded = False
         best_snapshot = _BestSnapshot()
-        archive = None
-        primary, secondary = _quality(init_cost_dict, self.cost_reducer)
-        if primary is not None:
-            mutable = {k: v for k, v in particles.items() if v.requires_grad or k in dropped_conf_names}
-            archive = _FeasibleArchive(mutable, primary, secondary)
-        # A stepped plan's body puts the postures back, runs on the arm's rollout and hands the gradients on.
+        archive = _FeasibleArchive({k: v for k, v in particles.items() if v.requires_grad}, *_quality(init_cost_dict))
+        # The body puts the postures back, runs on the arm's rollout and hands the gradients on.
         body = _StepBody(
-            particles, rollout_fn if steps is None else steps.rollout_fn, cost_fn, self.cost_reducer,
+            particles, steps.rollout_fn, cost_fn, self.cost_reducer,
             self.get_satisfying_mask, consider_types,
             params=[p for g in optimizer.param_groups for p in g["params"]], grad_masks=grad_masks,
             # The no-op Visualizer skips the vis block, and with it the block's syncs.
-            keep_vis=type(visualizer) is not Visualizer, archive=archive,
+            keep_vis=type(visualizer) is not Visualizer, steps=steps, archive=archive,
+            judge=torch.zeros((), dtype=torch.bool, device=world.device),
         )
-        if steps is not None:
-            body.stepped, body.steps = True, steps
-            body.judge = torch.zeros((), dtype=torch.bool, device=world.device)
-        step_graph = refresh_graph = None
+        step_graph = None
         use_graphs = self.config.cuda_graphs
         if use_graphs:
-            opt_metrics.update(capture_s=None, capture_step=None, refresh_capture_s=None, refresh_capture_step=None)
+            opt_metrics.update(capture_s=None, capture_step=None)
         try:
             for step in pbar:
                 if deadline is not None and time.monotonic() >= deadline:
                     time_exceeded = True
                     break
                 timer.start("optimization_step")  # a capture's cost lands in its step
-                # A stepped plan is judged only right after a refresh; the first ran before the loop (call 11).
-                judged = steps is None or step % self.config.reik_interval == 0
-                if steps is not None:
-                    body.judge.fill_(judged)
+                # A plan is judged only right after a refresh; the first ran before the loop (call 11).
+                judged = step % self.config.reik_interval == 0
+                body.judge.fill_(judged)
                 if use_graphs and step_graph is None:
-                    step_graph = self._capture_step(body, world, steps)
+                    step_graph = self._capture_step(body)
                     opt_metrics["capture_s"], opt_metrics["capture_step"] = step_graph.capture_s, step
                 if step_graph is not None:
                     step_graph.replay()  # never zero_grad after the capture: the graph owns .grad
@@ -784,19 +478,16 @@ class ParticleOptimizer:
                 torch.cuda.synchronize()
                 opt_metrics["elapsed"].append(time.perf_counter() - start_time)
 
-                # Best-seen snapshot + early-stop bookkeeping. Measured state is
-                # pre-step, so the clone is consistent with num_satisfying.
+                # Early-stop bookkeeping, on the judged steps only.
                 if judged:
-                    best_snapshot.update(step, num_satisfying, min_cost, particles)
-                if judged and best_snapshot.should_stop(
-                    step, self.config.early_stop_patience, archive, by_rank=steps is not None
-                ):
+                    best_snapshot.update(step, num_satisfying, min_cost)
+                if judged and best_snapshot.should_stop(step, self.config.early_stop_patience, archive):
                     ranked = ""
-                    if steps is not None and best_snapshot._center_step is not None:
-                        ranked = f"; best rank {best_snapshot._best_center:.0f} at step {best_snapshot._center_step}"
+                    if best_snapshot._score_step is not None:
+                        ranked = f"; best score {best_snapshot._best_score:.0f} at step {best_snapshot._score_step}"
                     why = f"no meaningful progress for {self.config.early_stop_patience} steps"
-                    if steps is not None and best_snapshot._best_center == 0:
-                        why = "a valid plan has rank 0, the lowest there is"
+                    if best_snapshot.centred:
+                        why = "the best plan has no unit of side lean or off centre left"
                     _log.info(
                         f"Early stop at step {step}: {why} (best "
                         f"{best_snapshot.best_sat} satisfying at step {best_snapshot.best_step}{ranked})"
@@ -809,27 +500,14 @@ class ParticleOptimizer:
                 # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
                 if vis is not None and (step % vis_every == 0 or step == num_steps - 1):
                     with timer.time("visualize_opt_rollout"):
-                        self._visualize_step(visualizer, step, vis, num_satisfying, loss_val, indices)
+                        self._visualize_step(visualizer, step, vis, num_satisfying, loss_val)
 
                 # The body already ran the backward and the grad masks.
-                if steps is not None:
-                    steps.step(optimizer, body.params, particles)
-                else:
-                    optimizer.step()
+                steps.step(optimizer, body.params, particles)
                 # Counts from 1 so the first refresh lands at step K-1 (after
-                # the first batch of pose updates), not step 0.
-                if steps is not None and (step + 1) % self.config.reik_interval == 0:
+                # the first batch of updates), not step 0.
+                if (step + 1) % self.config.reik_interval == 0:
                     steps.refresh(particles)  # the world model at the current commands (call 7)
-                if ik_deps and (step + 1) % self.config.reik_interval == 0:
-                    if refresh_graph is not None:
-                        refresh_graph(step)
-                    else:
-                        _refresh_balanced(particles, ik_deps, world, reik_gate, step)
-                        # Captured at the first refresh after G_step exists.
-                        if step_graph is not None:
-                            refresh_graph = _StaticRefresh(particles, ik_deps, world, reik_gate)
-                            opt_metrics["refresh_capture_s"] = refresh_graph.graph.capture_s
-                            opt_metrics["refresh_capture_step"] = step
                 timer.stop("optimization_step")
                 pbar.set_description(
                     f"Loss: {loss_val:.3f}, Min: {min_cost:.3f}, "
@@ -840,48 +518,20 @@ class ParticleOptimizer:
             if step_graph is not None:
                 step_graph.release()
                 body.clear_autograd()
-            if refresh_graph is not None:
-                refresh_graph.graph.release()
 
-        # Restore the best-seen state if the loop ended on a dip of the
-        # post-convergence oscillation (final state is otherwise a lottery).
-        if steps is not None:
-            # The current state was last judged on a stand-in, so every archived state goes back (call 11).
-            unjudged = torch.zeros_like(archive.center, dtype=torch.bool)
-            restored = archive.restore(particles, unjudged, archive.center, archive.effort)
-            # The last refresh: the final check below reads the world model's values. No command moves after it, so
-            # it measures no slope: the particles' own rows only, without their nudged copies (2026-11-24).
-            steps.refresh(particles, slopes=False)
-        elif archive is None:
-            restored = best_snapshot.restore_if_better(
-                particles, opt_metrics["num_satisfying"][-1] if opt_metrics["num_satisfying"] else 0
-            )
-        else:
-            with torch.no_grad():
-                final_costs = cost_fn(rollout_fn(particles), particles)
-                restored = archive.restore(
-                    particles, self.get_satisfying_mask(final_costs, verbose=False),
-                    final_costs["soft"]["max_center_distance_m"],
-                    self.cost_reducer.secondary_effort(final_costs),
-                )
+        # The current state was last judged on a stand-in, so every archived state goes back (call 11).
+        unjudged = torch.zeros_like(archive.score, dtype=torch.bool)
+        restored = archive.restore(particles, unjudged, *archive.keys)
+        # The last refresh: the final check below reads the world model's values. No command moves after it, so
+        # it measures no slope: the particles' own rows only, without their nudged copies (2026-11-24).
+        steps.refresh(particles, slopes=False)
         opt_metrics["best_num_satisfying"] = best_snapshot.best_sat
-        # What Adam added over step 0, which measures the untouched IK init (None if no step ran:
-        # best_sat stays -1), and whether the reported particles are a restored snapshot.
+        # What Adam added over step 0, which measures the untouched start (None if no step ran:
+        # best_sat stays -1), and whether the reported particles are a restored record.
         opt_metrics["adam_gain"] = (
             best_snapshot.best_sat - opt_metrics["num_satisfying"][0] if best_snapshot.best_sat >= 0 else None
         )
         opt_metrics["restored"] = restored
-
-        # No re-IK after the loop: the satisfaction check below drops any covered conf that drifted off its
-        # target in the steps since the last refresh (a final GN IK repair here changed no blocks_t1 plan, 2026-11-06).
-        if reik_gate is not None:
-            reik_gate.flush()  # the queued refresh records sit on the device until here
-        if reik_gate is not None and reik_gate.stats:
-            opt_metrics["reik_refresh"] = reik_gate.stats
-            total_s = sum(r["solve_s"] for r in reik_gate.stats)
-            _log.info(
-                f"re-IK refresh: {len(reik_gate.stats)} dep-refreshes, {total_s:.1f}s IK time"
-            )
 
         # Now we've finished the optimization loop. Check the satisfying particles and compute their costs.
         with torch.no_grad():
@@ -894,15 +544,12 @@ class ParticleOptimizer:
         _log.info(f"{num_satisfying}/{self.config.num_particles} satisfying after optimization")
         opt_metrics["num_satisfying_final"] = num_satisfying
 
-        quality = _fixed_row_quality(plan_info, cost_dict, costs, soft_costs, self.cost_reducer)
+        quality = _fixed_row_quality(cost_dict, costs, soft_costs, self.cost_reducer)
         best_idx = _best_fixed_row(quality, satisfying_mask) if num_satisfying else int(costs.argmin())
         opt_metrics.update({k: float(v[best_idx]) if num_satisfying else None for k, v in quality.items()})
         if num_satisfying and "max_center_distance_m" not in quality:
             opt_metrics["best_cost"] = float(costs[satisfying_mask].min())
-        if steps is None:
-            opt_metrics["best_com_margin"] = particle_com_margin(world, {k: v[best_idx] for k, v in particles.items()})
-        else:  # best_com_margin measures against the starting stance
-            opt_metrics["steps"] = steps.stats
+        opt_metrics["steps"] = steps.stats
 
         # Log initial state
         timer.start("visualize_rollout")

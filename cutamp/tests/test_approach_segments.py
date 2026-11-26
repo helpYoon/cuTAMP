@@ -1,6 +1,6 @@
 """Each pick and place as an approach, a straight insert and a leave along the grasp's axis (design 7.8): the pre and
-post hand targets, the FK line check, the active hand's criteria row, the held block's gap to the floor the lift starts
-from, and the retry on a line miss. blocks_t1's segments end to end are test_motion_anchor's plan audit."""
+post hand targets, the FK line check, the active hand's criteria row and the held block's gap to the floor the lift
+starts from. blocks_t1's segments end to end are test_motion_anchor's plan audit."""
 
 import math
 
@@ -141,35 +141,6 @@ def test_line_motion_restores_the_row(planner):
 
 
 @needs_cuda
-def test_retimed_retract_rejects_self_collision_between_clear_endpoints(real_world, planner, monkeypatch):
-    from types import SimpleNamespace
-
-    from curobo.types import JointState
-
-    import cutamp.motion_solver as ms
-    from cutamp.tests.test_t1_real_legs_model import hips_crossed
-    from cutamp.utils.timer import TorchTimer
-
-    home = real_world.q_init.flatten()
-    names = list(planner.kinematics.joint_names)
-    original = JointState.from_position(torch.stack([home, home]), joint_names=names)
-    retimed = JointState.from_position(torch.stack([home, hips_crossed(real_world), home]), joint_names=names)
-    # Supply the two consecutive solver outputs so the final gate must inspect the resampled frame.
-    result = SimpleNamespace(get_interpolated_plan=lambda: original)
-    monkeypatch.setattr(ms, "_plan_arm_to_conf", lambda *a, **kw: result)
-    stats = {"retime": 2.0, "binding": "torque", "com_min_margin": 0.05, "zmp_min_margin": 0.05}
-    monkeypatch.setattr(ms, "_balance_gate", lambda *a: (retimed, stats, original))
-    meta = SimpleNamespace(action_type="retract", arm="left", is_motion=True)
-    op = SimpleNamespace(operator=SimpleNamespace(metadata=meta), name="Retract", values=("q_ret",))
-    from cutamp.config import TAMPConfiguration
-
-    with pytest.raises(RuntimeError, match=r"self.collision.*frame 1") as err:  # a step-route check
-        ms.solve_curobo({"plan_skeleton": [op]}, {"left_q0": home, "q_ret": home}, real_world,
-                        TAMPConfiguration(), TorchTimer(), None, get_planner=lambda: planner, ik_tol=None)
-    assert err.value.check == "self_collision" and err.value.op_idx == 0
-
-
-@needs_cuda
 def test_attached_block_clears_the_floor(real_world, real_plan, planner):
     # blocks_t1 on the floor (h 0.0): with the first pick's block attached at its grasp conf, where the lift starts,
     # the RRT's feasibility check (on the planner's spheres) passes. The same spheres moved just into the floor fail
@@ -201,58 +172,3 @@ def test_attached_block_clears_the_floor(real_world, real_plan, planner):
         assert not bool(feasible(q))
     finally:
         ms._reset_attachment_state(planner, real_world)
-
-
-@needs_cuda
-def test_line_miss_retries_next_particle(real_world, real_plan, planner, monkeypatch):
-    # The first insert's line check misses: solve_curobo's RuntimeError carries the first pick's op_idx, and
-    # _motion_plan_with_retries moves on to the next candidate. The skeleton is cut after the first pick, so the
-    # approach IK has only that pick's confs, which the init's GN accepted. The gate's soles check is off, so the
-    # test's miss is the first error the retry meets whatever the init drew: on the init whose first pick is block2's
-    # (PYTHONHASHSEED 1, 3, 4 and 5) both candidates' approaches leave the stance by 6.5 and 9.3 mm (2026-11-08), which
-    # would fail them first. test_real_legs_motion tests that check. On that init the second candidate's insert
-    # plans (the gate slows it; trajopt dropped it on torque until 2026-11-09) and its lift misses its line by 1.5 mm.
-    import cutamp.algorithm as alg
-    import cutamp.motion_solver as ms
-    from cutamp.config import TAMPConfiguration
-    from cutamp.particle_initialization import IKTol
-    from cutamp.tests.conftest import default_checker
-    from cutamp.tests.test_real_legs_gn import _accepted
-    from cutamp.utils.timer import TorchTimer
-    from cutamp.utils.visualizer import Visualizer
-
-    skeleton, particles = real_plan
-    k = next(i for i, op in enumerate(skeleton) if op.operator.metadata.action_type == "pick")
-    rows = torch.nonzero(_accepted(real_world, real_plan, skeleton[k].values[-1])).flatten()[:2]
-    candidates = [{name: v[r].detach().clone() for name, v in particles.items()} for r in rows.tolist()]
-    assert len(candidates) == 2
-
-    check_line, solve, lines, errors = ms.check_line, alg.solve_curobo, [], []
-
-    def miss_first(palm, start, end):
-        lines.append(len(palm))
-        if len(lines) == 1:
-            raise RuntimeError("palm strays 9.9 mm from its line at frame 0 (the test's miss)")
-        check_line(palm, start, end)
-
-    def solve_spy(plan_info, particle, *args, **kwargs):
-        try:
-            return solve(plan_info, particle, *args, **kwargs)
-        except RuntimeError as e:
-            errors.append(e)
-            raise
-
-    monkeypatch.setattr(ms, "check_line", miss_first)
-    monkeypatch.setattr(ms, "_check_planted", lambda world, q: None)
-    monkeypatch.setattr(alg, "solve_curobo", solve_spy)
-    monkeypatch.setattr(alg, "_PLAN_ATTEMPTS", (20,))  # one pass: the next candidate plans, or the test fails here
-    config = TAMPConfiguration(num_particles=64, curobo_plan=True, enable_visualizer=False)
-    _, _, attempts, _, failures = alg._motion_plan_with_retries(
-        {"plan_skeleton": list(skeleton[: k + 1])}, candidates, real_world, config, TorchTimer(),
-        Visualizer(config, None), get_planner=lambda: planner, ik_tol=IKTol.from_checker(default_checker()))
-    assert errors and errors[0].op_idx == k and "the test's miss" in str(errors[0]), errors
-    assert "insert" in str(errors[0]) and failures[0] == str(errors[0])
-    assert not hasattr(errors[0], "out_of_attempts")  # a line miss: the retry's second pass skips it
-    # The next candidate planned its own insert: its line check ran, or its insert failed on its own (a failed trajopt
-    # ends "for <op> insert", a gate rejection reads "<op> insert: ...").
-    assert attempts == 2 and (len(lines) >= 2 or f"{skeleton[k]} insert" in str(errors[1])), errors

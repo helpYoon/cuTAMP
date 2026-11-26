@@ -1,8 +1,10 @@
 """Shared pytest fixtures for cuTAMP tests (cuRobo single-MotionPlanner)."""
 
 import dataclasses
+import functools
 import gc
 import importlib.util
+import math
 import os
 import struct
 import sys
@@ -58,7 +60,7 @@ def skeleton_through(initial, goal, *actions):
     """The T1 task plan from ``initial`` to ``goal`` whose picks and places are ``actions`` in order, each an
     ``(operator name, object)`` pair, with the motions ``ManipulationPrefix`` grounds before, between and after them."""
     from cutamp.t1_domain import all_t1_operators
-    from cutamp.task_planning.search import ManipulationPrefix
+    from cutamp.task_planning.plan_search import ManipulationPrefix
 
     prefix = ManipulationPrefix(initial, goal, all_t1_operators)
     for name, obj in actions:
@@ -125,27 +127,61 @@ def real_world(_real_world_slot):
     return _real_world_slot[0]
 
 
+@functools.cache
+def landing_predictor():
+    """The trained landing predictor the planner loads (``LANDING_BUNDLE``), loaded once per process."""
+    from cutamp.landing_accuracy import LANDING_BUNDLE
+    from cutamp.landing_predictor import LandingPredictor
+    return LandingPredictor(LANDING_BUNDLE)
+
+
+def zero_step_plan(world, num_particles: int = 64, actions=BLOCKS_T1_ACTIONS, seed: int = 0, **config):
+    """The planner's plan without steps on ``world``, as ``refine_stepped_plan`` builds it: a ``SteppedPlan`` on the
+    task plan through ``actions`` (:func:`skeleton_through`), standing where the robot stands, its starting particles
+    drawn after ``torch.manual_seed(seed)``, on a ``TAMPConfiguration`` of ``num_particles`` and ``config``."""
+    from cutamp.cost_reduction import CostReducer
+    from cutamp.particle_initialization import _pick_pools
+    from cutamp.scripts.utils import default_constraint_to_mult
+    from cutamp.step_loop import SteppedPlan
+    from cutamp.step_planner import StepInputs
+    from cutamp.task_planning.insert_steps import with_steps
+    from cutamp.task_planning.landing_options import ChosenLandings
+    from cutamp.task_planning.plan_search import RankedPlan
+
+    initial, goal = world.initial_state, world.goal_state
+    skeleton = with_steps(skeleton_through(initial, goal, *actions), {}, initial, goal)
+    proposal = RankedPlan(skeleton, ("none",) * len(actions), ChosenLandings((), (0, 0)), 0.0)
+    cfg = TAMPConfiguration(num_particles=num_particles, **config)
+    torch.manual_seed(seed)
+    return SteppedPlan(proposal, world, cfg, landing_predictor(), StepInputs(), _pick_pools(world, skeleton),
+                       default_checker(), reducer=CostReducer(default_constraint_to_mult.copy()))
+
+
+def plan_info(plan) -> dict:
+    """The ``plan_info`` ``ParticleOptimizer.__call__`` reads for ``plan`` (a ``SteppedPlan``), as
+    ``refine_stepped_plan`` hands it over."""
+    return {"plan_skeleton": plan.arm_skeleton, "particles": plan.particles, "rollout_fn": plan.rollout,
+            "cost_fn": plan, "steps": plan}
+
+
 @pytest.fixture(scope="module")
 def real_plan(real_world):
-    """``[skeleton, particles]``: blocks_t1's task plan (``BLOCKS_T1_ACTIONS``) and its seeded 64-particle
-    init on ``real_world``. Read-only: tests run on ``clone_particles(particles)``. A list, so teardown can free the
-    particles while pytest still holds the yielded object; ``real_world``'s slot then empties the cache."""
-    from cutamp.particle_initialization import ParticleInitializer
-
-    skeleton = skeleton_through(real_world.initial_state, real_world.goal_state, *BLOCKS_T1_ACTIONS)
-    torch.manual_seed(0)
-    particles = ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())(skeleton)
-    plan = [skeleton, particles]
-    del skeleton, particles  # the list holds the only references
-    yield plan
-    plan.clear()
+    """``[skeleton, particles]``: blocks_t1's task plan (``BLOCKS_T1_ACTIONS``) without steps and the starting
+    particles of its 64-particle plan on ``real_world`` (:func:`zero_step_plan`), without the grasp indices. Read-only:
+    tests run on ``clone_particles(particles)``. A list, so teardown can free the particles while pytest still holds
+    the yielded object; ``real_world``'s slot then empties the cache."""
+    plan = zero_step_plan(real_world)
+    held = [plan.arm_skeleton, {k: v for k, v in plan.particles.items() if not k.endswith("_idx")}]
+    del plan  # the list holds the only references
+    yield held
+    held.clear()
 
 
 def only_schedule(monkeypatch, orders, arm):
-    """Pass on only the joint A*'s skeletons whose picks and places all use ``arm`` with these foot ``orders``."""
-    from cutamp.task_planning import search
+    """Pass on only the plan search's plans whose picks and places all use ``arm`` with these foot ``orders``."""
+    from cutamp.task_planning import plan_search as search_module
 
-    skeletons = search.arm_step_skeletons
+    skeletons = search_module.plan_search
 
     def matching(*args, **kwargs):
         for proposal in skeletons(*args, **kwargs):
@@ -153,34 +189,34 @@ def only_schedule(monkeypatch, orders, arm):
             if proposal.orders == tuple(orders) and arms == {arm}:
                 yield proposal
 
-    monkeypatch.setattr(search, "arm_step_skeletons", matching)
+    monkeypatch.setattr(search_module, "plan_search", matching)
 
 
 def standing_skeleton(monkeypatch, *actions):
-    """In place of the joint A*'s proposals, propose one plan that takes no step: the world's task plan whose picks and
-    places are ``actions`` (:func:`skeleton_through`), with an empty footstep schedule. Filtering the A* for such a plan
-    walks every stepped schedule its reach evidence ranks ahead first: on blocks_t1's floor it was still in
-    ``StepSearch.edges`` after 11 minutes (2026-11-21)."""
-    from cutamp.step_search import Schedule
-    from cutamp.task_planning import search
+    """In place of the plan search's plans, propose one plan that takes no step: the world's task plan whose picks and
+    places are ``actions`` (:func:`skeleton_through`), with no chosen landings. Filtering the plan search for such a
+    plan walks every stepped schedule its reach evidence ranks ahead first: on blocks_t1's floor it was still in
+    ``LandingOptions.edges`` after 11 minutes (2026-11-21)."""
+    from cutamp.task_planning.landing_options import ChosenLandings
+    from cutamp.task_planning import plan_search as search_module
     from cutamp.task_planning.insert_steps import with_steps
 
-    def propose(step_search, world, operators, incoming, **kwargs):
+    def propose(options, world, operators, incoming, **kwargs):
         initial, goal = world.initial_state, world.goal_state
         skeleton = with_steps(skeleton_through(initial, goal, *actions), {}, initial, goal)
-        yield search.RankedStepSkeleton(skeleton, ("none",) * len(actions), Schedule((), (0, 0)), 0.0)
+        yield search_module.RankedPlan(skeleton, ("none",) * len(actions), ChosenLandings((), (0, 0)), 0.0)
 
-    monkeypatch.setattr(search, "arm_step_skeletons", propose)
+    monkeypatch.setattr(search_module, "plan_search", propose)
 
 
 def first_schedules(monkeypatch, count):
-    """Pass on only the first ``count`` skeletons of the joint A* (after any earlier :func:`only_schedule`)."""
+    """Pass on only the first ``count`` plans of the plan search (after any earlier :func:`only_schedule`)."""
     from itertools import islice
 
-    from cutamp.task_planning import search
+    from cutamp.task_planning import plan_search as search_module
 
-    skeletons = search.arm_step_skeletons
-    monkeypatch.setattr(search, "arm_step_skeletons", lambda *a, **kw: islice(skeletons(*a, **kw), count))
+    skeletons = search_module.plan_search
+    monkeypatch.setattr(search_module, "plan_search", lambda *a, **kw: islice(skeletons(*a, **kw), count))
 
 
 def clone_particles(particles: dict) -> dict:
@@ -188,17 +224,39 @@ def clone_particles(particles: dict) -> dict:
     return {k: v.detach().clone().requires_grad_(v.requires_grad) for k, v in particles.items()}
 
 
-def make_plan_info(world, skeleton, particles: dict, config) -> dict:
-    """The four ``plan_info`` keys ``ParticleOptimizer.__call__`` reads, with a
-    fresh rollout and cost function."""
-    from cutamp.cost_function import CostFunction
-    from cutamp.rollout import RolloutFunction
-    return {
-        "plan_skeleton": skeleton,
-        "particles": particles,
-        "rollout_fn": RolloutFunction(skeleton, world),
-        "cost_fn": CostFunction(skeleton, world, config),
-    }
+def ik_check(world, q, world_from_ee, arms, movables, tol):
+    """``(ok, safe, hand_err)``, each ``[N]``, from one FK of ``q`` ``[N, dof]``, with rows in ``arms``' dep-major
+    blocks (``gn_project_balanced``'s layout). ``safe``: the conf stands balanced (the CoM inside the support
+    rectangle, both soles on the stance within ``tol``), clear of the scene, of ``movables`` ``[N, M, 4]`` and of
+    itself. ``ok``: safe, with the hand on ``world_from_ee`` within ``tol``. The GN tests' IK oracle."""
+    from curobo.types import Pose
+
+    from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
+    from cutamp.costs import curobo_pose_error
+    from cutamp.gn_refresh import _row_layout, _row_tool_pose, collision_penetration, soles_on_stance
+
+    arms = (arms,) if isinstance(arms, str) else tuple(arms)
+    _, is_left = _row_layout(world.model, arms, q.shape[0], q.shape[1], q.device, q.dtype)
+    state = _fk_state(world, q)
+    pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
+    pos_err, rot_err = curobo_pose_error(
+        Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix(), world_from_ee,
+    )
+    safe = (com_polygon_mask_from_state(state, world.model.support)
+            & soles_on_stance(world, state, tol.sole_pos, tol.sole_rot)
+            & (collision_penetration(world, state.robot_spheres, movables) <= 0))
+    return safe & (pos_err <= tol.pos) & (rot_err <= tol.rot), safe, pos_err + rot_err
+
+
+def fixed_stances(world, particles: dict) -> dict:
+    """``CostFunction``'s ``achieved_stances`` for feet that never move: the world's stance, both soles' (x, y, yaw)
+    ``[N, 2, 3]``, under every key of ``particles``."""
+    import torch
+
+    soles = world.stance_soles
+    yaw = torch.atan2(soles[..., 1, 0], soles[..., 0, 0])
+    xyyaw = torch.cat((soles[..., :2, 3], yaw.unsqueeze(-1)), -1).reshape(2, 3)
+    return {k: xyyaw.expand(v.shape[0], 2, 3) for k, v in particles.items()}
 
 
 def default_checker():
@@ -283,14 +341,24 @@ _INT_VIEW = {torch.float32: torch.int32, torch.float64: torch.int64, torch.float
              torch.bfloat16: torch.int16, torch.bool: torch.uint8}
 
 
-def bitwise_diffs(a, b, raw: bool = True, path: str = "") -> list:
+#: torch.testing.assert_close's float32 tolerances: what ``close`` comparisons allow. The plan's Adam step is not bit
+#: for bit repeatable even eagerly: cuRobo's kinematics backward sums with shared-memory atomicAdd
+#: (kinematics_backward_kernel.cuh:180-215), one posture gradient element off by 7.5e-9 on 2026-11-25. The graph and
+#: lockstep tests compare at these (the user's ruling, 2026-11-25).
+F32_RTOL, F32_ATOL = 1.3e-6, 1e-5
+
+
+def bitwise_diffs(a, b, raw: bool = True, path: str = "", close: bool = False) -> list:
     """Every difference between ``a`` and ``b`` through dicts, lists and tuples, as ``(path, detail)`` pairs.
-    ``raw`` compares tensor bits and float bytes (NaN equals the same NaN, -0.0 differs); else ``torch.equal``."""
+    ``raw`` compares tensor bits and float bytes (NaN equals the same NaN, -0.0 differs); else ``torch.equal``.
+    ``close`` compares floating values at ``F32_RTOL`` and ``F32_ATOL`` instead (NaN equals NaN); the rest stay exact."""
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         # First: != promotes dtypes and broadcasts shapes, so f32 could pass against f64 and [1] against [N].
         if (a.dtype, a.shape, a.device) != (b.dtype, b.shape, b.device):
             return [(path, f"{a.dtype} {tuple(a.shape)} {a.device} vs {b.dtype} {tuple(b.shape)} {b.device}")]
-        if raw:
+        if close and a.is_floating_point():
+            ne = ~torch.isclose(a.detach(), b.detach(), rtol=F32_RTOL, atol=F32_ATOL, equal_nan=True)
+        elif raw:
             dt = _INT_VIEW.get(a.dtype, a.dtype)
             ne = a.detach().contiguous().view(dt) != b.detach().contiguous().view(dt)
         else:
@@ -302,9 +370,12 @@ def bitwise_diffs(a, b, raw: bool = True, path: str = "") -> list:
     if isinstance(a, dict) and isinstance(b, dict):
         if list(a) != list(b):
             return [(path, f"keys {list(a)} vs {list(b)}")]
-        return [d for k in a for d in bitwise_diffs(a[k], b[k], raw, f"{path}[{k!r}]")]
+        return [d for k in a for d in bitwise_diffs(a[k], b[k], raw, f"{path}[{k!r}]", close)]
     if isinstance(a, (list, tuple)) and type(a) is type(b) and len(a) == len(b):
-        return [d for i, (x, y) in enumerate(zip(a, b)) for d in bitwise_diffs(x, y, raw, f"{path}[{i}]")]
+        return [d for i, (x, y) in enumerate(zip(a, b)) for d in bitwise_diffs(x, y, raw, f"{path}[{i}]", close)]
+    if close and isinstance(a, float) and isinstance(b, float):
+        same = math.isclose(a, b, rel_tol=F32_RTOL, abs_tol=F32_ATOL) or (math.isnan(a) and math.isnan(b))
+        return [] if same else [(path, f"{a!r} vs {b!r}")]
     if raw and isinstance(a, float) and isinstance(b, float):
         return [] if struct.pack("<d", a) == struct.pack("<d", b) else [(path, f"{a!r} vs {b!r}")]
     nodes = (torch.Tensor, dict, list, tuple)
@@ -313,9 +384,9 @@ def bitwise_diffs(a, b, raw: bool = True, path: str = "") -> list:
     return [(path, f"{a!r:.80} vs {b!r:.80}")]
 
 
-def assert_bitwise(got, want, where: str, raw: bool = False) -> None:
+def assert_bitwise(got, want, where: str, raw: bool = False, close: bool = False) -> None:
     """``got`` has no :func:`bitwise_diffs` from ``want``; the message names ``where`` and the first differences."""
-    diffs = bitwise_diffs(got, want, raw)
+    diffs = bitwise_diffs(got, want, raw, close=close)
     assert not diffs, f"{where}: {len(diffs)} differences, the first {diffs[:5]}"
 
 
@@ -330,7 +401,7 @@ def sync_debug_error():
 
 
 def install_step_replay_spy(monkeypatch) -> list:
-    """Check every G_step replay bitwise against its eager twin (:func:`twin_body`), run first. Returns one
+    """Check every G_step replay against its eager twin, at float32 tolerance (``F32_RTOL``, ``F32_ATOL``) (:func:`twin_body`), run first. Returns one
     list of compared replay indices per G_step graph, in capture order. Holds graphs weakly, so a release
     still frees them."""
     from cutamp.cuda_graphs import CapturedGraph
@@ -349,36 +420,11 @@ def install_step_replay_spy(monkeypatch) -> list:
         twin = twin_body(self.body)
         want = step_outputs(*_StepBody.__call__(twin), twin.params)
         orig(self)
-        assert_bitwise(step_outputs(*self.outputs, self.body.params), want, f"G_step replay {k}")
+        assert_bitwise(step_outputs(*self.outputs, self.body.params), want, f"G_step replay {k}", close=True)
         mine.append(k)
 
     monkeypatch.setattr(CapturedGraph, "replay", spy)
     return replays
-
-
-def install_refresh_spy(monkeypatch) -> list:
-    """Check every G_refresh replay bitwise against an eager ``_refresh_balanced`` on clones, run first (it
-    shares the gate site and ``kinematics_jac``): covered confs and slot, and every other particle
-    unchanged. Returns the replays' steps."""
-    from cutamp.optimize_plan import _ReikDriftGate, _refresh_balanced, _StaticRefresh
-
-    orig, eager = _StaticRefresh.__call__, []
-
-    def spy(self, step):
-        clones, before = clone_particles(self.particles), clone_particles(self.particles)
-        g2 = _ReikDriftGate(self.gate.pos_tol, self.gate.rot_tol)
-        _refresh_balanced(clones, self.ik_deps, self.world, g2, step)
-        orig(self, step)
-        where = f"G_refresh replay at step {step}"
-        assert_bitwise({"q": {n: self.particles[n] for n in self.q_names}, "slot": self.slot},
-                       {"q": {n: clones[n] for n in self.q_names}, "slot": g2._queued[-1].packed}, where)
-        others = [n for n in self.particles if n not in self.q_names]
-        assert_bitwise({n: self.particles[n] for n in others}, {n: before[n] for n in others},
-                       f"{where}: a particle outside the covered confs")
-        eager.append(step)
-
-    monkeypatch.setattr(_StaticRefresh, "__call__", spy)
-    return eager
 
 
 def cupti_sync_events() -> dict:

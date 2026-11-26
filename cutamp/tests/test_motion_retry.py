@@ -1,13 +1,10 @@
-"""Tests for the next-best-particle motion-plan retry
-(algorithm._motion_plan_with_retries, motion_solver._reset_attachment_state)."""
-import math
+"""Tests for the motion stage's playback, demo report and retry reset (motion_solver._reset_attachment_state)."""
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import cutamp.algorithm as alg
-import cutamp.com_polygon_cost as cpc
 import cutamp.motion_solver as ms
 from cutamp.config import TAMPConfiguration
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
@@ -39,46 +36,6 @@ def test_demo_names_successful_rerun_recording_and_playback_timeline(caplog, mon
                     experiment_id="floor-transfer")
     assert "12 segments" in caplog.text and "two_steps_floor_transfer" in caplog.text
     assert "floor-transfer" in caplog.text and "curobo" in caplog.text
-
-
-@pytest.mark.parametrize("centering_weight", [0.0, 1.0])
-def test_retry_skips_candidates_that_repeat_a_failed_plan(monkeypatch, centering_weight):
-    # Ops read: 0 -> left_q0, left_q1; 1 -> grasp1, left_q1; 2 -> pose1, left_q3.
-    skeleton = [SimpleNamespace(values=v) for v in (
-        ("left_q0", "traj1", "left_q1"),
-        ("block3", "grasp1", "left_q1"),
-        ("block3", "grasp1", "pose1", "goal", "left_q3"),
-    )]
-
-    def cand(q1, q3):
-        return {"left_q0": torch.zeros(2), "grasp1": torch.zeros(7), "pose1": torch.zeros(4),
-                "left_q1": torch.tensor([q1, 0.0]), "left_q3": torch.tensor([q3, 0.0])}
-
-    planned, tol = [], object()  # tol: the run's IK tolerances, which the retry passes through
-
-    def fake_solve_curobo(plan_info, particle, *a, ik_tol, **k):
-        assert ik_tol is tol
-        q1, q3 = float(particle["left_q1"][0]), float(particle["left_q3"][0])
-        planned.append((q1, q3))
-        if q1 == 0 or q3 == 0:  # pick fails on q1 == 0, else place fails on q3 == 0
-            e = RuntimeError("pick failed" if q1 == 0 else "place failed")
-            e.op_idx = 1 if q1 == 0 else 2
-            raise e
-        return "PLAN", {}
-
-    monkeypatch.setattr(alg, "solve_curobo", fake_solve_curobo)
-    candidates = [cand(0, 0), cand(0, 1), cand(1, 0), cand(1, 0), cand(1, 1)]
-    plan, _, attempts, rank, failures = alg._motion_plan_with_retries(
-        {"plan_skeleton": skeleton}, candidates, None, TAMPConfiguration(com_center_weight=centering_weight),
-        None, None, ik_tol=tol,
-    )
-    # (0, 1) repeats (0, 0) through the failing pick; the second (1, 0) repeats
-    # the first through the failing place; (1, 1) differs at the place, so it runs.
-    assert planned == [(0, 0), (1, 0), (1, 1)]
-    # rank names the planned particle, which attempts can't once candidates are skipped (known-bugs N3)
-    assert (plan, attempts, rank) == ("PLAN", 3, 4)
-    # Each planned candidate that failed keeps its message, so a report can count what each was lost to.
-    assert failures == ["pick failed", "place failed"]
 
 
 def test_motion_playback_starts_at_original_scene_and_replays_held_object():
@@ -136,87 +93,6 @@ def test_rerun_segment_returns_native_end_for_the_next_segment(monkeypatch):
         [1_375_000_000],
     ]
     assert start == 1.375
-
-
-def test_retry_gives_cuRobos_full_budget_only_to_candidates_that_ran_out_of_attempts(monkeypatch):
-    # The balance gate rejects candidate 0's plan, which no budget changes; candidate 1's pick needs more than 2
-    # plan_cspace attempts (out_of_attempts, as _plan_arm_to_conf sets it). The cheap pass fails both; the full pass
-    # skips 0 and plans 1.
-    skeleton = [SimpleNamespace(values=("left_q0", "traj1", "left_q1"))]
-    calls = []
-
-    def fake_solve_curobo(plan_info, particle, *a, max_attempts, **k):
-        q1 = float(particle["left_q1"][0])
-        calls.append((q1, max_attempts))
-        if q1 == 0 or max_attempts < 20:
-            e = RuntimeError("trajectory ZMP leaves the support region" if q1 == 0 else "pick failed")
-            e.op_idx = 0
-            if q1 == 0:
-                e.check = "zmp"
-            else:
-                e.out_of_attempts = True
-            raise e
-        return "PLAN", {}
-
-    monkeypatch.setattr(alg, "solve_curobo", fake_solve_curobo)
-    candidates = [{"left_q0": torch.zeros(2), "left_q1": torch.tensor([q1, 0.0])} for q1 in (0.0, 1.0)]
-    plan, _, attempts, rank, failures = alg._motion_plan_with_retries(
-        {"plan_skeleton": skeleton}, candidates, None, None, None, None, ik_tol=None,
-    )
-    assert calls == [(0.0, 2), (1.0, 2), (1.0, 20)]
-    assert (plan, attempts, rank) == ("PLAN", 3, 1)
-    assert failures == ["trajectory ZMP leaves the support region", "pick failed"]
-
-
-@pytest.mark.parametrize("weight, expected_calls, winner", [
-    (1.0, [(0, 2), (0, 20)], 0),
-    (0.0, [(0, 2), (1, 2)], 1),
-])
-def test_centered_candidate_gets_full_budget_before_trying_a_worse_posture(monkeypatch, weight, expected_calls, winner):
-    skeleton = [SimpleNamespace(values=("left_q0", "left_q1"))]
-    candidates = [{"left_q0": torch.zeros(1), "left_q1": torch.tensor([i])} for i in (0, 1)]
-    calls = []
-
-    def solve(info, particle, *args, max_attempts, **kwargs):
-        index = particle["left_q1"].item()
-        calls.append((index, max_attempts))
-        if index == 0 and max_attempts == 2:
-            err = RuntimeError("pick approach needs more attempts")
-            err.out_of_attempts = True
-            raise err
-        return ["motion"], {}
-
-    monkeypatch.setattr(alg, "solve_curobo", solve)
-    _, _, _, rank, _ = alg._motion_plan_with_retries(
-        {"plan_skeleton": skeleton}, candidates, None, TAMPConfiguration(com_center_weight=weight),
-        None, None, ik_tol=None,
-    )
-    assert calls == expected_calls and rank == winner
-
-
-def test_com_margin_is_the_min_over_the_particles_confs(monkeypatch):
-    # planned_com_margin: the planned particle's margin, computed as optimize_plan computes best_com_margin for the
-    # lowest-soft-cost satisfying particle, which need not be the planned one (known-bugs N3). Grasps and placements
-    # aren't confs.
-    monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 0])
-    particle = {"left_q0": torch.tensor([0.3, 0.0]), "left_q1": torch.tensor([0.1, 0.0]),
-                "right_q3": torch.tensor([0.2, 0.0]), "grasp1": torch.tensor([-1.0, 0.0, 0.0, 0.0])}
-    assert cpc.particle_com_margin(None, particle) == pytest.approx(0.1)
-
-
-def test_planned_metrics_describe_the_planned_particle(monkeypatch):
-    # After a retry the plan comes from candidates[rank], not rank 0 (known-bugs N3). Tilt and travel are the worst
-    # over its pick and place confs, without the retract; planned_com_margin stays the min over all its confs.
-    from cutamp.tests.test_grasp_choice import _fake_world, _op
-    monkeypatch.setattr(cpc, "compute_com_margin", lambda world, q: q[:, 5])
-    skeleton = [_op("pick", "block", "grasp1", "left_q1"), _op("place", "block", "grasp1", "pose1", "table", "left_q2"),
-                _op("retract", "block", "grasp1", "left_q2", "traj", "left_q3")]
-    conf = lambda z, pitch, margin: torch.tensor([0.0, 0.0, z, pitch, 0.0, margin])
-    candidates = [{name: conf(0.7, 0.0, 0.3) for name in ("left_q1", "left_q2", "left_q3")},
-                  {"left_q1": conf(0.5, 0.2, 0.1), "left_q2": conf(0.6, 0.1, 0.2), "left_q3": conf(0.0, 1.0, 0.4)}]
-    assert alg._planned_metrics(_fake_world(), skeleton, candidates, 1) == {
-        "motion_plan_rank": 1, "planned_com_margin": pytest.approx(0.1),
-        "planned_trunk_tilt_deg": pytest.approx(math.degrees(0.2)), "planned_trunk_travel": pytest.approx(0.2)}
 
 
 @needs_cuda

@@ -22,14 +22,10 @@ per-parameter normalization, a zero gradient produces a zero step.
 Per-operator locking policy for T1, on the planning model's slices
 (``world.model``), set by the first operator that names the conf:
 
-* Arm action / arm motion (Pick, Place, MoveFree, MoveHolding): lock the
+* Every arm operator (Pick, Place, Retract, MoveFree, MoveHolding): lock the
   inactive arm (the 7 DOFs of the non-active arm). Active arm, base and
-  legs/Waist remain free.
-* Retract (RetractHolding, RetractFree): a retract conf stands where its reach
-  stood (design 7.3), so its base and body are locked too, at home, where
-  particle init puts them, beside the inactive arm. Only its active arm moves.
-  In a plan with steps (``stepped=True``) a retract stands on the landed stance, so only its inactive arm is
-  locked and the feet cost holds the rest (design 2026-11-22-adam-alone-steps, call 14).
+  legs/Waist remain free; a retract stands on the stance its gap ends on, held there by the put-back and the feet
+  rows (design 2026-11-22-adam-alone-steps, call 14).
 """
 
 from __future__ import annotations
@@ -48,29 +44,20 @@ def _indices(s: slice) -> List[int]:
     return list(range(s.start, s.stop))
 
 
-def get_conf_locked_dofs(
-    plan_skeleton: PlanSkeleton, conf_name: str, model: "T1Model", *, stepped: bool = False
-) -> List[int]:
-    """Return the DOF indices that should be gradient-locked for ``conf_name``.
+def get_conf_locked_dofs(plan_skeleton: PlanSkeleton, conf_name: str, model: "T1Model") -> List[int]:
+    """Return the DOF indices that should be gradient-locked for ``conf_name``: its operator's idle arm.
 
     Locking is determined by the metadata of the first operator in the plan
     skeleton that references the conf as one of its parameters. Indices are
-    into ``model``'s cspace. ``stepped``: the plan has steps, and a retract
-    locks its idle arm only.
+    into ``model``'s cspace.
     """
-    left_arm = _indices(model.left_arm)
-    right_arm = _indices(model.right_arm)
-
     for ground_op in plan_skeleton:
         if conf_name not in ground_op.values:
             continue
         meta = ground_op.operator.metadata
         if meta.arm not in ("left", "right"):
             return []
-        idle_arm = right_arm if meta.arm == "left" else left_arm
-        if meta.action_type == "retract" and not stepped:
-            return _indices(model.base) + _indices(model.body) + idle_arm
-        return idle_arm
+        return _indices(model.right_arm if meta.arm == "left" else model.left_arm)
     return []
 
 
@@ -80,20 +67,18 @@ def build_grad_masks(
     param_to_type: Dict[str, str],
     conf_type: str,
     model: "T1Model",
-    *,
-    stepped: bool = False,
 ) -> Dict[int, torch.Tensor]:
     """Build a tensor mask per Conf parameter; index = ``id(tensor)``.
 
     The mask has the same shape as the parameter and contains 1.0 at free
     DOFs and 0.0 at locked DOFs. Apply by ``param.grad.mul_(mask)`` after
-    ``loss.backward()``. ``stepped`` as in :func:`get_conf_locked_dofs`.
+    ``loss.backward()``.
     """
     masks: Dict[int, torch.Tensor] = {}
     for param_name, tensor in particles.items():
         if param_to_type.get(param_name) != conf_type:
             continue
-        locked = get_conf_locked_dofs(plan_skeleton, param_name, model, stepped=stepped)
+        locked = get_conf_locked_dofs(plan_skeleton, param_name, model)
         if not locked:
             continue
         dof = tensor.shape[-1]

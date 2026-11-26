@@ -1,5 +1,5 @@
-"""``--cuda_graphs``: the Adam step and the balance-first re-IK refresh, captured
-as G_step and G_refresh and replayed, each replay against its eager counterpart bitwise."""
+"""``--cuda_graphs``: the Adam step, captured as G_step and replayed, each replay against its eager counterpart
+bitwise, on a plan without steps (:func:`~cutamp.tests.conftest.zero_step_plan`)."""
 
 import gc
 import subprocess
@@ -12,10 +12,9 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from cutamp.config import SUPPORTED_SOFT_COSTS, TAMPConfiguration
 from cutamp.tests.conftest import (
-    SpyVis, clone_particles, cupti_sync_events, install_refresh_spy, install_step_replay_spy, make_optimizer,
-    make_plan_info, needs_cuda, run_optimizer,
+    SpyVis, cupti_sync_events, install_step_replay_spy, make_optimizer, needs_cuda, plan_info, run_optimizer,
+    zero_step_plan,
 )
 from cutamp.tests.test_step_lockstep import _site_ptrs
 from cutamp.utils.timer import TorchTimer
@@ -33,18 +32,16 @@ def test_cli_defaults_on(monkeypatch):
 
 
 def test_cli_reaches_cutamp_demo(monkeypatch):
-    # The flags a motion-planning run passes: n, the motion plan, no visualizer, a soft cost, an experiment id and an
-    # automatically named saved plan all reach cutamp_demo.
+    # The flags a motion-planning run passes: n, the motion plan, no visualizer, an experiment id and an automatically
+    # named saved plan all reach cutamp_demo.
     import cutamp.scripts.run_cutamp as rc
     seen = []
     monkeypatch.setattr(rc, "cutamp_demo", lambda env, config, **kw: seen.append((config, kw)))
     monkeypatch.setattr(sys, "argv", ["run_cutamp", "-n", "64", "--disable_visualizer", "--motion_plan",
-                                      "--save_plan", "auto", "--soft_cost", "joint_limit_margin",
-                                      "--experiment_id", "cli_run"])
+                                      "--save_plan", "auto", "--experiment_id", "cli_run"])
     rc.entrypoint()
     config, kw = seen[-1]
     assert (config.num_particles, config.curobo_plan, config.enable_visualizer) == (64, True, False)
-    assert config.soft_cost == ["joint_limit_margin"]
     assert kw == {"experiment_id": "cli_run", "save_plan": "auto"}
 
 
@@ -100,53 +97,32 @@ def test_guard_trips_on_resize():
         g.release()
 
 
-def _graph_config(**kw):
-    return TAMPConfiguration(**{**dict(num_particles=64, early_stop_patience=0, cuda_graphs=True,
-                                       enable_visualizer=False), **kw})
+def _graph_plan(world, **kw):
+    """blocks_t1's plan without steps on ``world``, at 64 particles, recorded, with no early stop."""
+    return zero_step_plan(world, **{**dict(early_stop_patience=0, cuda_graphs=True, enable_visualizer=False), **kw})
 
 
 @needs_cuda
-@pytest.mark.parametrize("sc", [pytest.param(None, id="no_soft_cost"), *SUPPORTED_SOFT_COSTS])
-def test_step_graph_captures_for_soft_cost(real_world, real_plan, monkeypatch, sc):
-    world, (skeleton, base) = real_world, real_plan
-    config = _graph_config(num_opt_steps=2, soft_cost=[] if sc is None else [sc])
-    replays = install_step_replay_spy(monkeypatch)
-    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config,
-                         visualizer=SpyVis(config))
-    assert m["capture_step"] == 0 and replays == [[0, 1]]  # replay 1 runs on inputs Adam has moved
-
-
-@needs_cuda
-def test_step_graph_lockstep(real_world, real_plan, monkeypatch):
-    world, (skeleton, base) = real_world, real_plan
-    config = _graph_config(num_opt_steps=25)
+def test_step_graph_lockstep(real_world, monkeypatch):
+    plan = _graph_plan(real_world, num_opt_steps=25)
+    config = plan.config
     replays, vis = install_step_replay_spy(monkeypatch), SpyVis(config)
-    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, visualizer=vis)
+    m, _ = run_optimizer(plan_info(plan), config, visualizer=vis)
     assert m["capture_step"] == 0 and m["capture_s"] > 0
     assert replays == [list(range(25))]             # one graph; step 0 too: the capture itself runs nothing
     assert vis.opt_steps == [0, 10, 20, 24]
     assert vis.losses == [m["loss"][s] for s in vis.opt_steps]
 
 
-@needs_cuda
-def test_refresh_graph_lockstep(real_world, real_plan, monkeypatch):
-    world, (skeleton, base) = real_world, real_plan
-    config = _graph_config(num_opt_steps=12, reik_interval=1)
-    eager = install_refresh_spy(monkeypatch)
-    m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config)
-    assert m["refresh_capture_step"] == 0 and m["refresh_capture_s"] > 0
-    assert eager == list(range(1, 12))
-
-
 # The leak check is the bytes the tensors request, which is exact. memory_allocated is not compared: the caching
 # allocator counts each request at the size of the block it lands in, so memory_allocated can move between calls with
 # nothing new held. (test_cuda_graphs_whole_call compares the calls' results bitwise, not their memory.)
 @needs_cuda
-def test_second_optimize_call_recaptures(real_world, real_plan, monkeypatch):
+def test_second_optimize_call_recaptures(real_world, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
-    world, (skeleton, base) = real_world, real_plan
-    config = _graph_config(num_opt_steps=10)
-    plan_info, mem, sites, released = make_plan_info(world, skeleton, clone_particles(base), config), [], [], []
+    world = real_world
+    plan = _graph_plan(world, num_opt_steps=10)
+    config, info, mem, sites, released = plan.config, plan_info(plan), [], [], []
     orig, req = CapturedGraph.release, []            # req: the bytes the tensors request, after each call
 
     def release(self):                               # what each release must free; no strong refs kept
@@ -157,9 +133,9 @@ def test_second_optimize_call_recaptures(real_world, real_plan, monkeypatch):
     monkeypatch.setattr(CapturedGraph, "release", release)
     opt = make_optimizer(config)
     for call in range(2):
-        m, _ = run_optimizer(plan_info, config, optimizer=opt)
-        assert Counter(n for n, _, _ in released) == {"G_step": call + 1, "G_refresh": call + 1}  # once per call each
-        assert all(v.grad is None for v in plan_info["particles"].values())
+        m, _ = run_optimizer(info, config, optimizer=opt)
+        assert Counter(n for n, _, _ in released) == {"G_step": call + 1}  # once per call
+        assert all(v.grad is None for v in info["particles"].values())
         gc.collect()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -176,23 +152,20 @@ def test_second_optimize_call_recaptures(real_world, real_plan, monkeypatch):
 
 
 @needs_cuda
-def test_short_and_early_stopped_calls(real_world, real_plan, monkeypatch):
+def test_short_and_early_stopped_calls(real_world, monkeypatch):
     from cutamp.cuda_graphs import CapturedGraph
-    world, (skeleton, base) = real_world, real_plan
     released, orig = [], CapturedGraph.release
     monkeypatch.setattr(CapturedGraph, "release", lambda self: released.append(self.name) or orig(self))
 
     def run(**kw):
-        config = _graph_config(**kw)
-        info = make_plan_info(world, skeleton, clone_particles(base), config)
-        return (*run_optimizer(info, config), info["particles"])
+        plan = _graph_plan(real_world, **kw)
+        return (*run_optimizer(plan_info(plan), plan.config), plan.particles)
     m, _, _ = run(num_opt_steps=3)                                     # ends before refresh #1
     assert m["capture_step"] == 0 and released == ["G_step"]
-    assert m["refresh_capture_step"] is None
     m, timer, parts = run(num_opt_steps=50, early_stop_patience=1)     # early stop
     assert m.get("early_stopped_at") is not None and "optimization_step" not in timer._start_time
     assert timer.get_summaries()["optimization_step"]["count"] == len(m["elapsed"])  # the stopping step is timed too
-    assert len(released) == 1 + sum(m[k] is not None for k in ("capture_step", "refresh_capture_step"))
+    assert released == ["G_step"] * 2
     assert all(v.grad is None for v in parts.values())
 
 
@@ -226,46 +199,47 @@ class _ProfilingTimer(TorchTimer):
 
 
 @needs_cuda
-@pytest.mark.parametrize("arm", ["S1", "G"])
-def test_loop_sync_audit(real_world, real_plan, arm):
-    # Each profiled step has the loop's 3 device syncs, the profiler's own and packed.tolist()'s copy
-    # and stream sync; a refresh step adds 2 timing events. A G step is 1 graph launch (2 with the
-    # refresh) plus the eager Adam step (the captured body alone is ~1,000 kernels, hence < 100);
-    # inside the graphs, the global-mode capture is the audit, and every soft cost is on.
-    world, (skeleton, base) = real_world, real_plan
-    config = _graph_config(num_opt_steps=50, cuda_graphs=arm == "G",
-                           soft_cost=list(SUPPORTED_SOFT_COSTS))
-    timer = _ProfilingTimer(range(40, 50))
-    try:
-        m, _ = run_optimizer(make_plan_info(world, skeleton, clone_particles(base), config), config, timer=timer)
-    finally:
-        timer.close()
-    assert sorted(timer.names) == list(range(40, 50))
-    # The step where num_satisfying first turns positive adds the first-solution sync.
-    first = next((s for s, k in enumerate(m["num_satisfying"]) if k > 0), None)
+def test_loop_sync_audit(real_world):
+    # Each profiled step without a refresh has the loop's 3 device syncs, the profiler's own and packed.tolist()'s
+    # copy and stream sync. A G step is 1 graph launch plus the eager Adam step and the plan's own step, so it launches
+    # fewer kernels than the same step run eagerly (S1), which also launches the captured body's; inside the graph,
+    # the global-mode capture is the audit. A refresh step (44, 49) also runs the plan's eager refresh, which this
+    # audit leaves out.
     sync_events = bool(cupti_sync_events())
-    for step, names in sorted(timer.names.items()):
-        if step == first:
-            continue
-        kind = "refresh" if step in (44, 49) else "plain"
-        got = {
-            "Synchronize": Counter(n for n in names if "Synchronize" in n),
-            "DtoH": sum("DtoH" in n for n in names),
-            "HtoD": sum("HtoD" in n for n in names),
-            "EventRecord": sum("EventRecord" in n for n in names),
-            "cudaGraphLaunch": names.count("cudaGraphLaunch"),
-        }
-        want = {
-            "Synchronize": {"cudaDeviceSynchronize": 4, "cudaStreamSynchronize": 1},
-            "DtoH": 1,
-            "HtoD": 0,
-            "EventRecord": 2 if kind == "refresh" else 0,
-            "cudaGraphLaunch": 0 if arm == "S1" else 1 + (kind == "refresh"),
-        }
-        if sync_events:  # CUPTI's sync records also catch driver-API waits
-            got["sync events"] = Counter(n for n in names if n.endswith(" Sync"))
-            want["sync events"] = {"Context Sync": 4, "Stream Sync": 1}
-        launches = sum(n.startswith(("cudaLaunch", "cuLaunch")) for n in names)
-        assert got == want, f"{arm} step {step} ({kind})"
-        if arm == "G":
-            assert launches < 100, f"G step {step} ({kind}): {launches} kernel launches, not the eager Adam step's"
+    launches = {}
+    for arm in ("S1", "G"):
+        plan = _graph_plan(real_world, num_opt_steps=50, cuda_graphs=arm == "G")
+        timer = _ProfilingTimer(range(40, 50))
+        try:
+            m, _ = run_optimizer(plan_info(plan), plan.config, timer=timer)
+        finally:
+            timer.close()
+        assert sorted(timer.names) == list(range(40, 50))
+        # The step where num_satisfying first turns positive adds the first-solution sync.
+        first = next((s for s, k in enumerate(m["num_satisfying"]) if k > 0), None)
+        for step, names in sorted(timer.names.items()):
+            if step == first or step in (44, 49):
+                continue
+            got = {
+                "Synchronize": Counter(n for n in names if "Synchronize" in n),
+                "DtoH": sum("DtoH" in n for n in names),
+                "HtoD": sum("HtoD" in n for n in names),
+                "EventRecord": sum("EventRecord" in n for n in names),
+                "cudaGraphLaunch": names.count("cudaGraphLaunch"),
+            }
+            want = {
+                "Synchronize": {"cudaDeviceSynchronize": 4, "cudaStreamSynchronize": 1},
+                "DtoH": 1,
+                "HtoD": 0,
+                "EventRecord": 0,
+                "cudaGraphLaunch": 0 if arm == "S1" else 1,
+            }
+            if sync_events:  # CUPTI's sync records also catch driver-API waits
+                got["sync events"] = Counter(n for n in names if n.endswith(" Sync"))
+                want["sync events"] = {"Context Sync": 4, "Stream Sync": 1}
+            assert got == want, f"{arm} step {step}"
+            launches[arm, step] = sum(n.startswith(("cudaLaunch", "cuLaunch")) for n in names)
+    for (arm, step), count in launches.items():
+        if arm == "G" and ("S1", step) in launches:
+            eager = launches["S1", step]
+            assert count < eager, f"G step {step}: {count} kernel launches, the eager step's {eager}"

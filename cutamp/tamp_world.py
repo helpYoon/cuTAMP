@@ -10,8 +10,8 @@
 """TAMPWorld for cuTAMP (cuRobo single-MotionPlanner architecture).
 
 The world wraps a TAMPEnvironment with: collision Scene and T1 Kinematics, on the planning model
-``world.model``; ``motion_solver.build_motion_planner`` builds the MotionPlanner from it. The IK is GN's
-(``particle_initialization.gn_ik``), on these kinematics. T1 exposes two tool frames in
+``world.model``; ``motion_solver.build_motion_planner`` builds the MotionPlanner from it. The IK projection is GN's
+(``gn_refresh.gn_project_balanced``), on these kinematics. T1 exposes two tool frames in
 ``robot_container.tool_frames``.
 """
 
@@ -94,7 +94,7 @@ class TAMPWorld:
         self._obj_to_aabb: Dict[str, torch.Tensor] = {}
 
         # Arm-home end-effector positions in world frame. Used by the
-        # A* (task_planning/search.py) for each palm's home
+        # plan search (task_planning/plan_search.py) for each palm's home
         # position. Uses palm frames (*_base_link) because they're already in
         # tool_frames per t1_29dof.yml.
         home_js = JointState.from_position(

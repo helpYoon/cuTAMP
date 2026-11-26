@@ -174,7 +174,7 @@ class SegmentTorques:
         """``(force, moment, com)``, each ``[T, 3]`` in the support frame (``model.support.link``): the floor's wrench
         on the robot, which is the first pass's base wrench (``base_wrench``), with its moment about the support
         frame's origin, and the CoM about that origin. Linear in the first pass's torques, so at a uniform time scale s
-        the wrench is w_0 + (w_1 - w_0) / s^2, as the torques are (motion_solver._torque_scale)."""
+        the wrench is w_0 + (w_1 - w_0) / s^2, as the torques are."""
         with torch.no_grad():
             js, tau_free, ks = self._free_pass(plan_js)
             F, M, P = base_wrench(js.position[0][:, self.base], tau_free[0][:, self.base])

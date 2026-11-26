@@ -42,7 +42,7 @@ from curobo._src.cost.cost_base_cfg import BaseCostCfg
 
 # --- The support region's margins, the CoM penalty's barrier and the balance tolerances ---
 # The trajectory gate's rectangle (support.gate_half) shrinks the soles by COM_SAFETY_MARGIN for the model and
-# tracking errors a real robot adds: every trajectory frame's CoM and ZMP stay inside it (motion_solver._balance_gate).
+# tracking errors a real robot adds: every trajectory frame's CoM and ZMP stayed inside it (the no-step motion gate, removed 2026-11-25).
 # The keyframes' rectangle (support.keyframe_half) sits COM_DYNAMIC_RESERVE further in, so a segment can decelerate
 # into its end conf without the ZMP leaving. The reserve was set on the simplified model (branch ablation-baseline):
 # a conf on the support edge needed 4-7x slowdowns, and a 1 cm reserve left the optimizer no satisfying conf on 2 of
@@ -328,20 +328,10 @@ def compute_com_margin(world, q_batch: torch.Tensor) -> torch.Tensor:
     """``[B]`` stability margins for full-cspace configs via FK, against the keyframes' rectangle
     (``world.model.support.keyframe_half``).
 
-    Measure-only companion to :func:`compute_com_polygon_mask`, through :func:`particle_com_margin`."""
+    Measure-only companion to :func:`compute_com_polygon_mask`."""
     support = world.model.support
     com, base_T = _fk_com_and_base(world, q_batch)
     return com_margin_from_base(_project_com_to_base(com, base_T), support.keyframe_half)
-
-
-def particle_com_margin(world, particle: "dict[str, torch.Tensor]") -> float:
-    """One particle's CoM margin: :func:`compute_com_margin`'s min over its confs (``[full_dof]`` entries named
-    ``left_q``/``right_q``/``q``). Measure only: the best particle's ``best_com_margin`` (optimize_plan.py) and
-    the planned one's ``planned_com_margin`` (algorithm.py)."""
-    return min(
-        compute_com_margin(world, v.unsqueeze(0)).item()
-        for k, v in particle.items() if k.startswith(("left_q", "right_q", "q")) and v.ndim == 1
-    )
 
 
 def com_zmp_in_support(world, plan_js):

@@ -1,6 +1,6 @@
 """COM-anchored pick/place terminals (plan_cspace to the conf), and blocks_t1 end to end on the real legs through
-cutamp_demo: its retract values, segments and their phase tags, planted soles, torques and speeds, straight lines,
-saved raw plan, and balance metrics against its exported frames."""
+cutamp_demo: its segments and their phase tags, planted soles, torques and speeds, straight lines, saved raw plan, and
+balance metrics against its exported frames."""
 import os
 import pickle
 from types import SimpleNamespace
@@ -73,10 +73,9 @@ def test_plan_arm_to_conf_raises_on_failure(monkeypatch):
             return "R"
 
     fp = FakePlanner()
-    with pytest.raises(RuntimeError, match="cspace-anchored") as e:
+    with pytest.raises(RuntimeError, match="cspace-anchored"):
         ms._plan_arm_to_conf(fp, torch.zeros(33), "LAST", disable_obstacle=None, ground_op="OP")
     assert fp.n == 1  # no repeat: the same start and goal plan the same way
-    assert e.value.out_of_attempts  # the retry's second pass gives it more
 
 
 def _sole_errors(world, q: torch.Tensor):
@@ -93,25 +92,21 @@ def _sole_errors(world, q: torch.Tensor):
 @needs_graspgenx
 def test_real_legs_plan_audit(tmp_path, monkeypatch):
     # One real-legs plan end to end (blocks_t1, seed 0, 64 particles, the surface at 0.5 m, the motion plan saved raw),
-    # on its standing plan (BLOCKS_T1_ACTIONS, which picks both blocks before placing either): setup_cutamp
+    # on its plan without steps (BLOCKS_T1_ACTIONS, which picks both blocks before placing either): setup_cutamp
     # builds the world from REAL_LEGS, load_t1_container and q_init = REAL_LEGS.home, and the spies only record. The
-    # metrics the gate records hold for the exported segments, and the CoM and the multibody ZMP re-measured on those
-    # frames stay inside the gate's rectangle (support.gate_half). On the real legs the gate sets each segment's pace,
+    # metrics the gate records hold for the exported segments. On the real legs the gate sets each segment's pace,
     # never faster than the planner's. Each pick and place plans an approach, a straight insert and a leave, and each
     # retract one segment: 16 in skeleton order, each tagged with its op, phase and gripper event, and every straight
     # segment saved still on its line.
-    import cutamp.algorithm as alg
     import cutamp.scripts.run_cutamp as rc
-    from curobo.types import JointState
-    from cutamp.com_polygon_cost import com_margin_from_base, com_zmp_in_support, soles_planted
+    from cutamp.com_polygon_cost import soles_planted
     from cutamp.config import TAMPConfiguration
     from cutamp.envs.utils import get_env_dir, load_env, raise_surface_height
     from cutamp.robots.t1 import REAL_LEGS
-    from cutamp.task_planning.constraints import Motion
     from cutamp.tests.test_real_legs_motion import _actuated
 
-    seen = {"retract": []}
-    run, solve, top = rc.run_cutamp, alg.solve_curobo, alg.get_top_satisfying_particles
+    seen = {}
+    run, solve = rc.run_cutamp, ms.solve_curobo
 
     def run_spy(*args, **kwargs):
         seen["run"] = run(*args, **kwargs)
@@ -121,19 +116,8 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
         seen["world"] = world
         return solve(plan_info, particle, world, *args, **kwargs)
 
-    def top_spy(plan_info, constraint_checker, cost_reducer, n, **kwargs):
-        # The satisfying particles' retract values, which the Motion loss and the mask include.
-        particles = plan_info["particles"]
-        with torch.no_grad():
-            cost_dict = plan_info["cost_fn"](plan_info["rollout_fn"](particles), particles)
-        mask = constraint_checker.get_mask(cost_dict, verbose=False)
-        values = cost_dict[Motion.type]["values"]
-        seen["retract"].append({k: values[k][mask].cpu() for k in ("retract_self_collision", "retract_joint_limit")})
-        return top(plan_info, constraint_checker, cost_reducer, n, **kwargs)
-
     monkeypatch.setattr(rc, "run_cutamp", run_spy)
-    monkeypatch.setattr(alg, "solve_curobo", solve_spy)
-    monkeypatch.setattr(alg, "get_top_satisfying_particles", top_spy)
+    monkeypatch.setattr(ms, "solve_curobo", solve_spy)
     standing_skeleton(monkeypatch, *BLOCKS_T1_ACTIONS)
     env = load_env(os.path.join(get_env_dir(), "blocks_t1.yml"))
     raise_surface_height(env, 0.5)
@@ -145,7 +129,6 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
     curobo_plan, _, metrics = seen["run"]
     assert metrics["found_solution"] and metrics["motion_plan_success"], metrics.get("motion_plan_failures")
     assert metrics["traj_com_min_margin"] >= 0 and metrics["traj_zmp_min_margin"] >= 0
-    assert seen["retract"] and all(not bool(v.any()) for d in seen["retract"] for v in d.values())
     # Each op's segments in skeleton order (blocks_t1 picks both blocks before placing either): a pick's approach,
     # insert (the hand closes at its end) and lift, a place's approach, insert (it opens) and back-out, a retract's one.
     kinds = {"Pick": [("approach", None), ("insert", "close"), ("lift", None)],
@@ -198,15 +181,3 @@ def test_real_legs_plan_audit(tmp_path, monkeypatch):
             np.testing.assert_allclose(timing["position"][[0, -1]], seg["position"][[0, -1]], rtol=0, atol=1e-6,
                                        err_msg=f"segment {k}")
     assert metrics["retime_max"] == pytest.approx(max(scales)) and min(scales) >= 1  # never faster than the planner
-    # Measured again on the frames actually exported, so a gated segment that never reaches the export fails here.
-    for k, seg in enumerate(segments):
-        js = JointState(position=torch.as_tensor(seg["position"], device=world.device),
-                        velocity=torch.as_tensor(seg["velocity"], device=world.device),
-                        acceleration=torch.as_tensor(seg["acceleration"], device=world.device),
-                        joint_names=list(world.model.joint_names))
-        com, zmp = com_zmp_in_support(world, js)
-        half = world.model.support.gate_half
-        margin = com_margin_from_base(com, half).min().item()
-        assert margin >= 0, f"segment {k}: an exported CoM is {-100 * margin:.2f} cm outside the gate's rectangle"
-        margin = com_margin_from_base(zmp, half).min().item()
-        assert margin >= 0, f"segment {k}: an exported ZMP is {-100 * margin:.2f} cm outside the gate's rectangle"

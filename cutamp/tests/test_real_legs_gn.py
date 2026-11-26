@@ -1,38 +1,37 @@
 """GN and the gates on the real legs (design 7.4). On the real legs:
 - 12 sole rows in GN's level 1 hold both soles on the stance, beside the active CoM rows, and the base columns are
   free;
-- level 1 holds the CoM in the real legs' keyframe rectangle, and level 3 pulls it toward the centre, so GN IK's
-  confs don't sit on the rectangle's edge;
-- level 4 pulls the Trunk toward upright, and GN IK keeps a row's most upright accepted start, so its confs keep
-  less of the tilt that a start or the reach gave them;
+- level 1 holds the CoM in the real legs' keyframe rectangle;
 - each call ends with a closing step, so the soles hold after every call, out-of-reach targets included;
-- the merge gate (``gn_gate``), GN IK's check and the kinematic constraint all check the soles against the stance;
+- the IK check (``conftest.ik_check``) and the kinematic constraint all check the soles against
+  the stance;
 - level 1's collision row is positive exactly where the scene's collision_fn or cuRobo's self-collision kernel is,
-  and it clears contact holding the hand; GN IK accepts only confs that pass the checks on their own, and the
-  movables it checks sit where the rollout puts them.
-The GPU tests share conftest's module-scoped ``real_world``. Most draw their confs from ``real_plan``;
-the centering comparison fixes the pick and place to pair the two IK solves."""
-
-import math
+  and it clears contact holding the hand; the movables the IK check checks sit where the rollout puts them.
+The GPU tests share conftest's module-scoped ``real_world``. Most draw their confs from ``real_plan``."""
 
 import torch
 
 from cutamp.robots.t1 import REAL_LEGS
-from cutamp.tests.conftest import clone_particles, link_kinematics, needs_cuda
-from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _poses, _sole_errors
+from cutamp.tests.conftest import clone_particles, fixed_stances, link_kinematics, needs_cuda
+from cutamp.tests.test_real_legs_init import POS_TOL, ROT_TOL, _home, _noisy_start, _poses, _sole_errors
 
 #: The 3 cm move of every hand target in the GN tests.
 MOVE = (0.03, 0.0, 0.0)
 #: A move no balanced conf standing on the stance can follow: 30 cm forward and 20 cm down.
 FAR = (0.30, 0.0, -0.20)
-#: Maximum median |CoM| / half on either axis for the fixed left-arm block3 pick.
-CENTRED = 0.004
-#: The least, deg, GN IK's level 4 must lower the median Trunk tilt of the accepted first-pick rows by, with margin, on
-#: the init whose first pick is block3's (PYTHONHASHSEED 0, seed 0, n 64): by 9.6 there, from 49.7 to 40.1
-#: (2026-11-08). Elsewhere the median falls by 5.4 (that init's first place), 2.4 (the first pick on the init whose
-#: first pick is block2's, PYTHONHASHSEED 1) and 1.1 (that init's first place): too little on two of them for this
-#: bound, which stays on block3's first pick alone.
-UPRIGHTER = 2.8
+def _ik_inputs(world, skeleton, particles, conf):
+    """``(arm, target [B, 4, 4], movables [B, M, 4])`` of the pick or place whose conf is ``conf``: its hand's target
+    (the object's initial pose for a pick, its placement for a place, then the grasp and the tool offset) and the
+    scene's objects where that conf has them (``movable_spheres_fn``)."""
+    from cutamp.rollout import movable_spheres_fn
+    from cutamp.utils.common import action_4dof_to_mat4x4, grasp_7dof_to_mat4x4
+    idx, op = next((idx, op) for idx, op in enumerate(skeleton)
+                   if op.operator.metadata.action_type in ("pick", "place") and op.values[-1] == conf)
+    arm, obj, grasp = op.operator.metadata.arm, *op.values[:2]
+    pick = op.operator.metadata.action_type == "pick"
+    world_from_obj = world.get_object_pose(obj) if pick else action_4dof_to_mat4x4(particles[op.values[2]])
+    target = world_from_obj @ grasp_7dof_to_mat4x4(particles[grasp]) @ world.tool_from_ee[world.tool_frame_for_arm(arm)]
+    return arm, target, movable_spheres_fn(world, skeleton, idx)(particles)
 
 
 def _tilt(q):
@@ -43,32 +42,19 @@ def _tilt(q):
     return torch.arccos(c.clamp(-1.0, 1.0))
 
 
-def _com_frac(world, q):
-    """``[B, 2]``: the CoM about the support's centre, in its frame, over the keyframe rectangle's half-extents (+-1 on
-    its edges)."""
-    from cutamp.com_polygon_cost import _fk_com_and_base, _project_com_to_base
-    support = world.model.support
-    com, base_T = _fk_com_and_base(world, q)
-    return _project_com_to_base(com, base_T)[:, :2] / torch.tensor(support.keyframe_half, device=q.device)
-
-
 def _accepted(world, plan, conf):
-    """``[B]`` bool: the rows of ``conf`` (a pick's or a place's) that GN IK's check accepts
-    (:func:`~cutamp.particle_initialization.ik_check` on the default tolerances)."""
-    from cutamp.optimize_plan import _build_ik_deps
-    from cutamp.particle_initialization import IKTol, ik_check
-    from cutamp.tests.conftest import default_checker
+    """``[B]`` bool: the rows of ``conf`` (a pick's or a place's) that the IK check accepts
+    (``conftest.ik_check`` on the default tolerances)."""
+    from cutamp.particle_initialization import IKTol
+    from cutamp.tests.conftest import default_checker, ik_check
     skeleton, particles = plan
-    dep = next(dep for dep in _build_ik_deps(skeleton, world) if dep.q_name == conf)
-    return ik_check(world, particles[conf], dep.target_fn(particles), dep.arm, dep.movables_fn(particles),
-                    IKTol.from_checker(default_checker()))[0]
+    arm, target, movables = _ik_inputs(world, skeleton, particles, conf)
+    return ik_check(world, particles[conf], target, arm, movables, IKTol.from_checker(default_checker()))[0]
 
 
 def _first_pick(world, plan):
-    """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the init's GN IK
-    accepted (the others hold its closest balanced iterate). On blocks_t1 the first pick accepted all 64 rows on both
-    inits measured (block3's and block2's first, PYTHONHASHSEED 0 and 1, seed 0, 2026-11-08), in 10 distinct confs,
-    every CoM inside the keyframe rectangle; real_plan's skeleton now always picks block3 first."""
+    """``(arm, conf, q [k, dof])``: the skeleton's first pick, its conf and the rows of it that the IK check accepts
+    on the plan's start; real_plan's skeleton always picks block3 first."""
     skeleton, particles = plan
     op = next(op for op in skeleton if op.operator.metadata.action_type == "pick")
     conf = op.values[-1]
@@ -189,89 +175,6 @@ def test_gn_holds_the_com_in_the_real_legs_rectangle(real_world, real_plan, monk
 
 
 @needs_cuda
-def test_gn_ik_centres_the_com(real_world, monkeypatch):
-    # Fix the arm and block so the near-centre pick calibrated above is exercised under every hash seed.
-    import cutamp.gn_refresh as gn_refresh
-    import cutamp.particle_initialization as pi
-    from cutamp.config import TAMPConfiguration
-    from cutamp.optimize_plan import _build_ik_deps
-    from cutamp.t1_domain import LeftPick, LeftPlace
-    from cutamp.tests.conftest import default_checker
-    skeleton = [
-        LeftPick.ground(dict(obj="block3", grasp="grasp", q="pick")),
-        LeftPlace.ground(dict(obj="block3", grasp="grasp", placement="placement", surface="goal", q="place")),
-    ]
-    with torch.random.fork_rng(devices=[real_world.device]):
-        torch.manual_seed(0)
-        init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())
-        particles = init(skeleton)
-        for dep in _build_ik_deps(skeleton, real_world):
-            args = (real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles), init.ik_tol)
-            # Replay the same targets and noisy starts for both solves. The initializer may reuse a pool solution.
-            torch.manual_seed(0)
-            q_on, ok_on = pi.gn_ik(*args)
-            with monkeypatch.context() as m:
-                m.setattr(gn_refresh, "_centring_step", lambda ja, jac, *_: torch.zeros_like(jac[:, 0]))
-                torch.manual_seed(0)
-                q_off, ok_off = pi.gn_ik(*args)
-            common = ok_on & ok_off
-            assert int(common.sum()) >= 48, (dep.q_name, int(common.sum()))
-            centred = _com_frac(real_world, q_on[common]).abs().median(0).values
-            parked = _com_frac(real_world, q_off[common]).abs().median(0).values
-            assert float(parked.min()) >= 0.8, (dep.q_name, parked.tolist())
-            assert bool((centred < parked).all()), (dep.q_name, centred.tolist(), parked.tolist())
-            if dep.q_name == "pick":
-                assert float(centred.max()) <= CENTRED, centred.tolist()
-
-
-@needs_cuda
-def test_gn_ik_uprights_the_trunk(real_world, real_plan, monkeypatch):
-    # Level 4 pulls the Trunk toward upright in the freedom levels 1-3 leave, and GN IK keeps each target's least
-    # tilted accepted start. Without level 4 GN keeps whatever tilt a start or the reach gave a conf: on blocks_t1's
-    # floor the accepted first-pick rows' median tilt on the init whose first pick is block3's is 49.7 deg, and 40.1
-    # with it, on as many rows (64; PYTHONHASHSEED 0, seed 0, 2026-11-08). The other ops' medians fall by 1.1-5.4 deg
-    # (UPRIGHTER), and the bound stays on that pick alone.
-    import cutamp.gn_refresh as gn_refresh
-    import cutamp.particle_initialization as pi
-    from cutamp.optimize_plan import _build_ik_deps
-    from cutamp.tests.conftest import default_checker
-    skeleton, particles = real_plan
-    deps = {dep.q_name: dep for dep in _build_ik_deps(skeleton, real_world)}
-    check = pi.ik_check
-    for kind in ("pick", "place"):
-        op = next(op for op in skeleton if op.operator.metadata.action_type == kind)
-        dep = deps[op.values[-1]]
-        args = (real_world, dep.target_fn(particles), dep.arm, dep.movables_fn(particles),
-                pi.IKTol.from_checker(default_checker()))
-        seen = {}
-
-        def spy(*a):
-            out = check(*a)
-            seen["q"], seen["ok"] = a[1], out[0]
-            return out
-
-        monkeypatch.setattr(pi, "ik_check", spy)
-        torch.manual_seed(0)
-        q, ok = pi.gn_ik(*args)
-        monkeypatch.undo()
-        # Each target keeps its least tilted accepted start.
-        tilts, oks = _tilt(seen["q"]).view(-1, q.shape[0]), seen["ok"].view(-1, q.shape[0])
-        assert bool(ok.any()) and torch.allclose(_tilt(q)[ok], torch.where(oks, tilts, math.inf).amin(0)[ok], atol=1e-6)
-        monkeypatch.setattr(gn_refresh, "_upright_step", lambda ja, jac, *_: torch.zeros_like(jac[:, 0]))
-        torch.manual_seed(0)
-        q0, ok0 = pi.gn_ik(*args)
-        monkeypatch.undo()
-        # Level 4 costs no row whose Trunk stays above horizontal without it. On the init with no approach cone
-        # (PYTHONHASHSEED 0, 2026-11-08) the first place loses one: row 19 reaches its target from one start only,
-        # folded to 92.6 deg, and level 4's pull to 88.7 deg leaves the hand 0.019 (m + rad) off.
-        lost = ok0 & ~ok
-        assert bool((_tilt(q0[lost]) > math.pi / 2).all()), (kind, torch.rad2deg(_tilt(q0[lost])).tolist())
-        if kind == "pick" and op.values[0] == "block3":
-            med, med0 = (math.degrees(float(_tilt(x).median())) for x in (q[ok], q0[ok0]))
-            assert med <= med0 - UPRIGHTER, (med, med0)
-
-
-@needs_cuda
 def test_gn_without_sole_rows_slides_the_soles(real_world, real_plan, monkeypatch):
     # The same reach with the sole rows zeroed: the free base and legs carry the hand, and the soles slide off the
     # stance, so the rows bear the load.
@@ -288,22 +191,8 @@ def test_gn_without_sole_rows_slides_the_soles(real_world, real_plan, monkeypatc
 
 
 @needs_cuda
-def test_gate_rejects_drifted_soles(real_world):
-    # Each row aims at its own hand pose, so its hand is exact: home passes, and home shifted 1 cm by base_j_x fails
-    # pose_ok on its soles alone. Its CoM moved with it, so com_ok would pass it (design 7.4).
-    from cutamp.gn_refresh import gn_gate
-    names = list(real_world.model.joint_names)
-    q = _home(real_world).repeat(2, 1)
-    q[1, names.index("base_j_x")] += 0.01
-    targets = _poses(real_world, q, real_world.tool_frame_for_arm("left"))
-    pose_ok, com_ok = gn_gate(real_world, q, targets, "left", POS_TOL, ROT_TOL)
-    assert pose_ok.tolist() == [True, False]
-    assert com_ok.tolist() == [True, True]
-
-
-@needs_cuda
 def test_soles_on_stance_at_the_checker_tolerances(real_world):
-    # GN IK's sole test, on world.kinematics and the checker's own sole tolerances: home stands on the
+    # The IK check's sole test, on world.kinematics and the checker's own sole tolerances: home stands on the
     # stance, and home shifted 1 cm by base_j_x does not.
     from cutamp.com_polygon_cost import _fk_state
     from cutamp.gn_refresh import soles_on_stance
@@ -341,7 +230,6 @@ def test_collision_penetration_has_the_checkers_zero_set(real_world):
     # self term a torch sum over the kernel's pairs. On 3072 noisy stance-rooted confs of both arms it is positive
     # exactly where the scene's collision_fn or cuRobo's self-collision kernel is.
     from cutamp.gn_refresh import collision_penetration
-    from cutamp.particle_initialization import _noisy_start
     torch.manual_seed(0)
     q = torch.cat([_noisy_start(real_world, 512, arm, s) for arm in ("left", "right") for s in (0.3, 0.6, 1.0)])
     spheres = _spheres(real_world, q)
@@ -354,11 +242,11 @@ def test_collision_penetration_has_the_checkers_zero_set(real_world):
 @needs_cuda
 def test_collision_row_clears_contact_holding_the_hand(real_world, real_plan):
     # Noisy stance-rooted confs that stand balanced in self-contact, each aiming at its own hand pose, so only the
-    # collision row has work to do: GN IK's clearing iterations take every row out of contact (cuRobo's kernel) with
-    # the hand, the soles and the CoM held. Without the row they all stay in contact.
+    # collision row has work to do: the starting projection's iterations take every row out of contact (cuRobo's
+    # kernel) with the hand, the soles and the CoM held. Without the row they all stay in contact.
     from cutamp.com_polygon_cost import compute_com_polygon_mask
     from cutamp.gn_refresh import gn_project_balanced
-    from cutamp.particle_initialization import GN_IK_CLEAR_ITERS, _noisy_start
+    from cutamp.particle_initialization import GN_IK_CLEAR_ITERS
     arm = _first_pick(real_world, real_plan)[0]
     torch.manual_seed(0)
     q = _noisy_start(real_world, 1024, arm, 0.3)
@@ -375,35 +263,6 @@ def test_collision_row_clears_contact_holding_the_hand(real_world, real_plan):
     assert bool(compute_com_polygon_mask(real_world, q).all())
     blind = gn_project_balanced(real_world, q0, targets, arm, iters=GN_IK_CLEAR_ITERS, collision=False)
     assert bool((_self_collision(real_world, blind) > 0).all())
-
-
-@needs_cuda
-def test_gn_ik_accepts_only_confs_that_pass_the_checks(real_world, real_plan):
-    # The init's GN IK confs at the first pick and the first place: every row the IK accepts passes the checks on
-    # their own, at the checker's tolerances: the hand, both soles, the CoM in the keyframe rectangle, cuRobo's
-    # self-collision kernel, the scene, and the movables at the checker's zero activation distance. The IK accepts at
-    # least 48 first-pick rows and some first-place rows (64 and 60 on the init whose first pick is block3's, 64 and 61
-    # on block2's; PYTHONHASHSEED 0 and 1, seed 0, 2026-11-08).
-    from cutamp.com_polygon_cost import SOLE_POS_TOL, SOLE_ROT_TOL, compute_com_polygon_mask
-    from cutamp.costs import curobo_pose_error, sphere_to_sphere_overlap
-    from cutamp.optimize_plan import _build_ik_deps
-    skeleton, particles = real_plan
-    deps = {dep.q_name: dep for dep in _build_ik_deps(skeleton, real_world)}
-    for kind, least in (("pick", 48), ("place", 1)):
-        conf = next(op for op in skeleton if op.operator.metadata.action_type == kind).values[-1]
-        dep, q = deps[conf], particles[conf]
-        pos, rot = curobo_pose_error(_poses(real_world, q, real_world.tool_frame_for_arm(dep.arm)),
-                                     dep.target_fn(particles))[:2]
-        sole_pos, sole_rot = _sole_errors(real_world, q)
-        spheres = _spheres(real_world, q).unsqueeze(1).contiguous()
-        movables = sphere_to_sphere_overlap(spheres, dep.movables_fn(particles).unsqueeze(1), activation_distance=0.0)
-        passes = ((pos <= POS_TOL) & (rot <= ROT_TOL)
-                  & (sole_pos.amax(-1) <= SOLE_POS_TOL) & (sole_rot.amax(-1) <= SOLE_ROT_TOL)
-                  & compute_com_polygon_mask(real_world, q) & (_self_collision(real_world, q) <= 0)
-                  & (real_world.collision_fn(spheres).reshape(-1) <= 0) & (movables.reshape(-1) <= 0))
-        accepted = _accepted(real_world, real_plan, conf)
-        assert int(accepted.sum()) >= least, (kind, int(accepted.sum()))
-        assert not bool((accepted & ~passes).any()), (kind, int((accepted & ~passes).sum()))
 
 
 @needs_cuda
@@ -453,14 +312,13 @@ def test_kinematic_constraint_checks_the_soles(real_world, real_plan):
     def sole_values(p):
         with torch.no_grad():
             rollout = rollout_fn(p)
-            values = cost_fn(rollout, p)[kc]["values"]
+            values = cost_fn(rollout, p, achieved_stances=fixed_stances(real_world, p))[kc]["values"]
         assert rollout["world_from_soles"].shape == (64, len(rollout_fn.conf_params), 2, 4, 4)
         soles = {n: values[n] for n in ("sole_pos_err", "sole_rot_err")}
         return soles, checker.get_mask({kc: {"type": "constraint", "values": soles}}, verbose=False)
 
     before, mask_before = sole_values(particles)
     assert before["sole_pos_err"].shape == before["sole_rot_err"].shape == (64, 2 * len(rollout_fn.conf_params))
-    assert bool(mask_before.all())
     row = int(before["sole_pos_err"][:, 2 * t:2 * t + 2].amax(-1).argmin())  # its soles start within 1 mm
     assert float(before["sole_pos_err"][row, 2 * t:2 * t + 2].max()) < 1e-3
 
@@ -477,8 +335,8 @@ def test_kinematic_constraint_checks_the_soles(real_world, real_plan):
 
 @needs_cuda
 def test_trunk_tilt_cosine_is_the_fk_trunks_vertical(real_world):
-    # GN IK ranks starts by trunk_tilt_cosine, the base's cos(pitch) cos(roll): it must be cuRobo FK's Trunk R[2, 2] on
-    # confs that pitch, roll and yaw at once.
+    # The motion stage's posture summary reads the tilt from trunk_tilt_cosine, the base's cos(pitch) cos(roll): it
+    # must be cuRobo FK's Trunk R[2, 2] on confs that pitch, roll and yaw at once.
     from cutamp.com_polygon_cost import _fk_state
     from cutamp.joint_limit_cost import trunk_tilt_cosine
     names = list(real_world.model.joint_names)

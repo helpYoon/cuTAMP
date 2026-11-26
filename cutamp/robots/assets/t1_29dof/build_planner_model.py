@@ -93,7 +93,7 @@ ANKLE_PITCH = ("Left_Ankle_Pitch", "Right_Ankle_Pitch")  # capped at the motor's
 # Trajopt's internal timing. Trajopt times each segment against these, so they shape each path, its time profile and
 # its fastest pace. The balance gate keeps that profile and only
 # slows a segment, by a uniform time scale, for the robot's speed limits, efforts and the ZMP
-# (motion_solver._balance_gate), so their shape and pace reach every exported motion. They are not robot facts: the
+# (motion_solver._supported_segment_gate), so their shape and pace reach every exported motion. They are not robot facts: the
 # acceleration and jerk caps are trajopt's pace limits for the real legs, and the base's velocity limit is cuRobo's
 # default for extra links (link_params.py:32), written out. With non-binding caps in their place (1e4, 1e6, 1e3) both
 # seed-0 runs of P2's check set failed every candidate's first trajopt on torque, when its success test still judged

@@ -267,11 +267,14 @@ def test_the_side_lean_row_reads_the_heading():
 
 def test_with_a_heading_the_side_lean_comes_before_the_centring():
     # A stepped plan's lower levels, in the order its plans are ranked by: level 3 the side lean, level 4 the CoM toward
-    # the centre in what the side lean leaves. Levels 1-2 are as without the heading; neither lower level moves the
-    # soles or the hand; level 4 keeps the side lean where level 3 put it; and the whole step crosses no plane that
-    # levels 1-2's leaves the CoM inside.
-    from cutamp.gn_refresh import _side_lean_row
-    from cutamp.step_costs import side_lean
+    # the centre in what the side lean leaves, then level 5 the forward lean toward 0 in what both leave (``d4`` holds
+    # levels 4 and 5). Levels 1-2 are as without the heading; no lower level moves the soles or the hand; levels 4-5
+    # keep the side lean where level 3 put it; and the whole step crosses no plane that levels 1-2's leaves the CoM
+    # inside.
+    from unittest import mock
+
+    from cutamp.gn_refresh import _null_space_step, _side_lean_row
+    from cutamp.step_costs import forward_lean, side_lean
 
     stack, _ = _synthetic(0, coll=True)
     q, jac, jac_com, com, jac_sole = stack[0], stack[2], stack[3], stack[4], stack[9]
@@ -297,6 +300,23 @@ def test_with_a_heading_the_side_lean_comes_before_the_centring():
         return com + (jac_com @ s.unsqueeze(-1)).squeeze(-1)
 
     assert float(after(step)[centred].norm(dim=-1).median()) < float(after(step3)[centred].norm(dim=-1).median())
+
+    # Level 5 alone, the whole step against the same call with its step zeroed (its solve is the one with three rows
+    # above it, the side lean's and the CoM's two): it lowers the forward lean wherever it moves a row, and moves
+    # neither the soles, the hand, the CoM nor the side lean.
+    def without_level_5(*args, extra=None, **kwargs):
+        out = _null_space_step(*args, extra=extra, **kwargs)
+        return out * 0 if extra is not None and extra.shape[1] == 3 else out
+
+    with mock.patch("cutamp.gn_refresh._null_space_step", without_level_5):
+        step4 = _balanced_step(*stack[:8], None, *stack[9:], upright=UPRIGHT, region=region, heading=heading)[0]
+    d5 = step - step4
+    moved = d5.norm(dim=-1) > 1e-4
+    assert int(moved.sum()) >= 40
+    bow4, bow5 = (forward_lean(q + s, stance, REAL_LEGS).abs() for s in (step4, step))
+    assert bool((bow5[moved] < bow4[moved]).all())
+    for rows in (jac_sole, jac, jac_com, row):
+        assert float((rows @ d5.unsqueeze(-1))[moved].abs().max()) < 1e-6
     kept_inside = _violation(region, after(step12)) <= 0
     assert bool((_violation(region, after(step))[kept_inside] <= 1e-6).all())
     assert bool((_violation(region, after(step3))[kept_inside] <= 1e-6).all())

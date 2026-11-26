@@ -87,7 +87,7 @@ def movable_spheres_fn(world: TAMPWorld, plan_skeleton: PlanSkeleton, op_idx: in
     the conf of ``plan_skeleton[op_idx]`` (a pick or a place), as ``robot_to_movables`` checks that conf: each
     object at its initial pose until a place moves it, then at that place's placement, the conf's own place
     included; objects in ``world.movables`` order. The initial poses are transformed here, so ``fn`` makes no
-    host copy and captures (G_refresh)."""
+    host copy."""
     source = {obj.name: None for obj in world.movables}
     for op in list(plan_skeleton)[: op_idx + 1]:
         if op.operator.metadata.action_type == "place":

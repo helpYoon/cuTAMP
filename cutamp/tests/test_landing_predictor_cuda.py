@@ -130,9 +130,9 @@ def test_chain_uses_terminal_histories_and_correct_row_clocks(order, predictor):
 
 @needs_cuda
 def test_fresh_prediction_for_the_ranked_floor_pick(predictor):
-    from cutamp.step_search import StepSearch, TargetRegion
+    from cutamp.task_planning.landing_options import LandingOptions, TargetRegion
 
-    search = StepSearch.load(
+    search = LandingOptions.load(
         REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8
     )
     target = TargetRegion("left", (0.48, 0.18, 0.025), (0.05,) * 3, solid_pick=True)

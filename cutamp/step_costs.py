@@ -24,6 +24,18 @@ def side_lean(q: Tensor, stance: Tensor, model) -> Tensor:
     return -h.sin() * r.cos() * p.sin() + h.cos() * -r.sin()
 
 
+def forward_lean(q: Tensor, stance: Tensor, model) -> Tensor:
+    """The forward lean ``[...]`` in radians: the trunk's up axis tipped along the two soles' mean heading, the angle
+    of its part along the heading over its vertical part. Positive forward (a bow), negative leaning back. An angle, not
+    a sine as :func:`side_lean`'s: a sine is 0 again with the trunk upside down, and past 90 degrees its slope points
+    there (blocks_t1 folded a place 120 degrees back on it, 2026-11-25)."""
+    p = q[..., model.joint_names.index("base_j_pitch")]
+    r = q[..., model.joint_names.index("base_j_roll")]
+    yaw = stance[..., 2].to(q)
+    h = torch.atan2(yaw.sin().mean(-1), yaw.cos().mean(-1))
+    return torch.atan2(h.cos() * r.cos() * p.sin() - h.sin() * r.sin(), r.cos() * p.cos())
+
+
 def joint_effort(world, q: Tensor) -> Tensor:
     """Joint effort ``[n, H]`` of postures ``q`` ``[n, H, dof]``: at rest, each joint outside the base its torque
     (``world.segment_torques``) over its limit, squared, summed. The torque model gives no gradient, so where ``q``
@@ -50,9 +62,19 @@ def joint_effort(world, q: Tensor) -> Tensor:
 
 
 def plan_rank(lean: Tensor, off_centre: Tensor) -> Tensor:
-    """A plan's place in the strict order of the preferences, smaller first: whole units of its worst side ``lean``
-    (radians), then whole units of its worst ``off_centre`` (metres)."""
+    """Whole units of a plan's worst side ``lean`` (radians), then of its worst ``off_centre`` (metres), in strict
+    order, smaller first: 0 where both are under one unit, which is what ends the Adam loop
+    (:meth:`cutamp.optimize_plan._BestSnapshot.should_stop`), and the tie-break between plans of one
+    :func:`plan_score`."""
     return (lean / UNIT_RAD).floor() * RANK_BASE + (off_centre / UNIT_M).floor().clamp(max=RANK_BASE - 1)
+
+
+def plan_score(lean: Tensor, off_centre: Tensor, bow: Tensor) -> Tensor:
+    """A plan's preferences as one number, smaller first: whole units of its worst side ``lean``, of its worst
+    ``off_centre`` and of its worst forward lean ``bow`` (radians, metres, radians), added. Valid plans are ordered by
+    it: in a strict order one unit of an earlier preference outweighs any amount of a later one, and a plan folded 117
+    degrees back won on 15 mm of centring (blocks_t1, 2026-11-25)."""
+    return (lean / UNIT_RAD).floor() + (off_centre / UNIT_M).floor() + (bow / UNIT_RAD).floor()
 
 
 def lines(values: Tensor, n: int, ticks_changed: Tensor, finite: Tensor) -> tuple[Tensor, Tensor]:

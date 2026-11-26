@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from cutamp.step_preview import _check_issued_landings
 from cutamp.tests.conftest import needs_cuda
 
 

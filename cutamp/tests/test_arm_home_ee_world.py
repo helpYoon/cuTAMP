@@ -1,4 +1,4 @@
-"""TAMPWorld.arm_home_ee_world, each palm's home position, which the A* (task_planning/search.py)
+"""TAMPWorld.arm_home_ee_world, each palm's home position, which the plan search (task_planning/plan_search.py)
 reads."""
 from cutamp.tests.conftest import make_blocks_t1_world, needs_cuda
 

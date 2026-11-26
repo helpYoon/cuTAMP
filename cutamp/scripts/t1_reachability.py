@@ -5,7 +5,7 @@ From the repository root, with the cuTAMP environment active:
     python -m cutamp.scripts.t1_reachability build --nominal-only
 
 build writes the full map (every foot order's stances, which experiments/score_t1_landing_accuracy.py reads)
-under data/t1-reachability/. With --nominal-only it writes only the home stance, the map step search reads
+under data/t1-reachability/. With --nominal-only it writes only the home stance, the map the landing options read
 (shipped as t1-nominal-hand-map.npz).
 """
 

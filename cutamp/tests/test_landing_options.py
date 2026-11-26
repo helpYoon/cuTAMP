@@ -1,4 +1,4 @@
-"""CPU search over exact foot orders and a transported nominal hand workspace."""
+"""Landing options: the menu step sequences from the current feet, with reach and landing-accuracy evidence."""
 
 
 import numpy as np
@@ -6,28 +6,28 @@ import pytest
 
 from cutamp.landing_accuracy import CHECKPOINT_SHA256, LANDING_ACCURACY, SOURCE_SHA256
 from cutamp.reachability import ORDERS, REACH_MAP, ReachMap, _box_gaps, _box_gaps_rows, _rot, canonical_stance
-from cutamp.step_search import StepSearch, TargetRegion
+from cutamp.task_planning.landing_options import LandingOptions, TargetRegion
 
 HOME = ((0.0, 0.10, 0.0), (0.0, -0.10, 0.0))
 FWD = (0.12, 0.20, 0.0)
 
 
 def test_stances_with_identical_frames_reuse_the_same_hand_map_query(monkeypatch):
-    from cutamp import step_search
+    from cutamp.task_planning import landing_options
 
     calls = []
-    box_gaps = step_search._box_gaps
+    box_gaps = landing_options._box_gaps
     def measured(*args):
         calls.append(1)
         return box_gaps(*args)
-    monkeypatch.setattr(step_search, "_box_gaps", measured)
-    search = StepSearch(atlas(), commands=())
+    monkeypatch.setattr(landing_options, "_box_gaps", measured)
+    search = LandingOptions(atlas(), commands=())
     region = target(0.005)
     (home,) = search.edges(HOME, region)
     initial_count = len(calls)
     widened = ((0.0, 0.12, 0.0), (0.0, -0.12, 0.0))
     (wide,) = search.edges(widened, region)
-    assert home.soles != wide.soles and home.witness == wide.witness
+    assert home.soles != wide.soles and (home.distance_m, home.posture) == (wide.distance_m, wide.posture)
     assert len(calls) == initial_count > 0
     search.edges(widened, target(0.065))
     assert len(calls) > initial_count
@@ -96,23 +96,23 @@ def passing(*orders):
 
 
 def test_carry_incoming_feet_and_reset_foot_flags():
-    search = StepSearch(atlas(), accuracy=passing("L", "R"), lag=8, commands=(FWD,))
+    search = LandingOptions(atlas(), accuracy=passing("L", "R"), lag=8, commands=(FWD,))
     goals = (target(0.065), target(0.065))
     initial = search.edges(HOME, goals[0])
     assert [e.order for e in initial] == list(ORDERS)
     assert [e.cost for e in initial] == [(1, 0), (0, 1), (0, 1), (1, 2), (1, 2)]
     second = search.edges(initial[1].soles, goals[1])
     assert second[0].cost == (0, 0)
-    assert second[0].posture == "crouch" and second[0].witness == (42.0,)
+    assert second[0].posture == "crouch"
     assert "LR" not in [e.order for e in second]  # identical first landing is illegal
-    another = StepSearch(atlas(), commands=(FWD, (0.24, 0.20, 0)))
+    another = LandingOptions(atlas(), commands=(FWD, (0.24, 0.20, 0)))
     first = another.edges(HOME, goals[0])
     a = next(e for e in first if e.order == "L")
     assert any(e.order == "L" for e in another.edges(a.soles, goals[1]))  # foot flags reset
 
 
 def test_missing_map_or_region_is_finite_and_floor_collision_excludes_endpoint():
-    search = StepSearch(atlas(), commands=(FWD,))
+    search = LandingOptions(atlas(), commands=(FWD,))
     unknown = TargetRegion("right", None, None)
     assert min(e.cost for e in search.edges(HOME, unknown)) == (1, 0)
     assert search.edges(HOME, TargetRegion("right", (0.0, 0.0, 0.5), (0.01, 0.01, 0.01)))[0].distance_m is None
@@ -123,14 +123,14 @@ def test_missing_map_or_region_is_finite_and_floor_collision_excludes_endpoint()
 
 
 def test_only_objects_that_intersect_the_sole_height_band_block_a_landing():
-    search = StepSearch(atlas(), commands=())
+    search = LandingOptions(atlas(), commands=())
     for bottom, expected in ((0.006, ("L",)), (0.05, ()), (-0.08, ())):
         cube = TargetRegion("left", (0.0, 0.1, bottom + 0.025), (0.05,) * 3, solid_pick=True)
         assert search.blocked_feet(HOME, cube) == expected
 
 
 def test_floor_pick_uses_oriented_sole_and_box_interiors():
-    search = StepSearch(atlas(), commands=())
+    search = LandingOptions(atlas(), commands=())
     # A thin box crosses the thin left sole at right angles without containing any
     # of its vertices. Translating by .11 m leaves only an edge in contact.
     for shift, expected in ((0, ("L",)), (0.11, ())):
@@ -145,7 +145,7 @@ def test_floor_pick_uses_oriented_sole_and_box_interiors():
 
 def test_matching_signed_commands_only_and_transferred_prior():
     records = profile("L", [{"lag": 8, "stages": [stage("L")], "all_handoffs_pass": True}])
-    search = StepSearch(atlas(), accuracy=records, lag=8, commands=(FWD,))
+    search = LandingOptions(atlas(), accuracy=records, lag=8, commands=(FWD,))
     query = target(0.065)
     edges = search.edges(HOME, query)
     l, r = edges[1:3]
@@ -155,7 +155,7 @@ def test_matching_signed_commands_only_and_transferred_prior():
     moved = search.edges(shifted, target(0.465))[1]
     assert moved.cost == l.cost and moved.accuracy == "transferred"
     assert search.edges(HOME, target(0.065, loaded=True))[1].cost == (1, 1)
-    assert StepSearch(atlas(), commands=(FWD,), lag=8).edges(HOME, query)[1].cost == (1, 1)
+    assert LandingOptions(atlas(), commands=(FWD,), lag=8).edges(HOME, query)[1].cost == (1, 1)
 
 
 def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():
@@ -166,7 +166,7 @@ def test_accuracy_requires_each_issued_pair_legal_and_final_original_pair():
     trials[3]["stages"][0]["handoff"]["nominal_xy_error_m"][0] = 0.022  # intermediate nominal only
     del trials[4]["stages"][1]["handoff"]["issued_xy_error_m"]
     trials[5].pop("stages")  # an old/reduced unversioned flag is insufficient
-    seen = StepSearch(atlas(), accuracy=profile("LR", trials), lag=8, commands=(FWD,))
+    seen = LandingOptions(atlas(), accuracy=profile("LR", trials), lag=8, commands=(FWD,))
     edge = next(e for e in seen.edges(HOME, target(0.065)) if e.order == "LR")
     assert (edge.passes, edge.trials) == (1, 4)
 
@@ -176,11 +176,11 @@ def test_different_model_or_handoff_profile_does_not_supply_accuracy(field):
     records = profile("L", [{"lag": 8, "all_handoffs_pass": True, "stages": [stage("L")]}])
     records["provenance"][field] = {} if field == "source_sha256" else "other"
     with pytest.raises(ValueError, match="incompatible"):
-        StepSearch(atlas(), accuracy=records, lag=8, commands=(FWD,))
+        LandingOptions(atlas(), accuracy=records, lag=8, commands=(FWD,))
 
 
 def test_yawed_voxels_keep_pose_and_do_not_fill_sampling_gaps():
-    search = StepSearch(atlas(points=((0.005, 0.005, 0.505), (0.155, 0.005, 0.505))), commands=())
+    search = LandingOptions(atlas(points=((0.005, 0.005, 0.505), (0.155, 0.005, 0.505))), commands=())
     a = 0.731
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     feet = tuple((*((R @ np.array(s[:2])) + [0.43, 0.2]), a) for s in HOME)
@@ -195,7 +195,7 @@ def test_yawed_voxels_keep_pose_and_do_not_fill_sampling_gaps():
 
 
 def test_saved_low_pick_matches_geometric_and_lag8_contributor_counts():
-    search = StepSearch.load(
+    search = LandingOptions.load(
         REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8
     )
     pick = TargetRegion("left", (0.48, 0.18, 0.025), (0.05, 0.05, 0.05), solid_pick=True)
@@ -287,14 +287,14 @@ def test_box_gaps_rows_match_the_scalar_gaps():
 ])
 @pytest.mark.parametrize("bar", [0.0, 0.03])
 def test_reaches_matches_the_hand_index(target, bar):
-    search = StepSearch.load(REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8)
+    search = LandingOptions.load(REACH_MAP, accuracy_path=LANDING_ACCURACY, lag=8)
     soles = random_pairs(2000, seed=0)  # [2000, 2, 3]: right sole 0.15-0.45 m to the right of the left, turns within 0.6 rad
     center, half = np.asarray(target.center), tuple(np.asarray(target.size) / 2)
     expected = []
-    for feet in soles:  # the task planner's own per-stance test, step_search.py:283-286
+    for feet in soles:  # the task planner's own per-stance test, LandingOptions.reaches
         _, frame = canonical_stance(feet)
         local = (*((center[:2] - frame[:2]) @ _rot(-frame[2])), center[2])
-        gap, _, _ = search.hands[target.arm].nearest(local, half, target.yaw - frame[2])
+        gap, _ = search.hands[target.arm].nearest(local, half, target.yaw - frame[2])
         expected.append(gap <= bar + 1e-12)
     got = search.reaches(soles, target, bar)
     assert got.dtype == bool and got.shape == (2000,)

@@ -111,7 +111,7 @@ def test_default_cost_checks_the_same_particle_at_each_fixed_stance_wrist():
     from cutamp.scripts.utils import default_constraint_to_mult
     from cutamp.t1_domain import LeftPick, LeftPlace, RightPick
     from cutamp.tamp_world import TAMPWorld
-    from cutamp.tests.conftest import default_checker
+    from cutamp.tests.conftest import default_checker, fixed_stances
 
     dc = DeviceCfg()
     home = dc.to_device(REAL_LEGS.home)
@@ -134,7 +134,7 @@ def test_default_cost_checks_the_same_particle_at_each_fixed_stance_wrist():
 
     rollout = RolloutFunction(skeleton, world)(particles)
     cost_fn = CostFunction(skeleton, world, TAMPConfiguration())
-    costs = cost_fn(rollout, particles)
+    costs = cost_fn(rollout, particles, achieved_stances=fixed_stances(world, particles))
     comfort = {"ComComfort": costs["ComComfort"]}
     checker = default_checker()
     mask = checker.get_full_mask(comfort)["ComComfort"]["margin_shortfall_squared"]

@@ -293,7 +293,7 @@ def _obb_gap(A, ah, B, bh):
 
 def _local_box(obj, like):
     """``(centre [3], half [3])`` of ``obj``'s box in its own frame, as tensors like ``like``: a copy from the host."""
-    from cutamp.step_search import _local_bounds
+    from cutamp.task_planning.landing_options import _local_bounds
 
     bounds = _local_bounds(obj)
     if bounds is None:

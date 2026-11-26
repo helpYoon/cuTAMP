@@ -90,7 +90,7 @@ class T1Model:
     asset_root: Path                     # where its relative asset paths resolve
     joint_names: Tuple[str, ...]         # == world.kinematics.joint_names
     base: slice
-    body: slice                          # legs and trunk joints (minimize_body_movement)
+    body: slice                          # legs and trunk joints
     left_arm: slice
     right_arm: slice
     home: Tuple[float, ...]
@@ -286,7 +286,7 @@ def _trajopt_metrics_dict() -> dict:
     """cuRobo's metrics YAML for trajopt's success test, without its torque bound. With timeopt off, trajopt judges a
     segment at the fastest pace its speed, acceleration and jerk caps allow, so a torque bound there drops segments
     that fit slower: at h 0.2 (2026-11-09), every segment dropped on torque fit at half speed. The balance gate slows
-    each segment until every effort holds (``motion_solver._torque_scale``); trajopt's cost still penalizes torque."""
+    each segment until every effort holds (``motion_solver._retime``); trajopt's cost still penalizes torque."""
     from curobo.config_io import join_path, resolve_config
     from curobo.content import get_task_configs_path
 

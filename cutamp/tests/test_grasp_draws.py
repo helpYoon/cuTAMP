@@ -1,8 +1,6 @@
-"""Init gives each row a grasp from its object's GraspGenX grasps (design 7.8): the load-time drops of grasps whose
-hand spheres reach below the object's bottom face or touch the object, per arm; each pick's pool of every grasp the
-hand can take; each pick's chosen grasps and their pool confs, or the score draw where no grasp is balanced; the
-redraw of the rows whose IK failed, at picks and places; and the place yaw that follows the held grasp. The GPU tests
-share conftest's module-scoped ``real_world``."""
+"""A plan's grasps come from its objects' GraspGenX grasps (design 7.8): the load-time drops of grasps whose hand
+spheres reach below the object's bottom face or touch the object, per arm; each pick's pool of every grasp the hand can
+take; and the place yaw that follows the held grasp. The GPU tests share conftest's module-scoped ``real_world``."""
 
 import math
 from types import SimpleNamespace
@@ -14,7 +12,7 @@ from curobo.types import DeviceCfg
 
 from cutamp.grasps import AZIMUTH_CONE, GraspSet, drop_grasps
 from cutamp.robots.t1 import get_t1_gripper_spheres, load_sweep_volume
-from cutamp.tests.conftest import default_checker, needs_cuda
+from cutamp.tests.conftest import needs_cuda
 from cutamp.utils.common import grasp_7dof_to_mat4x4, mat4x4_to_grasp_7dof
 from cutamp.utils.shapes import sample_greedy_surface_spheres
 
@@ -110,11 +108,10 @@ def test_drops_run_per_arm(real_world):
 def test_pick_pool_is_every_grasp_the_hand_can_take(real_world):
     # No approach cone (user, 2026-11-08: "Top grasps are not always a good grasp"): each pick judges every grasp
     # grasp_candidates keeps, top or side, from any direction. With the cone, blocks_t1's pools were 222 and 221.
-    from cutamp.config import TAMPConfiguration
-    from cutamp.particle_initialization import ParticleInitializer
+    from cutamp.particle_initialization import _pick_pools
 
     skeleton, _, _ = _first_plan(real_world)
-    pools = ParticleInitializer(real_world, TAMPConfiguration(num_particles=8), default_checker())._pick_pools(skeleton)
+    pools = _pick_pools(real_world, skeleton)
     picks = [op for op in skeleton if op.operator.metadata.action_type == "pick"]
     assert len(picks) == len(pools) == 2
     for op in picks:
@@ -134,8 +131,7 @@ def _first_plan(world):
 
 @needs_cuda
 def test_no_grasp_left_names_the_rules(real_world, monkeypatch):
-    from cutamp.config import TAMPConfiguration
-    from cutamp.particle_initialization import ParticleInitializer
+    from cutamp.particle_initialization import NoGraspCandidates, _pick_pools
 
     world, top = real_world, _top_down()
     # Two grasps beside the block and 4 cm low reach below its bottom face without touching it; three turned ones
@@ -147,210 +143,11 @@ def test_no_grasp_left_names_the_rules(real_world, monkeypatch):
     monkeypatch.setattr(world, "_grasps", {name: bad for name in world.grasps})
     monkeypatch.setattr(world, "_grasp_candidates", {})
     skeleton, obj, arm = _first_plan(world)
-    with pytest.raises(ValueError) as err:
-        ParticleInitializer(world, TAMPConfiguration(num_particles=8), default_checker())(skeleton)
+    with pytest.raises(NoGraspCandidates) as err:
+        _pick_pools(world, skeleton)
     message = str(err.value)
     assert obj in message and f"{arm} hand" in message, message
     assert "5 grasps" in message and "each reaches below its bottom face or touches it" in message, message
-
-
-def _fake_ik(monkeypatch, accept):
-    """gn_ik and ik_check stand-ins. A row's targets hold its drawn value v; gn_ik answers q = (v, v), accepts
-    accept(v) and records each call's values and arms; ik_check accepts a conf whose first entry is >= 0."""
-    import cutamp.particle_initialization as pi
-    calls, arms_seen = [], []
-
-    def gn_ik(world, world_from_ee, arms, movables, tol):
-        v = world_from_ee[:, 0, 0]
-        calls.append(v.tolist())
-        arms_seen.append(tuple(arms))
-        return torch.stack([v, v], -1), accept(v)
-
-    def ik_check(world, q, world_from_ee, arms, movables, tol):
-        return q[:, 0] >= 0, q[:, 0] >= 0, torch.zeros(len(q))
-
-    monkeypatch.setattr(pi, "gn_ik", gn_ik)
-    monkeypatch.setattr(pi, "ik_check", ik_check)
-    return calls, arms_seen
-
-
-def _step(particles, name, values, redraw, arm="left", **kw):
-    """A walk step ``name`` on four CPU rows, drawn as ``values``; its targets hold its value, the fake IK's input.
-    ``redraw``: a number (row i redraws to it plus i) or the step's redraw."""
-    import cutamp.particle_initialization as pi
-    particles[name] = torch.tensor(values, dtype=torch.float)
-    inputs = lambda rows: (particles[name][rows, None, None].expand(-1, 4, 4), torch.zeros(len(rows), 1, 4))
-    redraws = redraw if callable(redraw) else lambda rows: redraw + rows.float()
-    return pi._Step(name, f"q_{name}", arm, inputs, redraws, **kw)
-
-
-def _solve(particles, steps, rounds=2):
-    import cutamp.particle_initialization as pi
-    return pi._solve_steps(SimpleNamespace(device="cpu", q_init=torch.zeros(2)), particles, steps, 4, rounds, None)
-
-
-def test_redraw_only_failed_rows(monkeypatch):
-    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 10))
-    particles = {}
-    q, ok, accepted = _solve(particles, [_step(particles, "x", [0, 1, 2, 3], redraw=10)])["q_x"]
-    assert calls == [[0, 1, 2, 3], [10, 12]]  # only the failed rows drew again and were solved again
-    assert particles["x"].tolist() == [10, 1, 12, 3] and q[:, 0].tolist() == [10, 1, 12, 3]
-    assert ok.all() and accepted == [2, 4]
-    calls.clear()
-    q, ok, accepted = _solve(particles, [_step(particles, "x", [0, 1, 2, 3], redraw=10)], rounds=0)["q_x"]
-    assert calls == [[0, 1, 2, 3]] and ok.tolist() == [False, True, False, True] and accepted == [2]
-
-
-def test_check_the_start_before_solving(monkeypatch):
-    # Rows 0 and 2 pass the check and keep their start conf; gn_ik solves rows 1 and 3, accepts 3; row 1 redraws
-    # (G4).
-    calls, _ = _fake_ik(monkeypatch, lambda v: (v == 3) | (v >= 100))
-    start = torch.tensor([[1.0, 7.0], [-1.0, 7.0], [1.0, 8.0], [-1.0, 8.0]])
-    particles = {}
-    q, ok, accepted = _solve(particles, [_step(particles, "x", [0, 1, 2, 3], redraw=100, q_start=start)])["q_x"]
-    assert calls == [[1, 3], [101]]
-    assert torch.equal(q[[0, 2]], start[[0, 2]])
-    assert q[1].tolist() == [101, 101] and q[3].tolist() == [3, 3]
-    assert particles["x"].tolist() == [0, 101, 2, 3] and ok.all() and accepted == [3, 4]
-
-
-def test_steps_solve_in_one_call_per_round(monkeypatch):
-    # Two steps, one per hand: one call solves both, then one call per round their failed rows, each step's rows a
-    # block of the call's arms, the smaller block repeating its rows up to the larger's (y's row 1 twice).
-    calls, arms = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
-    particles = {}
-    steps = [_step(particles, "x", [0, 1, 2, 3], redraw=100), _step(particles, "y", [5, 4, 7, 9], redraw=200,
-                                                                    arm="right")]
-    solved = _solve(particles, steps)
-    assert calls == [[0, 1, 2, 3, 5, 4, 7, 9], [100, 102, 201, 201]]
-    assert arms == [("left", "right")] * 2
-    assert solved["q_x"][0][:, 0].tolist() == [100, 1, 102, 3] and solved["q_y"][0][:, 0].tolist() == [5, 201, 7, 9]
-    assert solved["q_x"][2] == [2, 4] and solved["q_y"][2] == [3, 4]
-
-
-def test_a_redrawn_grasp_redraws_its_place(monkeypatch):
-    # The place reads the pick's grasp (drawn_from): the pick's row 0 draws again, so the place's row 0 draws again
-    # and is solved again, though its IK had passed; its other rows stay.
-    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
-    particles = {}
-    steps = [_step(particles, "g", [0, 1, 3, 5], redraw=100),
-             _step(particles, "p", [7, 9, 11, 13], redraw=300, drawn_from=("g",))]
-    _solve(particles, steps)
-    assert calls == [[0, 1, 3, 5, 7, 9, 11, 13], [100, 300]]
-    assert particles["p"].tolist() == [300, 9, 11, 13]
-
-
-def test_a_redrawn_grasp_restores_its_places_redraws(monkeypatch):
-    # The pick's row 0 fails twice and draws again in both rounds, so its place's row 0 draws twice for the grasp;
-    # under the final grasp it still has its own two redraws, as when the pick finished before the place drew.
-    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
-    sequence = lambda *values: (lambda it: lambda rows: torch.tensor([next(it) for _ in rows], dtype=torch.float))(
-        iter(values))
-    particles = {}
-    steps = [_step(particles, "g", [0, 1, 3, 5], redraw=sequence(2, 101)),
-             _step(particles, "p", [7, 9, 11, 13], redraw=sequence(10, 12, 14, 301), drawn_from=("g",))]
-    q, ok, accepted = _solve(particles, steps)["q_p"]
-    assert calls == [[0, 1, 3, 5, 7, 9, 11, 13], [2, 10], [101, 12], [14], [301]]
-    assert particles["p"].tolist() == [301, 9, 11, 13] and ok.all() and accepted == [4, 3, 3, 3, 4]
-
-
-def test_a_moved_placement_rechecks_the_later_steps(monkeypatch):
-    # b's movables read a's placement (checked_against): a's rows 0 and 1 draw again, so b's rows 0 and 1 are checked
-    # again where they stand; row 0 fails the check (q < 0) and is solved again, as drawn; row 1 passes and stays.
-    calls, _ = _fake_ik(monkeypatch, lambda v: (v % 2 == 1) | (v >= 100))
-    particles = {}
-    steps = [_step(particles, "a", [0, 2, 5, 7], redraw=100),
-             _step(particles, "b", [-1, 3, 5, 7], redraw=300, checked_against=("a",))]
-    solved = _solve(particles, steps)
-    assert calls == [[0, 2, 5, 7, -1, 3, 5, 7], [100, 101, -1, -1]]
-    assert particles["b"].tolist() == [-1, 3, 5, 7] and solved["q_b"][1].all()
-
-
-@needs_cuda
-def test_floor_picks_choose_upright_grasps(real_world):
-    # blocks_t1 on the floor (real_world), n 64, seed 0. Each pick chooses ten balanced grasps: those at 0.7 or more
-    # first, then the best-scoring ones below it (G2, G5; test_grasp_choice pins their order), and every particle
-    # holds one of them. The first pick's scene is the pool
-    # walk's, so its particles take the ten in turn with the pool walk's confs, accepted as they are (G4).
-    import cutamp.particle_initialization as pi
-    from cutamp.config import TAMPConfiguration
-    from cutamp.grasps import GRASP_SCORE_CUTOFF
-
-    skeleton, _, _ = _first_plan(real_world)
-    torch.manual_seed(0)
-    init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=64), default_checker())
-    particles = init(skeleton)
-    picks = [op for op in skeleton if op.operator.metadata.action_type == "pick"]
-    assert [c.grasp for c in init.grasp_choice] == [op.values[1] for op in picks]
-    for c in init.grasp_choice:
-        high = min(10, int((c.ok & (c.scores >= GRASP_SCORE_CUTOFF)).sum()))
-        assert len(c.chosen) == 10 and c.ok[c.chosen].all()
-        assert (c.scores[c.chosen] >= GRASP_SCORE_CUTOFF).tolist() == [True] * high + [False] * (10 - high)
-        assert (particles[c.grasp][:, None] == c.grasps[c.chosen][None]).all(-1).any(-1).all()
-    first, q = init.grasp_choice[0], picks[0].values[2]
-    rank = first.chosen[torch.arange(64, device=first.chosen.device) % 10]
-    assert torch.equal(particles[first.grasp], first.grasps[rank])  # in turn, nothing redrawn
-    assert torch.equal(particles[q][10:], particles[q][:-10])  # the same grasp, the same copied conf
-
-
-@needs_cuda
-def test_each_walk_solves_its_steps_together(real_world, monkeypatch):
-    # blocks_t1's first plan: the pool walk's two picks and two places solve in one gn_ik call, a block per step; the
-    # particle walk's in one call, then one per redraw round, a step's rounds restarting where a value it reads drew
-    # again (at most 1 + steps * GRASP_REDRAW_ROUNDS calls).
-    import cutamp.particle_initialization as pi
-    from cutamp.config import TAMPConfiguration
-    from cutamp.grasps import GRASP_REDRAW_ROUNDS
-
-    real_gn_ik, arms_seen = pi.gn_ik, []
-
-    def counted(world, world_from_ee, arms, movables, tol):
-        arms_seen.append(tuple(arms))
-        return real_gn_ik(world, world_from_ee, arms, movables, tol)
-
-    monkeypatch.setattr(pi, "gn_ik", counted)
-    skeleton, _, _ = _first_plan(real_world)
-    torch.manual_seed(0)
-    pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=16), default_checker())(skeleton)
-    steps = tuple(op.operator.metadata.arm for op in skeleton if op.operator.metadata.action_type in ("pick", "place"))
-    assert len(steps) == 4 and arms_seen[0] == steps
-    assert 1 <= len(arms_seen) - 1 <= 1 + len(steps) * GRASP_REDRAW_ROUNDS, arms_seen
-
-
-@needs_cuda
-def test_no_balanced_grasp_falls_back_to_the_score_draw(real_world, monkeypatch, caplog):
-    # Every pool-walk IK fails (its one call is wider than any of the particle walk's, at most its 4 steps' n rows), so
-    # no grasp is balanced: each pick warns and draws by score from its pool, as before (G6): torch.multinomial on the
-    # pick's own scores, not the pool walk's draw in turn.
-    import logging
-    import cutamp.particle_initialization as pi
-    from cutamp.config import TAMPConfiguration
-
-    n, real_gn_ik, real_multinomial, draws = 8, pi.gn_ik, torch.multinomial, []
-
-    def pool_fails(world, world_from_ee, arms, movables, tol):
-        q, ok = real_gn_ik(world, world_from_ee, arms, movables, tol)
-        return q, ok & (len(ok) <= 4 * n)
-
-    def multinomial(input, *args, **kwargs):
-        draws.append(input.clone())
-        return real_multinomial(input, *args, **kwargs)
-
-    monkeypatch.setattr(pi, "gn_ik", pool_fails)
-    skeleton, _, _ = _first_plan(real_world)
-    torch.manual_seed(0)
-    init = pi.ParticleInitializer(real_world, TAMPConfiguration(num_particles=n), default_checker())
-    with caplog.at_level(logging.WARNING, logger="cutamp.particle_initialization"), monkeypatch.context() as m:
-        m.setattr(torch, "multinomial", multinomial)
-        particles = init(skeleton)
-    warnings = [r.getMessage() for r in caplog.records
-                if r.name == "cutamp.particle_initialization" and r.levelno == logging.WARNING]
-    assert init.grasp_choice
-    for c in init.grasp_choice:
-        assert c.chosen is None and not c.ok.any()
-        assert any(c.obj in message for message in warnings)
-        assert any(torch.equal(scores, c.scores) for scores in draws), c.obj
-        assert (particles[c.grasp][:, None] == c.grasps[None]).all(-1).any(-1).all()
 
 
 def test_place_yaw_follows_the_grasp():

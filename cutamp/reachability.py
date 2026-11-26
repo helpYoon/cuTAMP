@@ -1,4 +1,4 @@
-"""Sparse T1 hand reach map, the step command menu and the geometry step search uses. Meters and radians."""
+"""Sparse T1 hand reach map, the step command menu and the geometry the landing options use. Meters and radians."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-#: The nominal-stance hand reach map the step search loads by default (``t1_reachability build --nominal-only``).
+#: The nominal-stance hand reach map the landing options load by default (``t1_reachability build --nominal-only``).
 REACH_MAP = Path(__file__).parent / "robots" / "assets" / "t1_29dof" / "t1-nominal-hand-map.npz"
 
 ORDERS = ("none", "L", "R", "LR", "RL")

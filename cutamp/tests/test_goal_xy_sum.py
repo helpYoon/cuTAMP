@@ -6,7 +6,7 @@ import os
 import pytest
 import torch
 
-from cutamp.tests.conftest import needs_cuda, sync_debug_error
+from cutamp.tests.conftest import fixed_stances, needs_cuda, sync_debug_error
 
 pytestmark = pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 
@@ -105,7 +105,7 @@ def test_cost_function_is_run_to_run_bitwise(real_world, real_plan, monkeypatch)
     # under cfa7a46's atomics, hence 256; the grad-enabled repeats below vary more, so 8 suffice there.
     def outputs():
         with torch.no_grad():
-            cost_dict = cost_fn(rollout_fn(particles), particles)
+            cost_dict = cost_fn(rollout_fn(particles), particles, achieved_stances=fixed_stances(world, particles))
             out = {(c, n): v.clone() for c, e in cost_dict.items() for n, v in e["values"].items()}
             out["costs"] = reducer(cost_dict, consider_types=ADAM_CONSIDER_TYPES).clone()
             out["mask"] = checker.get_mask(cost_dict, verbose=False).clone()
@@ -135,7 +135,8 @@ def test_cost_function_is_run_to_run_bitwise(real_world, real_plan, monkeypatch)
     with monkeypatch.context() as m:
         m.setattr("cutamp.cost_function._per_object_sum", recording)
         with torch.no_grad():
-            values = cost_fn(rollout_fn(particles), particles)["StablePlacement"]["values"]
+            values = cost_fn(rollout_fn(particles), particles,
+                             achieved_stances=fixed_stances(world, particles))["StablePlacement"]["values"]
     assert len(calls) == len(cost_fn.surface_to_placements), [c[:2] for c in calls]
     for surface, (shape, counts, result) in zip(cost_fn.surface_to_placements, calls):
         assert counts is cost_fn.surface_to_sphere_counts[surface] and shape == (64, sum(counts)), (surface, shape)
@@ -143,7 +144,7 @@ def test_cost_function_is_run_to_run_bitwise(real_world, real_plan, monkeypatch)
 
     def grad_outputs():  # with grad, on fresh leaf clones: TorchScript specializes on requires_grad
         leaves = {k: v.detach().clone().requires_grad_(v.is_floating_point()) for k, v in particles.items()}
-        cost_dict = cost_fn(rollout_fn(leaves), leaves)
+        cost_dict = cost_fn(rollout_fn(leaves), leaves, achieved_stances=fixed_stances(world, leaves))
         costs = reducer(cost_dict, consider_types=ADAM_CONSIDER_TYPES)
         out = {(c, n): v.detach().clone() for c, e in cost_dict.items() for n, v in e["values"].items()}
         out["costs"] = costs.detach().clone()

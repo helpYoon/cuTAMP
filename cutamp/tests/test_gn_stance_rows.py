@@ -106,7 +106,12 @@ def test_on_the_worlds_stance_levels_1_and_2_match(real_world, real_plan):
 
 @needs_cuda
 def test_a_moved_stance_gives_the_moved_posture(real_world, real_plan):
+    # Every joint 0.01 rad inside its limits first: GN blocks a joint at its limit by the sign of its step, which on a
+    # joint exactly at the limit (most of the plan's starting rows, at the ankle cap) moving the scene's float32
+    # rounding can flip; then the two calls take different steps (2026-11-25: 8 of 60 rows, 0.048 rad).
     arm, _, q0 = _first_pick(real_world, real_plan)
+    lower, upper = real_world.joint_limits
+    q0 = torch.minimum(torch.maximum(q0, lower + 0.01), upper - 0.01)
     targets, _ = _moved_targets(real_world, q0, arm)
     home = _home(real_world, len(q0))
     want = gn_project_balanced(real_world, q0, targets, arm, collision=False, stances=home)

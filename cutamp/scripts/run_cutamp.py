@@ -100,7 +100,6 @@ def cutamp_demo(
 def entrypoint():
     import argparse
 
-    from cutamp.config import SUPPORTED_SOFT_COSTS
     _defaults = TAMPConfiguration()
 
     parser = argparse.ArgumentParser(
@@ -119,29 +118,20 @@ def entrypoint():
              "new z with no support geometry added.",
     )
 
-    # Soft costs
     parser.add_argument(
         "--reik_interval", type=int, default=_defaults.reik_interval,
-        help="Periodic IK projection cadence K. Smaller K bounds KinematicConstraint drift but does more IK calls.",
+        help="Refresh cadence K: every K Adam steps the plan refreshes, its postures through the IK projection. "
+             "Smaller K bounds KinematicConstraint drift but does more refreshes.",
     )
     parser.add_argument(
         "--cuda_graphs", dest="cuda_graphs", action="store_true",
-        help="Replay the Adam step and re-IK refresh as CUDA graphs. On by default.",
+        help="Replay the Adam step, the landing model and the stance IK as CUDA graphs. On by default.",
     )
     parser.add_argument(
         "--no_cuda_graphs", dest="cuda_graphs", action="store_false",
-        help="Run the Adam step and re-IK refresh eagerly.",
+        help="Run them eagerly.",
     )
     parser.set_defaults(cuda_graphs=_defaults.cuda_graphs)
-    parser.add_argument(
-        "--soft_cost",
-        nargs="*",
-        default=None,
-        choices=list(SUPPORTED_SOFT_COSTS),
-        help="Soft cost(s) to optimize (default: place_close_to_base, joint_limit_margin and "
-             "minimize_body_movement; a bare --soft_cost runs none). "
-             "Can specify multiple: --soft_cost retract_close_to_home minimize_body_movement",
-    )
 
     parser.add_argument(
         "--num_opt_steps", type=int, default=_defaults.num_opt_steps, help="Number of optimization steps to run for each skeleton."
@@ -164,8 +154,7 @@ def entrypoint():
     parser.add_argument(
         "--com_center_weight", type=float, default=_defaults.com_center_weight,
         help="Prioritize the worst pick/place CoM distance for every positive value. Also weights the centering "
-             "term: squared in a plan without steps, linear (one per 5 mm) in a plan with steps. Zero disables "
-             "centering.",
+             "term, linear (one per 5 mm). Zero disables centering.",
     )
     parser.add_argument("--step_lag", type=int, default=_defaults.step_lag, help="Actuator lag in physics substeps.")
     parser.add_argument(
@@ -230,7 +219,6 @@ def entrypoint():
         step_lag=args.step_lag,
         reik_interval=args.reik_interval,
         cuda_graphs=args.cuda_graphs,
-        soft_cost=args.soft_cost,
         curobo_plan=args.motion_plan,
         enable_visualizer=not args.disable_visualizer,
         experiment_root=args.experiment_root,

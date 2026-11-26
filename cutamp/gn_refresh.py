@@ -17,15 +17,12 @@ projects q onto that target's constraint manifold; on the 6-DOF pose residual al
 ``gn_project_balanced`` puts that residual at level 2 of a four-level hierarchy whose level 1 holds the CoM in
 the support rectangle, both soles on the stance (12 rows, design 7.4: the base columns are free), the robot
 out of collision with the scene, the objects and itself (one row); level 3, beside the collision row, pulls the
-CoM toward the rectangle's centre, and level 4, below it, the Trunk toward upright. ``gn_gate`` checks the soles
-too.
+CoM toward the rectangle's centre, and level 4, below it, the Trunk toward upright.
 
-Two callers: the particle init (``particle_initialization.gn_ik``: from home and from noisy stance-rooted
-starts, iterations that reach balance first, then iterations with the collision row on, since only the conf
-the iterates end at must be clear) and the periodic refresh inside the Adam loop (``GN_ITERS`` iterations from
-the stored q, the collision row on in every one, captured as G_refresh). A refresh projects all of its deps in
-one call and makes no host syncs (the Adam loop is host-launch-bound), so its solves are the unchecked ``*_ex``
-kernels. Strictly local: a row that doesn't converge resumes at the next refresh.
+Its caller: the plan's IK projection (``step_loop.SteppedPlan.project``, with stances), at the plan's start
+and at every refresh inside the Adam loop (``GN_ITERS`` iterations from the stored q, the collision row on in every
+one). Its solves are the unchecked ``*_ex`` kernels, which wait on nothing (the Adam
+loop is host-launch-bound). Strictly local: a row that doesn't converge resumes at the next refresh.
 """
 
 from functools import lru_cache
@@ -34,13 +31,12 @@ from typing import Optional, Sequence, Tuple
 import roma
 import torch
 
-from curobo.types import JointState, Pose
+from curobo.types import JointState
 
 from cutamp._curobo_internals import sphere_position_vjp
 
 # ponytail: fixed schedule tuned for mm-scale drift; revisit only if the
-# refresh records' gn_fail counts (opt_metrics["reik_refresh"]) show a fat
-# non-converged band.
+# refreshes leave a fat non-converged band.
 GN_ITERS = 3
 # Levenberg damping on JJ^T. Units mix metres/radians; at mm/mrad residuals
 # the conditioning effect dominates and the bias is negligible.
@@ -336,9 +332,9 @@ def _upright_step(ja, jac, jac_com, active, half, q3, cols, free):
     which move exactly as the own-complement solve (gain below 1) and the box take them, though pitch alone can still
     cross 0 by the two rows' coupling.
 
-    Without it, GN's minimum-norm steps keep whatever tilt a conf's start or reach gave it: gn_ik's noisy starts
-    tilt the Trunk by up to 50 deg and that tilt survives (start-to-end correlation 0.3-0.8 on the accepted rows),
-    and blocks_t1's first places tilt back past 5 deg on 16 of 47 rows even from home (2026-11-06)."""
+    Without it, GN's minimum-norm steps keep whatever tilt a conf's start or reach gave it: the former init's noisy
+    starts tilt the Trunk by up to 50 deg and that tilt survives (start-to-end correlation 0.3-0.8 on the accepted
+    rows), and blocks_t1's first places tilt back past 5 deg on 16 of 47 rows even from home (2026-11-06)."""
     f64 = torch.float64
     pitch, roll = cols
     mask = torch.stack([free[:, pitch], free[:, roll]], -1).to(f64)                  # [B, 2]
@@ -363,6 +359,24 @@ def _side_lean_row(q, cols, free, heading):
     rows[:, 0, pitch] = -h.sin() * r.cos() * p.cos() * free[:, pitch].to(f64)
     rows[:, 0, roll] = (h.sin() * r.sin() * p.sin() - h.cos() * r.cos()) * free[:, roll].to(f64)
     return rows, (h.sin() * r.cos() * p.sin() + h.cos() * r.sin()).unsqueeze(-1)
+
+
+def _forward_lean_row(q, cols, free, heading):
+    """``(rows [B, 1, dof], target [B, 1])``, float64: the forward lean (:func:`cutamp.step_costs.forward_lean`, an
+    angle ``atan2(a, z)``: ``a`` the trunk's up axis along the heading ``heading`` ``[B]``, ``z`` its vertical part)
+    linear in the base's pitch and roll (``cols``) at ``q`` ``[B, dof]`` on the columns ``free`` leaves, and minus its
+    value there. The angle's slope points back to upright from any tilt, where a sine's turns past 90 degrees."""
+    f64 = torch.float64
+    pitch, roll = cols
+    p, r, h = q[:, pitch].to(f64), q[:, roll].to(f64), heading.to(f64)
+    a, z = h.cos() * r.cos() * p.sin() - h.sin() * r.sin(), r.cos() * p.cos()
+    da = (h.cos() * r.cos() * p.cos(), -h.cos() * r.sin() * p.sin() - h.sin() * r.cos())       # d/dpitch, d/droll
+    dz = (-r.cos() * p.sin(), -r.sin() * p.cos())
+    n = a * a + z * z
+    rows = torch.zeros(free.shape[0], 1, free.shape[1], device=free.device, dtype=f64)
+    for k, col in enumerate(cols):
+        rows[:, 0, col] = (z * da[k] - a * dz[k]) / n * free[:, col].to(f64)
+    return rows, -torch.atan2(a, z).unsqueeze(-1)
 
 
 def _fraction_that_fits(base, extra):
@@ -507,7 +521,8 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     axes alike, in metres.
 
     ``heading`` ``[N]`` (with ``centre`` and ``upright``) swaps the lower levels for a stepped plan's: level 3 the side
-    lean across that heading (:func:`_side_lean_row`), level 4 the CoM toward the centre, below it."""
+    lean across that heading (:func:`_side_lean_row`), level 4 the CoM toward the centre, below it, and level 5 the
+    Trunk upright, the forward lean along that heading toward 0, below both."""
     from cutamp.com_polygon_cost import _half_extents
 
     if region is None:
@@ -566,7 +581,7 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
     # both), since it moves no CoM axis (to first order) and never raises that sum. Its own veto is the caller's
     # contact test, where a row takes ``step3``.
     free = torch.ones_like(q)
-    free3 = free4 = free
+    free3 = free4 = free5 = free
     for _ in range(3):
         fc = free.unsqueeze(1)
         row_coll = (None, None) if coll is None else (jac_pen * fc, coll_target)
@@ -580,7 +595,7 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
         dq = dq1 + dq2
         com_lin = com + (jac_com @ dq.unsqueeze(-1)).squeeze(-1)
         if centre and heading is not None:
-            # A plan with steps: its two preferences in the order its plans are ranked by. Level 3 is the side lean,
+            # A plan with steps: its two preferences in the order of its rank (plan_rank). Level 3 is the side lean,
             # aimed from levels 1-2's box-scaled step as level 4 aims from levels 1-3's in the other order; level 4 is
             # the CoM toward the centre from where levels 1-3 leave it (linear), in the side lean's null space too.
             f3c, f4c = free3.unsqueeze(1), free4.unsqueeze(1)
@@ -589,6 +604,14 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
                                    own_complement=True).to(jac.dtype)
             dq4 = _centring_step(ja * f4c, jac * f4c, jac_com * f4c, com_lin + (jac_com @ dq3.unsqueeze(-1)).squeeze(-1),
                                  active, half, extra=_side_lean_row(q12, upright, free4, heading)[0])
+            # Level 5, the last preference: the Trunk upright, the forward lean (:func:`_forward_lean_row`) toward 0
+            # from where levels 1-4 leave it, in the null space of the side lean and the CoM rows too.
+            f5c = free5.unsqueeze(1)
+            q4 = q + _scaled_step(q, dq1, dq2, lower, upper, dq3, dq4)
+            w = ((~active).to(jac_com.dtype) / half).unsqueeze(-1)
+            above = torch.cat([_side_lean_row(q12, upright, free5, heading)[0], (jac_com * f5c * w).double()], 1)
+            dq5 = _null_space_step(ja * f5c, jac * f5c, *_forward_lean_row(q4, upright, free5, heading),
+                                   extra=above, own_complement=True).to(jac.dtype)
         elif centre:
             f3c = free3.unsqueeze(1)
             dq3 = _centring_step(ja * f3c, jac * f3c, jac_com * f3c, com_lin, active, half)
@@ -610,6 +633,8 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
             free3 = free3 * free * ~_lower_level_blocked(q, (dq1, dq2), dq3, lower, upper)
             if upright is not None:
                 free4 = free4 * free3 * ~_lower_level_blocked(q, (dq1, dq2, dq3), dq4, lower, upper)
+            if heading is not None:
+                free5 = free5 * free4 * ~_lower_level_blocked(q, (dq1, dq2, dq3, dq4), dq5, lower, upper)
 
     step12 = _scaled_step(q, dq1, dq2, lower, upper)
     if not centre:
@@ -633,9 +658,11 @@ def _balanced_step(q, r, jac, jac_com, com, lower, upper, col_mask, half, jac_so
         return step3, step3, step12
     step4 = _add_scaled(q, step, dq4, lower, upper)
     if heading is not None:
-        # The CoM's level is the last one here, so the whole step is the one tested: a row whose side lean alone
-        # would carry the CoM out still takes it together with the pull back, and a row whose whole step would
-        # takes ``step3``.
+        # The CoM's level and the upright below it are the last ones here, so the whole step is the one tested: a row
+        # whose side lean alone would carry the CoM out still takes it together with the pull back, and a row whose
+        # whole step would takes ``step3``. The upright has no contact test of its own: where the whole step ends in
+        # contact, the caller's test takes ``step3`` too.
+        step4 = _add_scaled(q, step4, dq5, lower, upper)
         skip = in_contact | leaves(step4)
     return torch.where(skip, step3, step4), step3, step12
 
@@ -673,8 +700,7 @@ def gn_project_balanced(
     with ``movables`` (``[N, M, 4]`` world-frame object spheres per row, the objects where the rollout puts
     them at that conf; ``None``: none) and with itself (one row on :func:`collision_penetration`, active where
     it is positive and driven ``GN_COLL_MARGIN`` past contact), since Adam's collision costs never move a
-    covered conf (``collision=False`` drops the row, for :func:`~cutamp.particle_initialization.gn_ik`'s
-    reaching iterations); (2) least squares
+    covered conf (``collision=False`` drops the row); (2) least squares
     on the pose residual in whatever freedom level 1 leaves; (3) with the collision row on, on every iteration
     but the last, the CoM toward the rectangle's centre in whatever freedom levels 1-2 leave
     (:func:`_centring_step`), so a conf doesn't stay edge-parked where level 1 stopped its CoM, except on a row
@@ -724,13 +750,14 @@ def gn_project_balanced(
     ``region``). The region and its centre are built once per call, without gradient.
 
     ``side_lean_first`` (it needs ``stances``) gives the lower levels the preferences of a plan with steps, in the
-    order its plans are ranked by (:func:`~cutamp.step_costs.plan_rank`): level 3 the side lean toward 0, across each
+    order of its rank (:func:`~cutamp.step_costs.plan_rank`): level 3 the side lean toward 0, across each
     row's stance heading (the mean of its two soles' yaws, :func:`_side_lean_row`), level 4 the CoM toward the centre
-    in what that leaves. The forward bow is left free, as those preferences leave it. The call then serves them in
-    place of Adam's small moves (2026-11-25).
+    in what that leaves, and level 5, the last preference, the Trunk upright: the forward lean
+    (:func:`~cutamp.step_costs.forward_lean`) toward 0 in what those leave. The call then serves them in place of
+    Adam's small moves (2026-11-25).
 
     Returns ``[N, dof]`` projected joint positions, clamped to the joint
-    limits. Convergence is NOT guaranteed: :func:`gn_gate` measures it.
+    limits. Convergence is NOT guaranteed.
     """
     from cutamp.com_polygon_cost import _project_com_to_base
 
@@ -811,38 +838,6 @@ def gn_project_balanced(
         q = (q + _sole_closing_step(state, frames, sole_idx, goals, q, lower, upper, col_mask,
                                     is_left)).clamp(lower, upper)
     return q.detach()
-
-
-def gn_gate(
-    world,
-    q_full: torch.Tensor,
-    world_from_ee: torch.Tensor,
-    arms: str | Sequence[str],
-    pos_tol: float,
-    rot_tol: float,
-    kin=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge gate for :func:`gn_project_balanced`'s output (same ``arms``), from
-    one FK pass on ``kin`` (default ``world.kinematics``) and with no host syncs.
-
-    Returns ``(pose_ok [N], com_ok [N])``: the hand's pose errors (``curobo_pose_error``, the
-    checker's metric, on each row's own arm) strictly under ``pos_tol`` and
-    ``rot_tol``, both soles' errors against the stance too
-    (:func:`soles_on_stance`, at most the same tolerances), and
-    ``compute_com_polygon_mask``. ``q_full`` must be contiguous float32 on
-    the kinematics device, as cuRobo's FK requires.
-    """
-    from cutamp.com_polygon_cost import _fk_state, com_polygon_mask_from_state
-    from cutamp.costs import curobo_pose_error
-
-    arms = (arms,) if isinstance(arms, str) else tuple(arms)
-    _, is_left = _row_layout(world.model, arms, q_full.shape[0], q_full.shape[1], q_full.device, q_full.dtype)
-    state = _fk_state(world, q_full, kin)
-    pos, quat = _row_tool_pose(state, world.tool_frame_for_arm("left"), world.tool_frame_for_arm("right"), is_left)
-    ee = Pose(position=pos.contiguous(), quaternion=quat.contiguous()).get_matrix()
-    pos_err, rot_err = curobo_pose_error(ee, world_from_ee)
-    pose_ok = (pos_err < pos_tol) & (rot_err < rot_tol) & soles_on_stance(world, state, pos_tol, rot_tol)
-    return pose_ok, com_polygon_mask_from_state(state, world.model.support)
 
 
 def soles_on_stance(world, state, pos_tol: float, rot_tol: float) -> torch.Tensor:

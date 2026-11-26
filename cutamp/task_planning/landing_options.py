@@ -1,6 +1,6 @@
 """Landing options for one pick or place: every menu step sequence from the current feet that lands legally and off
-the pick object, with the hand reach map's distance to the target and the landing-accuracy evidence. The A* in
-``cutamp.task_planning.search`` chooses among them.
+the pick object, with the hand reach map's distance to the target and the landing-accuracy evidence. The plan
+search (``cutamp.task_planning.plan_search``) chooses among them.
 
 World geometry uses meters and radians, with left/right sole poses in that order.
 An edge's cost is (unresolved manipulation, number of steps).
@@ -32,6 +32,7 @@ from cutamp.reachability import (
     apply_command,
     canonical_stance,
 )
+from cutamp.utils.common import file_version
 
 
 def _tuples(rows):
@@ -122,14 +123,12 @@ class TargetRegion:
 
 
 @dataclass(frozen=True)
-class LandingEdge:
+class LandingOption:
     order: str
     commands: tuple
     soles: tuple
-    steps: tuple  # achieved in the *search geometry*, one nominal sole pair per command
     distance_m: float | None
     posture: str | None
-    witness: tuple | None  # nominal, stance-local configuration
     accuracy: str  # "profiled" matches the nominal sole pair; actual state/history is assessed in refinement
     passes: int
     trials: int
@@ -141,8 +140,8 @@ class LandingEdge:
 
 
 @dataclass(frozen=True)
-class Schedule:
-    edges: tuple[LandingEdge, ...]
+class ChosenLandings:
+    edges: tuple[LandingOption, ...]
     cost: tuple[int, int]
 
 
@@ -165,7 +164,7 @@ class _HandIndex:
 
     def nearest(self, center, half, yaw):
         if self.tree is None:
-            return None, None, None
+            return None, None
         half_cell = self.voxel / 2
         _, seed = self.tree.query(center)
         (upper,) = _box_gaps(self.tree.data[seed : seed + 1] - center, half, half_cell, yaw)
@@ -180,9 +179,7 @@ class _HandIndex:
             cell, gap = ids[i], float(gaps[i])
         row = int(self.source[cell])
         layer_id = int(np.searchsorted(self.ends, row, side="right"))
-        layer = self.layers[layer_id]
-        row -= int(self.ends[layer_id - 1]) if layer_id else 0
-        return (0.0 if gap <= 1e-12 else gap, layer["posture"], tuple(layer["q"][row].tolist()))
+        return 0.0 if gap <= 1e-12 else gap, self.layers[layer_id]["posture"]
 
     def within(self, centers, half, yaws, bar):
         """Per row, whether some cell's gap to the box is <= bar + 1e-12: ``nearest``'s answer without its minimum."""
@@ -210,7 +207,7 @@ class _HandIndex:
         return cKDTree(self.tree.data * (1, 1, z_scale))
 
 
-class StepSearch:
+class LandingOptions:
     """One immutable map/menu/accuracy profile shared by all queries in a planning run."""
 
     def __init__(self, atlas, *, accuracy=None, lag=None, commands=COMMANDS):
@@ -323,11 +320,49 @@ class StepSearch:
             feet = steps[-1] if steps else incoming
             if self.blocked_feet(feet, target):
                 continue
-            gap, posture, q = None, None, None
+            gap, posture = None, None
             if known:
                 _, frame = canonical_stance(feet)
                 local = (*((center[:2] - frame[:2]) @ _rot(-frame[2])), center[2])
-                gap, posture, q = arm_map.nearest(local, half, target.yaw - frame[2])
+                gap, posture = arm_map.nearest(local, half, target.yaw - frame[2])
             evidence = self._accuracy(order, commands, exact_start, target.loaded)
-            candidates.append(LandingEdge(order, commands, feet, steps, gap, posture, q, *evidence))
+            candidates.append(LandingOption(order, commands, feet, gap, posture, *evidence))
         return tuple(candidates)
+
+
+def load_landing_options(config, *, applicable=True):
+    """The run's :class:`LandingOptions` from the shipped hand reach map (``REACH_MAP``) and landing-accuracy table
+    (``LANDING_ACCURACY``), and notes on what was loaded. Kept in memory until either file changes. Without
+    ``applicable`` (the start's dynamics differ from the table's) the table is left out."""
+    # Read at call time, so a test can point them at other files.
+    from cutamp.landing_accuracy import LANDING_ACCURACY
+    from cutamp.reachability import REACH_MAP
+
+    accuracy = file_version(LANDING_ACCURACY) if applicable else None
+    tables, notes = _step_tables(file_version(REACH_MAP), accuracy, config.step_lag)
+    return tables, (
+        dict(notes) if applicable else dict(notes, accuracy_status="dynamics outside the profiled condition")
+    )
+
+
+@lru_cache(maxsize=4)
+def _step_tables(map_version, accuracy_version, lag):
+    path = Path(map_version[0])
+    if map_version[1] is None:
+        raise FileNotFoundError(f"Reach map is unavailable at {path}")
+    try:
+        atlas = ReachMap.load(path, nominal_only=True)
+    except (ValueError, KeyError, OSError) as e:
+        raise ValueError(f"Reach map at {path} failed to load: {e}") from e
+    accuracy = Path(accuracy_version[0]) if accuracy_version else None
+    notes = {"map": str(path), "accuracy": str(accuracy) if accuracy is not None else None}
+    records = None
+    if accuracy is not None and accuracy.is_file():
+        try:
+            records = json.loads(accuracy.read_text())
+            return LandingOptions(atlas, accuracy=records, lag=lag), notes
+        except (ValueError, KeyError) as e:
+            notes["accuracy_status"] = str(e)
+    else:
+        notes["accuracy_status"] = "unavailable"
+    return LandingOptions(atlas, lag=lag), notes

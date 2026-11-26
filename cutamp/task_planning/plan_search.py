@@ -1,5 +1,6 @@
-"""A* over object-bound arm choices and nominal landing sequences. ``ManipulationPrefix`` grounds the moves from one
-pick or place to the next; ``cutamp.step_search`` offers the foot landings before each."""
+"""The plan search: a best-first search (A*-like) over the next pick or place, with its arm, and the landing options
+before it, which hands out ranked plans one at a time, best first. ``ManipulationPrefix`` grounds the moves from one
+pick or place to the next; ``cutamp.task_planning.landing_options`` lists the landing options before each."""
 
 from collections import deque
 from collections.abc import Sequence
@@ -12,7 +13,7 @@ from time import monotonic
 import numpy as np
 
 from cutamp.reachability import _rot, canonical_stance
-from cutamp.step_search import Schedule, StepSearch, TargetRegion
+from cutamp.task_planning.landing_options import ChosenLandings, LandingOptions, TargetRegion
 from cutamp.task_planning.base_structs import GroundOperator, Operator, State
 from cutamp.task_planning.grounding import _Node, get_valid_ground_operators
 from cutamp.task_planning.insert_steps import with_steps
@@ -72,19 +73,20 @@ class ManipulationPrefix:
 
 
 @dataclass
-class RankedStepSkeleton:
+class RankedPlan:
     """A task plan with its steps inserted, the foot order (``none``, ``L``, ``R``, ``LR`` or ``RL``) before each pick
     and place, and the landing path the plan search ranked it by. The particles' commands do not start at the path's:
     they start on grid paths over these foot orders that reach the ``targets``, one ``TargetRegion`` per pick and place
-    aligned with ``schedule.edges``, by the reach test of ``search``, the ``StepSearch`` that ranked the plan; when no
-    grid path reaches, on legal, feet-clear paths that do not reach (:func:`cutamp.step_refresh.draw_grid_paths`)."""
+    aligned with ``schedule.edges``, by the reach test of ``landing_options``, the ``LandingOptions`` that ranked the
+    plan; when no grid path reaches, on legal, feet-clear paths that do not reach
+    (:func:`cutamp.step_refresh.draw_grid_paths`)."""
 
     skeleton: PlanSkeleton
     orders: tuple[str, ...]
-    schedule: Schedule
+    schedule: ChosenLandings
     arm_approach_m: float | None = None
     targets: tuple = ()
-    search: StepSearch | None = None
+    landing_options: LandingOptions | None = None
 
     @property
     def cost(self) -> tuple[int, int]:
@@ -114,8 +116,9 @@ class _Branch:
         return self.missing_reach, self.approach + self.gap + self.remaining, self.unresolved, self.steps
 
 
-def arm_step_skeletons(search, world, operators, incoming, *, max_base_plans, admitted, deadline=None):
-    """Score a bound pick before querying its step edges."""
+def plan_search(options, world, operators, incoming, *, max_base_plans, admitted, deadline=None):
+    """Ranked plans, best first, from the feet ``incoming``, each pick or place's landing options listed by
+    ``options`` (:class:`LandingOptions`). A pick is scored before its landing options are listed."""
     root = ManipulationPrefix(world.initial_state, world.goal_state, operators, deadline=deadline)
     feet = tuple(tuple(row) for row in incoming)
     _, initial_frame = canonical_stance(feet)
@@ -163,7 +166,7 @@ def arm_step_skeletons(search, world, operators, incoming, *, max_base_plans, ad
     while queue and (deadline is None or monotonic() < deadline):
         _, _, node = heappop(queue)
         if node.pending:
-            for edge in search.edges(node.feet, node.targets[-1]):
+            for edge in options.edges(node.feet, node.targets[-1]):
                 unresolved, steps = edge.cost
                 push(replace(
                     node, feet=edge.soles, edges=(*node.edges, edge), pending=False,
@@ -186,8 +189,8 @@ def arm_step_skeletons(search, world, operators, incoming, *, max_base_plans, ad
                 seen.add(orders)
                 gaps = {i: order for i, order in enumerate(orders) if order != "none"}
                 stepped = with_steps(skeleton, gaps, world.initial_state, world.goal_state)
-                yield RankedStepSkeleton(stepped, orders, Schedule(node.edges, (node.unresolved, node.steps)),
-                                         node.approach, targets=node.targets, search=search)
+                yield RankedPlan(stepped, orders, ChosenLandings(node.edges, (node.unresolved, node.steps)),
+                                 node.approach, targets=node.targets, landing_options=options)
             continue
 
         for child in node.prefix.choices():
