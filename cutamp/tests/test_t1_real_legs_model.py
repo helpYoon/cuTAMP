@@ -196,7 +196,7 @@ def test_home_clears_itself(real_world):
     assert _fk(kin, home).robot_spheres.shape[-2] == sum(map(len, body.values())) + 12  # 6 slots per attached object
     assert _self_collision(kin, home) == 0.0  # the gripper clears the thighs (call 11)
     gap = _leg_gap(kin, home)
-    assert abs(gap - 0.092) <= 0.005, gap  # gap between the facing thigh proxies at home
+    assert abs(gap - 0.0785) <= 0.005, gap  # gap between the facing feet's spheres at home (the thighs' is 0.092)
     crossed = hips_crossed(real_world)
     assert _leg_gap(kin, crossed) < gap and _self_collision(kin, crossed) > 0.0  # the check fires
     from cutamp.robots.t1 import t1_curobo_cfg

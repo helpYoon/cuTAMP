@@ -221,7 +221,7 @@ class TAMPWorld:
         return self._grasps
 
     def hand_spheres(self, arm: str) -> torch.Tensor:
-        """``[14, 4]``: ``arm``'s hand spheres in its tool frame (``*_base_link``), for the grasp drops: the gripper's 12
+        """``[n, 4]``: ``arm``'s hand spheres in its tool frame (``*_base_link``), for the grasp drops: the gripper's 12
         (``gripper_spheres``), then the ``*_hand_link`` and the wrist (AL6 / AR6) spheres, placed by FK at
         ``model.home``. Hand_Roll moves the wrist sphere less than 2 mm in that frame across its range, so the set is
         taken as rigid."""

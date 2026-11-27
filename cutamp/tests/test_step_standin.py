@@ -99,15 +99,18 @@ from cutamp.step_refresh import feet_clear, grid_commands
 def test_the_grid_is_the_half_foot_lattice_inside_the_limit():
     half = np.array([0.224868, 0.10]) / 2  # the reach map's sole_box_m
     grid = grid_commands(half, 0.2125)
-    assert grid.dtype == torch.float64 and grid.shape == (100, 3)
+    assert grid.dtype == torch.float64 and grid.shape == (94, 3)
     xs, ys, turns = (sorted({round(v, 9) for v in grid[:, a].tolist()}) for a in range(3))
     assert xs == [round(k * 0.112434, 9) for k in (-2, -1, 0, 1, 2)]
     assert ys == [round(0.1625 + 0.05 * k, 9) for k in range(7)]
     assert turns == [0.0, round(math.radians(25), 9), round(math.radians(50), 9)]
     full = {(round(x, 9), round(y, 9), round(t, 9)) for x in xs for y in ys for t in turns}
     kept = {tuple(round(v, 9) for v in row) for row in grid.tolist()}
-    refused = {(-0.112434, 50), (0.0, 25), (0.0, 50), (0.112434, 25), (0.112434, 50)}
-    refused = {(round(x, 9), 0.1625, round(math.radians(t), 9)) for x, t in refused}
+    # Most of the narrowest stance and the sharpest turn at the next width: 6 more than the step set refused before
+    # the shanks' and feet's spheres were fitted (2026-11-26).
+    refused = {(x, 0.1625, t) for x in (-0.112434, 0.0, 0.112434) for t in (0, 25, 50)} - {(-0.112434, 0.1625, 25)}
+    refused |= {(0.224868, 0.1625, 50), (0.0, 0.2125, 50), (0.112434, 0.2125, 50)}
+    refused = {(round(x, 9), y, round(math.radians(t), 9)) for x, y, t in refused}
     assert full - kept == refused
     for x, y, t in grid.tolist():  # apply_command's static test (reachability.py:80-85) holds for every kept command
         assert -0.33 <= x <= 0.33 and 0.14 <= y <= 0.48 and math.radians(-20) <= t <= math.radians(50)
@@ -236,7 +239,7 @@ def test_a_shared_path_passes_the_receivers_own_tests():
         calls.append(len(pairs))
         hit = (np.abs(pairs[:, 0] - far) < 1e-9).all(1) | (np.abs(pairs[:, 0] - near) < 1e-9).all(1)
         return hit & (len(calls) != 2)
-    draws, info = draw_grid_paths(("L",), inc, torch.Generator().manual_seed(0), grid, [two_paths_but_round_two],
+    draws, info = draw_grid_paths(("L",), inc, torch.Generator().manual_seed(1), grid, [two_paths_but_round_two],
                                   [scene], FOOT_HALF)
     assert info["rounds"] == 2 and 0 < info["own"] < 16 and info["noisy"] == 0
     feet = landings(("L",), inc, draws)

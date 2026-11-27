@@ -18,7 +18,8 @@ from cutamp.utils.shapes import sample_greedy_surface_spheres
 
 CPU = DeviceCfg(device=torch.device("cpu"))
 
-#: Each hand's ``*_hand_link`` and wrist (AL6 / AR6) sphere in its ``*_base_link`` frame at home (Hand_Roll 0), worked
+#: Each hand's first ``*_hand_link`` sphere and its wrist (AL6 / AR6) sphere in its ``*_base_link`` frame at home
+#: (Hand_Roll 0), worked
 #: out by hand from t1_planner.urdf (the fixed joint at (0, ±0.084, 0), yaw ±90 deg, and Hand_Roll's origin) and
 #: t1_29dof_spheres.yml's radii.
 WRIST_SPHERES = {
@@ -38,7 +39,8 @@ def _block():
 
 
 def _hand(arm: str) -> torch.Tensor:
-    """``arm``'s 14 hand spheres in its tool frame, as ``TAMPWorld.hand_spheres`` builds them."""
+    """``arm``'s gripper spheres, its first ``*_hand_link`` sphere and its wrist sphere, in its tool frame as
+    ``TAMPWorld.hand_spheres`` places them (which also holds the ``*_hand_link``'s fitted spheres)."""
     return torch.cat([get_t1_gripper_spheres(arm, CPU), torch.tensor(WRIST_SPHERES[arm])])
 
 
@@ -95,7 +97,8 @@ def test_drops_run_per_arm(real_world):
     for arm in ("left", "right"):
         hand = world.hand_spheres(arm)
         assert torch.equal(hand[:12], world.gripper_spheres[world.tool_frame_for_arm(arm)]), arm
-        torch.testing.assert_close(hand[12:].cpu(), torch.tensor(WRIST_SPHERES[arm]), atol=1e-6, rtol=0)
+        assert hand.shape == (22, 4), arm  # the gripper's 12, the *_hand_link's 9, the wrist's 1
+        torch.testing.assert_close(hand[[12, -1]].cpu(), torch.tensor(WRIST_SPHERES[arm]), atol=1e-6, rtol=0)
         keeps[arm] = drop_grasps(obj_from_G, hand, world.get_collision_spheres(obj), BOTTOM)
         candidates = world.grasp_candidates(obj, arm)
         assert torch.equal(candidates.grasps, grasps.grasps[keeps[arm]]), arm
